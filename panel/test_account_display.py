@@ -37,7 +37,8 @@ class AccountDisplayTests(unittest.TestCase):
 
     def test_status_cell_prefers_cooldown_over_credential_expiry(self):
         # 冷却中必须走冷却分支；凭证有效期只对非冷却号展示。
-        self.assertIn("p.cooling ? (coolLeft(p.coolRemaining)", self.app_js)
+        self.assertIn("var coolSub = p.cooling", self.app_js)
+        self.assertIn("esc(coolLeft(p.coolRemaining)", self.app_js)
         self.assertIn("'凭证剩 '", self.app_js)
 
     def test_last_activity_distinguishes_no_success_from_no_record(self):
@@ -49,6 +50,24 @@ class AccountDisplayTests(unittest.TestCase):
         self.assertIn("function coolLeft(sec)", self.index)
         self.assertIn("function coolReason(p)", self.index)
         self.assertIn("'无成功记录'", self.index)
+
+    def test_cooldown_rows_carry_a_live_countdown(self):
+        # 冷却中的行必须带截止时间戳，交给每秒 tick 就地刷新；否则用户只能等下次
+        # 整页拉取才看到剩余时间变化。
+        self.assertIn("function startCoolTicker()", self.app_js)
+        self.assertIn("function tickCooldowns()", self.app_js)
+        self.assertIn("data-cool-end=", self.app_js)
+        self.assertIn("startCoolTicker();", self.app_js)
+        self.assertIn("data-cool-end=", self.index)
+
+    def test_minute_scale_cooldown_uses_clock_format(self):
+        # 一小时内的冷却显示 mm:ss，秒数每秒可见变化。
+        self.assertIn("(ss < 10 ? '0' : '') + ss", self.app_js)
+
+    def test_countdown_reloads_once_when_it_hits_zero(self):
+        # 归零后补取一次数据，让「冷却中」翻成可用；不能每秒重拉。
+        self.assertIn("COOL_RELOAD_PENDING", self.app_js)
+        self.assertIn("if (document.hidden) return;", self.app_js)
 
 
 if __name__ == "__main__":

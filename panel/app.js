@@ -1,5 +1,7 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-20：2.1.2 冷却状态带实时倒计时（data-cool-end + 每秒就地刷新，归零自动补取
+//             一次数据），并把分钟级冷却显示成 mm:ss。
 // 2026-09-20：2.1.2 账号表状态列改显示冷却剩余与原因，最近活动区分「无成功记录」与
 //             「无记录」——此前冷却中的号把凭证有效期（剩 363 天）显示在「冷却中」旁，
 //             且只有错误记录时整列显示「从未」，两处都误导排查。
@@ -59,12 +61,43 @@ function coolLeft(sec){
   var s = Number(sec) || 0;
   if (s <= 0) return '即将恢复';
   if (s < 60) return '剩 ' + s + ' 秒';
-  if (s < 3600) return '剩 ' + Math.ceil(s / 60) + ' 分钟';
+  if (s < 3600) {
+    var mm = Math.floor(s / 60), ss = s % 60;
+    return '剩 ' + mm + ':' + (ss < 10 ? '0' : '') + ss;
+  }
   if (s < 86400) {
     var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
     return '剩 ' + h + ' 小时' + (m ? ' ' + m + ' 分' : '');
   }
   return '剩 ' + Math.round(s / 86400) + ' 天';
+}
+
+// 冷却倒计时：状态列只在下一次拉取数据时才重算，用户盯着页面看不到秒数变化。
+// 渲染时把截止时刻写进 data-cool-end，这里每秒就地更新文本；有账号归零时补一次
+// 刷新，让「冷却中」及时翻成可用状态。
+var COOL_TICK = null, COOL_RELOAD_PENDING = false;
+function startCoolTicker(){
+  if (COOL_TICK) return;
+  COOL_TICK = setInterval(tickCooldowns, 1000);
+}
+function tickCooldowns(){
+  var nodes = document.querySelectorAll('[data-cool-end]');
+  if (!nodes.length) return;
+  var now = Date.now(), expired = false;
+  for (var i = 0; i < nodes.length; i++){
+    var node = nodes[i];
+    var end = Number(node.getAttribute('data-cool-end')) || 0;
+    var left = Math.max(0, Math.round((end - now) / 1000));
+    var reason = node.getAttribute('data-cool-reason') || '';
+    if (left <= 0) expired = true;
+    node.textContent = coolLeft(left) + (reason ? ' · ' + reason : '');
+  }
+  if (!expired || COOL_RELOAD_PENDING) return;
+  // 归零后只补取一次：等后端把这号从冷却里摘掉再渲染，避免每秒重拉。
+  // 页面在后台时不补取——用户看不到，等切回来时 30s 定时器自然会拉新数据。
+  if (document.hidden) return;
+  COOL_RELOAD_PENDING = true;
+  setTimeout(function(){ COOL_RELOAD_PENDING = false; loadAll(); }, 1500);
 }
 // coolReason 冷却原因转可读文案。上游原始 reason 已是运维可读串（如 "429 rate limit"），
 // 只做英文短语到中文的映射，未知值原样透出，不编造。
@@ -505,13 +538,21 @@ function renderAccounts(){
       : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
     // 状态列：冷却中显示冷却剩余与原因；正常号才显示凭证有效期（两者混在一起会把
     // 「冷却中」误读成要等 363 天，见 coolLeft 注释）。
-    var coolSub = p.cooling ? (coolLeft(p.coolRemaining) + (coolReason(p) ? ' · ' + coolReason(p) : ''))
-      : (left != null ? (left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') : '');
+    // 冷却中的行带 data-cool-end（截止毫秒时间戳），交给 tickCooldowns 每秒就地刷新，
+    // 不必等下一次整页数据拉取。
+    var coolReasonTxt = coolReason(p);
+    var coolSub = p.cooling
+      ? '<span class="sub" data-cool-end="' + (Date.now() + (Number(p.coolRemaining) || 0) * 1000) +
+        '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
+        esc(coolLeft(p.coolRemaining) + (coolReasonTxt ? ' · ' + coolReasonTxt : '')) + '</span>'
+      : (left != null
+        ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
+        : '');
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
       '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + esc(String(a.realm || '').toUpperCase()) + '</div></td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
-      (coolSub ? '<span class="sub">' + esc(coolSub) + '</span>' : '') +
+      coolSub +
       '</span></td>' +
       '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
       '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +
@@ -988,6 +1029,8 @@ function init(){
   go(v);
   loadAll();
   loadIdentity();
+  // 冷却倒计时按秒走；页面隐藏时 tick 仍在跑但没有任何可见成本，切回来即可对齐。
+  startCoolTicker();
   setInterval(function(){
     if (!document.hidden && !DT.timer) loadAll();
   }, 30000);
