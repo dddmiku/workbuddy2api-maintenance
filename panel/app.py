@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：2.1.1 密钥列表支持按需复制与逐密钥重复推理保护，沿用管理员会话和来源校验。
 # 2026-09-15: 初版。workbuddy2api 账号管理面板后端：
 #   扫码加号(OAuth url/poll)、启用/禁用(改名 .disabled)、删除(移入回收站)、
 #   账号池状态与积分聚合、容器重启。网关自身无管理接口，故独立成服务。
@@ -67,6 +68,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
+PANEL_VERSION = "2.1.1"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -773,6 +775,7 @@ def build_state(force_credit=False):
 
     return {
         "service": "wb2api-admin",
+        "version": PANEL_VERSION,
         "containerRunning": container_running(),
         "accounts": accounts,
         "pool": {
@@ -794,7 +797,7 @@ def build_state(force_credit=False):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "wb2api-admin/1.1"
+    server_version = "wb2api-admin/" + PANEL_VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -1000,7 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path in ("/api/keys", "/api/keys/update", "/api/keys/delete"):
+        if path in ("/api/keys", "/api/keys/update", "/api/keys/delete", "/api/keys/copy"):
             return self.keys_post(path)
         try:
             if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
@@ -1130,19 +1133,25 @@ class Handler(BaseHTTPRequestHandler):
         except RequestBodyError as error:
             self.close_connection = True
             return self._json(error.status, {"ok": False, "message": str(error)})
+        if "reasoning_loop_guard" in body and type(body["reasoning_loop_guard"]) is not bool:
+            return self._json(400, {"ok": False, "message": "重复推理保护必须为开启或关闭"})
         if path == "/api/keys":
-            if set(body) - {"name", "note", "models"}:
+            if set(body) - {"name", "note", "models", "reasoning_loop_guard"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             return self.keys_request("POST", "/keys", body)
         key_id = body.get("id")
         if not isinstance(key_id, str) or not re.fullmatch(r"legacy|key_[0-9a-f]{24}", key_id):
             return self._json(400, {"ok": False, "message": "密钥标识不正确"})
+        if path == "/api/keys/copy":
+            if set(body) != {"id"}:
+                return self._json(400, {"ok": False, "message": "包含不支持的字段"})
+            return self.keys_request("POST", "/keys/" + key_id + "/copy", {})
         if path == "/api/keys/delete":
             if set(body) != {"id"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             return self.keys_request("DELETE", "/keys/" + key_id)
         changes = {k: v for k, v in body.items() if k != "id"}
-        if not changes or set(changes) - {"name", "note", "enabled", "models"}:
+        if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard"}:
             return self._json(400, {"ok": False, "message": "没有有效的修改字段"})
         if "models" in changes:
             models = changes["models"]

@@ -73,6 +73,8 @@ Cookie 路径为 `/`，同时兼容根路径与 `/admin/` 部署；发放或清�
 | 添加账号 | 账号页 → 添加账号，扫码后在 App 内确认 |
 | 启用 / 停用账号 | 账号列表，改完自动重启网关容器 |
 | 创建 API key | 密钥页 → 创建密钥，可绑定模型白名单 |
+| 复制 API key | 密钥列表 → 复制；关闭创建窗口后仍可再次复制 |
+| 重复推理保护 | 每把密钥后独立开关；创建或编辑时也可设置，对后续请求生效 |
 | 调整定时任务 | 任务页开关，改完重启网关生效 |
 | 查看请求日志 | 请求日志页，带表头（密钥 / 账号 / TTFB / token），可开自动刷新 |
 | 查看 token 用量 | 用量统计页，总量卡片 + 按密钥明细 + 单密钥模型拆分 |
@@ -140,7 +142,8 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | POST | `/api/task/run`、`/api/task/toggle` | 任务运行、开关 |
 | POST | `/api/credit` | 刷新积分 |
 | POST | `/api/service/restart` | 重启网关容器 |
-| POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含 `models` 绑定）、删除 |
+| POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含模型绑定和 `reasoning_loop_guard` 开关）、删除 |
+| POST | `/api/keys/copy` | 管理员按 ID 读取完整密钥用于复制，响应禁止缓存 |
 | POST | `/api/update/check`、`/api/update/apply` | 检查远端版本、触发一次热更新 |
 
 所有 POST 接口（包括登录和退出）都需要 `Content-Type: application/json`、`X-Admin-Request: 1` 和有效的 JSON 对象；携带 `Origin` 时必须同源。管理动作还需要登录 Cookie。请求长度必须明确且合法，不接受分块请求体；密钥与热更新请求上限为 8 KiB，其他 POST 为 64 KiB。开关必须是 JSON 布尔值，不能用字符串 `"false"`。热更新的 `tag` 字段只允许字母、数字、点、下划线和短横线。

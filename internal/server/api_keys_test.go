@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-20：完整密钥复制接口不能被普通公开 API 访问。
 package server
 
 import (
@@ -63,5 +65,12 @@ func TestManagedKeysAuthorizeAndRevokeAllPublicRoutes(t *testing.T) {
 		if rec.Code != 404 {
 			t.Fatal("key management exposed publicly")
 		}
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/keys/legacy/copy", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer "+key)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatal("key copying exposed on the public API")
 	}
 }

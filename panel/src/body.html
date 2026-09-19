@@ -185,12 +185,12 @@
           </div>
           <div class="tblwrap">
             <table class="tbl key-table">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>状态</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="6"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>状态</th><th>重复推理保护</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="7"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
-        <p class="sub key-footnote">完整密钥仅在创建时显示一次。忘记密钥时，请创建新的密钥并停用旧密钥。</p>
+        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复推理的请求，对后续请求生效。</p>
       </section>
 
       <section class="view hide" data-view="usage">
@@ -424,11 +424,12 @@
           <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
           <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
         </div>
+        <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复推理时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
       </div>
       <div id="keyCreated" class="hide">
-        <div class="note ok">密钥已创建，可以用于连接网关。</div>
-        <p class="key-secret-hint">请现在复制并保存。关闭窗口后，完整密钥无法再次查看。</p>
-        <label class="fld"><span class="k">完整密钥</span><textarea id="keySecret" class="key-secret" rows="3" readonly spellcheck="false" aria-label="新创建的完整密钥"></textarea></label>
+        <div class="note ok" id="keySecretStatus" role="status">密钥已创建，可以用于连接网关。</div>
+        <p class="key-secret-hint" id="keySecretHint">可以现在复制，也可以关闭后从密钥列表再次复制。</p>
+        <label class="fld"><span class="k">完整密钥</span><textarea id="keySecret" class="key-secret" rows="3" readonly spellcheck="false" aria-label="完整密钥"></textarea></label>
         <button type="button" class="btn pri" id="btnCopyKey">复制密钥</button>
       </div>
       <p id="keyFormError" class="key-form-error hide" role="alert"></p>

@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-20：侧栏显示管理台实际版本，避免发布 2.1.1 后仍标为 v1。
 // 2026-09-19：积分查询失败时显示错误和缓存状态，避免把尚未取到的余额显示为零。
 // 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
 // 2026-09-18：退出失败时保留页面并显示错误，不再跳转伪装成功；重启提示与后台收尾行为保持一致。
@@ -234,7 +235,7 @@ function emptyBox(icon, title, sub){
 /* ── 渲染 ─────────────────────────────────────────── */
 function render(){
   var d = S.data; if (!d) return;
-  if (d.service) $('#brandVer').textContent = d.service + ' · v1';
+  if (d.service) $('#brandVer').textContent = d.service + (d.version ? ' · v' + d.version : '');
   var a = d.accounts || [], tasks = taskList();
   $('#tabAcct').textContent = a.length;
   $('#tabTask').textContent = tasks.length ? tasks.length : '—';

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：复制接口和逐密钥保护开关必须经过管理员会话、来源和字段校验。
 # 2026-09-16：验证密钥管理的管理员登录、请求来源、大小和字段限制，使用本地服务与合成会话。
 # 2026-09-17：覆盖模型绑定字段的透传与非法输入的本地拒绝。
 # 2026-09-17：覆盖用量统计页的数据通道：登录保护 + 经本机管理 socket 读 /usage。
@@ -91,6 +92,40 @@ class KeyManagementTests(unittest.TestCase):
         for body in bad_update:
             with self.subTest(body=body[:40]), patch.object(app.key_management, "request") as upstream:
                 self.assertEqual(self.request("/api/keys/update", body)[0], 400)
+                upstream.assert_not_called()
+
+    def test_copy_requires_admin_and_valid_origin(self):
+        for headers in ({"Cookie": "", "Authorization": "Bearer ordinary-key"},
+                        {"Origin": "https://unrelated.invalid"}, {"X-Admin-Request": ""}):
+            with self.subTest(headers=headers), patch.object(app.key_management, "request") as upstream:
+                code, _ = self.request("/api/keys/copy", '{"id":"legacy"}', headers=headers)
+                self.assertEqual(code, 401 if not headers.get("Cookie", "test-session") else 403)
+                upstream.assert_not_called()
+
+    def test_copy_forwards_only_id_to_private_endpoint(self):
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+                patch.object(app.key_management, "request", return_value=(200, {"ok": True, "key": "synthetic-copy"})) as upstream:
+            code, result = self.request("/api/keys/copy", '{"id":"legacy"}')
+            self.assertEqual(code, 200)
+            self.assertEqual(result["key"], "synthetic-copy")
+            upstream.assert_called_once_with("/tmp/test.sock", "POST", "/keys/legacy/copy", {})
+        for body in ('{"id":"../../config"}', '{"id":"legacy","enabled":true}'):
+            with patch.object(app.key_management, "request") as upstream:
+                self.assertEqual(self.request("/api/keys/copy", body)[0], 400)
+                upstream.assert_not_called()
+
+    def test_reasoning_guard_boolean_passes_create_and_update(self):
+        for path, body, method, endpoint, forwarded in (
+            ("/api/keys", {"name": "client", "reasoning_loop_guard": False}, "POST", "/keys", {"name": "client", "reasoning_loop_guard": False}),
+            ("/api/keys/update", {"id": "legacy", "reasoning_loop_guard": True}, "PATCH", "/keys/legacy", {"reasoning_loop_guard": True}),
+        ):
+            with self.subTest(path=path), patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+                    patch.object(app.key_management, "request", return_value=(200, {"ok": True})) as upstream:
+                self.assertEqual(self.request(path, json.dumps(body))[0], 200)
+                upstream.assert_called_once_with("/tmp/test.sock", method, endpoint, forwarded)
+        for value in ("false", 0, None, []):
+            with self.subTest(value=value), patch.object(app.key_management, "request") as upstream:
+                self.assertEqual(self.request("/api/keys/update", json.dumps({"id": "legacy", "reasoning_loop_guard": value}))[0], 400)
                 upstream.assert_not_called()
 
     def test_usage_requires_admin_session(self):

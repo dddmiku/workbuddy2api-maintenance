@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：向密钥管理接口提供重复推理保护默认值，支持每把密钥单独覆盖。
 // 2026-09-19：将重复推理保护的明确开关传入共享HTTP处理器。
 // 2026-09-19：不再向 HTTP handler 传入旧输入倍率，用量始终使用上游原值。
 // 2026-09-18：请求、排程结束后再统一关闭用量/账号池/Redis；热更新退出同样等待最终落盘。
@@ -324,8 +325,8 @@ func main() {
 	connectionState := trackConnections(&connections)
 	serveAdmin := func(listener net.Listener) {
 		mux := http.NewServeMux()
-		mux.Handle("/keys", keyStore.AdminHandler())
-		mux.Handle("/keys/", keyStore.AdminHandler())
+		mux.Handle("/keys", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
+		mux.Handle("/keys/", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
 		mux.Handle("/", h.InternalHandler())
 		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, ConnState: connectionState}
 		adminMu.Lock()

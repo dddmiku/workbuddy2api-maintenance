@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：已鉴权密钥可覆盖重复推理保护默认值，每次请求使用独立策略快照。
 // 2026-09-19：会话绑定和上游关联头按已鉴权密钥隔离，避免不同调用方共用或互相解除绑定。
 // 2026-09-19：重复推理保护返回明确非重试错误，停止本次流但保留已知用量和账号/粘性状态。
 // 2026-09-19：移除输入倍率依赖，HTTP 出口保留上游原始用量。
@@ -51,8 +52,8 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
-	// ReasoningLoopGuard nil defaults to enabled; an explicit false disables the
-	// model-scoped, repetition-based guard without changing request model or effort.
+	// ReasoningLoopGuard is the server default (nil = enabled). An authenticated
+	// key can override it without changing the requested model or reasoning effort.
 	ReasoningLoopGuard *bool
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -788,6 +789,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
+	if info, ok := requestKeyInfo(r); ok && info.ReasoningLoopGuard != nil {
+		reasoningLoopGuard = *info.ReasoningLoopGuard
+	}
 	tried := map[string]bool{}
 	var lastErr error
 
@@ -1056,7 +1061,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		stats := newChatStatsReaderSince(rc, st.start)
 		streamOptions := upstream.StreamOptions{
 			Model:              peek.Model,
-			ReasoningLoopGuard: h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard,
+			ReasoningLoopGuard: reasoningLoopGuard,
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。

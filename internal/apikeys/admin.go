@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：增加仅限管理通道的按需复制接口，以及逐密钥重复推理保护设置。
 // 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
 // 2026-09-17：管理接口支持模型绑定字段，与密钥库校验保持一致。
 // 2026-09-17：拆分"路径被活着的进程占用"这一种失败，并支持等旧进程释放后重绑，
@@ -19,21 +20,26 @@ import (
 	"time"
 )
 
-func (s *Store) AdminHandler() http.Handler {
+func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
+	guardDefault := true
+	if len(defaultGuard) > 0 {
+		guardDefault = defaultGuard[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /keys", func(w http.ResponseWriter, r *http.Request) {
-		reply(w, 200, map[string]any{"ok": true, "keys": s.List(), "max_keys": MaxKeys})
+		reply(w, 200, map[string]any{"ok": true, "keys": s.List(), "max_keys": MaxKeys, "default_reasoning_loop_guard": guardDefault})
 	})
 	mux.HandleFunc("POST /keys", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name   string   `json:"name"`
-			Note   string   `json:"note"`
-			Models []string `json:"models"`
+			Name               string   `json:"name"`
+			Note               string   `json:"note"`
+			Models             []string `json:"models"`
+			ReasoningLoopGuard *bool    `json:"reasoning_loop_guard"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		entry, key, err := s.Create(body.Name, body.Note, body.Models)
+		entry, key, err := s.Create(body.Name, body.Note, body.Models, Options{ReasoningLoopGuard: body.ReasoningLoopGuard})
 		if err != nil {
 			replyError(w, err)
 			return
@@ -42,24 +48,37 @@ func (s *Store) AdminHandler() http.Handler {
 	})
 	mux.HandleFunc("PATCH /keys/{id}", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name    *string   `json:"name"`
-			Note    *string   `json:"note"`
-			Enabled *bool     `json:"enabled"`
-			Models  *[]string `json:"models"`
+			Name               *string   `json:"name"`
+			Note               *string   `json:"note"`
+			Enabled            *bool     `json:"enabled"`
+			Models             *[]string `json:"models"`
+			ReasoningLoopGuard *bool     `json:"reasoning_loop_guard"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil {
+		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil && body.ReasoningLoopGuard == nil {
 			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
 			return
 		}
-		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models)
+		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models, Options{ReasoningLoopGuard: body.ReasoningLoopGuard})
 		if err != nil {
 			replyError(w, err)
 			return
 		}
 		reply(w, 200, map[string]any{"ok": true, "entry": entry})
+	})
+	mux.HandleFunc("POST /keys/{id}/copy", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{}
+		if !readBody(w, r, &body) {
+			return
+		}
+		key, err := s.Secret(r.PathValue("id"))
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		reply(w, http.StatusOK, map[string]any{"ok": true, "key": key})
 	})
 	mux.HandleFunc("DELETE /keys/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.Delete(r.PathValue("id")); err != nil {
@@ -104,6 +123,9 @@ func replyError(w http.ResponseWriter, err error) {
 		code = 400
 		message = err.Error()
 	case errors.Is(err, ErrLimit):
+		code = 409
+		message = err.Error()
+	case errors.Is(err, ErrSecretNotStored), errors.Is(err, ErrSecretUnavailable):
 		code = 409
 		message = err.Error()
 	default:

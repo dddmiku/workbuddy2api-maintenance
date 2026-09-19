@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：逐密钥保护设置保持跨实例同步，返回值及调用方指针不能修改存储策略。
 // 2026-09-18：复现热更新窗口的密钥跨实例丢写、撤销失效，以及返回切片对策略的意外修改。
 package apikeys
 
@@ -9,6 +10,43 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestLiveStoreReasoningGuardPolicyIsIndependentAndPersistent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := false
+	entry, key, err := s.Create("client", "", nil, Options{ReasoningLoopGuard: &guard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard = true
+	*entry.ReasoningLoopGuard = true
+	listed := s.List()
+	*listed[0].ReasoningLoopGuard = true
+	name := "renamed"
+	if _, err := s.Update(entry.ID, &name, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok := reopened.Resolve(key)
+	if !ok || info.ReasoningLoopGuard == nil || *info.ReasoningLoopGuard {
+		t.Fatal("returned/input policy pointers or rename changed stored protection")
+	}
+	guard = true
+	if _, err := s.Update(entry.ID, nil, nil, nil, nil, Options{ReasoningLoopGuard: &guard}); err != nil {
+		t.Fatal(err)
+	}
+	info, ok = reopened.Resolve(key)
+	if !ok || info.ReasoningLoopGuard == nil || !*info.ReasoningLoopGuard {
+		t.Fatal("another live instance did not observe the updated policy")
+	}
+}
 
 func TestLiveStoresPreserveOtherInstanceChanges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.json")

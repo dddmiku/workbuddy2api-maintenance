@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：密钥加密保存以支持管理员再次复制，旧密钥在有效鉴权时补齐；增加逐密钥重复推理保护覆盖。
 // 2026-09-16：增加持久化多密钥管理，保留原密钥并使启停、删除立即生效，只保存随机密钥的 SHA-256。
 // 2026-09-17：密钥可绑定模型白名单；空列表保持不限制，非法模型名拒绝保存。
 // 2026-09-18：热更新并存实例按文件版本同步密钥，持锁读改写避免丢失撤销和新建操作；返回策略使用独立副本。
@@ -38,13 +39,16 @@ var (
 )
 
 type Info struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Note      string    `json:"note"`
-	MaskedKey string    `json:"masked_key"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
-	Legacy    bool      `json:"legacy"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Note          string    `json:"note"`
+	MaskedKey     string    `json:"masked_key"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+	Legacy        bool      `json:"legacy"`
+	CopyAvailable bool      `json:"copy_available,omitempty"`
+	// nil follows the server default; a bool overrides it for this key.
+	ReasoningLoopGuard *bool `json:"reasoning_loop_guard,omitempty"`
 	// Models 该密钥允许调用的模型白名单（裸名或带 realm 前缀）。
 	// 空列表表示不限制模型，保持旧密钥零回归。
 	Models []string `json:"models"`
@@ -52,7 +56,12 @@ type Info struct {
 
 type record struct {
 	Info
-	Digest string `json:"sha256"`
+	Digest       string `json:"sha256"`
+	EncryptedKey string `json:"encrypted_key,omitempty"`
+}
+
+type Options struct {
+	ReasoningLoopGuard *bool
 }
 
 type document struct {
@@ -61,11 +70,12 @@ type document struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	path     string
-	keys     []record
-	persist  func(document) error
-	fileInfo os.FileInfo
+	mu             sync.RWMutex
+	path           string
+	keys           []record
+	persist        func(document) error
+	fileInfo       os.FileInfo
+	copyRetryAfter time.Time
 }
 
 func Open(path, existingKey string) (*Store, error) {
@@ -161,7 +171,16 @@ func (s *Store) lockAndRefresh() (func(), error) {
 
 func copyInfo(info Info) Info {
 	info.Models = append([]string(nil), info.Models...)
+	info.ReasoningLoopGuard = copyBool(info.ReasoningLoopGuard)
 	return info
+}
+
+func copyBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
 }
 
 func digest(key string) string {
@@ -243,7 +262,11 @@ func (s *Store) Resolve(key string) (Info, bool) {
 	}
 	for _, entry := range s.keys {
 		if entry.Enabled && subtle.ConstantTimeCompare([]byte(want), []byte(entry.Digest)) == 1 {
-			return copyInfo(entry.Info), true
+			info := s.recordInfo(entry)
+			if !info.CopyAvailable && !time.Now().Before(s.copyRetryAfter) {
+				return s.captureSecretLocked(entry.ID, key, info)
+			}
+			return info, true
 		}
 	}
 	return Info{}, false
@@ -257,12 +280,12 @@ func (s *Store) List() []Info {
 	}
 	result := make([]Info, 0, len(s.keys))
 	for _, entry := range s.keys {
-		result = append(result, copyInfo(entry.Info))
+		result = append(result, s.recordInfo(entry))
 	}
 	return result
 }
 
-func (s *Store) Create(name, note string, models []string) (Info, string, error) {
+func (s *Store) Create(name, note string, models []string, options ...Options) (Info, string, error) {
 	name, note = strings.TrimSpace(name), strings.TrimSpace(note)
 	models = normalizeModels(models)
 	if !validLabel(name, note) {
@@ -281,6 +304,9 @@ func (s *Store) Create(name, note string, models []string) (Info, string, error)
 	}
 	key := "wbk_" + base64.RawURLEncoding.EncodeToString(raw[:])
 	entry := record{Info: Info{ID: "key_" + hex.EncodeToString(id[:]), Name: name, Note: note, MaskedKey: mask(key), Enabled: true, CreatedAt: time.Now().UTC(), Models: models}, Digest: digest(key)}
+	if len(options) > 0 {
+		entry.ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockAndRefresh()
@@ -291,14 +317,18 @@ func (s *Store) Create(name, note string, models []string) (Info, string, error)
 	if len(s.keys) >= MaxKeys {
 		return Info{}, "", ErrLimit
 	}
+	entry.EncryptedKey, err = s.sealSecret(entry, key)
+	if err != nil {
+		return Info{}, "", err
+	}
 	next := append(append([]record{}, s.keys...), entry)
 	if err := s.commit(next); err != nil {
 		return Info{}, "", err
 	}
-	return copyInfo(entry.Info), key, nil
+	return s.recordInfo(entry), key, nil
 }
 
-func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]string) (Info, error) {
+func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]string, options ...Options) (Info, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockAndRefresh()
@@ -323,6 +353,9 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		if models != nil {
 			next[i].Models = normalizeModels(*models)
 		}
+		if len(options) > 0 && options[0].ReasoningLoopGuard != nil {
+			next[i].ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+		}
 		if !validLabel(next[i].Name, next[i].Note) {
 			return Info{}, ErrInvalid
 		}
@@ -332,7 +365,7 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		if err := s.commit(next); err != nil {
 			return Info{}, err
 		}
-		return copyInfo(next[i].Info), nil
+		return s.recordInfo(next[i]), nil
 	}
 	return Info{}, ErrNotFound
 }

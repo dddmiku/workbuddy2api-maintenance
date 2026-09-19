@@ -1,4 +1,5 @@
 /* 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
+/* 2026-09-20：列表复制入口和逐密钥重复推理保护开关，兼容移动端卡片。 */
 /* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
 .key-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:2px 0 18px}
 .key-summary p{margin:0}.key-count{font:600 25px/1 var(--mono);letter-spacing:-1px;color:var(--ink)}
@@ -6,6 +7,12 @@
 .key-note{margin-top:4px;max-width:310px;white-space:normal;overflow-wrap:anywhere}
 .key-legacy{font-size:10px;font-weight:400;padding:1px 5px;border:1px solid var(--line-2);border-radius:3px;color:var(--ink-2);white-space:nowrap}
 .key-mask{white-space:nowrap;font-size:12px}.key-date{font-size:11px;color:var(--ink-2);white-space:nowrap}
+.key-value{display:flex;align-items:center;gap:8px;min-width:0}
+.key-guard-toggle{white-space:nowrap;color:var(--ink-3)}
+.key-guard-toggle[aria-checked=true]{color:var(--ok);background:var(--ok-soft);border-color:var(--ok)}
+.key-guard-field{display:flex;align-items:flex-start;gap:9px;margin:10px 0 4px;cursor:pointer}
+.key-guard-field input{width:16px;height:16px;margin-top:3px;accent-color:var(--accent);flex:none}
+.key-guard-field b{font-size:13px;font-weight:500}.key-guard-field small{display:block;margin-top:4px;font-size:11.5px;color:var(--ink-3);line-height:1.7}
 .key-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap}.key-table th:last-child{width:178px}
 .key-footnote{line-height:1.7;margin:13px 1px}.key-dialog{margin:auto;padding:0;border:1px solid var(--line-2);border-radius:7px;width:min(500px,calc(100% - 28px));max-height:calc(100dvh - 40px);overflow:auto;color:var(--ink);background:var(--surface);box-shadow:0 18px 70px rgba(0,0,0,.35)}
 .key-dialog::backdrop{background:rgba(0,0,0,.55)}.key-dialog-head{display:flex;align-items:center;justify-content:space-between;padding:17px 20px;border-bottom:1px solid var(--line)}
