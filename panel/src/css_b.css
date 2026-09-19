@@ -1,63 +1,84 @@
-/* ══ 主区 ═══════════════════════════════════════════════════════════ */
-.main{flex:1;min-width:0;margin-left:var(--rail);display:flex;flex-direction:column}
-.top{height:var(--head);flex:none;display:flex;align-items:center;gap:12px;padding:0 22px;
-  background:var(--surface);border-bottom:1px solid var(--line)}
-.ptitle{font-size:16px;font-weight:600;line-height:1.2}
-.pdesc{font-size:11.5px;color:var(--ink-3);line-height:1.3;margin-top:1px}
-.chips{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--line);
-  border-radius:999px;font-size:11.5px;color:var(--ink-2);background:var(--surface-2);white-space:nowrap}
-.chip i{width:6px;height:6px;border-radius:50%;background:var(--ink-3);flex:none}
-.chip.ok i{background:var(--ok)} .chip.ok{color:var(--ok)}
-.chip.e i{background:var(--err)} .chip.e{color:var(--err)}
-.chip.w i{background:var(--warn)} .chip.w{color:var(--warn)}
-.vbtn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
-  border:1px solid var(--line);border-radius:var(--r2);color:var(--ink-2);background:var(--surface)}
-.vbtn:hover{border-color:var(--line-2);color:var(--ink);background:var(--surface-2)}
-.vbtn.danger:hover{color:var(--err);border-color:var(--err)}
-.vbtn[disabled]{opacity:.45;pointer-events:none}
-.body{flex:1;overflow-y:auto}
-.inner{max-width:1360px;margin:0 auto;padding:18px 22px 72px}
+/* ══ 主区 / 页头 / 面板 ══════════════════════════════════════════════
+ * 参照 new-api：内容区是画布底色 + 白色卡片（卡片自身带 1px 描边和 14px 圆角），
+ * 页头直接放在画布上，不再用一条贯穿的横线把它和内容切开。
+ * 卡片头 padding 14px、卡片体 padding 16px，和 new-api 的 CardHeader/CardContent 对齐。
+ * 2026-09-20：主区排版重做——去掉顶栏下横线、面板改 14px 圆角、页头与内容对齐一致。
+ */
+/* 主区高度锁在视口内、滚动发生在 .body 里：侧栏与顶栏保持固定，
+   和 new-api 的 SidebarInset（h-[calc(100svh-header)] overflow-hidden）一致。 */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;
+  height:calc(100vh - var(--head));overflow:hidden}
+.body{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin}
+.inner{max-width:1440px;margin:0 auto;padding:20px 22px 64px;width:100%}
 .notes{display:flex;flex-direction:column;gap:8px}
 .notes:not(:empty){margin-bottom:16px}
 
-/* ══ 页头 / 面板 ════════════════════════════════════════════════════ */
-.vhead{display:flex;align-items:center;gap:12px;margin:0 0 11px}
-.vhead h1{font-size:13.5px;font-weight:600}
-.vhead .d{font-size:11.5px;color:var(--ink-3)}
-.rule{height:1px;background:var(--line);margin:20px 0 0}
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
-.ph{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.ph h2{font-size:12.5px;font-weight:600}
-.ph .sub{font-size:11px;color:var(--ink-3)}
-.pb{padding:14px}
+/* ══ 顶栏控件 ═══════════════════════════════════════════════════════ */
+.vbtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;
+  border:1px solid transparent;border-radius:var(--r2);color:var(--ink-2);background:transparent;
+  transition:background .12s var(--ease),color .12s var(--ease),border-color .12s var(--ease)}
+.vbtn:hover{background:var(--sunken);color:var(--ink)}
+.vbtn.danger:hover{color:var(--err);background:var(--err-soft)}
+.vbtn[disabled]{opacity:.45;pointer-events:none}
+.chip{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 11px;border:1px solid var(--line);
+  border-radius:999px;font-size:12.5px;color:var(--ink-2);background:var(--surface);white-space:nowrap}
+.chip i{width:6px;height:6px;border-radius:50%;background:var(--ink-3);flex:none}
+.chip.ok{color:var(--ok);border-color:var(--ok-soft);background:var(--ok-soft)}
+.chip.ok i{background:var(--ok)}
+.chip.e{color:var(--err);border-color:var(--err-soft);background:var(--err-soft)}
+.chip.e i{background:var(--err)}
+.chip.w{color:var(--warn);border-color:var(--warn-soft);background:var(--warn-soft)}
+.chip.w i{background:var(--warn)}
+
+/* ══ 页头 ═══════════════════════════════════════════════════════════ */
+.vhead{display:flex;align-items:center;gap:10px;margin:0 0 12px;min-height:28px;flex-wrap:wrap}
+.vhead h1{font-size:17px;font-weight:600;letter-spacing:-.014em}
+.vhead .d{font-size:12px;color:var(--ink-3)}
+/* 页面标题统一由内容区顶部的 .vhead 显示，各页只保留一行操作条，避免标题重复。 */
+.vacts{display:flex;align-items:center;gap:10px;margin:0 0 12px;min-height:32px;flex-wrap:wrap}
+/* 概览里的分区标题（账号池与积分 / 今日排程）比页面标题低一档。 */
+.vhead.sec{margin-top:18px}
+.vhead.sec h1{font-size:15px}
+.rule{display:none}
+
+/* ══ 面板 ═══════════════════════════════════════════════════════════ */
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--shadow);overflow:hidden}
+.ph{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);
+  flex-wrap:wrap;background:var(--surface)}
+.ph h2{font-size:14px;font-weight:600;letter-spacing:-.011em}
+.ph b{font-size:14px;font-weight:600;letter-spacing:-.011em}
+.ph .sub{font-size:12px;color:var(--ink-3)}
+.pb{padding:16px}
 .pb.flush{padding:0}
-.pairs{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:14px;align-items:start}
-.pairs.wide{grid-template-columns:minmax(0,320px) minmax(0,1fr)}
+.pairs{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:16px;align-items:start}
+.pairs.wide{grid-template-columns:minmax(0,330px) minmax(0,1fr)}
 
 /* ══ 指标行 ═════════════════════════════════════════════════════════ */
-.mrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:8px 0;
-  border-bottom:1px solid var(--line);font-size:12.5px}
+.mrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 0;
+  border-bottom:1px solid var(--line);font-size:13px}
 .mrow:last-child{border-bottom:0}
-.mrow .k{color:var(--ink-3);flex:none}
+.mrow .k{color:var(--ink-2);flex:none}
 .mrow .v{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;min-width:0}
 .mrow .v.ok{color:var(--ok)} .mrow .v.w{color:var(--warn)} .mrow .v.e{color:var(--err)}
-.big{display:flex;align-items:flex-end;gap:7px}
-.big .v{font:600 30px/1 var(--mono);font-variant-numeric:tabular-nums}
-.big .u{font-size:11.5px;color:var(--ink-3);padding-bottom:4px}
-.comp{display:flex;height:5px;overflow:hidden;background:var(--sunken);margin:12px 0 14px}
-.comp i{display:block;height:100%}
+.big{display:flex;align-items:flex-end;gap:8px}
+.big .v{font:600 30px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.big .u{font-size:12px;color:var(--ink-3);padding-bottom:3px}
+.comp{display:flex;height:5px;overflow:hidden;background:var(--sunken);margin:14px 0;border-radius:3px}
+.comp i{display:block;height:100%;transition:width .3s var(--ease)}
 .comp .a{background:var(--ok)} .comp .b{background:var(--warn)} .comp .c{background:var(--line-2)}
-.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:var(--surface);
-  border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
-.metric{padding:13px 15px;border-right:1px solid var(--line);min-width:0}
-.metric:last-child{border-right:0}
-.metric .k{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
-.metric .v{display:flex;align-items:baseline;gap:6px;margin-top:8px;flex-wrap:wrap}
-.metric .v b{font:600 21px/1 var(--mono);font-variant-numeric:tabular-nums}
-.metric .v small{font-size:11.5px;color:var(--ink-3)}
-.metric .s{font-size:11px;color:var(--ink-3);margin-top:6px}
+
+/* ══ 概览指标卡 ═════════════════════════════════════════════════════ */
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.metric{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--shadow);padding:15px 16px;min-width:0}
+.metric .k{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-2);font-weight:500}
+.metric .k svg{color:var(--ink-3)}
+.metric .v{display:flex;align-items:baseline;gap:6px;margin-top:10px;flex-wrap:wrap}
+.metric .v b{font:600 26px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.022em}
+.metric .v small{font-size:12px;color:var(--ink-3)}
+.metric .s{font-size:12px;color:var(--ink-3);margin-top:7px}
 .metric .s.ok{color:var(--ok)} .metric .s.w{color:var(--warn)} .metric .s.e{color:var(--err)}
-.metric .bar{height:4px;background:var(--sunken);margin-top:9px;overflow:hidden}
-.metric .bar i{display:block;height:100%;background:var(--ok)}
+.metric .bar{height:4px;background:var(--sunken);margin-top:11px;overflow:hidden;border-radius:3px}
+.metric .bar i{display:block;height:100%;background:var(--ok);transition:width .3s var(--ease)}
 .metric .bar i.w{background:var(--warn)} .metric .bar i.e{background:var(--err)}

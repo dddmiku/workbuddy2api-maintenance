@@ -1,12 +1,14 @@
-/* ── 版本与热更新 ─────────────────────────────────── */
+/* ── 版本与热更新 ───────────────────────────────────
+ * 2026-09-20：对齐 new-api 规范——空态与标签统一 10px / 全圆角。
+ */
 .upd-rows{ padding:2px 0 }
 .upd-empty{
-  padding:14px 16px; border-radius:10px; line-height:1.6;
-  background:var(--sunken); color:var(--ink-2); font-size:12.5px;
+  padding:14px 16px; border-radius:var(--r2); line-height:1.65;
+  background:var(--sunken); color:var(--ink-2); font-size:13px;
 }
 .upd-tag{
   display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
-  font-size:11.5px; font-weight:600; letter-spacing:.2px;
+  font-size:12px; font-weight:500;
   background:var(--ok-soft); color:var(--ok);
 }
 .upd-tag::before{ content:''; width:6px; height:6px; border-radius:50%; background:currentColor }

@@ -6,51 +6,57 @@
 <meta name="color-scheme" content="light dark">
 <title>登录 · workbuddy2api</title>
 <style>
+/* 2026-09-20：登录页跟随 new-api 面板规范——azure 主色、14px 卡片圆角、10px 控件圆角。 */
 :root{
-  --line:#dfe3e8; --line2:#c8ced6; --bg:#f2f4f6; --surface:#fff; --surface2:#f8f9fb;
-  --text:#14171a; --text2:#5b636b; --text3:#8d959d; --accent:#d95b1f; --accent-soft:#fdefe8;
-  --err:#c8352c; --err-soft:#fdeceb; --ok:#1a8b52;
+  --line:#e8e8e8; --line2:#d4d4d4; --bg:#f7f8fa; --surface:#fff; --surface2:#fafafa;
+  --text:#0a0a0a; --text2:#5c5c5c; --text3:#8f8f8f; --accent:#3ea4ec; --accent-2:#2b8fd6;
+  --accent-soft:rgba(62,164,236,.10);
+  --err:#e7000b; --err-soft:rgba(231,0,11,.09); --ok:#009966;
+  --r:14px; --r2:10px; --r3:6px;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
   --font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
 }
 html[data-theme=dark]{
-  --line:#25282d; --line2:#343940; --bg:#0b0c0e; --surface:#121417; --surface2:#171a1e;
-  --text:#e9ebee; --text2:#9aa2ab; --text3:#6b737b; --accent:#f0743a; --accent-soft:#2a1a12;
-  --err:#ff6b60; --err-soft:#2a1614; --ok:#43d17f;
+  --line:rgba(255,255,255,.10); --line2:rgba(255,255,255,.18); --bg:#1e1e1e;
+  --surface:#2a2a2a; --surface2:#2f2f2f;
+  --text:#f3f3f3; --text2:#b7b7b7; --text3:#8a8a8a; --accent:#3f9ce0; --accent-2:#5aaeea;
+  --accent-soft:rgba(63,156,224,.16);
+  --err:#ff6467; --err-soft:rgba(255,100,103,.14); --ok:#00bc7d;
 }
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
   font:400 14px/1.55 var(--font);-webkit-font-smoothing:antialiased;display:grid;place-items:center;padding:24px}
-.card{width:100%;max-width:384px;background:var(--surface);border:1px solid var(--line);
-  border-top:2px solid var(--accent)}
-.head{display:flex;align-items:center;gap:11px;padding:20px 22px 16px;border-bottom:1px solid var(--line)}
-.mark{width:30px;height:30px;flex:none;background:var(--accent);color:#fff;display:grid;place-items:center;
-  font-size:11px;font-weight:700;letter-spacing:.02em}
-.title{font-size:15px;font-weight:600;line-height:1.25}
-.sub{font-size:11.5px;color:var(--text3);line-height:1.35}
-form{padding:20px 22px 18px;margin:0}
-label{display:block;margin-bottom:14px}
-label .k{display:block;font-size:11.5px;color:var(--text2);margin-bottom:6px}
-input{width:100%;height:36px;padding:0 11px;border:1px solid var(--line);border-radius:3px;
-  background:var(--surface2);color:var(--text);font:13px/1 var(--font);outline:none}
+.card{width:100%;max-width:392px;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--r);box-shadow:0 8px 28px rgba(10,10,10,.10)}
+.head{display:flex;align-items:center;gap:11px;padding:22px 24px 18px;border-bottom:1px solid var(--line)}
+.mark{width:32px;height:32px;flex:none;border-radius:9px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-size:11px;font-weight:700;letter-spacing:.02em}
+.title{font-size:15.5px;font-weight:600;line-height:1.25;letter-spacing:-.011em}
+.sub{font-size:12px;color:var(--text3);line-height:1.35}
+form{padding:22px 24px 20px;margin:0}
+label{display:block;margin-bottom:15px}
+label .k{display:block;font-size:12px;color:var(--text2);margin-bottom:6px}
+input{width:100%;height:38px;padding:0 12px;border:1px solid var(--line2);border-radius:var(--r2);
+  background:var(--surface);color:var(--text);font:13.5px/1 var(--font);outline:none;
+  transition:border-color .12s ease,box-shadow .12s ease}
 .pw{position:relative;display:block}
 .pw input{padding-right:38px}
 .eye{position:absolute;right:0;top:50%;transform:translateY(-50%);width:34px;height:32px;margin:0;
   display:grid;place-items:center;background:none;border:0;color:var(--text3);cursor:pointer}
 .eye:hover{color:var(--text2)}
-input:focus{border-color:var(--accent)}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 input::placeholder{color:var(--text3)}
-button{width:100%;height:38px;margin-top:4px;border:0;border-radius:3px;background:var(--accent);
-  color:#fff;font:600 13px/1 var(--font);cursor:pointer}
-button:hover{filter:brightness(1.06)}
+button{width:100%;height:40px;margin-top:4px;border:0;border-radius:var(--r2);background:var(--accent);
+  color:#fff;font:600 13.5px/1 var(--font);cursor:pointer;transition:background .12s ease}
+button:hover{background:var(--accent-2)}
 button[disabled]{opacity:.6;cursor:default}
-.msg{display:none;align-items:flex-start;gap:9px;margin-bottom:14px;padding:10px 12px;border-radius:3px;
-  border:1px solid var(--err);background:var(--err-soft);color:var(--err);font-size:12.5px}
+.msg{display:none;align-items:flex-start;gap:9px;margin-bottom:14px;padding:11px 13px;border-radius:var(--r2);
+  border:1px solid var(--err);background:var(--err-soft);color:var(--err);font-size:13px}
 .msg.on{display:flex}
-.foot{padding:13px 22px;border-top:1px solid var(--line);display:flex;align-items:center;
-  justify-content:space-between;gap:10px;font-size:11.5px;color:var(--text3)}
-.foot code{font-family:var(--mono);font-size:11px}
+.foot{padding:14px 24px;border-top:1px solid var(--line);display:flex;align-items:center;
+  justify-content:space-between;gap:10px;font-size:12px;color:var(--text3)}
+.foot code{font-family:var(--mono);font-size:12px}
 .themebtn{background:none;border:0;color:var(--text3);cursor:pointer;width:auto;height:auto;margin:0;
   font:inherit;font-size:11.5px;padding:0}
 .themebtn:hover{color:var(--text2)}
@@ -86,7 +92,7 @@ button[disabled]{opacity:.6;cursor:default}
     <button id="go" type="submit">登录</button>
   </form>
   <div class="foot">
-    <span id="hint">会话有效期 12 小时</span>
+    <span id="hint">会话有效期 30 天</span>
     <button class="themebtn" id="theme" type="button">切换主题</button>
   </div>
 </div>

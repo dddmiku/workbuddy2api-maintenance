@@ -1,10 +1,11 @@
-/* 2026-09-19：滚动时保留表头，窄屏继续按列显示并允许表格横向滚动。 */
+/* 2026-09-20：浮层表头底色改跟随卡片，避免与新的极浅表头底色出现色差。
+ * 2026-09-19：滚动时保留表头，窄屏继续按列显示并允许表格横向滚动。 */
 .table-head-float{position:fixed;top:0;z-index:30;overflow:hidden;pointer-events:none;
-  background:var(--surface);box-shadow:0 2px 5px rgba(0,0,0,.1)}
+  background:var(--surface-2);box-shadow:0 1px 0 var(--line)}
 .table-head-float[hidden]{display:none}
 .table-head-float .tbl{margin:0;table-layout:fixed}
 .table-head-float .tbl thead{display:table-header-group}
-.table-head-float th{box-sizing:border-box;background:var(--surface)}
+.table-head-float th{box-sizing:border-box;background:var(--surface-2)}
 @media (max-width:900px){
   .tblwrap.table-scroll{overflow-x:auto}
   .table-scroll .tbl{min-width:980px}

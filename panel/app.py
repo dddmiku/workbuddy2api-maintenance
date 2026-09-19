@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
+#             卡片 14px 圆角），并把登录会话有效期从 12 小时改为 30 天。
 # 2026-09-20：2.1.3 冷却剩余带实时倒计时（状态列每秒就地刷新，归零自动补取数据）。
 # 2026-09-20：2.1.2 账号状态列显示冷却剩余与原因（不再把凭证有效期摆在「冷却中」旁），
 #             最近活动区分「无成功记录」与「无记录」，并透出冷却台账字段。
@@ -9,7 +11,7 @@
 #   扫码加号(OAuth url/poll)、启用/禁用(改名 .disabled)、删除(移入回收站)、
 #   账号池状态与积分聚合、容器重启。网关自身无管理接口，故独立成服务。
 # 2026-09-16: 内建登录层，撤掉 nginx basic auth：
-#   自带 /login 登录页与会话 cookie（滑动 12 小时）、登录失败按 IP 限流、
+#   自带 /login 登录页与会话 cookie（滑动过期，现为 30 天）、登录失败按 IP 限流、
 #   账密在线修改（用户名 + 密码），旧 htpasswd 的 $apr1$ 口令继续可校验。
 # 2026-09-16：新增登录保护的多密钥管理路由，使用本机管理通道、严格请求校验并隐藏配置中的完整密钥。
 # 2026-09-17：路径、端口与容器名支持环境变量覆盖，便于与网关同一 Compose 项目部署。
@@ -63,7 +65,9 @@ LOGIN_PATH = os.path.join(HERE, "login.html")
 CRED_PATH = os.path.join(AUTH_DIR, "credentials.json")
 HTPASSWD_PATH = os.environ.get("WB2API_HTPASSWD_PATH", "/etc/nginx/.htpasswd_wb2admin")
 
-SESSION_TTL = 12 * 3600          # 会话滑动过期
+# 会话滑动过期：30 天。管理台是长期挂着的运维界面，12 小时会让人一天里反复登录；
+# 续期仍按剩余不足 1/3（即少于 10 天）时滑动刷新，令牌本身不换新。
+SESSION_TTL = 30 * 24 * 3600
 PBKDF2_ROUNDS = 200000
 PBKDF2_PREFIX = "pbkdf2_sha256"
 LOGIN_MAX_FAILS = 6              # 同一 IP 在窗口内的失败次数
@@ -71,7 +75,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.3"
+PANEL_VERSION = "2.1.4"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

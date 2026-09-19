@@ -1,5 +1,9 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-20：按 new-api 面板规范重做外观：顶栏横跨整宽并承载品牌与全局操作，
+//             页标题移入内容区，主题按钮从侧栏底部移到顶栏（不再需要 themeLabel）。
+// 2026-09-20：渲染按当前页收敛——刷新只重绘可见页（此前每次 30 秒刷新都重建全部
+//             页面的 DOM，长表格页在刷新瞬间会明显卡顿）；搜索输入加防抖。
 // 2026-09-20：2.1.2 冷却状态带实时倒计时（data-cool-end + 每秒就地刷新，归零自动补取
 //             一次数据），并把分钟级冷却显示成 mm:ss。
 // 2026-09-20：2.1.2 账号表状态列改显示冷却剩余与原因，最近活动区分「无成功记录」与
@@ -27,6 +31,15 @@ function compactNum(v){
   if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
   return String(n);
+}
+// debounce 让高频输入（搜索框）只在停顿后触发一次渲染。
+function debounce(fn, wait){
+  var t = null;
+  return function(){
+    var self = this, args = arguments;
+    if (t) clearTimeout(t);
+    t = setTimeout(function(){ t = null; fn.apply(self, args); }, wait);
+  };
 }
 function shortUid(u){ return (u && u.length > 18) ? u.slice(0, 8) + '…' + u.slice(-6) : (u || '—'); }
 function fmtTime(iso){
@@ -141,7 +154,7 @@ var logKey = null, logName = '';
 function setTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   $('#icTheme').innerHTML = (t === 'dark') ? IC.moon : IC.sun;
-  $('#themeLabel').textContent = (t === 'dark') ? '暗色' : '亮色';
+  $('#btnTheme').setAttribute('title', (t === 'dark') ? '切换到亮色' : '切换到暗色');
   try { localStorage.setItem('wb2a-theme', t); } catch(e){}
 }
 $('#btnTheme').addEventListener('click', function(){
@@ -195,8 +208,11 @@ var PAGE = {
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
 };
 var sysLoaded = false;
+// CURRENT_VIEW 当前页标识：刷新时只重绘这一页（见 render）。
+var CURRENT_VIEW = 'overview';
 function go(v){
   if (!PAGE[v]) v = 'overview';
+  CURRENT_VIEW = v;
   $$('.view[data-view]').forEach(function(p){
     p.classList.toggle('hide', p.getAttribute('data-view') !== v);
   });
@@ -209,6 +225,8 @@ function go(v){
   try { localStorage.setItem('wb2a-view', v); } catch(e){}
   history.replaceState(null, '', '#' + v);
   closeNav();
+  // 进入页面立即用已有数据渲染一次：否则从别的页切回来会先看到上一次的旧内容。
+  renderView(v);
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
   // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
@@ -295,6 +313,9 @@ function emptyBox(icon, title, sub){
 }
 
 /* ── 渲染 ─────────────────────────────────────────── */
+// render(view) 只重绘指定页；不传时重绘当前页。刷新（30 秒定时或手动）不该重建
+// 用户没在看的页面：账号页最多几十行、日志页可达数百行，全部重建会让刷新瞬间掉帧。
+// 侧栏计数与提示条是全局信息，每次刷新都更新。
 function render(){
   var d = S.data; if (!d) return;
   if (d.service) $('#brandVer').textContent = d.service + (d.version ? ' · v' + d.version : '');
@@ -303,6 +324,21 @@ function render(){
   $('#tabTask').textContent = tasks.length ? tasks.length : '—';
   renderNotes();
   renderStrip();
+  renderView(CURRENT_VIEW);
+}
+
+// renderView 按页面分派；未列出渲染函数的页面保持原样（其数据由各自的 load 函数负责）。
+function renderView(v){
+  if (!S.data) return;
+  if (v === 'overview'){ renderMetrics(); renderPool(); renderCredit(); renderOvTasks(); }
+  else if (v === 'accounts'){ renderAccounts(); }
+  else if (v === 'tasks'){ renderTasks(); }
+  else if (v === 'system'){ renderSystem(); }
+}
+
+// 兼容旧调用点：仍可显式要求渲染全部页面（例如首次拿到数据后）。
+function renderAll(){
+  var d = S.data; if (!d) return;
   renderMetrics();
   renderPool();
   renderCredit();
@@ -529,7 +565,7 @@ function renderAccounts(){
         (typeof c.size === 'number' && c.size > 0
           ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
           : '') + '</div>'
-      : '<span style="color:var(--text3)">—</span>';
+      : '<span style="color:var(--ink-3)">—</span>';
     // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
     // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
     var errAt = (p.lastErr && String(p.lastErr).indexOf('0001') !== 0) ? p.lastErr : '';
@@ -564,7 +600,8 @@ function renderAccounts(){
       '" title="删除">' + svg(IC.trash, 13) + '</button></td></tr>';
   }).join('');
 }
-$('#acctSearch').addEventListener('input', function(e){ S.q = e.target.value; renderAccounts(); });
+// 搜索输入防抖：账号表在输入过程中每敲一个字都重建 DOM，几十行时能感到迟滞。
+$('#acctSearch').addEventListener('input', debounce(function(e){ S.q = e.target.value; renderAccounts(); }, 120));
 $('#acctFilter').addEventListener('click', function(e){
   var b = e.target.closest('button[data-f]'); if (!b) return;
   S.filter = b.getAttribute('data-f');
@@ -764,7 +801,9 @@ async function loadTaskLog(){
 }
 
 /* ── 请求日志（独立页，表格 + 自动刷新） ───────────── */
-var LOG = { loading:false, timer:null, auto:false };
+// sig 上一次渲染的内容指纹：自动刷新每 5 秒一次，几百行表格在内容没变时重建 DOM
+// 纯属浪费，指纹一致就跳过重绘（只更新时间戳）。
+var LOG = { loading:false, timer:null, auto:false, sig:'' };
 
 function logAutoText(){
   var b = $('#btnLogAuto');
@@ -799,12 +838,16 @@ async function loadLogs(){
   try{
     var r = await api('api/logs?lines=' + S.logLines);
     var rows = r.rows || [];
-    if (!rows.length){
-      $('#logRows').innerHTML = '<tr><td colspan="13"><div class="empty">还没有请求记录。</div></td></tr>';
-    } else {
-      $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
-        var cls = statusClass(it.status);
-        return '<tr>' +
+    // 内容指纹一致时跳过重绘：自动刷新每 5 秒跑一次，没新请求就没必要重建几百行 DOM。
+    var sig = S.logLines + '|' + rows.map(function(it){ return it.seq + it.status + it.total; }).join(',');
+    if (sig !== LOG.sig){
+      LOG.sig = sig;
+      if (!rows.length){
+        $('#logRows').innerHTML = '<tr><td colspan="13"><div class="empty">还没有请求记录。</div></td></tr>';
+      } else {
+        $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
+          var cls = statusClass(it.status);
+          return '<tr>' +
           '<td class="mono">#' + esc(it.seq) + '</td>' +
           '<td class="mono">' + esc(it.time) + '</td>' +
           '<td class="mono">' + esc(it.model) + '</td>' +
@@ -819,7 +862,8 @@ async function loadLogs(){
           '<td class="mono num">' + esc(it.rate) + '</td>' +
           '<td class="mono num">' + esc(it.total) + '</td>' +
           '</tr>';
-      }).join('');
+        }).join('');
+      }
     }
     var count = $('#logCount'); if (count) count.textContent = String(rows.length);
     var updated = $('#logUpdated');

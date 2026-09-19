@@ -1,22 +1,30 @@
-/* ══ 用量统计 ═══════════════════════════════════════════════════════ */
-.usage-filter{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunken);padding:2px;gap:2px;margin-bottom:10px}
-.usage-filter button{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:2px;font-size:12px;color:var(--ink-2);white-space:nowrap}
+/* ══ 用量统计 ═══════════════════════════════════════════════════════
+ * 2026-09-20：对齐 new-api 规范——筛选胶囊与分段控件统一 10px 圆角、卡片 14px 圆角、
+ *             日期/下拉与按钮同高（32px）。
+ */
+.usage-filter{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);padding:2px;gap:2px;margin-bottom:12px}
+.usage-filter button{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;border-radius:var(--r3);
+  font-size:12.5px;color:var(--ink-2);white-space:nowrap}
 .usage-filter button:hover{color:var(--ink)}
-.usage-filter button[aria-pressed=true]{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.usage-filter button[aria-pressed=true]{background:var(--surface);color:var(--ink);font-weight:500;box-shadow:var(--shadow)}
 .usage-filter button i{font-style:normal;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
 .usage-range{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin:0 0 12px}
 .usage-range .fld{display:flex;flex-direction:column;gap:4px}
-.usage-range .fld .k{font-size:10px;letter-spacing:.06em;color:var(--ink-3);text-transform:uppercase}
-.usage-range input[type=date],.usage-range select{height:30px;border:1px solid var(--line-2);border-radius:var(--r);padding:0 8px;background:var(--sunken);color:var(--ink);font-size:12px;font-family:inherit}
+.usage-range .fld .k{font-size:12px;color:var(--ink-2)}
+.usage-range input[type=date],.usage-range select{height:32px;border:1px solid var(--line-2);
+  border-radius:var(--r2);padding:0 10px;background:var(--surface);color:var(--ink);font-size:12.5px;font-family:inherit}
 .usage-range select{min-width:186px}
 .usage-range input[type=date]:disabled,.usage-range select:disabled{opacity:.5}
-.usage-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-bottom:14px}
-.usage-tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px}
-.usage-tile .k{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2);letter-spacing:.02em}
-.usage-tile .uz-ico{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:4px;background:var(--sunken);color:var(--ink-2);flex:none}
-.usage-tile .uz-ico svg{width:12px;height:12px}
-.usage-tile .v{font:600 20px/1.35 var(--mono);margin-top:2px}
-.usage-tile .s{font-size:11px;color:var(--ink-3)}
+.usage-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:16px}
+.usage-tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--shadow);padding:14px 16px}
+.usage-tile .k{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-2);font-weight:500}
+.usage-tile .uz-ico{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+  border-radius:var(--r3);background:var(--sunken);color:var(--ink-3);flex:none}
+.usage-tile .uz-ico svg{width:13px;height:13px}
+.usage-tile .v{font:600 22px/1.35 var(--mono);margin-top:6px;letter-spacing:-.02em}
+.usage-tile .s{font-size:12px;color:var(--ink-3)}
 .usage-table td.num,.usage-table th.r{text-align:right}
 .usage-key{display:flex;flex-direction:column;gap:2px;min-width:0}
 .usage-key b{font-weight:600}
@@ -25,6 +33,6 @@
 .usage-models li{display:flex;gap:8px;font-size:12px;color:var(--ink-2)}
 .usage-models li span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .usage-models li span:last-child{font-family:var(--mono)}
-.usage-note{margin:10px 0 0;font-size:12px;color:var(--ink-3)}
-.usage-bar{height:4px;border-radius:2px;background:var(--sunken);overflow:hidden;margin-top:6px}
+.usage-note{margin:10px 0 0;font-size:12px;color:var(--ink-3);line-height:1.65}
+.usage-bar{height:4px;border-radius:3px;background:var(--sunken);overflow:hidden;margin-top:6px}
 .usage-bar i{display:block;height:100%;background:var(--accent)}
