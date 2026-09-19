@@ -140,6 +140,7 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 | `content_blocked` | 上游内容策略拒绝 |
 | `context_length_exceeded` | 模型上下文超限 |
 | `rate_limit_exceeded` | 账号或模型限流 |
+| 国际版 `code 14017`（trial not activated） | 账号缺注册地；网关自动补交并重试，见[配置说明](configuration.md) |
 
 渠道拒绝、入口拦截和模型内容拒绝是不同原因。首次请求按正常转换发送；特定上游拦截可能触发有界的同路径字符串兼容重试，重试仍失败则返回对应错误，不保证任意请求都能通过。具体上游拦截规则不是静态协议承诺。
 

@@ -777,9 +777,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 func (s *Scheduler) runKeepalive(ctx context.Context) {
 	// 成功路径本来完全静默（只在失败时打 WARN），面板上会是一片空白。
 	// 统计后补一行汇总，至少能看出"刷了几个号、失败几个"。
-	okCnt, failCnt, skipCnt := 0, 0, 0
+	okCnt, failCnt, skipCnt, repairCnt := 0, 0, 0, 0
 	defer func() {
-		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d", okCnt, failCnt, skipCnt)
+		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d，补注册地 %d", okCnt, failCnt, skipCnt, repairCnt)
 	}()
 	for _, st := range s.cfg.Pool.List() {
 		if ctx.Err() != nil {
@@ -811,5 +811,19 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}
 		okCnt++
+		// 国际版注册地补全：账号没在官方登录流程里确认国家/地区时，chat 会被上游以
+		// 14017（trial not activated）永久拒绝。这里每天顺手补一次（幂等：已登记号
+		// 只多一次 register 调用，无副作用），让存量坏号不必等到被轮转选中才自愈。
+		// 失败只记 WARN，不影响 token 刷新结果。
+		if a.IsGlobal() {
+			area, rerr := s.cfg.Upstream.CompleteRegion(a)
+			switch {
+			case rerr != nil:
+				log.Printf("WARN: keepalive %s: region repair failed: %v", logfmt.UID8(st.UID), rerr)
+			case area.IOS2 != "":
+				repairCnt++
+				log.Printf("INFO: keepalive %s: region completed country=%s (%s)", logfmt.UID8(st.UID), area.IOS2, area.EnName)
+			}
+		}
 	}
 }

@@ -661,6 +661,85 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 	})
 }
 
+// TestChatRegionRepairRetriesSameAccount 缺注册地（14017）的自愈链路：
+// 首个响应是 14017 → 网关补交注册地 → 用**同一个账号**重发并成功。
+// 修复前：该号只能被软冷却轮换掉，且下次选中还会再撞 14017（永不恢复）。
+func TestChatRegionRepairRetriesSameAccount(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if calls[authz] == 1 {
+			return 429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated. Please log out of your current account and log in again to activate it immediately and start your free trial."}}}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at-global", ExpiresAt: 9999999999,
+		Domain: "www.workbuddy.ai"})
+	repaired := 0
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, SoftCooldown: 45 * time.Second,
+		RegionRepair: func(a *auth.Auth) (upstream.UserArea, error) {
+			repaired++
+			if a.UID != "g1" {
+				t.Errorf("repair called with uid=%s want g1", a.UID)
+			}
+			return upstream.UserArea{IOS2: "SG", IOS3: "SGP", EnName: "Singapore", Code: "65"}, nil
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:deepseek-v4.1-flash","messages":[],"stream":true}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if repaired != 1 {
+		t.Errorf("region repairs=%d want 1", repaired)
+	}
+	if calls["Bearer at-global"] != 2 {
+		t.Errorf("upstream calls=%d want 2 (14017 then retry on the same account)", calls["Bearer at-global"])
+	}
+	// 自愈成功 → 账号不该留下冷却，也不该被换掉。
+	st, _ := p.Status("g1")
+	if st.Cooling {
+		t.Errorf("recovered account must not stay cooling: %+v", st)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("the 14017 hit should still be visible in last_err")
+	}
+}
+
+// TestChatRegionRepairFailureFallsBackToRotation 补交失败时保持原语义：
+// 坏号按 14017 冷却并轮换到下一个账号，不把错误抛给客户端。
+func TestChatRegionRepairFailureFallsBackToRotation(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated."}}}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+	)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, SoftCooldown: 45 * time.Second,
+		RegionRepair: func(*auth.Auth) (upstream.UserArea, error) {
+			return upstream.UserArea{}, errors.New("repair unavailable")
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling {
+		t.Errorf("unrepaired account should still cool down: %+v", st)
+	}
+}
+
 // TestApplyErrorPolicySoftRateNoDoubleWhenCooling handler 层回归：无重置时间的 429
 // 保留有界冷却，但**冷却中的兜底探测不得翻倍**（这正是旧实现「越重试越冷」的根因，
 // 全池被推到 2h 封顶的元凶）。时长断言全部取自注入值，不依赖真实等待。

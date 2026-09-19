@@ -109,6 +109,18 @@ func (p *Pool) NoteError(uid string) {
 	}
 }
 
+// NoteTransientError 记录一次「已被网关自愈、不构成账号问题」的上游错误观测时间。
+// 只写 last_err（面板「最近活动」据此显示），**不**累计 errTotal / errorEMA / fails：
+// 典型场景是 global 14017（缺注册地）——网关补交注册地后同号立刻恢复，账号本身没坏，
+// 喂进成功率权重只会无故降权。调用方必须已确认该错误无需按失败记账。
+func (p *Pool) NoteTransientError(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		p.markCoolErrorLocked(uid, e, time.Now())
+	}
+}
+
 // ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
 // DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
 // handler_cost_test / global_e2e_test 断言账本内容。跨包（internal/server）

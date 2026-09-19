@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：2.1.2 账号状态列显示冷却剩余与原因（不再把凭证有效期摆在「冷却中」旁），
+#             最近活动区分「无成功记录」与「无记录」，并透出冷却台账字段。
 # 2026-09-20：2.1.1 密钥列表支持按需复制与逐密钥重复推理保护，沿用管理员会话和来源校验。
 # 2026-09-15: 初版。workbuddy2api 账号管理面板后端：
 #   扫码加号(OAuth url/poll)、启用/禁用(改名 .disabled)、删除(移入回收站)、
@@ -68,7 +70,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.1"
+PANEL_VERSION = "2.1.2"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -761,6 +763,13 @@ def build_state(force_credit=False):
             "breakerFails": p.get("breaker_fails") or 0,
             "lastSuccess": p.get("last_success"),
             "lastErr": p.get("last_err"),
+            # 冷却台账：面板据此显示「为什么冷却、还剩多久」，而不是把凭证有效期
+            # 的「剩 N 天」摆在「冷却中」旁边（用户反馈：看起来像冷却要等 363 天）。
+            "coolRemaining": p.get("cool_remaining_sec") or 0,
+            "coolKind": p.get("cool_kind") or "",
+            "reason": p.get("reason") or "",
+            "successCount": p.get("success_count") or 0,
+            "errTotal": p.get("err_total") or 0,
         }
         s["credits"] = {
             "remain": c.get("remain"),

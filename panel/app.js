@@ -1,5 +1,8 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-20：2.1.2 账号表状态列改显示冷却剩余与原因，最近活动区分「无成功记录」与
+//             「无记录」——此前冷却中的号把凭证有效期（剩 363 天）显示在「冷却中」旁，
+//             且只有错误记录时整列显示「从未」，两处都误导排查。
 // 2026-09-20：侧栏显示管理台实际版本，避免发布 2.1.1 后仍标为 v1。
 // 2026-09-19：积分查询失败时显示错误和缓存状态，避免把尚未取到的余额显示为零。
 // 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
@@ -49,6 +52,32 @@ function relTime(iso){
 function daysLeft(sec){
   if (!sec) return null;
   return Math.round((sec * 1000 - Date.now()) / 86400000);
+}
+// coolLeft 把冷却剩余秒数格式化成人读文案。冷却与凭证有效期是两回事，状态列在冷却中
+// 必须显示冷却剩余，否则「冷却中 + 剩 363 天」会被读成冷却要等一年（用户实测反馈）。
+function coolLeft(sec){
+  var s = Number(sec) || 0;
+  if (s <= 0) return '即将恢复';
+  if (s < 60) return '剩 ' + s + ' 秒';
+  if (s < 3600) return '剩 ' + Math.ceil(s / 60) + ' 分钟';
+  if (s < 86400) {
+    var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return '剩 ' + h + ' 小时' + (m ? ' ' + m + ' 分' : '');
+  }
+  return '剩 ' + Math.round(s / 86400) + ' 天';
+}
+// coolReason 冷却原因转可读文案。上游原始 reason 已是运维可读串（如 "429 rate limit"），
+// 只做英文短语到中文的映射，未知值原样透出，不编造。
+function coolReason(p){
+  var r = String((p && p.reason) || '');
+  if (!r) return '';
+  if (r.indexOf('429') >= 0) return '上游限流';
+  if (r.indexOf('14017') >= 0) return 'trial 未激活';
+  if (r.indexOf('6004') >= 0) return '模型限流';
+  if (r.indexOf('11140') >= 0) return '账号被上游封禁';
+  if (r.indexOf('404') >= 0) return '上游 404';
+  if (r.indexOf('余额') >= 0) return '余额不足';
+  return r;
 }
 function svg(inner, size){
   return '<svg width="' + (size||16) + '" height="' + (size||16) + '" viewBox="0 0 24 24" fill="none" ' +
@@ -468,14 +497,21 @@ function renderAccounts(){
           ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
           : '') + '</div>'
       : '<span style="color:var(--text3)">—</span>';
-    var lastTxt = p.lastSuccess ? relTime(p.lastSuccess) : '无记录';
-    var lastSub = (p.lastErr && String(p.lastErr).indexOf('0001') !== 0) ? ('错误 ' + relTime(p.lastErr))
+    // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
+    // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
+    var errAt = (p.lastErr && String(p.lastErr).indexOf('0001') !== 0) ? p.lastErr : '';
+    var lastTxt = p.lastSuccess ? relTime(p.lastSuccess) : (errAt ? '无成功记录' : '无记录');
+    var lastSub = errAt ? ('最近错误 ' + relTime(errAt))
       : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
+    // 状态列：冷却中显示冷却剩余与原因；正常号才显示凭证有效期（两者混在一起会把
+    // 「冷却中」误读成要等 363 天，见 coolLeft 注释）。
+    var coolSub = p.cooling ? (coolLeft(p.coolRemaining) + (coolReason(p) ? ' · ' + coolReason(p) : ''))
+      : (left != null ? (left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') : '');
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
       '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + esc(String(a.realm || '').toUpperCase()) + '</div></td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
-      (left != null ? '<span class="sub">' + (left > 0 ? ('剩 ' + left + ' 天') : '已过期') + '</span>' : '') +
+      (coolSub ? '<span class="sub">' + esc(coolSub) + '</span>' : '') +
       '</span></td>' +
       '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
       '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +

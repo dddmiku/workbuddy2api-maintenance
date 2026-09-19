@@ -88,6 +88,11 @@ type Config struct {
 
 	// Update 热更新管理器（可选；nil = /update/* 报未启用）。
 	Update *hotupdate.Manager
+
+	// RegionRepair 补交 global 账号注册地（14017 trial-not-activated 的自愈动作，
+	// 见 internal/upstream/region.go）。nil = 用 Upstream.CompleteRegion。
+	// 供测试注入确定性实现；生产留空走真实上游。
+	RegionRepair func(*auth.Auth) (upstream.UserArea, error)
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -961,8 +966,44 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
-		st.upstreamStarted = true
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+		//
+		// 注册地补交（global 14017）：账号若没在官方登录流程里确认国家/地区，chat 会被
+		// 上游以 429 + code 14017（trial not activated）永久拒绝——它不会自愈，只会被
+		// 反复冷却轮换掉，池子越用越小。命中该形态时补交一次注册地（幂等），然后用
+		// **同一个账号**重发一次：实测补交后同号立即从 429 变 200。只重发一次，
+		// 且只对本请求内已占用的这个账号做，不额外占用其他号。
+		var rc io.ReadCloser
+		var status int
+		var respBody []byte
+		var terr error
+		for sendAttempt := 0; ; sendAttempt++ {
+			st.upstreamStarted = true
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			if terr != nil || status < 400 || sendAttempt > 0 {
+				break
+			}
+			if upstream.Classify(status, string(respBody)) != upstream.ErrAccountFault {
+				break
+			}
+			if !upstream.RegionRequired(status, string(respBody)) {
+				break
+			}
+			// 命中即先留观测：无论补交成败，面板都该看到「这个号最近被上游拒过」。
+			// 用 NoteTransientError 而非 NoteError——14017 是配置缺失不是账号故障，
+			// 补交成功即恢复，不该污染成功率权重。
+			h.cfg.Pool.NoteTransientError(acct.UID)
+			repair := h.cfg.RegionRepair
+			if repair == nil {
+				repair = h.cfg.Upstream.CompleteRegion
+			}
+			area, rerr := repair(acct)
+			if rerr != nil {
+				log.Printf("WARN: [server] region repair failed uid=%s: %v", logfmt.UID8(acct.UID), rerr)
+				break
+			}
+			log.Printf("INFO: [server] region repair uid=%s country=%s (%s) — retrying same account",
+				logfmt.UID8(acct.UID), area.IOS2, area.EnName)
+		}
 		if terr != nil {
 			st.absorbUsage(nil)
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
