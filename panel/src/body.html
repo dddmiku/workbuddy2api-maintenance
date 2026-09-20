@@ -174,7 +174,7 @@
             </table>
           </div>
         </div>
-        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复推理的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
+        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复输出（推理或正文）的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
       </section>
 
       <section class="view hide" data-view="usage">
@@ -397,7 +397,7 @@
           <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
           <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
         </div>
-        <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复推理时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
+        <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复输出（推理或正文）时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
         <label class="fld"><span class="k">有效期 <span class="sub">（默认无限制）</span></span>
           <select id="keyExpiry" aria-label="选择密钥有效期">
             <option value="none">无限制</option>

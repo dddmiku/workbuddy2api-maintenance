@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：补正文（content）重复短行的检测与写出闸门回归：正文循环必须在客户端
+//
+//	零字节时被按住并标记可重发；正常正文、长行、多短行必须实时放行。
+//
 // 2026-09-19：回归短行循环阈值、Unicode/CRLF分片、EOF/取消、模型范围及有界检测内存。
 // 2026-09-20：补「压制期命中→客户端零字节且错误可重发」与「长推理按字符上限放行」两条回归。
 package upstream
@@ -264,5 +268,142 @@ func TestReasoningLoopGuardStreamReleasesOnTimeout(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "还在想") {
 		t.Fatal("timeout did not release the held-back reasoning")
+	}
+}
+
+func outputGuardTestFrame(text string) string {
+	raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": text}}}})
+	return "data: " + string(raw) + "\n\n"
+}
+
+// TestOutputLoopGuardDetectsRepeatedContent 复现线上「疯狂输出」的真实形态：重复发生在
+// 正文里（观测样本是 1864 行「我执行。」），推理侧几乎没有重复。旧实现只看
+// reasoning_content，因此既不中断也不重试。
+func TestOutputLoopGuardDetectsRepeatedContent(t *testing.T) {
+	text := strings.Repeat("我执行。\n", 400)
+	raw := outputGuardTestFrame(text) + "data: [DONE]\n\n"
+	options := StreamOptions{Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true}
+	result, err := Aggregate(strings.NewReader(raw), options)
+	if result != nil || !IsLoopGuardError(err) {
+		t.Fatalf("repeated content was not treated as a loop: %v", err)
+	}
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || streamErr.Code != OutputLoopErrorCode {
+		t.Fatalf("content loop used the wrong code: %+v", streamErr)
+	}
+	// 错误里只能有计数，不能回显用户正文。
+	if strings.Contains(err.Error(), "我执行") {
+		t.Fatal("content loop error exposed output text")
+	}
+}
+
+// TestOutputLoopGuardHoldsContentUntilRetryDecision 验证正文循环也能整段重发：
+// 命中时客户端必须还是零字节，错误标记 Retryable 供 handler 同账号重发。
+func TestOutputLoopGuardHoldsContentUntilRetryDecision(t *testing.T) {
+	text := strings.Repeat("我执行。\n", 400)
+	raw := outputGuardTestFrame(text) + "data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw), StreamOptions{
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsLoopGuardError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("content loop was not held back for retry: %v", err)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision: %q", len(body), body)
+	}
+
+	// 没有重发额度时必须如实回报，不能既不给内容也不给错误。
+	rec = httptest.NewRecorder()
+	err = Stream(rec, strings.NewReader(raw), StreamOptions{Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
+	if !IsLoopGuardError(err) || !strings.Contains(rec.Body.String(), OutputLoopErrorCode) {
+		t.Fatalf("exhausted retries did not surface the content loop: %v", err)
+	}
+}
+
+// TestOutputLoopGuardReleasesNormalContent 验证正文闸门不会拖慢正常回答：散文、代码块、
+// 列表、表格、单行长文本都必须在第一帧之后立刻放行。
+func TestOutputLoopGuardReleasesNormalContent(t *testing.T) {
+	var list strings.Builder
+	for index := 0; index < 400; index++ {
+		fmt.Fprintf(&list, "- 第 %d 项：说明文字各不相同\n", index)
+	}
+	for _, tc := range []struct{ name, text, needle string }{
+		{"prose", "这是一段正常的中文回答，第一行就超过三十二个字符，因此正文闸门立即放行。", "这是一段正常的中文回答"},
+		{"code_block", "```go\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n```\n", "func main()"},
+		{"list", list.String(), "- 第 0 项"},
+		// 三行交替重复的表格：不同短行只有 3 个、覆盖率 100%，但没有任何一行占主导，
+		// 正文侧必须放行，不能当成循环。
+		{"table", strings.Repeat("| 字段 | 说明 |\n| --- | --- |\n| alpha | beta |\n", 200), "| alpha | beta |"},
+		{"single_long_line", strings.Repeat("这是没有换行的长正文", 3000), "这是没有换行的长正文"},
+		{"short_reply", "好的。", "好的。"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := outputGuardTestFrame(tc.text) + "data: [DONE]\n\n"
+			rec := httptest.NewRecorder()
+			err := Stream(rec, strings.NewReader(raw), StreamOptions{
+				Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+			if err != nil {
+				t.Fatalf("normal content was rejected: %v", err)
+			}
+			// 帧是 JSON，正文里的换行会被转义，因此断言用一个不含换行的片段。
+			if !strings.Contains(rec.Body.String(), tc.needle) {
+				t.Fatal("normal content never reached the client")
+			}
+		})
+	}
+}
+
+// TestOutputLoopGuardIgnoresNonTargetModel 正文保护同样只在目标模型上生效，其他模型
+// 的重复正文必须原样透传（保护是启发式的，不应波及未观测到问题的模型）。
+func TestOutputLoopGuardIgnoresNonTargetModel(t *testing.T) {
+	text := strings.Repeat("我执行。\n", 400)
+	raw := outputGuardTestFrame(text) + "data: [DONE]\n\n"
+	for _, model := range []string{"deepseek-v3", "cn:glm-9.9", "other:deepseek-v4.1-flash"} {
+		result, err := Aggregate(strings.NewReader(raw), StreamOptions{Model: model, ReasoningLoopGuard: true})
+		if err != nil {
+			t.Fatalf("non-target model %q was guarded: %v", model, err)
+		}
+		if result["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["content"] != text {
+			t.Fatalf("non-target model %q lost content", model)
+		}
+	}
+}
+
+// TestOutputLoopGuardReleasesOnContentTimeout 验证正文压制期有独立的时间上限：一段
+// 没有换行、始终只有一两种短行的输出既不可能构成短行循环，也不该被压到推理侧的
+// 60 秒上限。到点必须放行，客户端能看到这段正文。
+func TestOutputLoopGuardReleasesOnContentTimeout(t *testing.T) {
+	previous := ContentLoopHoldBackTimeout
+	ContentLoopHoldBackTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { ContentLoopHoldBackTimeout = previous })
+
+	// 每行 8 个字符、只有两种短行交替：不会命中（没有占多数的一行），也不会因为长行、
+	// 空行或第三种短行而放行，只能靠时间上限出去。
+	var text strings.Builder
+	for index := 0; index < 200; index++ {
+		if index%2 == 0 {
+			text.WriteString("思考中\n")
+		} else {
+			text.WriteString("等待中\n")
+		}
+	}
+	raw := outputGuardTestFrame(text.String()) + "data: [DONE]\n\n"
+	chunks := make([]string, 0, len(raw))
+	for offset := 0; offset < len(raw); offset += 64 {
+		end := offset + 64
+		if end > len(raw) {
+			end = len(raw)
+		}
+		chunks = append(chunks, raw[offset:end])
+	}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, &reasoningGuardSlowReader{chunks: chunks, delay: 8 * time.Millisecond}, StreamOptions{
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	if err != nil {
+		t.Fatalf("ambiguous but non-looping content was rejected: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "思考中") {
+		t.Fatal("content timeout did not release the held-back content")
 	}
 }

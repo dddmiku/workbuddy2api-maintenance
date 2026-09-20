@@ -220,8 +220,14 @@ type streamChoice struct {
 	tools        map[int]*streamToolCall
 	function     *streamFunction
 	progress     uint64
-	loopProgress uint64
-	loopGuard    *reasoningLoopGuard
+	// nonContentProgress 只统计 refusal 与工具侧进展（新工具 ID/名称、非空参数增量）。
+	// 正文保护需要把「正文」与「其它可见进展」分开：正文本身是被监控的载荷，不能自我
+	// 重置窗口，而 refusal 或一次工具调用说明这轮输出换了阶段，应当重置正文窗口。
+	nonContentProgress     uint64
+	reasoningGuardProgress uint64
+	outputGuardProgress    uint64
+	reasoningGuard         *reasoningLoopGuard
+	outputGuard            *reasoningLoopGuard
 }
 
 type streamState struct {
@@ -253,9 +259,22 @@ func (s *streamState) hasVisibleProgress() bool {
 	return false
 }
 
+// hasNonContentProgress reports whether any choice has produced refusal text or
+// tool activity. 这类进展不是被监控的载荷，一出现就必须放行：不能因为另一个
+// choice 的正文还在压制区里，就把用户可见的 refusal 或工具调用也一起压住。
+func (s *streamState) hasNonContentProgress() bool {
+	for _, choice := range s.choices {
+		if choice.nonContentProgress > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (map[string]any, error) {
 	normalized := map[string]any{}
 	progress := false
+	nonContent := false
 	if role, _ := output["role"].(string); role != "" {
 		if !wholeMessage || c.role == "" {
 			normalized["role"] = role
@@ -282,6 +301,9 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 			normalized[key] = addition
 			if key != "reasoning_content" && strings.TrimSpace(addition) != "" {
 				progress = true
+				if key != "content" {
+					nonContent = true
+				}
 			}
 			if value != "" {
 				c.output = true
@@ -335,6 +357,7 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 					}
 					if field.key == "id" && value != *field.previous && strings.TrimSpace(value) != "" {
 						progress = true
+						nonContent = true
 					}
 					*field.previous = value
 				}
@@ -351,6 +374,7 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 				arguments, _ := nextFn["arguments"].(string)
 				if (state.function.name != previousName && strings.TrimSpace(state.function.name) != "") || arguments != "" {
 					progress = true
+					nonContent = true
 				}
 			} else if value, exists := call["function"]; exists && value != nil {
 				return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid tool function"}
@@ -390,6 +414,7 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 			arguments, _ := next["arguments"].(string)
 			if (c.function.name != previousName && strings.TrimSpace(c.function.name) != "") || arguments != "" {
 				progress = true
+				nonContent = true
 			}
 		}
 	} else if value, exists := output["function_call"]; exists && value != nil {
@@ -397,6 +422,9 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 	}
 	if progress {
 		c.progress++
+	}
+	if nonContent {
+		c.nonContentProgress++
 	}
 	return normalized, nil
 }
@@ -863,14 +891,21 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// ── 写出闸门（仅在重复推理保护启用时生效）────────────────────────────
 	//
 	// 保护命中时我们想「整段重发」而让用户完全无感，但流式一旦写出去就收不回。
-	// 因此在「还没产出任何正文/工具进展」的纯推理阶段，先把帧压在内存里：
-	//   - 一旦出现正文、拒绝或工具进展 → 立即放行并转为实时透传（此后命中只能照旧报错）；
-	//   - 压到字符上限、缓冲上限或时间上限仍未出现进展 → 同样放行（长推理不能无限等）；
+	// 因此先把帧压在内存里，直到能确认不是这条规则能抓的循环：
+	//   - 纯推理阶段一直压住，直到推理字符上限、缓冲上限或时间上限（长推理不能无限等）；
+	//   - 正文阶段压到出现长行、空行、第三种短行或正文上限为止（正常回答通常一行就放行）；
+	//   - refusal 与工具进展立即放行，它们不是被监控的载荷；
 	//   - 在压制期间命中循环 → 客户端零字节，错误标记 Retryable，由 handler 整段重发。
 	// 保护未启用时不进这个分支，行为与引入前完全一致。
 	var pending []byte
 	released := !state.loopGuardEnabled
 	holdBackDeadline := time.Now().Add(ReasoningLoopHoldBackTimeout)
+	// 正文压制期的独立时限：从第一帧正文开始计时，比推理侧短得多，避免「没有换行的
+	// 短回答」被闸门压到推理侧的 60 秒上限。holdingContent 记录当前是否正处于正文
+	// 压制期：一次工具调用会把正文窗口清零，之后若又出现可疑正文，时限要重新起算，
+	// 不能用上一段的旧期限把它立刻放行。
+	var contentDeadline time.Time
+	holdingContent := false
 	releasePending := func() error {
 		if released {
 			return nil
@@ -922,13 +957,27 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		// 先判定这一帧是否命中循环，再决定要不要放行：命中帧本身必须留在压制区里，
 		// 否则客户端会先看到一段重复推理，再收到错误。
 		guardErr := state.observeReasoningLoops(obj)
-		// 一旦出现正文/拒绝/工具进展，压制阶段立即结束：此后命中循环只能照旧报错，
-		// 因为客户端已经看到内容了。纯推理另有两个放行条件——累计推理超过压制字符上限、
-		// 或压制时间超过上限。命中循环的这一帧必须留在压制区里：先放行再报错，客户端
-		// 就会看到一段重复推理。
+		// 命中帧本身必须留在压制区里：先放行再报错，客户端就会看到一段重复文本。
+		// 未命中时按下面几条出口决定要不要继续压住：
+		//   - refusal 与工具进展一出现就放行，它们不是被监控的载荷；
+		//   - 纯推理阶段（还没有正文）继续压住，让推理循环有机会被整段丢弃后重发；
+		//   - 正文阶段只要还不能排除短行循环就继续压住（holdOutput），一旦出现长行、
+		//     短行种类变多或字符超限就放行；
+		//   - 推理累计到压制字符上限、或压制超时 → 放行（长推理不能无限等）。
 		if guardErr == nil {
-			if state.hasVisibleProgress() || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
-				!time.Now().Before(holdBackDeadline) {
+			// 纯推理阶段（hasVisibleProgress 为假）继续压住；一旦出现正文或其它可见
+			// 进展，就只按正文闸门与「非正文进展」决定。
+			contentHeld := !state.hasNonContentProgress() && state.holdOutput()
+			if contentHeld && !holdingContent {
+				holdingContent = true
+				contentDeadline = time.Now().Add(ContentLoopHoldBackTimeout)
+			} else if !contentHeld {
+				holdingContent = false
+			}
+			keepHolding := !state.hasVisibleProgress() || contentHeld
+			if !keepHolding || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
+				!time.Now().Before(holdBackDeadline) ||
+				(contentHeld && !time.Now().Before(contentDeadline)) {
 				if releaseErr := releasePending(); releaseErr != nil {
 					return true, releaseErr
 				}
@@ -995,15 +1044,19 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// 命中循环且客户端零字节时，整段压住的帧直接丢弃：调用方会在同一账号上重发，
 	// 客户端不该先看到半截推理再收到错误。
 	var heldErr *StreamError
-	heldLoop := err != nil && IsReasoningLoopError(err) && !released && errors.As(err, &heldErr)
+	heldLoop := err != nil && IsLoopGuardError(err) && !released && errors.As(err, &heldErr)
 	// 只有在调用方明确还会重发时（LoopRetryAvailable）才压制错误帧；否则按原有方式
 	// 把错误如实写给客户端，避免"既不重发也不报错"的黑洞。
 	retryPending := heldLoop && state.loopRetryAvailable
-	if !retryPending {
+	if heldLoop {
+		// 压住的这一段本身就是那串重复文本：重发时整段丢弃；重发用尽后同样丢弃，
+		// 只把错误写给客户端。否则用户会先看到一屏重复输出、再看到失败，正是这项
+		// 保护要消除的现象。直接清空缓冲并把闸门标记为已放行，让下面的错误帧照常写出。
+		pending = nil
+		released = true
+	} else if releaseErr := releasePending(); releaseErr != nil {
 		// 其余情况（正常收尾、上游截断等）把压住的帧原样放行，让客户端看到真实行为。
-		if releaseErr := releasePending(); releaseErr != nil {
-			return errors.Join(err, releaseErr)
-		}
+		return errors.Join(err, releaseErr)
 	}
 	if err == nil {
 		indexes := make([]int, 0, len(state.choices))

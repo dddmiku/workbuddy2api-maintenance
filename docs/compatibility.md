@@ -114,7 +114,7 @@ Responses 的同一 output item 只发送一次 `response.output_item.added`，�
 
 ## 重复推理的失败状态
 
-指定 DeepSeek 模型触发重复短行保护时，网关先在同一账号上重发一次；重发通常能拿到干净的一轮，调用方看不到这次内部重试。只有重发仍循环、或客户端已经收到内容时，才回报错误码 `upstream_reasoning_loop`，提示「检测到重复推理循环，已停止该次请求；可整理上下文后重试」，可附字符数与重复覆盖计数。非流式 Chat 与 Responses 返回 HTTP 422；已开始的流式请求保留 HTTP 200，Chat 返回错误事件，Responses 以 `response.failed` 结束，不附带成功终态。重发没能建立时返回 502 并写回原因。
+指定 DeepSeek 模型触发重复短行保护时，网关先在同一账号上重发一次；重发通常能拿到干净的一轮，调用方看不到这次内部重试。只有重发仍循环、或客户端已经收到内容时，才回报错误码：推理侧为 `upstream_reasoning_loop`（「检测到重复推理循环…」），正文侧为 `upstream_output_loop`（「检测到重复输出循环…」），两者都可附字符数与重复覆盖计数。正文侧单独设码，便于调用方区分「模型在思考里打转」与「重复正文正在刷屏」。非流式 Chat 与 Responses 返回 HTTP 422；已开始的流式请求保留 HTTP 200，Chat 返回错误事件，Responses 以 `response.failed` 结束，不附带成功终态。重发没能建立时返回 502 并写回原因。
 
 网关自身不对此类失败轮换账号或冷却，重发固定落在同一账号，已有会话绑定保留；客户端是否重试取决于其策略。账本保留已观测的原始用量（含被丢弃那一轮的计费），并同时增加失败和用量未完整返回计数。保护默认开启且可关闭；它可能误判合法短行重复，也不能检测所有循环，详细范围见 [重复推理保护](configuration.md#重复推理保护)。
 
@@ -135,6 +135,7 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 | `response_contract_violation` | 模型的成功结果未满足声明的工具或输出约束 |
 | `missing_tool_call` | 工具结束原因缺少实际调用 |
 | `upstream_reasoning_loop` | 重复短行推理触发保护；整理上下文后重试，合法重复场景可关闭保护 |
+| `upstream_output_loop` | 重复短行正文触发保护；整理上下文后重试，合法重复场景可关闭保护 |
 | `upstream_invalid_request` | 上游拒绝请求参数 |
 | `upstream_channel_rejected` | 上游拒绝调用渠道 |
 | `upstream_waf_blocked` | 上游入口拦截请求正文 |

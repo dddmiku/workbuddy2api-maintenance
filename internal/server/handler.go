@@ -1156,7 +1156,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			for {
 				streamOptions.LoopRetryAvailable = loopRetries < maxReasoningLoopRetries
 				streamErr = upstream.Stream(w, stats, streamOptions)
-				if streamErr == nil || !upstream.IsReasoningLoopError(streamErr) ||
+				if streamErr == nil || !upstream.IsLoopGuardError(streamErr) ||
 					!errors.As(streamErr, &loopErr) || !loopErr.Retryable ||
 					loopRetries >= maxReasoningLoopRetries || r.Context().Err() != nil {
 					break
@@ -1175,7 +1175,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 重发没能建立（传输层失败或上游直接报错）：Stream 已经压制了上一次
 					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
 					if !upstream.WriteStreamError(w, streamErr) {
-						writeOpenAIError(w, http.StatusBadGateway, upstream.ReasoningLoopErrorCode, streamErr.Error())
+						writeOpenAIError(w, http.StatusBadGateway, loopErrorCode(streamErr), streamErr.Error())
 					}
 					st.unreported = true
 					st.status = http.StatusBadGateway
@@ -1193,7 +1193,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.absorbUsage(stats)
 			if streamErr != nil {
 				rc.Close()
-				if upstream.IsReasoningLoopError(streamErr) {
+				if upstream.IsLoopGuardError(streamErr) {
 					// The stream was stopped before final usage could be established.
 					// Preserve observed counts but do not label them as a complete bill.
 					st.unreported = true
@@ -1241,7 +1241,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var loopErr *upstream.StreamError
 		for {
 			resp, err = upstream.Aggregate(stats, streamOptions)
-			if err == nil || !upstream.IsReasoningLoopError(err) ||
+			if err == nil || !upstream.IsLoopGuardError(err) ||
 				!errors.As(err, &loopErr) || loopRetries >= maxReasoningLoopRetries ||
 				r.Context().Err() != nil {
 				break
@@ -1257,7 +1257,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 重发没能建立：把失败如实回报，不能静默结束。
 				st.unreported = true
 				st.status = http.StatusBadGateway
-				writeOpenAIError(w, st.status, upstream.ReasoningLoopErrorCode, err.Error())
+				writeOpenAIError(w, st.status, loopErrorCode(err), err.Error())
 				if r.Context().Err() != nil {
 					st.status = 499
 				}
@@ -1269,10 +1269,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.absorbUsage(stats)
 		rc.Close()
 		if err != nil {
-			if upstream.IsReasoningLoopError(err) {
+			if upstream.IsLoopGuardError(err) {
 				st.unreported = true
 				st.status = http.StatusUnprocessableEntity
-				writeOpenAIError(w, st.status, upstream.ReasoningLoopErrorCode, err.Error())
+				writeOpenAIError(w, st.status, loopErrorCode(err), err.Error())
 				return
 			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
@@ -1438,6 +1438,17 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// loopErrorCode 取出重复短行保护的稳定错误码：推理侧与正文侧各自有码，调用方
+// 据此区分「模型在思考里打转」和「重复正文已经发出去」。取不到时回落到推理侧码，
+// 保持既有调用方兼容。
+func loopErrorCode(err error) string {
+	var streamErr *upstream.StreamError
+	if errors.As(err, &streamErr) && streamErr.Code != "" {
+		return streamErr.Code
+	}
+	return upstream.ReasoningLoopErrorCode
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) error {
 	raw, err := json.Marshal(v)

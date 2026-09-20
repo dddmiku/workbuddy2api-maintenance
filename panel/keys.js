@@ -128,7 +128,7 @@ function renderKeys(){
       '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
       '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
-      '" title="发现持续重复推理时结束该次请求；只影响此密钥后续请求">' + (keyGuardEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
+      '" title="发现持续重复输出（推理或正文）时结束该次请求；只影响此密钥后续请求">' + (keyGuardEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
       '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
       '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +

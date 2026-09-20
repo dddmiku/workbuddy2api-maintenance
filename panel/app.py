@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：2.1.9 重复推理保护扩到正文（上游修复同步到面板文案）。
 # 2026-09-20：2.1.8 密钥列表合并累计 token 用量，创建/编辑支持有效期（默认无限制）。
 # 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
 # 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
@@ -77,7 +78,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.8"
+PANEL_VERSION = "2.1.9"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

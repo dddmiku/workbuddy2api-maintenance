@@ -412,7 +412,12 @@ func TestUsageOutcomeCancelledUpstreamCountsOnce(t *testing.T) {
 }
 
 func TestUsageOutcomeDisconnectBeforeUsageStaysUnknown(t *testing.T) {
-	h, ledger := postreleaseUsageHandler(t, postreleaseUsageContent+postreleaseFinish("stop")+postreleaseUsageOnly+"data: [DONE]\n\n")
+	// 正文用超过 32 字符的长行：正文闸门立即放行，写入失败会当场中断本轮，用量帧
+	// 根本不会被读到——这正是本用例要覆盖的「断开早于用量」路径。若换成短行正文，
+	// 帧会先被正文闸门压住，用量反而会被读到，断言的对象就变了。
+	content := "data: {\"id\":\"usage-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+		strings.Repeat("answer ", 8) + "\",\"reasoning_content\":\"thought\"}}]}\n\n"
+	h, ledger := postreleaseUsageHandler(t, content+postreleaseFinish("stop")+postreleaseUsageOnly+"data: [DONE]\n\n")
 	w := &usageFinalWriteFailure{ResponseRecorder: httptest.NewRecorder(), match: "answer"}
 	h.ServeHTTP(w, postreleaseUsageRequest("/v1/chat/completions", true, ""))
 	if got := ledger.Snapshot().Totals; !w.failed || got.Requests != 1 || got.FailedRequests != 1 || got.UnreportedRequests != 1 || got.TotalTokens != 0 || got.Credit != 0 {

@@ -70,6 +70,10 @@ stream_idle_timeout_ms = 90000
 | `model_auto_compact_token_limit` | Codex 客户端 | 触发自动历史压缩的 token 阈值；未设置时使用该客户端版本的模型默认行为 |
 | `/v1/models` 中的 `context_length` | 网关模型目录 | 提供模型元数据，不能代替客户端配置或证明客户端已经采用该值 |
 
+模型目录里 `auto_compact_token_limit` 与 `context_window` 的关系要一起看：客户端实际生效的阈值是两者的较小值，且不超过 `context_window` 的 9/10。`global:deepseek-v4.1-flash` 与 `cn:deepseek-v4.1-flash` 的窗口是 1000000，因此把 `auto_compact_token_limit` 设成 900000 就取到客户端允许的上限；设得更大不会提高阈值，反而会让配置与实际生效值不一致。网关不写这个字段，它由客户端配置决定。
+
+若发现会话「远没到临界就被压缩」，先核对实际生效值：早期按 1.5 倍输入估计留下的 466666 会比真实阈值早很多触发。网关侧的 `input_token_scale` 已退役，用量按上游原值传递，客户端的压缩阈值应当按真实窗口设置。
+
 前两个字段设置在 Codex 实际读取的配置中，例如 `~/.codex/config.toml` 的顶层，与 `model` 同级，放在 `[model_providers.workbuddy2api]` 表之前。若由 cc switch 等工具生成配置，应核对它实际写入并由该客户端加载的文件，避免后续生成操作覆盖手工设置。
 
 CLI 0.153.4 还会用客户端模型元数据中的 `max_context_window` 限制配置窗口，配置文件里的数值不一定就是运行时生效值。自定义模型没有匹配目录条目时会使用回退元数据，不能只把配置窗口调大就认为限制已提高；对应实现见 [0.153.4 的窗口覆盖逻辑](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/models-manager/src/model_info.rs#L25)。
@@ -98,7 +102,7 @@ model_instructions_file = "/opt/workbuddy2api/examples/codex-instructions.md"
 
 ### 推理反复重复
 
-指定 DeepSeek 模型持续重复少量短行、没有新的正文或工具进展时，网关默认会先在同一账号上重发一次；重发仍循环才中止该次请求，返回 `upstream_reasoning_loop`。看到此错误后可整理上下文再重试；业务本来就需要大量重复短行时，可以关闭这项保护。它可能误报，也不能覆盖所有循环，设置与用量边界见 [重复推理保护](configuration.md#重复推理保护)。
+指定 DeepSeek 模型持续重复少量短行时，网关默认会先在同一账号上重发一次；重发仍循环才中止该次请求。推理侧返回 `upstream_reasoning_loop`，正文侧返回 `upstream_output_loop`。看到此错误后可整理上下文再重试；业务本来就需要大量重复短行时，可以关闭这项保护。它可能误报，也不能覆盖所有循环，设置与用量边界见 [重复推理保护](configuration.md#重复推理保护)。
 
 ### 预告文字与回合结束
 

@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：正文重复短行纳入保护：补「正文循环同账号重发、用户无感」回归，并把
+//
+//	「重复正文放行」的旧断言改为按闸门边界断言（长行立即放行才不重发）。
+//
 // 2026-09-19：以合成上游覆盖重复推理保护的四种出口、失败用量及账号/粘性边界。
 // 2026-09-19：按32字符短行规则补齐完整早期用量、关闭开关与正常进展边界，避免误截和用量推算。
 // 2026-09-20：改为可重发夹具，并补「重发成功用户无感」与「已出正文不再重发」两条回归。
@@ -128,6 +132,12 @@ func assertReasoningGuardFailure(t *testing.T, recorder *httptest.ResponseRecord
 // assertReasoningGuardFailureStatus 断言循环最终**如实回报**（重发也没救回来时）。
 // wantStatus 区分两类出口：重发建立失败走 502，重发后仍循环走 422。
 func assertReasoningGuardFailureStatus(t *testing.T, recorder *httptest.ResponseRecorder, path string, streaming bool, wantStatus int) {
+	assertLoopGuardFailureCode(t, recorder, path, streaming, wantStatus, "upstream_reasoning_loop")
+}
+
+// assertLoopGuardFailureCode 断言循环最终**如实回报**，并核对稳定错误码属于哪条文本流。
+// 正文侧单独设码，调用方据此区分「模型在思考里打转」与「重复正文正在刷屏」。
+func assertLoopGuardFailureCode(t *testing.T, recorder *httptest.ResponseRecorder, path string, streaming bool, wantStatus int, wantCode string) {
 	t.Helper()
 	expect := wantStatus
 	if streaming {
@@ -137,8 +147,8 @@ func assertReasoningGuardFailureStatus(t *testing.T, recorder *httptest.Response
 		t.Errorf("status=%d want=%d", recorder.Code, expect)
 	}
 	output := recorder.Body.String()
-	if !strings.Contains(output, `"code":"upstream_reasoning_loop"`) {
-		t.Errorf("missing stable loop error, output bytes=%d", len(output))
+	if !strings.Contains(output, `"code":"`+wantCode+`"`) {
+		t.Errorf("missing stable loop error %q, output bytes=%d", wantCode, len(output))
 	}
 	if strings.Contains(output, "after-guard-marker") {
 		t.Error("stream continued after the guarded loop")
@@ -243,6 +253,36 @@ func TestReasoningLoopGuardFourExitsAndUsage(t *testing.T) {
 	}
 }
 
+// TestOutputLoopGuardReportsContentCode 复现线上「疯狂输出」的真实形态：重复发生在
+// 正文里（观测样本是 1864 行「我执行。」），推理侧几乎没有重复，旧实现因此既不中断
+// 也不重试。现在必须在同账号重发一次，重发仍循环时用正文侧错误码如实回报。
+func TestOutputLoopGuardReportsContentCode(t *testing.T) {
+	payload := reasoningGuardFinish(
+		reasoningGuardFrame(map[string]any{"content": strings.Repeat("我执行。\n", 400)}), "stop")
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", path, streaming), func(t *testing.T) {
+				model := "global:deepseek-v4.1-flash"
+				h, _, _, calls, bindings := reasoningGuardFixtureSequence(t, []string{payload}, model)
+				recorder := httptest.NewRecorder()
+				h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+				assertLoopGuardFailureCode(t, recorder, path, streaming,
+					http.StatusUnprocessableEntity, "upstream_output_loop")
+				if *calls != 2 {
+					t.Errorf("content loop should retry exactly once on the same account: calls=%d", *calls)
+				}
+				if uid, ok := bindings.lastUID("reasoning-guard-session"); !ok || uid != "guard-first" {
+					t.Error("content loop guard invalidated the existing sticky binding")
+				}
+				// 正文循环的错误里只能有计数，不能把重复正文回显给调用方。
+				if strings.Contains(recorder.Body.String(), "我执行") {
+					t.Error("content loop error exposed output text")
+				}
+			})
+		}
+	}
+}
+
 func TestReasoningLoopGuardNormalOutputAndProgress(t *testing.T) {
 	var unique strings.Builder
 	for i := 0; i < 400; i++ {
@@ -258,7 +298,10 @@ func TestReasoningLoopGuardNormalOutputAndProgress(t *testing.T) {
 		{name: "long-unbroken-reasoning", payload: reasoningGuardFrame(map[string]any{"reasoning_content": longLine}), preserve: longLine},
 		{name: "repeated-lines-over-32-characters", payload: reasoningGuardFrame(map[string]any{"reasoning_content": strings.Repeat(strings.Repeat("m", 33)+"\n", 300)}), preserve: strings.Repeat("m", 33)},
 		{name: "distinct-short-reasoning-lines", payload: reasoningGuardFrame(map[string]any{"reasoning_content": unique.String()})},
-		{name: "repeated-visible-content", payload: reasoningGuardFrame(map[string]any{"content": reasoningGuardLines(300)})},
+		// 正文侧的多行正常输出：不同短行很快超过闸门上限，必须实时放行。
+		{name: "distinct-short-content-lines", payload: reasoningGuardFrame(map[string]any{"content": unique.String()})},
+		// 正文里的长行（超过 32 字符）永远不会被计为重复，必须立即放行。
+		{name: "long-content-line", payload: reasoningGuardFrame(map[string]any{"content": strings.Repeat("正常正文片段 ", 400)})},
 		{name: "content-resets-window", payload: before + reasoningGuardFrame(map[string]any{"content": "visible progress"}) + after},
 		{name: "refusal-resets-window", payload: before + reasoningGuardFrame(map[string]any{"refusal": "refusal progress"}) + after},
 		{name: "new-tool-resets-window", payload: before + reasoningGuardTool(0, "call_guard", "lookup", "{}") + after, finish: "tool_calls", tools: true},
@@ -392,48 +435,59 @@ func TestReasoningLoopGuardDisabled(t *testing.T) {
 func TestReasoningLoopGuardRetryIsInvisible(t *testing.T) {
 	loopPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
 	cleanPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"content": "after-guard-marker"}), "stop")
+	outputLoopPayload := reasoningGuardFinish(
+		reasoningGuardFrame(map[string]any{"content": strings.Repeat("我执行。\n", 400)}), "stop")
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
 		for _, streaming := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/stream=%t", path, streaming), func(t *testing.T) {
-				model := "global:deepseek-v4.1-flash"
-				h, ledger, bodies, calls, _ := reasoningGuardFixtureSequence(t, []string{loopPayload, cleanPayload}, model)
-				recorder := httptest.NewRecorder()
-				h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
-				output := recorder.Body.String()
-				if recorder.Code != http.StatusOK || strings.Contains(output, `"code":"upstream_reasoning_loop"`) ||
-					!strings.Contains(output, "after-guard-marker") {
-					t.Fatalf("retry did not deliver a clean success: status=%d", recorder.Code)
-				}
-				if path == "/v1/responses" && streaming && (strings.Count(output, "event: response.completed\n") != 1 ||
-					strings.Contains(output, "event: response.failed\n")) {
-					t.Error("retry did not emit exactly one successful Responses terminal")
-				}
-				// 被丢弃的第一轮上游确实计了费，只是没能读到完整 usage，
-				// 因此这一笔请求如实标记为「用量不完整」，不能伪装成完整账单。
-				if got := ledger.Snapshot().Totals.UnreportedRequests; got != 1 {
-					t.Errorf("discarded attempt should be flagged as unreported usage: %d", got)
-				}
-				if *calls != 2 {
-					t.Errorf("loop was not retried on the same account: calls=%d", *calls)
-				}
-				if strings.Contains(output, "checking the same step once more") {
-					t.Error("client received the discarded first attempt")
-				}
-				for i, body := range bodies[:min(*calls, len(bodies))] {
-					if body.closed == 0 {
-						t.Errorf("upstream body %d was not closed", i)
+			for _, tc := range []struct{ name, loop string }{
+				{"reasoning", loopPayload},
+				{"content", outputLoopPayload},
+			} {
+				t.Run(fmt.Sprintf("%s/stream=%t/%s", path, streaming, tc.name), func(t *testing.T) {
+					model := "global:deepseek-v4.1-flash"
+					h, ledger, bodies, calls, _ := reasoningGuardFixtureSequence(t, []string{tc.loop, cleanPayload}, model)
+					recorder := httptest.NewRecorder()
+					h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+					output := recorder.Body.String()
+					if recorder.Code != http.StatusOK || strings.Contains(output, `"code":"upstream_reasoning_loop"`) ||
+						strings.Contains(output, `"code":"upstream_output_loop"`) ||
+						!strings.Contains(output, "after-guard-marker") {
+						t.Fatalf("retry did not deliver a clean success: status=%d", recorder.Code)
 					}
-				}
-			})
+					if path == "/v1/responses" && streaming && (strings.Count(output, "event: response.completed\n") != 1 ||
+						strings.Contains(output, "event: response.failed\n")) {
+						t.Error("retry did not emit exactly one successful Responses terminal")
+					}
+					// 被丢弃的第一轮上游确实计了费，只是没能读到完整 usage，
+					// 因此这一笔请求如实标记为「用量不完整」，不能伪装成完整账单。
+					if got := ledger.Snapshot().Totals.UnreportedRequests; got != 1 {
+						t.Errorf("discarded attempt should be flagged as unreported usage: %d", got)
+					}
+					if *calls != 2 {
+						t.Errorf("loop was not retried on the same account: calls=%d", *calls)
+					}
+					if strings.Contains(output, "checking the same step once more") {
+						t.Error("client received the discarded first attempt")
+					}
+					for i, body := range bodies[:min(*calls, len(bodies))] {
+						if body.closed == 0 {
+							t.Errorf("upstream body %d was not closed", i)
+						}
+					}
+				})
+			}
 		}
 	}
 }
 
-// TestReasoningLoopGuardNoRetryAfterVisibleOutput 验证闸门边界：流式一旦把正文写出去
-// 就收不回，命中循环只能按原有方式如实回报错误；非流式客户端在读完前零字节，重发仍
-// 然无感，因此照常重试一次。
+// TestReasoningLoopGuardNoRetryAfterVisibleOutput 验证闸门边界：正文一旦被判定为正常
+// 并写出就收不回，此后推理命中循环只能如实回报错误，不能再重发；非流式客户端在读完
+// 前零字节，重发仍然无感，因此照常重试一次。
+//
+// 夹具里的正文是超过 32 字符的长行，正文闸门立即放行，因此这里考察的是「已放行之后
+// 才命中」的路径。正文本身构成循环的情形由 upstream 包的正文保护回归覆盖。
 func TestReasoningLoopGuardNoRetryAfterVisibleOutput(t *testing.T) {
-	payload := reasoningGuardFrame(map[string]any{"content": "visible-first"}) +
+	payload := reasoningGuardFrame(map[string]any{"content": "visible-first 正文已经放行，这一段明显超过三十二个字符的闸门上限。"}) +
 		reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}) +
 		postreleaseFinish("stop") + "data: [DONE]\n\n"
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
