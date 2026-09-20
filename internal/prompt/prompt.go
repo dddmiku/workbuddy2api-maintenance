@@ -1,4 +1,9 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：ActNote 明确禁止「先说下一步、再结束本轮」——客户端不会因为一句进度
+//
+//	叙述就自动继续，模型必须在本轮内直接返回工具调用。同时说明该约定适用于
+//	Chat Completions 与 Responses 两条路径。
+//
 // 2026-09-16：显式自定义提示词替换保留其余请求数字原值，避免 schema 与工具参数定义丢失精度。
 // 2026-09-17：新增 ActNote（运行约定）：抑制上游模型「一句话一个命令」的叙述式输出。
 // 2026-09-18：明确纯文字会结束客户端回合，要求待执行动作与实际工具调用同次返回，同时保留用户停手和确认边界。
@@ -25,17 +30,22 @@ var defaultPrompt string
 const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
 // ActNote supplements tool-enabled requests without replacing client instructions.
-// Chat Completions has no separate commentary turn that automatically resumes:
-// a standalone progress sentence can be interpreted as the final answer by Codex.
-// This is a model instruction, not a heuristic retry or a guarantee of completion.
-const ActNote = "Tool execution protocol: a reply containing only text ends the client's turn; " +
-	"there is no automatic continuation after a standalone progress message. If required work " +
-	"remains and you are ready to act, return an actual available tool call in this same response. " +
-	"Do not end with a promise such as 'Let me...', 'I will...', or 'next I will...' and expect " +
-	"another turn to execute it. Continue the authorized task through implementation and verification. " +
-	"Give a final text answer when the task is complete, when the user asked only for an answer, " +
-	"or when a blocker genuinely requires user input or approval. Respect the user's scope, " +
-	"stop requests, and approval requirements; this protocol grants no additional authorization."
+//
+// 适用于 Chat Completions 与 Responses 两条路径。核心约束：本轮只要还有「已经获准、
+// 且现在就能做」的动作，就必须在**同一次回复里**真正发起工具调用；只回一句「让我先
+// 确认一下」然后停下，客户端不会自动续跑，用户只能手动发「继续」。
+//
+// 这是模型指令，不是启发式重试，也不保证一定完成。
+const ActNote = "Tool execution protocol: a reply containing only text ends the client's turn, " +
+	"and nothing resumes it automatically. If required work remains and you can act now, " +
+	"return the actual tool call in this same response instead of describing what you are about " +
+	"to do. Never end a turn with a plan, a promise, or a progress note such as 'let me check', " +
+	"'I will now', 'next I will', or 'let me first confirm' and expect another turn to execute it: " +
+	"either call the tool now, or finish with the result. Keep working through implementation and " +
+	"verification in the same turn. Give a final text answer only when the task is complete, when " +
+	"the user asked for an answer rather than an action, or when a blocker genuinely requires user " +
+	"input or approval. Respect the user's scope, stop requests, and approval requirements; this " +
+	"protocol grants no additional authorization."
 
 // ActNoteDisabled 显式关闭 act_note 的取值。
 const ActNoteDisabled = "off"

@@ -96,6 +96,32 @@ func applyActNote(body []byte, note string, hasTools bool) []byte {
 	return out
 }
 
+// chatBodyHasTools 报告出站 chat 请求体是否声明了可调用的工具。
+//
+// 原生 /v1/chat/completions 没有 responsesRequest 那样的解析结果，因此直接从请求体
+// 判断：现代形态看非空 tools 数组，旧形态看 functions。解析失败按「没有工具」处理——
+// 约定只在有工具时才有意义，宁可不注入也不要在畸形请求上做额外改写。
+func chatBodyHasTools(body []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := jsonutil.Decode(body, &fields); err != nil || fields == nil {
+		return false
+	}
+	for _, key := range []string{"tools", "functions"} {
+		raw, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var list []any
+		if err := json.Unmarshal(raw, &list); err != nil {
+			continue
+		}
+		if len(list) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ActNoteFor 按配置取值：空 = 内置默认约定；"off" = 关闭；其他 = 自定义文本。
 func ActNoteFor(configured string) string {
 	switch value := strings.TrimSpace(configured); value {

@@ -811,6 +811,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 运行约定：原生 Chat Completions 路径同样注入（见 prompt.ActNote）。
+	//
+	// 此前只在 /v1/responses 里调用 applyActNote，走 /v1/chat/completions 的客户端
+	// （Devin、narrafork 等）拿不到这条约定：模型回一句「让我先确认…」就结束本轮，
+	// 客户端不再自动继续，用户只能手动发「继续」。这里按出站 chat 体的实际声明判断
+	// 有没有工具，避免用 responsesRequest 的工具字段（原生 chat 请求里根本没有）。
+	if _, responses := w.(*responsesWriter); !responses {
+		hasTools := chatBodyHasTools(body)
+		body = applyActNote(body, h.cfg.PromptActNote, hasTools)
+	}
+
 	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
 	if info, ok := requestKeyInfo(r); ok && info.ReasoningLoopGuard != nil {
 		reasoningLoopGuard = *info.ReasoningLoopGuard
