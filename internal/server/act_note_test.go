@@ -189,3 +189,32 @@ func TestActNoteSkippedOnNativeChatWithoutTools(t *testing.T) {
 		t.Fatal("无工具请求不应注入运行约定")
 	}
 }
+
+// TestActNoteNotInjectedTwiceOnResponsesPath 锁定两条路径的边界：/v1/responses 在
+// responsesToChat 之后注入一次，随后把请求交给 chatCompletions；后者必须靠 writer
+// 类型判断跳过，否则同一条约定会被追加两遍。
+func TestActNoteNotInjectedTwiceOnResponsesPath(t *testing.T) {
+	var captured []byte
+	h, _ := postreleaseUsageHandler(t, postreleaseUsageContent+postreleaseFinish("stop")+"data: [DONE]\n\n")
+	h.cfg.PromptActNote = ActNoteFor("")
+	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(req.Body)
+		captured = raw
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(postreleaseUsageContent + postreleaseFinish("stop") + "data: [DONE]\n\n")),
+		}, nil
+	})
+	body := `{"model":"cn:deepseek-v4.1-flash","stream":true,"instructions":"You are Codex.",` +
+		`"input":"do the task",` +
+		`"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if len(captured) == 0 {
+		t.Fatal("upstream never received the request")
+	}
+	if got := strings.Count(string(captured), prompt.ActNote); got != 1 {
+		t.Fatalf("运行约定被注入 %d 次，want 1", got)
+	}
+}
