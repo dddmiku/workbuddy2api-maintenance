@@ -1,6 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-19：以合成上游覆盖重复推理保护的四种出口、失败用量及账号/粘性边界。
 // 2026-09-19：按32字符短行规则补齐完整早期用量、关闭开关与正常进展边界，避免误截和用量推算。
+// 2026-09-20：改为可重发夹具，并补「重发成功用户无感」与「已出正文不再重发」两条回归。
 package server
 
 import (
@@ -49,9 +50,21 @@ func reasoningGuardFinish(payload, reason string) string {
 
 func reasoningGuardFixture(t *testing.T, payload, model string) (*Handler, *usage.Store, *reasoningGuardBody, *int, *bindStore) {
 	t.Helper()
+	h, ledger, bodies, calls, bindings := reasoningGuardFixtureSequence(t, []string{payload}, model)
+	return h, ledger, bodies[0], calls, bindings
+}
+
+// reasoningGuardFixtureSequence 让每次上游调用拿到**独立的**响应体：重复推理保护命中后
+// 网关会在同一账号上重发，重发必须能读到一份全新的 SSE，否则测的只是"读同一个已消费
+// 的 body"。payloads 用完后重复最后一项（便于构造"一直循环"的场景）。
+func reasoningGuardFixtureSequence(t *testing.T, payloads []string, model string) (*Handler, *usage.Store, []*reasoningGuardBody, *int, *bindStore) {
+	t.Helper()
+	if len(payloads) == 0 {
+		t.Fatal("fixture needs at least one payload")
+	}
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
-	h, ledger := postreleaseUsageHandler(t, payload)
+	h, ledger := postreleaseUsageHandler(t, payloads[0])
 	domain := ""
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "global:") {
 		domain = "www.workbuddy.ai"
@@ -62,19 +75,28 @@ func reasoningGuardFixture(t *testing.T, payload, model string) (*Handler, *usag
 	)
 	h.cfg.MaxRotate = 3
 	h.cfg.GlobalEnabled = true
-	body := &reasoningGuardBody{Reader: strings.NewReader(payload)}
+	var bodies []*reasoningGuardBody
 	calls := 0
 	h.cfg.Upstream.GlobalEnabled = true
 	h.cfg.Upstream.ChatBaseGlobal = "https://fixture.invalid"
+	// 预建 body：单 payload 的便捷夹具要在发请求前就能返回 bodies[0]；重发超出
+	// payload 数量时再用最后一段重建，保证每次上游调用都拿到未消费的 SSE。
+	for _, payload := range payloads {
+		bodies = append(bodies, &reasoningGuardBody{Reader: strings.NewReader(payload)})
+	}
 	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		index := calls
 		calls++
-		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+		if index >= len(bodies) {
+			bodies = append(bodies, &reasoningGuardBody{Reader: strings.NewReader(payloads[len(payloads)-1])})
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: bodies[index]}, nil
 	})
 	bindings := newBindStore()
 	h.cfg.Session = session.New(session.Config{TTL: time.Hour, Store: bindings,
 		Available: func() []string { return []string{"guard-first", "guard-second"} }})
 	h.cfg.Session.Bind("reasoning-guard-session", "guard-first")
-	return h, ledger, body, &calls, bindings
+	return h, ledger, bodies, &calls, bindings
 }
 
 func reasoningGuardRequest(path, model string, streaming bool, tools bool) *http.Request {
@@ -100,12 +122,19 @@ func reasoningGuardRequest(path, model string, streaming bool, tools bool) *http
 
 func assertReasoningGuardFailure(t *testing.T, recorder *httptest.ResponseRecorder, path string, streaming bool) {
 	t.Helper()
-	wantStatus := http.StatusUnprocessableEntity
+	assertReasoningGuardFailureStatus(t, recorder, path, streaming, http.StatusUnprocessableEntity)
+}
+
+// assertReasoningGuardFailureStatus 断言循环最终**如实回报**（重发也没救回来时）。
+// wantStatus 区分两类出口：重发建立失败走 502，重发后仍循环走 422。
+func assertReasoningGuardFailureStatus(t *testing.T, recorder *httptest.ResponseRecorder, path string, streaming bool, wantStatus int) {
+	t.Helper()
+	expect := wantStatus
 	if streaming {
-		wantStatus = http.StatusOK
+		expect = http.StatusOK
 	}
-	if recorder.Code != wantStatus {
-		t.Errorf("status=%d want=%d", recorder.Code, wantStatus)
+	if recorder.Code != expect {
+		t.Errorf("status=%d want=%d", recorder.Code, expect)
 	}
 	output := recorder.Body.String()
 	if !strings.Contains(output, `"code":"upstream_reasoning_loop"`) {
@@ -166,17 +195,21 @@ func TestReasoningLoopGuardFourExitsAndUsage(t *testing.T) {
 					payload += reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(300)})
 					payload += reasoningGuardFrame(map[string]any{"content": "after-guard-marker"}) + postreleaseFinish("stop") + "data: [DONE]\n\n"
 					model := "global:deepseek-v4.1-flash"
-					h, ledger, body, calls, bindings := reasoningGuardFixture(t, payload, model)
+					// 上游每次都给同一段循环输出：网关应当在同一账号上重发一次，
+					// 重发仍然循环才如实回报错误。
+					h, ledger, bodies, calls, bindings := reasoningGuardFixtureSequence(t, []string{payload}, model)
 					beforeFirst, _ := h.cfg.Pool.Status("guard-first")
 					beforeSecond, _ := h.cfg.Pool.Status("guard-second")
 					recorder := httptest.NewRecorder()
 					h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
-					assertReasoningGuardFailure(t, recorder, path, streaming)
-					if *calls != 1 {
-						t.Errorf("loop triggered upstream retries: calls=%d", *calls)
+					assertReasoningGuardFailureStatus(t, recorder, path, streaming, http.StatusUnprocessableEntity)
+					if *calls != 2 {
+						t.Errorf("loop should retry exactly once on the same account: calls=%d", *calls)
 					}
-					if body.closed == 0 {
-						t.Error("upstream body was not closed")
+					for i, body := range bodies {
+						if body.closed == 0 {
+							t.Errorf("upstream body %d was not closed", i)
+						}
 					}
 					afterFirst, firstPresent := h.cfg.Pool.Status("guard-first")
 					afterSecond, secondPresent := h.cfg.Pool.Status("guard-second")
@@ -188,16 +221,18 @@ func TestReasoningLoopGuardFourExitsAndUsage(t *testing.T) {
 					if uid, ok := bindings.lastUID("reasoning-guard-session"); !ok || uid != "guard-first" {
 						t.Error("loop guard invalidated the existing sticky binding")
 					}
+					// 账本按「一次请求」记账：重发不额外计请求数，但两次尝试里已知的用量
+					// 都会累计（失败/中断也保留已返回的数据）。
 					want := usage.Totals{Requests: 1, FailedRequests: 1, UnreportedRequests: 1}
 					if earlyUsage != "none" {
-						want.PromptTokens = 120
-						want.CachedTokens = 64
-						want.TotalTokens = 120
-						want.Credit = 0.5
+						want.PromptTokens = 240
+						want.CachedTokens = 128
+						want.TotalTokens = 240
+						want.Credit = 1.0
 					}
 					if earlyUsage == "complete" {
-						want.CompletionTokens = 8
-						want.TotalTokens = 128
+						want.CompletionTokens = 16
+						want.TotalTokens = 256
 					}
 					if got := ledger.Snapshot().Totals; got != want {
 						t.Errorf("partial usage lost or fabricated: got=%+v want=%+v", got, want)
@@ -275,12 +310,24 @@ func TestReasoningLoopGuardMetadataDoesNotReset(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/stream=%t/%s", path, streaming, tc.name), func(t *testing.T) {
 					model := "global:deepseek-v4.1-flash"
 					payload := reasoningGuardFinish(tc.prefix+before+tc.metadata+after, "stop")
-					h, ledger, body, calls, _ := reasoningGuardFixture(t, payload, model)
+					// 上游两次都给同一段循环：网关在同账号重发一次，仍循环才回报。
+					h, ledger, bodies, calls, _ := reasoningGuardFixtureSequence(t, []string{payload, payload}, model)
 					recorder := httptest.NewRecorder()
 					h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, tc.tools))
 					assertReasoningGuardFailure(t, recorder, path, streaming)
-					if *calls != 1 || body.closed == 0 {
-						t.Errorf("guard retried or failed to close upstream: calls=%d closed=%d", *calls, body.closed)
+					// 工具进展一旦写出去，客户端就不再是零字节，闸门放行后命中只能照旧
+					// 回报；其余场景客户端零字节，应当同账号重发一次。
+					wantCalls := 2
+					if streaming && tc.prefix != "" {
+						wantCalls = 1
+					}
+					if *calls != wantCalls {
+						t.Errorf("unexpected upstream calls=%d want=%d", *calls, wantCalls)
+					}
+					for i, body := range bodies[:min(*calls, len(bodies))] {
+						if body.closed == 0 {
+							t.Errorf("upstream body %d was not closed", i)
+						}
 					}
 					got := ledger.Snapshot().Totals
 					if got.Requests != 1 || got.FailedRequests != 1 || got.UnreportedRequests != 1 {
@@ -301,16 +348,18 @@ func TestReasoningLoopGuardModelScope(t *testing.T) {
 			for _, streaming := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/stream=%t", model, path, streaming), func(t *testing.T) {
 					payload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(300)}), "stop")
-					h, ledger, _, calls, _ := reasoningGuardFixture(t, payload, model)
+					h, ledger, _, calls, _ := reasoningGuardFixtureSequence(t, []string{payload, payload}, model)
 					recorder := httptest.NewRecorder()
 					h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+					wantCalls := 2
 					if model == "cn:deepseek-v4.1-flash-extra" || model == "cn:gpt-5.3-codex" {
 						assertReasoningGuardSuccess(t, recorder, path, streaming, ledger)
+						wantCalls = 1
 					} else {
 						assertReasoningGuardFailure(t, recorder, path, streaming)
 					}
-					if *calls != 1 {
-						t.Errorf("unexpected upstream calls=%d", *calls)
+					if *calls != wantCalls {
+						t.Errorf("unexpected upstream calls=%d want=%d", *calls, wantCalls)
 					}
 				})
 			}
@@ -332,6 +381,80 @@ func TestReasoningLoopGuardDisabled(t *testing.T) {
 				assertReasoningGuardSuccess(t, recorder, path, streaming, ledger)
 				if *calls != 1 || body.closed == 0 {
 					t.Errorf("disabled guard changed upstream lifecycle: calls=%d closed=%d", *calls, body.closed)
+				}
+			})
+		}
+	}
+}
+
+// TestReasoningLoopGuardRetryIsInvisible 验证用户无感：第一次上游循环、第二次正常，
+// 客户端只看到第二次的成功输出，既不出现循环那段推理，也没有任何错误标记。
+func TestReasoningLoopGuardRetryIsInvisible(t *testing.T) {
+	loopPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
+	cleanPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"content": "after-guard-marker"}), "stop")
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", path, streaming), func(t *testing.T) {
+				model := "global:deepseek-v4.1-flash"
+				h, ledger, bodies, calls, _ := reasoningGuardFixtureSequence(t, []string{loopPayload, cleanPayload}, model)
+				recorder := httptest.NewRecorder()
+				h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+				output := recorder.Body.String()
+				if recorder.Code != http.StatusOK || strings.Contains(output, `"code":"upstream_reasoning_loop"`) ||
+					!strings.Contains(output, "after-guard-marker") {
+					t.Fatalf("retry did not deliver a clean success: status=%d", recorder.Code)
+				}
+				if path == "/v1/responses" && streaming && (strings.Count(output, "event: response.completed\n") != 1 ||
+					strings.Contains(output, "event: response.failed\n")) {
+					t.Error("retry did not emit exactly one successful Responses terminal")
+				}
+				// 被丢弃的第一轮上游确实计了费，只是没能读到完整 usage，
+				// 因此这一笔请求如实标记为「用量不完整」，不能伪装成完整账单。
+				if got := ledger.Snapshot().Totals.UnreportedRequests; got != 1 {
+					t.Errorf("discarded attempt should be flagged as unreported usage: %d", got)
+				}
+				if *calls != 2 {
+					t.Errorf("loop was not retried on the same account: calls=%d", *calls)
+				}
+				if strings.Contains(output, "checking the same step once more") {
+					t.Error("client received the discarded first attempt")
+				}
+				for i, body := range bodies[:min(*calls, len(bodies))] {
+					if body.closed == 0 {
+						t.Errorf("upstream body %d was not closed", i)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestReasoningLoopGuardNoRetryAfterVisibleOutput 验证闸门边界：流式一旦把正文写出去
+// 就收不回，命中循环只能按原有方式如实回报错误；非流式客户端在读完前零字节，重发仍
+// 然无感，因此照常重试一次。
+func TestReasoningLoopGuardNoRetryAfterVisibleOutput(t *testing.T) {
+	payload := reasoningGuardFrame(map[string]any{"content": "visible-first"}) +
+		reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}) +
+		postreleaseFinish("stop") + "data: [DONE]\n\n"
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", path, streaming), func(t *testing.T) {
+				model := "global:deepseek-v4.1-flash"
+				h, _, bodies, calls, _ := reasoningGuardFixtureSequence(t, []string{payload, payload}, model)
+				recorder := httptest.NewRecorder()
+				h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+				assertReasoningGuardFailure(t, recorder, path, streaming)
+				wantCalls := 2
+				if streaming {
+					wantCalls = 1
+				}
+				if *calls != wantCalls {
+					t.Errorf("unexpected upstream calls=%d want=%d", *calls, wantCalls)
+				}
+				for i, body := range bodies[:min(*calls, len(bodies))] {
+					if body.closed == 0 {
+						t.Errorf("upstream body %d was not closed", i)
+					}
 				}
 			})
 		}

@@ -33,6 +33,9 @@ type StreamError struct {
 	Cause    error
 	// 合法 error 对象的原始 JSON 信封，仅 Stream 使用；保留信封外的 requestId 等诊断字段。
 	rawFrame json.RawMessage
+	// Retryable 表示这次失败发生时客户端**还没有收到任何字节**（仅 Stream 设置）。
+	// 调用方据此可以在同一账号上整段重发，而不会让用户看到半截输出或重复内容。
+	Retryable bool
 }
 
 func (e *StreamError) Error() string { return e.Message }
@@ -225,12 +228,27 @@ type streamState struct {
 	choices          map[int]*streamChoice
 	done             bool
 	loopGuardEnabled bool
+	// loopRetryAvailable 由 StreamOptions 传入：调用方还会重发时才压制错误帧。
+	loopRetryAvailable bool
 }
 
 func validFinishReason(reason string) bool {
 	switch reason {
 	case "stop", "length", "tool_calls", "content_filter", "function_call":
 		return true
+	}
+	return false
+}
+
+// hasVisibleProgress reports whether any choice has produced content, refusal or
+// tool activity. Reasoning-only output deliberately does not count: the loop
+// guard watches reasoning, so a run that never produces content must stay
+// eligible for detection.
+func (s *streamState) hasVisibleProgress() bool {
+	for _, choice := range s.choices {
+		if choice.progress > 0 || choice.finishReason != "" {
+			return true
+		}
 	}
 	return false
 }
@@ -816,6 +834,11 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // Stream 逐事件规范化并 flush；合法终态写唯一 [DONE]。
 // 上游错误/读错误/截断先发 error 再发 [DONE] 并返回 *StreamError。
 // [DONE] 只关闭传输，不覆盖已有 error；客户端写失败直接返回原始错误。
+//
+// 重复推理保护命中时：若 options.LoopRetryAvailable 为 true，说明调用方还会在同一
+// 账号上重发，本次不向客户端写任何字节（连 error 帧与 [DONE] 都不写），只把错误标成
+// Retryable 返回；调用方重发失败而无法继续时，必须用 WriteStreamError 补上错误帧，
+// 否则客户端会既收不到内容也看不到失败原因。
 func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -835,9 +858,46 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	var usage map[string]any
 	terminalMeta := map[string]any{}
 
+	state := newStreamState(options)
+
+	// ── 写出闸门（仅在重复推理保护启用时生效）────────────────────────────
+	//
+	// 保护命中时我们想「整段重发」而让用户完全无感，但流式一旦写出去就收不回。
+	// 因此在「还没产出任何正文/工具进展」的纯推理阶段，先把帧压在内存里：
+	//   - 一旦出现正文、拒绝或工具进展 → 立即放行并转为实时透传（此后命中只能照旧报错）；
+	//   - 压到 ReasoningLoopHoldBackBytes 仍未出现进展 → 同样放行（长推理不能无限等）；
+	//   - 在压制期间命中循环 → 客户端零字节，错误标记 Retryable，由 handler 整段重发。
+	// 保护未启用时不进这个分支，行为与引入前完全一致。
+	var pending []byte
+	released := !state.loopGuardEnabled
+	releasePending := func() error {
+		if released {
+			return nil
+		}
+		released = true
+		if len(pending) == 0 {
+			return nil
+		}
+		if _, werr := w.Write(pending); werr != nil {
+			return werr
+		}
+		pending = nil
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
 	// 正常帧和错误帧共享一个写出口，任何客户端断开均向上传递。
 	writeRaw := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+		frame := "data: " + payload + "\n\n"
+		if !released {
+			pending = append(pending, frame...)
+			if len(pending) >= ReasoningLoopHoldBackBytes {
+				return releasePending()
+			}
+			return nil
+		}
+		if _, werr := io.WriteString(w, frame); werr != nil {
 			return werr
 		}
 		if fl != nil {
@@ -846,7 +906,6 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		return nil
 	}
 
-	state := newStreamState(options)
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
 		obj, done, err := decodeSSEEvent(ev)
 		if err != nil || done {
@@ -859,11 +918,24 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		if err := state.observe(obj); err != nil {
 			return true, err
 		}
+		// 先判定这一帧是否命中循环，再决定要不要放行：命中帧本身必须留在压制区里，
+		// 否则客户端会先看到一段重复推理，再收到错误。
+		guardErr := state.observeReasoningLoops(obj)
+		// 一旦出现正文/拒绝/工具进展，压制阶段立即结束：此后命中循环只能照旧报错，
+		// 因为客户端已经看到内容了。纯推理超过压制上限同样放行——到了这个量级还没
+		// 命中就说明不是这条规则能抓的循环，继续压只会让长推理迟迟不显示。
+		// 命中循环的这一帧必须留在压制区里：先放行再报错，客户端就会看到一段重复推理。
+		if guardErr == nil {
+			if state.hasVisibleProgress() || state.reasoningCharacters() >= reasoningLoopHoldBackChars {
+				if releaseErr := releasePending(); releaseErr != nil {
+					return true, releaseErr
+				}
+			}
+		}
 		if value, ok := obj["usage"].(map[string]any); ok {
 			usage = MergeUsage(usage, value)
 			obj["usage"] = usage
 		}
-		guardErr := state.observeReasoningLoops(obj)
 		// Text, argument deltas and observed usage continue streaming. A finish
 		// is not safe to expose until late arguments and upstream errors have
 		// been consumed; the authoritative reasons remain in streamState.
@@ -893,6 +965,16 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		}
 		return guardErr != nil, guardErr
 	}, func(line string) error {
+		// SSE 注释行同样要过闸门：压制期间若直接写出，客户端就不是零字节了，
+		// 命中循环时便无法整段重发。
+		if !released {
+			pending = append(pending, line+"\n\n"...)
+			// 注释行也要受同一个上限约束：上游只发 keepalive 时不能让缓冲无限增长。
+			if len(pending) >= ReasoningLoopHoldBackBytes {
+				return releasePending()
+			}
+			return nil
+		}
 		if _, err := io.WriteString(w, line+"\n\n"); err != nil {
 			return err
 		}
@@ -906,6 +988,19 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	}
 	if err == nil {
 		err = state.end()
+	}
+	// 命中循环且客户端零字节时，整段压住的帧直接丢弃：调用方会在同一账号上重发，
+	// 客户端不该先看到半截推理再收到错误。
+	var heldErr *StreamError
+	heldLoop := err != nil && IsReasoningLoopError(err) && !released && errors.As(err, &heldErr)
+	// 只有在调用方明确还会重发时（LoopRetryAvailable）才压制错误帧；否则按原有方式
+	// 把错误如实写给客户端，避免"既不重发也不报错"的黑洞。
+	retryPending := heldLoop && state.loopRetryAvailable
+	if !retryPending {
+		// 其余情况（正常收尾、上游截断等）把压住的帧原样放行，让客户端看到真实行为。
+		if releaseErr := releasePending(); releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
 	}
 	if err == nil {
 		indexes := make([]int, 0, len(state.choices))
@@ -937,6 +1032,12 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		if !errors.As(err, &streamErr) {
 			return err
 		}
+		// 循环命中、尚未放行任何字节、且调用方还会重发 → 客户端什么都没看到，
+		// 这里不写 error 帧与 [DONE]，只把错误标成 Retryable 返回。
+		if retryPending {
+			streamErr.Retryable = true
+			return err
+		}
 		var raw []byte
 		var marshalErr error
 		if len(streamErr.rawFrame) > 0 {
@@ -958,4 +1059,43 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		return errors.Join(err, writeErr)
 	}
 	return err
+}
+
+// WriteStreamError 把一次未交付给客户端的流式失败补写成 SSE error 帧 + [DONE]。
+//
+// 用于 Stream 因「客户端零字节、调用方准备重发」而压制了错误帧、但重发最终没能建立
+// 的场景：那时必须把失败如实交给客户端，不能静默结束。
+// 返回是否真的写出了错误（未写出时调用方应改用普通错误响应）。
+func WriteStreamError(w http.ResponseWriter, err error) bool {
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) {
+		return false
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	var raw []byte
+	var marshalErr error
+	if len(streamErr.rawFrame) > 0 {
+		var compact bytes.Buffer
+		marshalErr = json.Compact(&compact, streamErr.rawFrame)
+		raw = compact.Bytes()
+	} else {
+		raw, marshalErr = json.Marshal(map[string]any{"error": streamErr.ErrorObject()})
+	}
+	if marshalErr != nil {
+		return false
+	}
+	fl, _ := w.(http.Flusher)
+	if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
+		return false
+	}
+	if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr != nil {
+		return false
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+	return true
 }

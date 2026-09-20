@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-20：验证重复推理保护按调用密钥独立开关，并在四种协议出口及后续请求中生效。
+// 2026-09-20：改用可重发的上游夹具，覆盖「命中后同账号重发一次」的新语义。
 package server
 
 import (
@@ -28,7 +29,7 @@ func TestKeyReasoningGuardFourExitsAndLiveChanges(t *testing.T) {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/%t", path, stream), func(t *testing.T) {
 				payload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
-				h, _, _, _, _ := reasoningGuardFixture(t, payload, "cn:deepseek-v4.1-flash")
+				h, _, _, _, _ := reasoningGuardFixtureSequence(t, []string{payload}, "cn:deepseek-v4.1-flash")
 				store, err := apikeys.Open(filepath.Join(t.TempDir(), "keys.json"), "")
 				if err != nil {
 					t.Fatal(err)
@@ -78,7 +79,7 @@ func TestKeyReasoningGuardOverridesServerDefault(t *testing.T) {
 	payload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
 	for _, override := range []bool{false, true} {
 		t.Run(fmt.Sprintf("override=%t", override), func(t *testing.T) {
-			h, _, _, _, _ := reasoningGuardFixture(t, payload, "cn:deepseek-v4.1-flash")
+			h, _, _, _, _ := reasoningGuardFixtureSequence(t, []string{payload}, "cn:deepseek-v4.1-flash")
 			defaultOff := false
 			h.cfg.ReasoningLoopGuard = &defaultOff
 			store, err := apikeys.Open(filepath.Join(t.TempDir(), "keys.json"), "")

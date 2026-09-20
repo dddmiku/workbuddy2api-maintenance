@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：判定命中改为「先截断、再自动重试」——新增 Stream 压制期的缓冲上限，客户端零字节时命中可整段重发（见 sse.go 的写出闸门与 Retryable）。
 // 2026-09-19：为已观察到循环的DeepSeek模型提供有界、可关闭的重复短行推理保护；不改正文、工具或用量。
 package upstream
 
@@ -20,6 +21,19 @@ const (
 	reasoningLoopCoveragePercent  = 95
 	reasoningLoopMaxRepeatedRunes = 32
 	reasoningLoopLineBufferRunes  = 4096
+
+	// ReasoningLoopHoldBackBytes 是流式转发在「纯推理、尚无正文/工具进展」阶段压在
+	// 内存里的兜底上限，防止异常大帧把缓冲撑爆。
+	//
+	// 压住不发的意义：命中循环时把这段推理整段丢弃、在同一账号上重发，用户就不会先
+	// 看到一段重复文本再看到答案。长推理不能无限等，因此另有字符数上限。
+	ReasoningLoopHoldBackBytes = 256 << 10
+
+	// reasoningLoopHoldBackChars 是压制期的字符上限：判定最少需要 8000 字符，只有
+	// ≤32 字符的短行才可能被判为重复，因此从零开始的循环最迟在 8000 字符处就会命中。
+	// 到这里还没命中，说明循环（如果有）只在更靠后的位置才开始，再压住只会让正常长
+	// 推理迟迟不显示；留 1.5 倍余量后恢复实时透传。
+	reasoningLoopHoldBackChars = reasoningLoopMinChars + reasoningLoopMinChars/2
 )
 
 // StreamOptions supplements the existing Stream/Aggregate APIs. Omitting it
@@ -27,6 +41,13 @@ const (
 type StreamOptions struct {
 	Model              string
 	ReasoningLoopGuard bool
+	// LoopRetryAvailable 告诉 Stream：命中循环且客户端零字节时，调用方**还会**在同一
+	// 账号上重发，因此这次不要向客户端写 error 帧与 [DONE]（避免用户看到半截失败），
+	// 只把错误标成 Retryable 返回。
+	//
+	// 重发次数用尽后调用方必须把它置 false：那时 Stream 按原有方式把错误如实写给客户端。
+	// 省略该字段（默认 false）= 原有行为，保持既有调用方兼容。
+	LoopRetryAvailable bool
 }
 
 func reasoningLoopModel(model string) bool {
@@ -198,8 +219,21 @@ func newStreamState(options []StreamOptions) *streamState {
 	state := &streamState{}
 	if len(options) > 0 {
 		state.loopGuardEnabled = options[0].ReasoningLoopGuard && reasoningLoopModel(options[0].Model)
+		state.loopRetryAvailable = options[0].LoopRetryAvailable
 	}
 	return state
+}
+
+// reasoningCharacters 返回各 choice 已累计的推理字符数最大值，供写出闸门判断
+// 「重复推理判定该触发就触发过了」，从而结束压制、恢复实时透传。
+func (s *streamState) reasoningCharacters() int {
+	maximum := 0
+	for _, choice := range s.choices {
+		if choice.loopGuard != nil && choice.loopGuard.characters > maximum {
+			maximum = choice.loopGuard.characters
+		}
+	}
+	return maximum
 }
 
 func streamChoiceIndex(choice map[string]any) int {

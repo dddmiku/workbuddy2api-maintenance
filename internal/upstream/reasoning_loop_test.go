@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-19：回归短行循环阈值、Unicode/CRLF分片、EOF/取消、模型范围及有界检测内存。
+// 2026-09-20：补「压制期命中→客户端零字节且错误可重发」与「长推理按字符上限放行」两条回归。
 package upstream
 
 import (
@@ -142,5 +143,52 @@ func TestReasoningLoopGuardDoesNotTurnCancellationIntoEOFFinalization(t *testing
 	err = Stream(rec, reasoningGuardCancelledReader{strings.NewReader(partial)}, options)
 	if !errors.Is(err, context.Canceled) || IsReasoningLoopError(err) || strings.Contains(rec.Body.String(), ReasoningLoopErrorCode) {
 		t.Fatalf("stream cancellation was replaced by loop detection: %v", err)
+	}
+}
+
+// TestReasoningLoopGuardStreamHoldsBackUntilRetryDecision 验证写出闸门：命中循环时
+// Stream 在 LoopRetryAvailable 下不向客户端写任何字节，并把错误标成 Retryable，
+// 让 handler 能在同一账号上整段重发而不让用户看到半截推理。
+func TestReasoningLoopGuardStreamHoldsBackUntilRetryDecision(t *testing.T) {
+	text := strings.Repeat(strings.Repeat("x", 32)+"\n", 300)
+	raw := reasoningGuardTestFrame(text) + "data: [DONE]\n\n"
+	options := StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw), options)
+	if !IsReasoningLoopError(err) {
+		t.Fatalf("guard did not trigger: %v", err)
+	}
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("loop error was not marked retryable: %+v", streamErr)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision: %q", len(body), body)
+	}
+
+	// 没有重发额度时必须如实回报，不能既不给内容也不给错误。
+	rec = httptest.NewRecorder()
+	err = Stream(rec, strings.NewReader(raw), StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true})
+	if !IsReasoningLoopError(err) || strings.Contains(rec.Body.String(), ReasoningLoopErrorCode) == false {
+		t.Fatalf("exhausted retries did not surface the loop error: %v", err)
+	}
+}
+
+// TestReasoningLoopGuardStreamReleasesLongReasoning 验证长推理不会因为保护而无限压制：
+// 纯推理超过压制上限仍未命中时立即放行，客户端能实时看到这段推理。
+func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
+	var unique strings.Builder
+	for index := 0; index < 1200; index++ {
+		fmt.Fprintf(&unique, "独立推理步骤 %04d\n", index)
+	}
+	raw := reasoningGuardTestFrame(unique.String()) + "data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw), StreamOptions{
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	if err != nil {
+		t.Fatalf("diverse reasoning was rejected: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "独立推理步骤") {
+		t.Fatal("long diverse reasoning never reached the client")
 	}
 }
