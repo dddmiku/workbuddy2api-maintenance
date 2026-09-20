@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：密钥管理接口接受可选 expires_at；字段缺省表示保持现状，显式 null 表示无限制。
 // 2026-09-20：增加仅限管理通道的按需复制接口，以及逐密钥重复推理保护设置。
 // 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
 // 2026-09-17：管理接口支持模型绑定字段，与密钥库校验保持一致。
@@ -8,6 +9,7 @@
 package apikeys
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +19,30 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// parseExpiry 把接口传来的 RFC3339 有效期转成时间；空串或 nil 表示无限制。
+// 时间格式或范围不合法时返回 ErrInvalidExpiry，由 replyError 映射成 400。
+func parseExpiry(raw *string) (*time.Time, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	value := strings.TrimSpace(*raw)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil, ErrInvalidExpiry
+	}
+	parsed = parsed.UTC()
+	if !validExpiry(&parsed, time.Now()) {
+		return nil, ErrInvalidExpiry
+	}
+	return &parsed, nil
+}
 
 func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 	guardDefault := true
@@ -35,11 +59,18 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			Note               string   `json:"note"`
 			Models             []string `json:"models"`
 			ReasoningLoopGuard *bool    `json:"reasoning_loop_guard"`
+			ExpiresAt          *string  `json:"expires_at"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		entry, key, err := s.Create(body.Name, body.Note, body.Models, Options{ReasoningLoopGuard: body.ReasoningLoopGuard})
+		expiresAt, err := parseExpiry(body.ExpiresAt)
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		entry, key, err := s.Create(body.Name, body.Note, body.Models,
+			Options{ReasoningLoopGuard: body.ReasoningLoopGuard, ExpiresAt: expiresAt, ExpiresAtSet: true})
 		if err != nil {
 			replyError(w, err)
 			return
@@ -53,15 +84,36 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			Enabled            *bool     `json:"enabled"`
 			Models             *[]string `json:"models"`
 			ReasoningLoopGuard *bool     `json:"reasoning_loop_guard"`
+			// ExpiresAt 用 RawMessage 区分「没提这个字段」与「显式传 null」：
+			// 前者保持现状，后者表示改成无限制。
+			ExpiresAt json.RawMessage `json:"expires_at"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil && body.ReasoningLoopGuard == nil {
+		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil &&
+			body.ReasoningLoopGuard == nil && len(body.ExpiresAt) == 0 {
 			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
 			return
 		}
-		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models, Options{ReasoningLoopGuard: body.ReasoningLoopGuard})
+		options := Options{ReasoningLoopGuard: body.ReasoningLoopGuard}
+		if len(body.ExpiresAt) > 0 {
+			if string(bytes.TrimSpace(body.ExpiresAt)) != "null" {
+				var raw string
+				if err := json.Unmarshal(body.ExpiresAt, &raw); err != nil {
+					replyError(w, ErrInvalidExpiry)
+					return
+				}
+				parsed, err := parseExpiry(&raw)
+				if err != nil {
+					replyError(w, err)
+					return
+				}
+				options.ExpiresAt = parsed
+			}
+			options.ExpiresAtSet = true
+		}
+		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models, options)
 		if err != nil {
 			replyError(w, err)
 			return
@@ -120,6 +172,9 @@ func replyError(w http.ResponseWriter, err error) {
 		code = 400
 		message = err.Error()
 	case errors.Is(err, ErrInvalidModels):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrInvalidExpiry):
 		code = 400
 		message = err.Error()
 	case errors.Is(err, ErrLimit):

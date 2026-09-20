@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-20：密钥列表增加累计 token 用量列与有效期列；创建/编辑可选有效期，留空表示无限制。
 // 2026-09-20：列表可再次复制完整密钥并单独切换重复推理保护；剪贴板失败时降级，关闭窗口立即清除明文。
 // 2026-09-16：实现密钥创建、编辑、启停、删除与一次性显示，沿用控制台交互与主题。
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
@@ -16,6 +17,46 @@ function keyModels(value){
   return String(value || '').split(',').map(function(item){return item.trim();}).filter(function(item,index,all){
     return item && all.indexOf(item) === index;
   });
+}
+
+// keyExpiryLabel 把 expires_at 渲染成列表文案：无限制 / 剩余时间 / 已过期。
+function keyExpiryLabel(key){
+  if (!key || !key.expires_at) return {text:'无限制', cls:'key-expiry sub'};
+  var when = new Date(key.expires_at);
+  if (isNaN(when.getTime())) return {text:'无限制', cls:'key-expiry sub'};
+  var left = when.getTime() - Date.now();
+  if (left <= 0) return {text:'已过期', cls:'key-expiry key-expiry-expired'};
+  var days = Math.floor(left / 86400000);
+  var text = days >= 1 ? (days + ' 天后到期') : '不到 1 天到期';
+  return {text:text, cls:'key-expiry sub', title:fmtTime(key.expires_at)};
+}
+
+// expiryToInput 把已有到期时间转成 datetime-local 的本地时间字符串。
+function expiryToInput(iso){
+  if (!iso) return '';
+  var when = new Date(iso);
+  if (isNaN(when.getTime())) return '';
+  function pad(x){ return x < 10 ? '0' + x : '' + x; }
+  return when.getFullYear() + '-' + pad(when.getMonth() + 1) + '-' + pad(when.getDate()) +
+    'T' + pad(when.getHours()) + ':' + pad(when.getMinutes());
+}
+
+// selectedExpiry 读取表单里的有效期选择，返回 RFC3339 字符串或 null（无限制）。
+// 校验失败时返回错误信息字符串，由调用方展示。
+function selectedExpiry(){
+  var mode = $('#keyExpiry').value;
+  if (mode === 'none') return {value:null};
+  if (mode === 'custom'){
+    var raw = $('#keyExpiryCustom').value;
+    if (!raw) return {error:'请选择到期时间，或把有效期改为「无限制」'};
+    var when = new Date(raw);
+    if (isNaN(when.getTime())) return {error:'到期时间格式不正确'};
+    if (when.getTime() <= Date.now()) return {error:'到期时间需要晚于当前时间'};
+    return {value:when.toISOString()};
+  }
+  var days = parseInt(mode, 10);
+  if (!days || days <= 0) return {error:'请选择有效期'};
+  return {value:new Date(Date.now() + days * 86400000).toISOString()};
 }
 
 async function loadKeyModels(){
@@ -69,11 +110,12 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="7">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="9">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
     var models = keyModels((key.models || []).join(','));
+    var expiry = keyExpiryLabel(key);
     return '<tr><td data-l="名称"><div class="key-name">' + esc(key.name) + (key.legacy ? '<span class="key-legacy">原有</span>' : '') + '</div>' +
       '<div class="sub key-note">' + esc(key.note || '未填写备注') + '</div></td>' +
       '<td data-l="密钥"><div class="key-value"><code class="key-mask">' + esc(key.masked_key) + '</code>' +
@@ -82,10 +124,12 @@ function renderKeys(){
       '<td data-l="模型绑定">' + (models.length
         ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
         : '<span class="sub">不限制</span>') + '</td>' +
+      '<td data-l="总用量" class="mono key-tokens">' + (Number(key.total_tokens) > 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub">0</span>') + '</td>' +
       '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
       '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
       '" title="发现持续重复推理时结束该次请求；只影响此密钥后续请求">' + (keyGuardEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
+      '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
       '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
       '<button class="btn sm" data-key-action="toggle" data-id="' + esc(key.id) + '">' + (key.enabled ? '停用' : '启用') + '</button>' +
@@ -105,6 +149,12 @@ function openKeyEditor(key){
   $('#keyNote').value = key ? (key.note || '') : '';
   fillModelInput(key ? keyModels((key.models || []).join(',')) : []);
   $('#keyGuard').checked = keyGuardEnabled(key);
+  // 有效期默认「无限制」：既有密钥和新密钥都保持这个默认，只有显式选择才设置。
+  // 编辑一把已经设过有效期的密钥时回填原值，避免保存时把有效期无声清掉。
+  var preset = key && key.expires_at ? expiryToInput(key.expires_at) : '';
+  $('#keyExpiry').value = preset ? 'custom' : 'none';
+  $('#keyExpiryCustom').value = preset;
+  $('#keyExpiryCustomField').classList.toggle('hide', !preset);
   $('#keyModelPick').value = '';
   $('#keySecret').value = '';
   $('#keyFields').classList.remove('hide'); $('#keyCreated').classList.add('hide');
@@ -147,6 +197,10 @@ $('#keyModelPick').addEventListener('change', function(){
   fillModelInput(models);
 });
 $('#btnClearModels').addEventListener('click', function(){ fillModelInput([]); });
+$('#keyExpiry').addEventListener('change', function(){
+  $('#keyExpiryCustomField').classList.toggle('hide', this.value !== 'custom');
+  if (this.value === 'custom') $('#keyExpiryCustom').focus();
+});
 
 $('#keyForm').addEventListener('submit', async function(event){
   event.preventDefault(); if (KD.busy || KD.secret) return;
@@ -154,6 +208,9 @@ $('#keyForm').addEventListener('submit', async function(event){
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
   if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
+  var expiry = selectedExpiry();
+  if (expiry.error){keyFormError(expiry.error);return;}
+  body.expires_at = expiry.value;
   if (KD.id) body.id = KD.id;
   KD.busy = true; $('#keyDialogSave').disabled = true; keyFormError('');
   try{

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：覆盖有效期字段的透传、显式 null 与非法值拒绝，以及密钥列表合并累计用量。
 # 2026-09-20：复制接口和逐密钥保护开关必须经过管理员会话、来源和字段校验。
 # 2026-09-16：验证密钥管理的管理员登录、请求来源、大小和字段限制，使用本地服务与合成会话。
 # 2026-09-17：覆盖模型绑定字段的透传与非法输入的本地拒绝。
@@ -135,6 +136,50 @@ class KeyManagementTests(unittest.TestCase):
                                      method="GET")
             self.assertEqual(status, 401)
             upstream.assert_not_called()
+
+    def test_expiry_passes_create_and_update_and_rejects_bad_values(self):
+        future = "2030-01-02T03:04:05Z"
+        for path, body, method, endpoint, forwarded in (
+            ("/api/keys", {"name": "c", "expires_at": future}, "POST", "/keys",
+             {"name": "c", "expires_at": future}),
+            ("/api/keys", {"name": "c", "expires_at": None}, "POST", "/keys",
+             {"name": "c", "expires_at": None}),
+            ("/api/keys/update", {"id": "legacy", "expires_at": future}, "PATCH", "/keys/legacy",
+             {"expires_at": future}),
+            ("/api/keys/update", {"id": "legacy", "expires_at": None}, "PATCH", "/keys/legacy",
+             {"expires_at": None}),
+        ):
+            with self.subTest(body=body), patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+                    patch.object(app.key_management, "request", return_value=(200, {"ok": True})) as upstream:
+                self.assertEqual(self.request(path, json.dumps(body))[0], 200)
+                upstream.assert_called_once_with("/tmp/test.sock", method, endpoint, forwarded)
+        for value in (123, [], {"at": future}, "x" * 41):
+            with self.subTest(value=value), patch.object(app.key_management, "request") as upstream:
+                body = {"id": "legacy", "expires_at": value}
+                self.assertEqual(self.request("/api/keys/update", json.dumps(body))[0], 400)
+                upstream.assert_not_called()
+
+    def test_key_list_merges_usage_totals(self):
+        keys_payload = {"ok": True, "keys": [
+            {"id": "key_a", "name": "A", "masked_key": "wbk_a…a"},
+            {"id": "key_b", "name": "B", "masked_key": "wbk_b…b"},
+        ], "max_keys": 256}
+        usage_payload = {"ok": True, "totals": {"requests": 5},
+                         "keys": [{"key_id": "key_a", "totals": {"requests": 4, "total_tokens": 4096}}]}
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+                patch.object(app.key_management, "request", side_effect=[(200, keys_payload), (200, usage_payload)]) as upstream:
+            code, result = self.request("/api/keys", body=None, method="GET")
+            self.assertEqual(code, 200)
+            self.assertEqual([k["total_tokens"] for k in result["keys"]], [4096, 0])
+            self.assertEqual(upstream.call_count, 2)
+
+    def test_key_list_survives_disabled_ledger(self):
+        keys_payload = {"ok": True, "keys": [{"id": "key_a", "name": "A"}], "max_keys": 256}
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+                patch.object(app.key_management, "request", side_effect=[(200, keys_payload), (200, {"ok": False, "message": "未启用"})]):
+            code, result = self.request("/api/keys", body=None, method="GET")
+            self.assertEqual(code, 200)
+            self.assertEqual(result["keys"][0]["total_tokens"], 0)
 
     def test_usage_proxies_management_socket(self):
         payload = {"ok": True, "totals": {"requests": 3, "total_tokens": 120},

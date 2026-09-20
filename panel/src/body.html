@@ -169,12 +169,12 @@
           </div>
           <div class="tblwrap">
             <table class="tbl key-table">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>状态</th><th>重复推理保护</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="7"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>状态</th><th>重复推理保护</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="9"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
-        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复推理的请求，对后续请求生效。</p>
+        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复推理的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
       </section>
 
       <section class="view hide" data-view="usage">
@@ -398,6 +398,17 @@
           <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
         </div>
         <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复推理时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
+        <label class="fld"><span class="k">有效期 <span class="sub">（默认无限制）</span></span>
+          <select id="keyExpiry" aria-label="选择密钥有效期">
+            <option value="none">无限制</option>
+            <option value="7">7 天后到期</option>
+            <option value="30">30 天后到期</option>
+            <option value="90">90 天后到期</option>
+            <option value="365">1 年后到期</option>
+            <option value="custom">自定义时间…</option>
+          </select>
+        </label>
+        <label class="fld hide" id="keyExpiryCustomField"><span class="k">到期时间</span><input type="datetime-local" id="keyExpiryCustom" aria-label="自定义到期时间"></label>
       </div>
       <div id="keyCreated" class="hide">
         <div class="note ok" id="keySecretStatus" role="status">密钥已创建，可以用于连接网关。</div>

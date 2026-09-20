@@ -169,8 +169,19 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if h.cfg.APIKeys != nil {
 			authz := r.Header.Get("Authorization")
-			info, ok := h.cfg.APIKeys.Resolve(strings.TrimPrefix(authz, "Bearer "))
-			if !strings.HasPrefix(authz, "Bearer ") || !ok {
+			provided := strings.TrimPrefix(authz, "Bearer ")
+			info, status := h.cfg.APIKeys.Lookup(provided)
+			if !strings.HasPrefix(authz, "Bearer ") {
+				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+				return
+			}
+			if status == apikeys.StatusExpired {
+				// 有效期已过：明确告知原因，否则调用方只会看到「密钥无效」而无从判断。
+				// 只有持有正确密钥的人才会走到这里，不构成枚举信号。
+				writeOpenAIError(w, http.StatusUnauthorized, "api_key_expired", "this API key has expired")
+				return
+			}
+			if status != apikeys.StatusActive {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}

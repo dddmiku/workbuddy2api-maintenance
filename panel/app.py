@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-20：2.1.8 密钥列表合并累计 token 用量，创建/编辑支持有效期（默认无限制）。
+# 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
 # 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
 #             卡片 14px 圆角），并把登录会话有效期从 12 小时改为 30 天。
 # 2026-09-20：2.1.3 冷却剩余带实时倒计时（状态列每秒就地刷新，归零自动补取数据）。
@@ -75,7 +77,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.4"
+PANEL_VERSION = "2.1.8"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -964,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         if path == "/api/keys":
-            return self.keys_request("GET", "/keys")
+            return self.keys_with_usage()
 
         if path == "/api/usage":
             # 用量账本只经本机管理通道读取：面板能看到全量，普通调用密钥看不到。
@@ -1094,6 +1096,30 @@ class Handler(BaseHTTPRequestHandler):
         code, result = key_management.request(path, method, endpoint, body)
         return self._json(code, result)
 
+    def keys_with_usage(self):
+        """密钥列表附带每把密钥的累计 token 用量。
+
+        用量账本与密钥库是两个独立文件，面板在这里做一次合并，省得前端再拉一次
+        /api/usage 并按 key_id 对齐。账本不可用时只丢用量列，密钥列表照常返回。
+        """
+        try:
+            socket = key_management.socket_path(CONFIG_PATH, BASE)
+        except (OSError, ValueError):
+            return self._json(503, {"ok": False, "message": "无法读取密钥管理配置"})
+        code, result = key_management.request(socket, "GET", "/keys")
+        if code != 200 or not isinstance(result, dict) or not isinstance(result.get("keys"), list):
+            return self._json(code, result)
+        totals = {}
+        usage_code, usage = key_management.request(socket, "GET", "/usage")
+        if usage_code == 200 and isinstance(usage, dict) and usage.get("ok"):
+            for item in usage.get("keys") or []:
+                if isinstance(item, dict) and isinstance(item.get("key_id"), str):
+                    totals[item["key_id"]] = (item.get("totals") or {}).get("total_tokens") or 0
+        for entry in result["keys"]:
+            if isinstance(entry, dict):
+                entry["total_tokens"] = totals.get(entry.get("id"), 0)
+        return self._json(200, result)
+
     def _origin_ok(self):
         """同源校验：没带 Origin（同源表单/脚本）或与 Host 完全一致才算合法。"""
         origin = self.headers.get("Origin")
@@ -1150,8 +1176,10 @@ class Handler(BaseHTTPRequestHandler):
         if "reasoning_loop_guard" in body and type(body["reasoning_loop_guard"]) is not bool:
             return self._json(400, {"ok": False, "message": "重复推理保护必须为开启或关闭"})
         if path == "/api/keys":
-            if set(body) - {"name", "note", "models", "reasoning_loop_guard"}:
+            if set(body) - {"name", "note", "models", "reasoning_loop_guard", "expires_at"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
+            if "expires_at" in body and not self._valid_expiry(body["expires_at"]):
+                return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
             return self.keys_request("POST", "/keys", body)
         key_id = body.get("id")
         if not isinstance(key_id, str) or not re.fullmatch(r"legacy|key_[0-9a-f]{24}", key_id):
@@ -1165,8 +1193,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             return self.keys_request("DELETE", "/keys/" + key_id)
         changes = {k: v for k, v in body.items() if k != "id"}
-        if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard"}:
+        if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard", "expires_at"}:
             return self._json(400, {"ok": False, "message": "没有有效的修改字段"})
+        if "expires_at" in changes and not self._valid_expiry(changes["expires_at"]):
+            return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
         if "models" in changes:
             models = changes["models"]
             if not isinstance(models, list) or len(models) > 64 or any(
@@ -1175,6 +1205,13 @@ class Handler(BaseHTTPRequestHandler):
                     for item in models) or len(set(models)) != len(models):
                 return self._json(400, {"ok": False, "message": "模型绑定需为最多 64 个不重复的模型名"})
         return self.keys_request("PATCH", "/keys/" + key_id, changes)
+
+    @staticmethod
+    def _valid_expiry(value):
+        """有效期允许 null（无限制）或 RFC3339 字符串；范围与格式由网关再校验一次。"""
+        if value is None:
+            return True
+        return isinstance(value, str) and len(value) <= 40
 
     # ── 登录 / 改密 ────────────────────────────────────────────────────
     def auth_login(self, body):

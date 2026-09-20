@@ -76,6 +76,8 @@ Cookie 路径为 `/`，同时兼容根路径与 `/admin/` 部署；发放或清�
 | 启用 / 停用账号 | 账号列表，改完自动重启网关容器 |
 | 创建 API key | 密钥页 → 创建密钥，可绑定模型白名单 |
 | 复制 API key | 密钥列表 → 复制；关闭创建窗口后仍可再次复制 |
+| 设置 key 有效期 | 创建或编辑密钥时选择有效期，留空表示无限制；到期后该密钥立即失效 |
+| 查看单 key 用量 | 密钥列表的「总用量」列显示该密钥累计 token，完整明细见用量统计页 |
 | 重复推理保护 | 每把密钥后独立开关；创建或编辑时也可设置，对后续请求生效 |
 | 调整定时任务 | 任务页开关，改完重启网关生效 |
 | 查看请求日志 | 请求日志页，带表头（密钥 / 账号 / TTFB / token），可开自动刷新 |
@@ -137,14 +139,14 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | GET | `/api/logs?lines=` | 网关容器日志（同时返回解析好的请求行 `rows`） |
 | GET | `/api/usage` | 按 API key 累计的 token 用量（经本机 Unix socket 读网关 `/usage`） |
 | GET | `/api/update` | 热更新状态（经本机 Unix socket 读网关 `/update`） |
-| GET | `/api/keys` | 密钥列表 |
+| GET | `/api/keys` | 密钥列表，并合并每把密钥的累计 token 用量 |
 | POST | `/api/auth/login`、`/api/auth/logout`、`/api/auth/password` | 登录、退出、修改管理员账号 |
 | POST | `/api/login/start`、`/api/login/poll` | 上游账号授权 |
 | POST | `/api/account/toggle`、`/api/account/delete` | 账号开关、回收 |
 | POST | `/api/task/run`、`/api/task/toggle` | 任务运行、开关 |
 | POST | `/api/credit` | 刷新积分 |
 | POST | `/api/service/restart` | 重启网关容器 |
-| POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含模型绑定和 `reasoning_loop_guard` 开关）、删除 |
+| POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含模型绑定、`reasoning_loop_guard` 开关与 `expires_at` 有效期）、删除 |
 | POST | `/api/keys/copy` | 管理员按 ID 读取完整密钥用于复制，响应禁止缓存 |
 | POST | `/api/update/check`、`/api/update/apply` | 检查远端版本、触发一次热更新 |
 

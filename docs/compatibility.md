@@ -129,6 +129,7 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 | 错误 | 排查方向 |
 |---|---|
 | `invalid_api_key` | 密钥缺失、停用或删除 |
+| `api_key_expired` | 密钥有效期已过；在管理台重新设置有效期后即可继续使用 |
 | `invalid_request` | 输入结构、工具选择、schema 或不支持的服务端能力 |
 | `request_body_too_large` | 入站请求超过配置上限 |
 | `response_contract_violation` | 模型的成功结果未满足声明的工具或输出约束 |

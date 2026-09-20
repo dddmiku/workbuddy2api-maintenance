@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：密钥增加可选有效期，未设置即无限制且既有记录零迁移；到期后鉴权按已过期拒绝并可被调用方区分。
 // 2026-09-20：密钥加密保存以支持管理员再次复制，旧密钥在有效鉴权时补齐；增加逐密钥重复推理保护覆盖。
 // 2026-09-16：增加持久化多密钥管理，保留原密钥并使启停、删除立即生效，只保存随机密钥的 SHA-256。
 // 2026-09-17：密钥可绑定模型白名单；空列表保持不限制，非法模型名拒绝保存。
@@ -35,7 +36,20 @@ var (
 	ErrNotFound      = errors.New("密钥不存在或已删除")
 	ErrInvalid       = errors.New("名称需为 1—64 字，备注不超过 256 字，且不能包含控制字符")
 	ErrInvalidModels = errors.New("模型绑定需为 1—64 个字符、不含空白或控制字符，且不能重复，最多 64 项")
+	ErrInvalidExpiry = errors.New("有效期需为将来时间，且不超过 10 年；留空表示无限制")
 	ErrLimit         = errors.New("密钥数量已达上限，请先删除不再使用的密钥")
+)
+
+// maxKeyLifetime 限制单个密钥的有效期长度，拦住把毫秒当秒之类的输入错误。
+const maxKeyLifetime = 10 * 365 * 24 * time.Hour
+
+// Status 描述一次密钥查询的结果，让调用方能区分「没有这把密钥」与「已过期」。
+type Status int
+
+const (
+	StatusUnknown Status = iota
+	StatusActive
+	StatusExpired
 )
 
 type Info struct {
@@ -52,6 +66,8 @@ type Info struct {
 	// Models 该密钥允许调用的模型白名单（裸名或带 realm 前缀）。
 	// 空列表表示不限制模型，保持旧密钥零回归。
 	Models []string `json:"models"`
+	// ExpiresAt 为 nil 表示无限制（既有密钥的默认状态）。
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 type record struct {
@@ -62,6 +78,10 @@ type record struct {
 
 type Options struct {
 	ReasoningLoopGuard *bool
+	// ExpiresAt 与 ExpiresAtSet 一起使用：ExpiresAtSet 为 false 表示不改动有效期，
+	// 为 true 时 ExpiresAt 为 nil 表示改为无限制。
+	ExpiresAt    *time.Time
+	ExpiresAtSet bool
 }
 
 type document struct {
@@ -172,7 +192,29 @@ func (s *Store) lockAndRefresh() (func(), error) {
 func copyInfo(info Info) Info {
 	info.Models = append([]string(nil), info.Models...)
 	info.ReasoningLoopGuard = copyBool(info.ReasoningLoopGuard)
+	if info.ExpiresAt != nil {
+		expiry := *info.ExpiresAt
+		info.ExpiresAt = &expiry
+	}
 	return info
+}
+
+func copyTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+// validExpiry 校验有效期：nil 表示无限制，其余必须是将来时间且不超过十年。
+// 用 UTC 比较，避免调用方传本地时间时出现偏差。
+func validExpiry(expiresAt *time.Time, now time.Time) bool {
+	if expiresAt == nil {
+		return true
+	}
+	expiry := expiresAt.UTC()
+	return expiry.After(now.UTC()) && expiry.Before(now.UTC().Add(maxKeyLifetime))
 }
 
 func copyBool(value *bool) *bool {
@@ -251,25 +293,48 @@ func (s *Store) Authenticate(key string) bool {
 
 // Resolve 返回可用密钥的信息副本；未命中或已停用时 ok=false。
 func (s *Store) Resolve(key string) (Info, bool) {
+	info, status := s.Lookup(key)
+	return info, status == StatusActive
+}
+
+// Lookup 返回密钥信息与状态，让调用方能区分「没有这把密钥」与「密钥已过期」。
+// 未启用或已删除按 StatusUnknown 处理，不向调用方泄露密钥是否存在。
+func (s *Store) Lookup(key string) (Info, Status) {
 	if key == "" || len(key) > 512 {
-		return Info{}, false
+		return Info{}, StatusUnknown
 	}
 	want := digest(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.refreshLocked(); err != nil {
-		return Info{}, false
+		return Info{}, StatusUnknown
 	}
 	for _, entry := range s.keys {
 		if entry.Enabled && subtle.ConstantTimeCompare([]byte(want), []byte(entry.Digest)) == 1 {
 			info := s.recordInfo(entry)
-			if !info.CopyAvailable && !time.Now().Before(s.copyRetryAfter) {
-				return s.captureSecretLocked(entry.ID, key, info)
+			if expired(info) {
+				return info, StatusExpired
 			}
-			return info, true
+			if !info.CopyAvailable && !time.Now().Before(s.copyRetryAfter) {
+				captured, ok := s.captureSecretLocked(entry.ID, key, info)
+				if !ok {
+					return Info{}, StatusUnknown
+				}
+				// 补交副本会重新读盘：期间可能刚好到期或被停用，按最新状态判定。
+				if expired(captured) {
+					return captured, StatusExpired
+				}
+				return captured, StatusActive
+			}
+			return info, StatusActive
 		}
 	}
-	return Info{}, false
+	return Info{}, StatusUnknown
+}
+
+// expired 判定密钥是否已过期；无有效期（nil）表示无限制，永不过期。
+func expired(info Info) bool {
+	return info.ExpiresAt != nil && !time.Now().Before(*info.ExpiresAt)
 }
 
 func (s *Store) List() []Info {
@@ -306,6 +371,12 @@ func (s *Store) Create(name, note string, models []string, options ...Options) (
 	entry := record{Info: Info{ID: "key_" + hex.EncodeToString(id[:]), Name: name, Note: note, MaskedKey: mask(key), Enabled: true, CreatedAt: time.Now().UTC(), Models: models}, Digest: digest(key)}
 	if len(options) > 0 {
 		entry.ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+		if options[0].ExpiresAtSet {
+			if !validExpiry(options[0].ExpiresAt, time.Now()) {
+				return Info{}, "", ErrInvalidExpiry
+			}
+			entry.ExpiresAt = copyTime(options[0].ExpiresAt)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -355,6 +426,12 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		}
 		if len(options) > 0 && options[0].ReasoningLoopGuard != nil {
 			next[i].ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+		}
+		if len(options) > 0 && options[0].ExpiresAtSet {
+			if !validExpiry(options[0].ExpiresAt, time.Now()) {
+				return Info{}, ErrInvalidExpiry
+			}
+			next[i].ExpiresAt = copyTime(options[0].ExpiresAt)
 		}
 		if !validLabel(next[i].Name, next[i].Note) {
 			return Info{}, ErrInvalid
