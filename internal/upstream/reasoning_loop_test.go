@@ -407,3 +407,39 @@ func TestOutputLoopGuardReleasesOnContentTimeout(t *testing.T) {
 		t.Fatal("content timeout did not release the held-back content")
 	}
 }
+
+// TestReasoningLoopGuardHoldsThroughTinyFrames 复现线上真实的碎帧形态：上游把推理切成
+// 约 220 字节的小帧、每帧只带一两个字符（实测 124–222 字节/字符）。此时字节上限比字符
+// 上限更早触发，2 MiB 只折合一万多字符——缓冲会在 256 行窗口凑满之前放行，客户端先看到
+// 一屏重复文本、再收到 422，重发保护形同虚设。这正是 devin 那把密钥反复断流的原因。
+//
+// 夹具前半是一条极长的「非重复」推理（单字符帧，永不构成 256 行重复窗口），后半是重复
+// 短行。判定点落在两万多字符，字节量已超过旧的 2 MiB 上限，但远低于新的字符上限 64K。
+func TestReasoningLoopGuardHoldsThroughTinyFrames(t *testing.T) {
+	var payload strings.Builder
+	// 前半：32000 个单字符帧。每帧约 70 字节，因此这部分已经超过 2 MiB；单字符
+	// 拼成一条长行，永远不会被计为重复，不会提前触发判定。
+	for index := 0; index < 32000; index++ {
+		payload.WriteString(reasoningGuardTestFrame(string(rune('a' + index%26))))
+	}
+	// 后半：重复短行「x」，凑满 256 行窗口后重复覆盖达标（每行两个帧：内容 + 换行）。
+	for index := 0; index < 400; index++ {
+		payload.WriteString(reasoningGuardTestFrame("x"))
+		payload.WriteString(reasoningGuardTestFrame("\n"))
+	}
+	raw := payload.String() + "data: [DONE]\n\n"
+	// 夹具必须超过旧的 2 MiB 上限，否则它测不到这个回归。
+	if len(raw) <= 2<<20 {
+		t.Fatalf("fixture must exceed the previous 2 MiB byte cap: %d bytes", len(raw))
+	}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw), StreamOptions{
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsLoopGuardError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("tiny-frame loop was not held back for retry: %v", err)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision", len(body))
+	}
+}
