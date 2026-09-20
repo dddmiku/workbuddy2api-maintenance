@@ -116,7 +116,9 @@ func TestCallerSessionIsolation(t *testing.T) {
 					t.Error("request IDs must be unique")
 				}
 				wantBindings := 2
-				if scenario == "no-session" || scenario == "sticky-off" {
+				// no-session：客户端一个会话标识都不发（narrafork 形态），网关按正文派生
+				// 对话级回退键补上粘性，因此仍然建立绑定（每个调用方各一份，互不串号）。
+				if scenario == "sticky-off" {
 					wantBindings = 0
 				}
 				if len(bindings.LoadBinds()) != wantBindings {
@@ -180,5 +182,127 @@ func TestExplicitConversationsOverrideSharedCacheForSameCaller(t *testing.T) {
 				t.Error("shared cache key overrode two explicit conversations")
 			}
 		})
+	}
+}
+
+// narraforkFixture 构造专供 narrafork 形态回归的夹具：账号属 global 域，与线上
+// 实测一致（narrafork 走的是 global:deepseek-v4.1-flash）。
+func narraforkFixture(t *testing.T) (*Handler, string, *[]http.Header, *bindStore) {
+	t.Helper()
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	h, _ := postreleaseUsageHandler(t, sseOK)
+	h.cfg.Pool = testPoolWith(
+		&auth.Auth{UID: "narrafork-a", Domain: "www.workbuddy.ai", AccessToken: "synthetic-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "narrafork-b", Domain: "www.workbuddy.ai", AccessToken: "synthetic-b", ExpiresAt: 9999999999},
+	)
+	store, err := apikeys.Open(filepath.Join(t.TempDir(), "narrafork-keys.json"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.APIKeys = store
+	_, key, err := store.Create("narrafork", "session-less client regression", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := newBindStore()
+	h.cfg.Session = session.New(session.Config{TTL: time.Hour, Store: bindings, Available: h.cfg.Pool.AvailableUIDs})
+	var headers []http.Header
+	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		headers = append(headers, req.Header.Clone())
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(sseOK))}, nil
+	})
+	return h, key, &headers, bindings
+}
+
+// narraforkRequest 复刻线上实测的 narrafork /v1/chat/completions 形状：顶层只有
+// model / messages / stream / stream_options / max_tokens / tools / tool_choice /
+// reasoning_effort，**没有任何**会话标识字段（无 conversation_id、无 metadata、
+// 无 prompt_cache_key）。抓包证据见本轮排查记录。
+func narraforkRequest(t *testing.T, key, firstUser, lastUser string) *http.Request {
+	t.Helper()
+	messages := []any{
+		map[string]any{"role": "system", "content": "You are Cascade, a powerful agentic AI coding assistant."},
+		map[string]any{"role": "user", "content": firstUser},
+	}
+	if lastUser != "" {
+		messages = append(messages,
+			map[string]any{"role": "assistant", "content": "好的"},
+			map[string]any{"role": "user", "content": lastUser})
+	}
+	raw, err := json.Marshal(map[string]any{
+		"model": "global:deepseek-v4.1-flash", "messages": messages, "stream": true,
+		"stream_options": map[string]any{"include_usage": true}, "max_tokens": 8192,
+		"tools": []any{}, "tool_choice": "auto", "reasoning_effort": "max",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(raw)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("User-Agent", "narrafork/0.7.5 (Windows 10.0.19045; x64) Bun/1.4.2")
+	return req
+}
+
+// TestSessionLessClientKeepsAccountAffinity 回归：一个会话标识都不发的客户端
+// （narrafork 形态）在同一对话内必须保持同一个账号，不能每轮换号。
+//
+// 修复前的实际表现：ExtractKey 恒空 → 粘性完全不生效 → 每轮 Pick 随机换号 →
+// 上游提示缓存整段失效（线上日志里这类请求 hit 恒为 0，而带 prompt_cache_key 的
+// Codex 那路 hit 稳定在数十万）。
+func TestSessionLessClientKeepsAccountAffinity(t *testing.T) {
+	h, key, captured, bindings := narraforkFixture(t)
+
+	// 同一对话推进三轮：首条 user 不变，末条 user 每轮不同。
+	turns := []struct{ first, last string }{
+		{"分析这个 APK 的签名校验", ""},
+		{"分析这个 APK 的签名校验", "继续"},
+		{"分析这个 APK 的签名校验", "再看下一处"},
+	}
+	for _, turn := range turns {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, narraforkRequest(t, key, turn.first, turn.last))
+		if rr.Code != 200 {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	}
+	if len(*captured) != 3 {
+		t.Fatalf("upstream calls=%d want 3", len(*captured))
+	}
+	first := (*captured)[0].Get("X-User-Id")
+	for i, header := range *captured {
+		if header.Get("X-User-Id") != first {
+			t.Fatalf("turn %d switched accounts: %s vs %s (同一对话必须保持粘性)", i, header.Get("X-User-Id"), first)
+		}
+	}
+	if len(bindings.LoadBinds()) != 1 {
+		t.Errorf("bindings=%d want 1（同一对话只应有一份绑定）", len(bindings.LoadBinds()))
+	}
+
+	// 另一条对话（首条 user 不同）应绑到另一份键上：粘性是按对话隔离的。
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, narraforkRequest(t, key, "完全不同的另一个任务", ""))
+	if rr.Code != 200 {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if len(bindings.LoadBinds()) != 2 {
+		t.Errorf("bindings=%d want 2（不同对话应各自绑定）", len(bindings.LoadBinds()))
+	}
+}
+
+// TestSessionLessClientRespectsStickyOff 关掉粘性（Session==nil）时，回退键也不应生效。
+func TestSessionLessClientRespectsStickyOff(t *testing.T) {
+	h, key, _, bindings := narraforkFixture(t)
+	h.cfg.Session = nil
+	for _, last := range []string{"", "继续"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, narraforkRequest(t, key, "分析这个 APK 的签名校验", last))
+		if rr.Code != 200 {
+			t.Fatalf("status=%d", rr.Code)
+		}
+	}
+	if len(bindings.LoadBinds()) != 0 {
+		t.Errorf("bindings=%d want 0（粘性关闭时不应建立绑定）", len(bindings.LoadBinds()))
 	}
 }

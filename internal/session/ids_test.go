@@ -134,3 +134,66 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		}
 	}
 }
+
+// TestContentKeyDerivation 对话级回退键：取第一条 user 消息文本并哈希。
+// 回归背景：narrafork 的 /v1/chat/completions 请求体顶层只有
+// model/messages/stream/stream_options/max_tokens/tools/tool_choice/reasoning_effort，
+// 没有任何会话标识字段，ExtractKey 恒返回空串 → 会话粘性失效、每轮换号。
+func TestContentKeyDerivation(t *testing.T) {
+	const narraforkShape = `{"model":"global:deepseek-v4.1-flash","messages":` +
+		`[{"role":"system","content":"You are Cascade"},` +
+		`{"role":"user","content":"分析这个 APK 的签名校验"},` +
+		`{"role":"assistant","content":"好的"}],` +
+		`"stream":true,"tools":[],"tool_choice":"auto","reasoning_effort":"max"}`
+
+	key := ContentKey([]byte(narraforkShape))
+	if len(key) != 35 || !strings.HasPrefix(key, "c1:") {
+		t.Fatalf("ContentKey must be a bounded prefixed digest, got %q", key)
+	}
+	if ContentKey([]byte(narraforkShape)) != key {
+		t.Error("same conversation must derive the same key")
+	}
+
+	// 同一对话推进：轮内追加 assistant/tool 消息、首条 user 不变 → 键必须不变
+	// （这正是粘性要的「对话级」稳定性）。
+	advanced := `{"model":"global:deepseek-v4.1-flash","messages":` +
+		`[{"role":"system","content":"You are Cascade"},` +
+		`{"role":"user","content":"分析这个 APK 的签名校验"},` +
+		`{"role":"assistant","content":"好的"},` +
+		`{"role":"tool","content":"结果"},` +
+		`{"role":"user","content":"继续"}],"stream":true}`
+	if got := ContentKey([]byte(advanced)); got != key {
+		t.Errorf("conversation-level key drifted as the turn advanced: %q vs %q", got, key)
+	}
+
+	// 首条 user 用数组形态（多模态 parts）也要能取到文本。
+	parts := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:x"}}]}]}`
+	if got := ContentKey([]byte(parts)); got == "" || got == key {
+		t.Errorf("multimodal first user message should derive its own key, got %q", got)
+	}
+
+	for _, tc := range []struct{ name, body string }{
+		{"no messages", `{"model":"x"}`},
+		{"empty messages", `{"messages":[]}`},
+		{"system only", `{"messages":[{"role":"system","content":"sys"}]}`},
+		{"assistant first", `{"messages":[{"role":"assistant","content":"hi"}]}`},
+		{"empty first user", `{"messages":[{"role":"user","content":""},{"role":"user","content":"real"}]}`},
+		{"whitespace first user", `{"messages":[{"role":"user","content":"  \n "}]}`},
+		{"image only first user", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`},
+		{"null content", `{"messages":[{"role":"user","content":null}]}`},
+		{"broken json", `{broken`},
+		{"empty body", ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ContentKey([]byte(tc.body)); got != "" {
+				t.Errorf("ContentKey(%q) = %q, want empty (no fabricated key)", tc.body, got)
+			}
+		})
+	}
+
+	// 不同对话必须得到不同键，否则两个对话会被钉在同一个号上。
+	other := `{"messages":[{"role":"user","content":"另一个完全不同的任务"}]}`
+	if ContentKey([]byte(other)) == key {
+		t.Error("different conversations must derive different keys")
+	}
+}

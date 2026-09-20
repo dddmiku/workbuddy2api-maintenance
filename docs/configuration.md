@@ -45,6 +45,8 @@
 
 多密钥模式用已鉴权的密钥 ID 隔离会话键和上游关联头。不同调用密钥即使提交相同 `conversation_id`、`prompt_cache_key`、`metadata.user_id` 或显式关联头，也不会共用绑定或互相解绑。同一密钥内优先读取 `metadata` 会话 ID、顶层会话 ID、`client_metadata` 线程/会话 ID，最后回落缓存键及用户 ID；Chat 与 Responses 的识别一致。原始消息正文不改写。升级后旧的未隔离绑定不再用于多密钥请求，新绑定会重新建立；单密钥模式保留原有键。
 
+一个会话标识都不发的客户端（例如 narrafork 的 `/v1/chat/completions`，请求体顶层只有 `model`、`messages`、`stream`、`tools` 等，既无 `conversation_id` 也无 `metadata`、`prompt_cache_key`）此前粘性完全不生效，同一对话每轮换号、上游提示缓存整段失效。这类请求现在会从正文派生对话级回退键：取**第一条** user 消息的文本做哈希，因此同一对话的后续轮次（首条 user 不变、末尾不断追加）保持同一账号，不同对话各自绑定。回退键只用于账号绑定，不参与上游关联头的聚合粒度（那部分仍按对话轮）。客户端裁剪历史把首条 user 消息删掉时键会变化、绑定重新分配，只影响缓存亲和；两条对话恰好以同样文本开头时会共用绑定，粒度仍细于 `metadata.user_id` 回退。
+
 ## 重复推理保护
 
 `features.reasoning_loop_guard` 默认开启。当模型长时间反复输出少量短行、没有新的正文或工具进展时，网关可停止该次请求，返回 `upstream_reasoning_loop`。这是减少继续空转的启发式保护，不是对上游循环原因的诊断。

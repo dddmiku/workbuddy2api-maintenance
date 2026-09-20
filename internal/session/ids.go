@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：新增 ContentKey：客户端一个会话标识都不发时，从请求正文派生对话级粘性键。
 // 2026-09-19：按已鉴权调用密钥隔离绑定键和关联 ID，保留同一调用方的稳定性。
 // ids.go 会话头族 ID 的解析与生成（issue #35 后台聚合）。
 //
@@ -112,20 +113,15 @@ func TurnKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	var obj struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &obj); err != nil {
+	messages, ok := parseMessages(body)
+	if !ok {
 		return ""
 	}
-	for i := len(obj.Messages) - 1; i >= 0; i-- {
-		if obj.Messages[i].Role != "user" {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
 			continue
 		}
-		text := contentText(obj.Messages[i].Content)
+		text := contentText(messages[i].Content)
 		if text == "" {
 			// 最后一条 user 消息没有文本（纯图片等）→ 本轮不建立聚合键。
 			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
@@ -134,6 +130,74 @@ func TurnKey(body []byte) string {
 		return fmt.Sprintf("u%d:%s", i, text)
 	}
 	return ""
+}
+
+// ContentKey 派生「对话级」回退粘性键：客户端一个会话标识都不发时使用。
+//
+// 背景：实测 narrafork（/v1/chat/completions）的请求体顶层只有
+// model / messages / stream / stream_options / max_tokens / tools / tool_choice /
+// reasoning_effort，既无 conversation_id 也无 metadata、prompt_cache_key，
+// 于是 ExtractKey 恒返回空串、会话粘性对这类客户端完全失效：同一对话每轮换号，
+// 上游提示缓存整段失效（线上日志里这类请求 hit 恒为 0）。
+//
+// 取**第一条** user 消息的文本并哈希：对话开头在整个对话内不变，因此同一对话恒同键
+// （实测同一对话多轮的首条 user 文本哈希一致，不同对话则不同）。与 TurnKey 取最后
+// 一条（轮级语义）相反，这里的语义是「对话级」。
+//
+// 返回值恒为 "c1:" + 32 hex（定长，可安全进绑定表与 redis 镜像；前缀避免与客户端
+// 自带的显式会话 ID 撞值）。
+//
+// 已知边界：客户端若把开头的 user 消息剪掉（少数客户端会裁剪历史），键会变化、
+// 绑定重新分配——只影响缓存亲和，不影响正确性。
+//
+// 粒度取舍：两条对话恰好以同样文本开头时会共用绑定（例如大量客户端都以同一句
+// 开场白开头）。这是可接受的——ExtractKey 第 5 步的 metadata.user_id 回退比这更粗
+// （一个用户的所有对话共用一个号），本函数只是把那档粒度细化到「对话」；
+// 单轮请求（如只发一句"hi"）确实会被并到同一个号上，但粘性 TTL 到期即重新分配，
+// 且只影响账号均衡，不影响正确性与用量记账。
+//
+// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（保持原有的无粘性行为，
+// 不伪造键）。
+func ContentKey(body []byte) string {
+	messages, ok := parseMessages(body)
+	if !ok {
+		return ""
+	}
+	for i := range messages {
+		if messages[i].Role != "user" {
+			continue
+		}
+		// 只取第一条：往前找会让键随对话推进漂移，失去「对话级」语义。
+		text := strings.TrimSpace(contentText(messages[i].Content))
+		if text == "" {
+			// 首条 user 消息没有文本（纯图片等）→ 本轮不建立回退键。
+			// 不继续往后找：后续消息位置会随对话推进漂移。
+			return ""
+		}
+		sum := sha256.Sum256([]byte(text))
+		return "c1:" + hex.EncodeToString(sum[:16])
+	}
+	return ""
+}
+
+// message 是 messages 数组里网关需要理解的最小字段子集。
+type message struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// parseMessages 解析请求体的 messages 数组；缺失或非法返回 ok=false。
+func parseMessages(body []byte) ([]message, bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	var obj struct {
+		Messages []message `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, false
+	}
+	return obj.Messages, true
 }
 
 // contentText 取消息 content 的文本：字符串形态直接返回；数组形态（多模态 parts）

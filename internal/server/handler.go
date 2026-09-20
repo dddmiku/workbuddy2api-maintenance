@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-20：无会话标识的客户端（narrafork 形态）按正文派生对话级回退键补上会话粘性；此前这类请求每轮换号、上游提示缓存整段失效。
 // 2026-09-20：已鉴权密钥可覆盖重复推理保护默认值，每次请求使用独立策略快照。
 // 2026-09-19：会话绑定和上游关联头按已鉴权密钥隔离，避免不同调用方共用或互相解除绑定。
 // 2026-09-19：重复推理保护返回明确非重试错误，停止本次流但保留已知用量和账号/粘性状态。
@@ -811,15 +812,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		sessKey = session.ExtractKey(body)
 	}
 	sessKey = session.ScopeKey(st.keyID, sessKey)
+
+	// stickyKey 只用于「绑定/解绑账号」，与上方聚合用的 sessKey 分开：
+	// 部分 OpenAI 兼容客户端（实测 narrafork 的 /v1/chat/completions）请求体顶层
+	// 只有 model / messages / stream / tools 等，既无 conversation_id 也无
+	// metadata、prompt_cache_key，ExtractKey 恒返回空串 → 会话粘性对它们完全失效，
+	// 同一对话每轮换号、上游提示缓存整段失效（线上表现为这类请求 hit 恒为 0）。
+	// 这里在无显式会话标识时，从正文派生对话级回退键补上粘性；显式标识仍优先。
+	//
+	// 不并进 sessKey：sessKey 还决定会话头族的聚合粒度（无显式标识时按「轮」聚合，
+	// 见下方 turnKey），把回退键混进去会把聚合粒度从轮级改成对话级，属于另一件事。
+	stickyKey := sessKey
+	if stickyKey == "" {
+		stickyKey = session.ScopeKey(st.keyID, session.ContentKey(body))
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
 		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
 		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
 		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
 		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 			stickyUID = uid
 		}
 	}
@@ -851,7 +866,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(stickyKey)
 			stickyUID = ""
 		}
 	}
@@ -1139,8 +1154,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.cfg.Pool.NoteSuccess(acct.UID)
 			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-			if sessKey != "" && h.cfg.Session != nil {
-				h.cfg.Session.Bind(sessKey, acct.UID)
+			// 绑定用 stickyKey（含无显式会话标识客户端的正文回退键）。
+			if stickyKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(stickyKey, acct.UID)
 			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
@@ -1182,8 +1198,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if stickyKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if err := writeJSON(w, http.StatusOK, resp); err != nil {
 			st.status = http.StatusBadGateway
