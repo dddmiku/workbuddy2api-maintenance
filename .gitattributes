@@ -11,3 +11,5 @@
 *.js text eol=lf
 *.css text eol=lf
 Dockerfile text eol=lf
+# 测试夹具是原始 SSE 字节（含上游的真实换行与分帧），行尾归一化会改变被断言的输入。
+*.sse -text
