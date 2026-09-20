@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -178,7 +179,7 @@ func TestReasoningLoopGuardStreamHoldsBackUntilRetryDecision(t *testing.T) {
 // 纯推理超过压制上限仍未命中时立即放行，客户端能实时看到这段推理。
 func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 	var unique strings.Builder
-	for index := 0; index < 1200; index++ {
+	for index := 0; index < 4000; index++ {
 		fmt.Fprintf(&unique, "独立推理步骤 %04d\n", index)
 	}
 	raw := reasoningGuardTestFrame(unique.String()) + "data: [DONE]\n\n"
@@ -190,5 +191,78 @@ func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "独立推理步骤") {
 		t.Fatal("long diverse reasoning never reached the client")
+	}
+}
+
+// TestReasoningLoopGuardStreamHoldsLateLoop 复现线上观测到的循环形态：先有一段很长的
+// 正常推理，之后才滑进重复短行。判定点在 18000–34000 字符之间，压制必须能撑到那时，
+// 否则客户端先看到重复文本、重发就失去意义。
+func TestReasoningLoopGuardStreamHoldsLateLoop(t *testing.T) {
+	var text strings.Builder
+	for index := 0; index < 2000; index++ {
+		fmt.Fprintf(&text, "分析第 %04d 个独立步骤\n", index)
+	}
+	for index := 0; index < 400; index++ {
+		text.WriteString("检查同一步骤\n")
+	}
+	if chars := utf8.RuneCountInString(text.String()); chars < reasoningLoopMinChars*3 {
+		t.Fatalf("fixture no longer reproduces a late loop: %d characters", chars)
+	}
+	raw := reasoningGuardTestFrame(text.String()) + "data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw), StreamOptions{
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsReasoningLoopError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("late loop was not held back for retry: %v", err)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the late-loop retry decision", len(body))
+	}
+}
+
+// reasoningGuardSlowReader 每次只交付一小段，并在片段之间停顿，用来复现「想得慢、
+// 每次只吐几个字」的流。
+type reasoningGuardSlowReader struct {
+	chunks []string
+	delay  time.Duration
+	index  int
+}
+
+func (r *reasoningGuardSlowReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	return n, nil
+}
+
+// TestReasoningLoopGuardStreamReleasesOnTimeout 验证时间上限：推理量远没到字符上限、
+// 却迟迟没有新内容时，客户端不能一直等下去，到点必须放行并转为实时透传。
+func TestReasoningLoopGuardStreamReleasesOnTimeout(t *testing.T) {
+	previous := ReasoningLoopHoldBackTimeout
+	ReasoningLoopHoldBackTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { ReasoningLoopHoldBackTimeout = previous })
+
+	text := strings.Repeat("还在想\n", 40)
+	raw := reasoningGuardTestFrame(text) + "data: [DONE]\n\n"
+	chunks := make([]string, 0, len(raw))
+	for offset := 0; offset < len(raw); offset += 8 {
+		end := offset + 8
+		if end > len(raw) {
+			end = len(raw)
+		}
+		chunks = append(chunks, raw[offset:end])
+	}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, &reasoningGuardSlowReader{chunks: chunks, delay: 15 * time.Millisecond}, StreamOptions{
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	if err != nil {
+		t.Fatalf("slow but valid reasoning was rejected: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "还在想") {
+		t.Fatal("timeout did not release the held-back reasoning")
 	}
 }

@@ -865,11 +865,12 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// 保护命中时我们想「整段重发」而让用户完全无感，但流式一旦写出去就收不回。
 	// 因此在「还没产出任何正文/工具进展」的纯推理阶段，先把帧压在内存里：
 	//   - 一旦出现正文、拒绝或工具进展 → 立即放行并转为实时透传（此后命中只能照旧报错）；
-	//   - 压到 ReasoningLoopHoldBackBytes 仍未出现进展 → 同样放行（长推理不能无限等）；
+	//   - 压到字符上限、缓冲上限或时间上限仍未出现进展 → 同样放行（长推理不能无限等）；
 	//   - 在压制期间命中循环 → 客户端零字节，错误标记 Retryable，由 handler 整段重发。
 	// 保护未启用时不进这个分支，行为与引入前完全一致。
 	var pending []byte
 	released := !state.loopGuardEnabled
+	holdBackDeadline := time.Now().Add(ReasoningLoopHoldBackTimeout)
 	releasePending := func() error {
 		if released {
 			return nil
@@ -922,11 +923,12 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		// 否则客户端会先看到一段重复推理，再收到错误。
 		guardErr := state.observeReasoningLoops(obj)
 		// 一旦出现正文/拒绝/工具进展，压制阶段立即结束：此后命中循环只能照旧报错，
-		// 因为客户端已经看到内容了。纯推理超过压制上限同样放行——到了这个量级还没
-		// 命中就说明不是这条规则能抓的循环，继续压只会让长推理迟迟不显示。
-		// 命中循环的这一帧必须留在压制区里：先放行再报错，客户端就会看到一段重复推理。
+		// 因为客户端已经看到内容了。纯推理另有两个放行条件——累计推理超过压制字符上限、
+		// 或压制时间超过上限。命中循环的这一帧必须留在压制区里：先放行再报错，客户端
+		// 就会看到一段重复推理。
 		if guardErr == nil {
-			if state.hasVisibleProgress() || state.reasoningCharacters() >= reasoningLoopHoldBackChars {
+			if state.hasVisibleProgress() || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
+				!time.Now().Before(holdBackDeadline) {
 				if releaseErr := releasePending(); releaseErr != nil {
 					return true, releaseErr
 				}
@@ -969,8 +971,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		// 命中循环时便无法整段重发。
 		if !released {
 			pending = append(pending, line+"\n\n"...)
-			// 注释行也要受同一个上限约束：上游只发 keepalive 时不能让缓冲无限增长。
-			if len(pending) >= ReasoningLoopHoldBackBytes {
+			// 注释行也要受同样的约束：上游只发 keepalive 时既不能让缓冲无限增长，
+			// 也不能让客户端一直看不到任何响应。
+			if len(pending) >= ReasoningLoopHoldBackBytes || !time.Now().Before(holdBackDeadline) {
 				return releasePending()
 			}
 			return nil

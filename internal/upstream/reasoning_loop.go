@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -23,18 +24,26 @@ const (
 	reasoningLoopLineBufferRunes  = 4096
 
 	// ReasoningLoopHoldBackBytes 是流式转发在「纯推理、尚无正文/工具进展」阶段压在
-	// 内存里的兜底上限，防止异常大帧把缓冲撑爆。
+	// 内存里的兜底上限，防止分帧很碎的流把缓冲撑爆。
 	//
 	// 压住不发的意义：命中循环时把这段推理整段丢弃、在同一账号上重发，用户就不会先
-	// 看到一段重复文本再看到答案。长推理不能无限等，因此另有字符数上限。
-	ReasoningLoopHoldBackBytes = 256 << 10
+	// 看到一段重复文本再看到答案。长推理不能无限等，因此另有字符数上限与「看起来不像
+	// 循环就提前放行」的判据。
+	ReasoningLoopHoldBackBytes = 2 << 20
 
-	// reasoningLoopHoldBackChars 是压制期的字符上限：判定最少需要 8000 字符，只有
-	// ≤32 字符的短行才可能被判为重复，因此从零开始的循环最迟在 8000 字符处就会命中。
-	// 到这里还没命中，说明循环（如果有）只在更靠后的位置才开始，再压住只会让正常长
-	// 推理迟迟不显示；留 1.5 倍余量后恢复实时透传。
-	reasoningLoopHoldBackChars = reasoningLoopMinChars + reasoningLoopMinChars/2
+	// reasoningLoopHoldBackChars 是压制期的字符上限。线上实测的循环判定点落在
+	// 18085–34341 字符之间（自上次实际进展起算），这里取 40K：既覆盖已观测到的全部
+	// 形态，又给正常长推理留出可接受的等待上限。到了这个量级还没命中，说明不是这条
+	// 规则能抓的循环，继续压只会让长推理迟迟不显示。
+	reasoningLoopHoldBackChars = 40 << 10
 )
+
+// ReasoningLoopHoldBackTimeout 是压制期的时间上限。字符上限挡不住「想得慢、每次只吐
+// 几个字」的流：那种情况下客户端会长时间收不到任何东西。超过这个时长仍未命中就放行，
+// 改为实时透传；此后命中只能按原有方式回报错误。
+//
+// 变量而非常量：测试需要把等待压到毫秒级才能回归这条出口。
+var ReasoningLoopHoldBackTimeout = 60 * time.Second
 
 // StreamOptions supplements the existing Stream/Aggregate APIs. Omitting it
 // retains their previous behavior; the HTTP handler explicitly supplies its configuration.
