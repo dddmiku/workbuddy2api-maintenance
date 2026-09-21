@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：开关改为运行期状态，补管理通道热切换回归：改完立即作用于后续请求，
+//
+//	非法请求体被拒绝，且该端点只对本机管理通道开放。
+//
 // 2026-09-22：补「单项停止」开关回归：打开时命中循环只停不重发并如实报错，默认仍
 //
 //	同账号重发一次保持用户无感；两种模式都不改账号健康与粘性绑定。
@@ -500,6 +504,91 @@ func TestReasoningLoopGuardRetryIsInvisible(t *testing.T) {
 	}
 }
 
+// TestReasoningLoopFeatureToggleIsLive 覆盖管理台的热切换通道：默认（配置播种）为
+// 「命中后重发」，通过管理接口改成只停不重发后**下一次请求**立刻生效，再改回来也
+// 立即恢复。这条回归锁的是「改完必须立刻作用于后续请求」，而不是「重启后生效」。
+func TestReasoningLoopFeatureToggleIsLive(t *testing.T) {
+	loopPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
+	cleanPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"content": "after-guard-marker"}), "stop")
+	model := "global:deepseek-v4.1-flash"
+
+	h, _, _, calls, _ := reasoningGuardFixtureSequence(t, []string{loopPayload, cleanPayload}, model)
+	if h.reasoningLoopStopOnly() {
+		t.Fatal("default should keep the same-account retry")
+	}
+
+	// 管理通道：打开只停不重发。
+	recorder := httptest.NewRecorder()
+	h.InternalHandler().ServeHTTP(recorder,
+		httptest.NewRequest(http.MethodPost, "/features/reasoning-loop", strings.NewReader(`{"stop_only":true}`)))
+	if recorder.Code != http.StatusOK || !h.reasoningLoopStopOnly() {
+		t.Fatalf("toggle did not apply: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	// 下一次请求必须只调上游一次并如实报错。
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, reasoningGuardRequest("/v1/chat/completions", model, false, false))
+	assertReasoningGuardFailure(t, recorder, "/v1/chat/completions", false)
+	if *calls != 1 {
+		t.Errorf("stop-only must not retry: calls=%d", *calls)
+	}
+
+	// 改回重发，下一次请求恢复「第一次循环被丢弃、第二次干净输出」。
+	recorder = httptest.NewRecorder()
+	h.InternalHandler().ServeHTTP(recorder,
+		httptest.NewRequest(http.MethodPost, "/features/reasoning-loop", strings.NewReader(`{"stop_only":false}`)))
+	if recorder.Code != http.StatusOK || h.reasoningLoopStopOnly() {
+		t.Fatalf("toggle back did not apply: status=%d", recorder.Code)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, reasoningGuardRequest("/v1/chat/completions", model, false, false))
+	if output := recorder.Body.String(); !strings.Contains(output, "after-guard-marker") ||
+		strings.Contains(output, `"code":"upstream_reasoning_loop"`) {
+		t.Fatalf("retry did not resume after toggling back: status=%d", recorder.Code)
+	}
+}
+
+// TestReasoningLoopFeatureToggleInputAndScope 锁定这个端点的两道边界：请求体必须显式
+// 给布尔值（空体、字符串、多余字段都拒绝），并且只能从本机管理通道访问——普通调用
+// 密钥不能改所有调用方看到的行为。
+func TestReasoningLoopFeatureToggleInputAndScope(t *testing.T) {
+	h := NewHandler(Config{})
+	admin := h.InternalHandler()
+	for _, tc := range []struct{ name, body string }{
+		{"empty", `{}`},
+		{"string", `{"stop_only":"true"}`},
+		{"number", `{"stop_only":1}`},
+		{"null", `{"stop_only":null}`},
+		{"unknown_field", `{"stop_only":true,"other":1}`},
+		{"not_json", `nope`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			admin.ServeHTTP(recorder,
+				httptest.NewRequest(http.MethodPost, "/features/reasoning-loop", strings.NewReader(tc.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Errorf("invalid body accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if h.reasoningLoopStopOnly() {
+				t.Error("invalid body changed the runtime switch")
+			}
+		})
+	}
+	// 公开 mux（没有管理上下文）必须拿不到这个端点。
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder,
+		httptest.NewRequest(http.MethodPost, "/features/reasoning-loop", strings.NewReader(`{"stop_only":true}`)))
+	if recorder.Code == http.StatusOK || h.reasoningLoopStopOnly() {
+		t.Errorf("public path reached the internal toggle: status=%d", recorder.Code)
+	}
+	// GET 读回当前值，同样只走管理通道。
+	recorder = httptest.NewRecorder()
+	admin.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/features/reasoning-loop", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"stop_only":false`) {
+		t.Errorf("GET did not report the current value: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 // TestReasoningLoopGuardNoRetryAfterVisibleOutput 验证闸门边界：正文一旦被判定为正常
 // 并写出就收不回，此后推理命中循环只能如实回报错误，不能再重发；非流式客户端在读完
 // 前零字节，重发仍然无感，因此照常重试一次。
@@ -547,7 +636,8 @@ func TestReasoningLoopGuardStopOnlyDisablesRetry(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/stream=%t/stopOnly=%t", path, streaming, stopOnly), func(t *testing.T) {
 					model := "global:deepseek-v4.1-flash"
 					h, _, bodies, calls, bindings := reasoningGuardFixtureSequence(t, []string{loopPayload, cleanPayload}, model)
-					h.cfg.ReasoningLoopStopOnly = stopOnly
+					// 开关是运行期状态（管理台可热切换），必须走 setter 而不是直接改 cfg。
+					h.SetReasoningLoopStopOnly(stopOnly)
 					beforeFirst, _ := h.cfg.Pool.Status("guard-first")
 					beforeSecond, _ := h.cfg.Pool.Status("guard-second")
 					recorder := httptest.NewRecorder()

@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：重复推理保护改为「命中后重发 / 命中即停止」可在管理台热切换；开关值
+// 存进 handler 的原子字段，改完立即作用于后续请求，不需要重启，在途请求不受影响。
 // 2026-09-20：无会话标识的客户端（narrafork 形态）按正文派生对话级回退键补上会话粘性；此前这类请求每轮换号、上游提示缓存整段失效。
 // 2026-09-20：已鉴权密钥可覆盖重复推理保护默认值，每次请求使用独立策略快照。
 // 2026-09-19：会话绑定和上游关联头按已鉴权密钥隔离，避免不同调用方共用或互相解除绑定。
@@ -28,6 +30,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/apikeys"
@@ -64,6 +67,7 @@ type Config struct {
 	// ReasoningLoopStopOnly 命中重复短行时只停止该次请求，不做同账号重发。
 	// 缺省 false = 命中后先在同一账号上重发一次（用户侧无感）；显式 true = 命中即
 	// 停止并如实回报，把是否重试交回调用方。只影响「命中之后怎么办」，不影响检测本身。
+	// 这是启动默认值；管理台可以在运行期改（见 stopOnly 字段），改完立即生效。
 	ReasoningLoopStopOnly bool
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -121,6 +125,25 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// stopOnly 是 ReasoningLoopStopOnly 的运行期值（0 = 关闭，1 = 打开）。
+	// 用原子量而不是改 cfg：管理台热切换要立即作用于新请求，同时又不能让已经
+	// 开始的重发循环读到半个状态。启动时由 Config 播种，之后只由管理接口写。
+	stopOnly atomic.Uint32
+}
+
+// SetReasoningLoopStopOnly 运行期切换「命中循环后是否只停不重发」，立即作用于后续
+// 请求；已经开始的那次请求沿用开始时读到的值。
+func (h *Handler) SetReasoningLoopStopOnly(enabled bool) {
+	if enabled {
+		h.stopOnly.Store(1)
+		return
+	}
+	h.stopOnly.Store(0)
+}
+
+// reasoningLoopStopOnly 返回当前运行期值。Config 里显式打开时同样返回 true。
+func (h *Handler) reasoningLoopStopOnly() bool {
+	return h.stopOnly.Load() == 1
 }
 
 // NewHandler 构建 handler。
@@ -141,6 +164,8 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 把启动配置播种进运行期开关；之后管理台可以热切换，不必重启。
+	h.SetReasoningLoopStopOnly(cfg.ReasoningLoopStopOnly)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// Responses API 兼容层（NarraFork / Codex 等客户端走这条）：内部委托 chatCompletions。
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
@@ -157,6 +182,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /update", h.requireInternal(h.updateStatus))
 	h.mux.HandleFunc("POST /update/check", h.requireInternal(h.updateCheck))
 	h.mux.HandleFunc("POST /update/apply", h.requireInternal(h.updateApply))
+	// 重复推理保护的「命中后怎么办」热切换，同样只走本机管理通道：它改变的是所有
+	// 调用方看到的行为，不能让任一调用密钥自己改。
+	h.mux.HandleFunc("GET /features/reasoning-loop", h.requireInternal(h.reasoningLoopFeature))
+	h.mux.HandleFunc("POST /features/reasoning-loop", h.requireInternal(h.setReasoningLoopFeature))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -295,6 +324,37 @@ func (h *Handler) recordUsage(st *chatStat, model string) {
 }
 
 // updateStatus 返回热更新状态（当前版本、远端最新版本、最近错误）。
+// reasoningLoopFeature 返回重复推理保护的运行期设置（供管理台渲染开关）。
+func (h *Handler) reasoningLoopFeature(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"stop_only": h.reasoningLoopStopOnly(),
+		"default":   h.cfg.ReasoningLoopStopOnly,
+	})
+}
+
+// setReasoningLoopFeature 热切换「命中循环后是否只停不重发」。只接受显式布尔值：
+// 这个开关决定失败会不会被一次重发吸收掉，静默接受空值或字符串会悄悄改变调用方
+// 看到的行为。改完立即作用于后续请求，已经在跑的那次沿用开始时的语义。
+func (h *Handler) setReasoningLoopFeature(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		StopOnly *bool `json:"stop_only"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "请求体需为 {\"stop_only\": true|false}"})
+		return
+	}
+	if body.StopOnly == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "stop_only 必须是 true 或 false"})
+		return
+	}
+	h.SetReasoningLoopStopOnly(*body.StopOnly)
+	log.Printf("INFO: [server] reasoning loop stop-only set to %t via admin channel", *body.StopOnly)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stop_only": *body.StopOnly})
+}
+
 func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Update == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1159,6 +1219,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Model:              peek.Model,
 			ReasoningLoopGuard: reasoningLoopGuard,
 		}
+		// 本次请求一开始就快照「命中后是否只停不重发」：管理台在请求进行中切换开关时，
+		// 已经在跑的这一轮沿用开始时的语义，不会出现重发到一半忽然改判。
+		stopOnly := h.reasoningLoopStopOnly()
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
@@ -1171,7 +1234,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			for {
 				// 单项停止开关打开时不给重发额度：Stream 会把错误如实写给客户端，
 				// handler 这里也就不会进入下面的重发分支。
-				streamOptions.LoopRetryAvailable = !h.cfg.ReasoningLoopStopOnly &&
+				streamOptions.LoopRetryAvailable = !stopOnly &&
 					loopRetries < maxReasoningLoopRetries
 				streamErr = upstream.Stream(w, stats, streamOptions)
 				if streamErr == nil || !upstream.IsLoopGuardError(streamErr) ||
@@ -1261,7 +1324,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp, err = upstream.Aggregate(stats, streamOptions)
 			if err == nil || !upstream.IsLoopGuardError(err) ||
 				!errors.As(err, &loopErr) || loopRetries >= maxReasoningLoopRetries ||
-				h.cfg.ReasoningLoopStopOnly ||
+				stopOnly ||
 				r.Context().Err() != nil {
 				break
 			}

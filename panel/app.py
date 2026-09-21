@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：新增 /api/features/reasoning-loop，转发网关的「命中循环只停不重发」热切换；
+#             GET 读当前值，POST 改值，改完立即作用于后续请求，不需要重启网关。
 # 2026-09-20：2.1.9 重复推理保护扩到正文（上游修复同步到面板文案）。
 # 2026-09-20：2.1.8 密钥列表合并累计 token 用量，创建/编辑支持有效期（默认无限制）。
 # 2026-09-20：2.1.4 控制台按 new-api 面板规范重做外观（顶栏横跨、浅色侧栏、azure 主色、
@@ -78,7 +80,7 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.9"
+PANEL_VERSION = "2.1.17"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -976,6 +978,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/update":
             return self._gateway_admin("GET", "/update")
 
+        if path == "/api/features/reasoning-loop":
+            # 重复推理保护的「命中后怎么办」：网关内部接口只走本机管理通道。
+            return self._gateway_admin("GET", "/features/reasoning-loop")
+
         if path == "/api/models":
             # 面板经本机管理通道读取完整模型列表，不受单个调用密钥的绑定限制。
             payload = gateway_get("/v1/models")
@@ -1054,6 +1060,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.task_toggle(body))
             if path == "/api/service/restart":
                 return self._json(200, self.service_restart())
+            if path == "/api/features/reasoning-loop":
+                return self._json(200, self.reasoning_loop_toggle(body))
             if path in ("/api/update/check", "/api/update/apply"):
                 return self.update_post(path, body)
             if path == "/api/credit":
@@ -1074,6 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
             "/api/service/restart": set(), "/api/credit": set(),
+            "/api/features/reasoning-loop": {"stop_only"},
         }
         allowed = shapes.get(path)
         if allowed is not None and set(body) - allowed:
@@ -1084,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
         for route, field in (("/api/account/toggle", "disabled"), ("/api/task/toggle", "enabled")):
             if path == route and type(body.get(field)) is not bool:
                 raise RequestBodyError(400, "开关值必须明确指定为 true 或 false")
+        if path == "/api/features/reasoning-loop" and type(body.get("stop_only")) is not bool:
+            raise RequestBodyError(400, "开关值必须明确指定为 true 或 false")
         if path.startswith("/api/account/") and not UID_RE.fullmatch(body.get("uid", "")):
             raise RequestBodyError(400, "账号标识不正确")
         if path in ("/api/task/run", "/api/task/toggle") and body.get("key") not in TASK_ENABLE_KEY:
@@ -1413,6 +1424,25 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             ok, msg, secs = restart_container()
         return {"ok": ok, "restart": secs if ok else None, "message": msg}
+
+    def reasoning_loop_toggle(self, body):
+        """热切换重复推理保护的「命中后怎么办」，经本机管理通道转发给网关。
+
+        与 config.json 里的 features.reasoning_loop_stop_only 是同一个语义：false
+        （默认）命中后同账号重发一次，true 命中即停止并如实报错。运行期值优先，
+        不需要重启，也不需要改配置文件。
+        """
+        stop_only = body.get("stop_only")
+        code, result = key_management.request(
+            key_management.socket_path(CONFIG_PATH, BASE), "POST",
+            "/features/reasoning-loop", {"stop_only": stop_only})
+        if code != 200 or not isinstance(result, dict) or not result.get("ok"):
+            message = result.get("message") if isinstance(result, dict) else ""
+            return {"ok": False,
+                    "message": message or "网关未响应（旧版本网关请先升级）"}
+        return {"ok": True, "stop_only": bool(result.get("stop_only")),
+                "message": "已切换为「命中即停止」" if result.get("stop_only")
+                           else "已切换为「命中后自动重发」"}
 
 
 class RequestBodyError(ValueError):

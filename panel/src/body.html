@@ -327,6 +327,25 @@
             </section>
             <section class="panel" style="margin-top:14px">
               <div class="ph">
+                <h2>重复推理保护</h2>
+                <span class="sp"></span>
+                <span class="sub" id="rlState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="rlRows"></div>
+                <label class="key-guard-field" style="margin-top:12px">
+                  <input type="checkbox" id="rlStopOnly">
+                  <span>
+                    <b>命中即停止，不自动重发</b>
+                    <small>关闭（默认）：模型持续重复短行时，网关在同一账号上重发一次，用户无感；
+                      重发仍循环才回报错误。开启：命中即停止该次请求并如实报错，把是否重试交回调用方。
+                      改完立即作用于后续请求，已经在跑的对话不受影响，不需要重启网关。</small>
+                  </span>
+                </label>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
                 <h2>容器状态</h2>
                 <span class="sp"></span>
                 <button class="btn sm" data-view="logs">查看请求日志</button>

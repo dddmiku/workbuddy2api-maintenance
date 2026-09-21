@@ -1,5 +1,7 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
+//             进入页面即拉取当前运行期值，改完立即生效、不需要重启网关。
 // 2026-09-20：按 new-api 面板规范重做外观：顶栏横跨整宽并承载品牌与全局操作，
 //             页标题移入内容区，主题按钮从侧栏底部移到顶栏（不再需要 themeLabel）。
 // 2026-09-20：渲染按当前页收敛——刷新只重绘可见页（此前每次 30 秒刷新都重建全部
@@ -231,6 +233,8 @@ function go(v){
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
   // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
   if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
+  // 重复推理保护开关同样不依赖 /api/state，进入系统页就拉当前运行期值。
+  if (v === 'system' && typeof loadReasoningLoop === 'function') loadReasoningLoop();
   if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
   if (v !== 'system' && typeof stopUpdatePoll === 'function') stopUpdatePoll();
   // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。

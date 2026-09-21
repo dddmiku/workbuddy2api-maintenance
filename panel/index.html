@@ -881,6 +881,25 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
             </section>
             <section class="panel" style="margin-top:14px">
               <div class="ph">
+                <h2>重复推理保护</h2>
+                <span class="sp"></span>
+                <span class="sub" id="rlState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="rlRows"></div>
+                <label class="key-guard-field" style="margin-top:12px">
+                  <input type="checkbox" id="rlStopOnly">
+                  <span>
+                    <b>命中即停止，不自动重发</b>
+                    <small>关闭（默认）：模型持续重复短行时，网关在同一账号上重发一次，用户无感；
+                      重发仍循环才回报错误。开启：命中即停止该次请求并如实报错，把是否重试交回调用方。
+                      改完立即作用于后续请求，已经在跑的对话不受影响，不需要重启网关。</small>
+                  </span>
+                </label>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
                 <h2>容器状态</h2>
                 <span class="sp"></span>
                 <button class="btn sm" data-view="logs">查看请求日志</button>
@@ -980,6 +999,8 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 "use strict";
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
+//             进入页面即拉取当前运行期值，改完立即生效、不需要重启网关。
 // 2026-09-20：按 new-api 面板规范重做外观：顶栏横跨整宽并承载品牌与全局操作，
 //             页标题移入内容区，主题按钮从侧栏底部移到顶栏（不再需要 themeLabel）。
 // 2026-09-20：渲染按当前页收敛——刷新只重绘可见页（此前每次 30 秒刷新都重建全部
@@ -1211,6 +1232,8 @@ function go(v){
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
   // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
   if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
+  // 重复推理保护开关同样不依赖 /api/state，进入系统页就拉当前运行期值。
+  if (v === 'system' && typeof loadReasoningLoop === 'function') loadReasoningLoop();
   if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
   if (v !== 'system' && typeof stopUpdatePoll === 'function') stopUpdatePoll();
   // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
@@ -2891,6 +2914,68 @@ async function actUpdateApply(){
 document.addEventListener('click', function(e){
   if (e.target.closest('#btnUpdCheck')){ actUpdateCheck(); return; }
   if (e.target.closest('#btnUpdApply')){ actUpdateApply(); }
+});
+
+/* ── 重复推理保护（命中后重发 / 命中即停止）────────────────
+ * 运行期开关，走网关本机管理接口 GET/POST /features/reasoning-loop。
+ * 与 config.json 的 features.reasoning_loop_stop_only 同义，但改完立即生效。
+ */
+var RL = { data:null, loading:false };
+
+function renderReasoningLoop(){
+  var box = $('#rlRows');
+  if (!box) return;
+  var r = RL.data;
+  if (!r || r.ok === false){
+    box.innerHTML = '<div class="upd-empty">' +
+      esc((r && r.message) || '网关未响应（旧版本网关请先升级）') + '</div>';
+    $('#rlState').textContent = '不可用';
+    $('#rlStopOnly').disabled = true;
+    return;
+  }
+  var stopOnly = !!r.stop_only;
+  $('#rlStopOnly').checked = stopOnly;
+  $('#rlStopOnly').disabled = false;
+  $('#rlState').innerHTML = '<span class="upd-tag ' + (stopOnly ? 'w' : '') + '">' +
+    (stopOnly ? '命中即停止' : '命中后自动重发') + '</span>';
+  box.innerHTML =
+    mrow('当前行为', stopOnly ? '命中即停止，不重发' : '命中后同账号重发一次', stopOnly ? 'w' : 'ok') +
+    mrow('启动配置', r.default ? '只停不重发' : '命中后重发') +
+    mrow('生效方式', '立即生效，不需要重启');
+}
+
+async function loadReasoningLoop(){
+  if (RL.loading) return;
+  RL.loading = true;
+  try{
+    RL.data = await api('api/features/reasoning-loop');
+  }catch(err){
+    RL.data = { ok:false, message: err.message };
+  }finally{
+    RL.loading = false;
+  }
+  renderReasoningLoop();
+}
+
+async function actReasoningLoopToggle(next){
+  var input = $('#rlStopOnly');
+  input.disabled = true;
+  try{
+    var r = await api('api/features/reasoning-loop', { stop_only: next });
+    if (r.ok === false){ toast(r.message || '切换失败', 'err'); }
+    else { toast(r.message || '已切换', 'ok'); }
+    await loadReasoningLoop();
+  }catch(err){
+    toast('切换失败：' + (err && err.message || err), 'err');
+    // 失败时把开关恢复成服务端当前值，避免界面显示与实际不一致。
+    await loadReasoningLoop();
+  }finally{
+    input.disabled = false;
+  }
+}
+
+document.addEventListener('change', function(e){
+  if (e.target && e.target.id === 'rlStopOnly') actReasoningLoopToggle(e.target.checked);
 });
 
 // ═══ 更新日志 ═══

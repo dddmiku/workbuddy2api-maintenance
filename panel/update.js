@@ -128,3 +128,65 @@ document.addEventListener('click', function(e){
   if (e.target.closest('#btnUpdCheck')){ actUpdateCheck(); return; }
   if (e.target.closest('#btnUpdApply')){ actUpdateApply(); }
 });
+
+/* ── 重复推理保护（命中后重发 / 命中即停止）────────────────
+ * 运行期开关，走网关本机管理接口 GET/POST /features/reasoning-loop。
+ * 与 config.json 的 features.reasoning_loop_stop_only 同义，但改完立即生效。
+ */
+var RL = { data:null, loading:false };
+
+function renderReasoningLoop(){
+  var box = $('#rlRows');
+  if (!box) return;
+  var r = RL.data;
+  if (!r || r.ok === false){
+    box.innerHTML = '<div class="upd-empty">' +
+      esc((r && r.message) || '网关未响应（旧版本网关请先升级）') + '</div>';
+    $('#rlState').textContent = '不可用';
+    $('#rlStopOnly').disabled = true;
+    return;
+  }
+  var stopOnly = !!r.stop_only;
+  $('#rlStopOnly').checked = stopOnly;
+  $('#rlStopOnly').disabled = false;
+  $('#rlState').innerHTML = '<span class="upd-tag ' + (stopOnly ? 'w' : '') + '">' +
+    (stopOnly ? '命中即停止' : '命中后自动重发') + '</span>';
+  box.innerHTML =
+    mrow('当前行为', stopOnly ? '命中即停止，不重发' : '命中后同账号重发一次', stopOnly ? 'w' : 'ok') +
+    mrow('启动配置', r.default ? '只停不重发' : '命中后重发') +
+    mrow('生效方式', '立即生效，不需要重启');
+}
+
+async function loadReasoningLoop(){
+  if (RL.loading) return;
+  RL.loading = true;
+  try{
+    RL.data = await api('api/features/reasoning-loop');
+  }catch(err){
+    RL.data = { ok:false, message: err.message };
+  }finally{
+    RL.loading = false;
+  }
+  renderReasoningLoop();
+}
+
+async function actReasoningLoopToggle(next){
+  var input = $('#rlStopOnly');
+  input.disabled = true;
+  try{
+    var r = await api('api/features/reasoning-loop', { stop_only: next });
+    if (r.ok === false){ toast(r.message || '切换失败', 'err'); }
+    else { toast(r.message || '已切换', 'ok'); }
+    await loadReasoningLoop();
+  }catch(err){
+    toast('切换失败：' + (err && err.message || err), 'err');
+    // 失败时把开关恢复成服务端当前值，避免界面显示与实际不一致。
+    await loadReasoningLoop();
+  }finally{
+    input.disabled = false;
+  }
+}
+
+document.addEventListener('change', function(e){
+  if (e.target && e.target.id === 'rlStopOnly') actReasoningLoopToggle(e.target.checked);
+});

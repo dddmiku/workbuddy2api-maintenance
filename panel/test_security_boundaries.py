@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：补 /api/features/reasoning-loop 的边界回归：必须登录、必须同源+管理标记、
+#             开关值必须是显式布尔，且失败时不落到「静默成功」。
 # 2026-09-18：通过隔离 HTTP 服务复现管理写操作来源校验、JSON 输入、退出续期和凭证损坏边界。
 
 import http.client
@@ -72,6 +74,7 @@ class ManagementBoundaryTests(unittest.TestCase):
             "/api/account/toggle": "account_toggle",
             "/api/task/toggle": "task_toggle",
             "/api/task/run": "task_run",
+            "/api/features/reasoning-loop": "reasoning_loop_toggle",
             "/api/login/start": "login_start",
             "/api/login/poll": "login_poll",
         }
@@ -105,6 +108,39 @@ class ManagementBoundaryTests(unittest.TestCase):
             with self.subTest(route=route, payload=payload), patch.object(app.Handler, method, return_value={"ok": True}) as action:
                 self.assertEqual(self.request(route, body=json.dumps(payload))[0], 400)
                 action.assert_not_called()
+
+    def test_reasoning_loop_toggle_requires_explicit_boolean(self):
+        """这个开关决定失败会不会被一次重发吸收掉，空值/字符串/多余字段都必须拒绝。"""
+        cases = [{}, {"stop_only": "true"}, {"stop_only": 1}, {"stop_only": None},
+                 {"stop_only": True, "extra": 1}]
+        for payload in cases:
+            with self.subTest(payload=payload), \
+                    patch.object(app.Handler, "reasoning_loop_toggle", return_value={"ok": True}) as action:
+                self.assertEqual(self.request("/api/features/reasoning-loop",
+                                              body=json.dumps(payload))[0], 400)
+                action.assert_not_called()
+
+    def test_reasoning_loop_toggle_reports_gateway_failure(self):
+        """网关没响应时必须如实回报失败，不能静默显示成功。"""
+        with patch.object(app.key_management, "request", return_value=(500, {"ok": False, "message": "网关未响应"})), \
+                patch.object(app.key_management, "socket_path", return_value="/tmp/fixture.sock"):
+            code, raw = self.request("/api/features/reasoning-loop", body=json.dumps({"stop_only": True}))
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("网关未响应", data["message"])
+
+    def test_reasoning_loop_toggle_forwards_explicit_value(self):
+        """成功路径：面板必须把显式布尔原样转发给网关，并回报生效后的值。"""
+        with patch.object(app.key_management, "request",
+                          return_value=(200, {"ok": True, "stop_only": True})) as request, \
+                patch.object(app.key_management, "socket_path", return_value="/tmp/fixture.sock"):
+            code, raw = self.request("/api/features/reasoning-loop", body=json.dumps({"stop_only": True}))
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["stop_only"])
+        self.assertEqual(request.call_args[0][3], {"stop_only": True})
 
     def test_logs_keep_stderr_when_stdout_is_present(self):
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)

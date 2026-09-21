@@ -139,6 +139,7 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | GET | `/api/logs?lines=` | 网关容器日志（同时返回解析好的请求行 `rows`） |
 | GET | `/api/usage` | 按 API key 累计的 token 用量（经本机 Unix socket 读网关 `/usage`） |
 | GET | `/api/update` | 热更新状态（经本机 Unix socket 读网关 `/update`） |
+| GET | `/api/features/reasoning-loop` | 重复推理保护的运行期设置（命中后重发 / 命中即停止） |
 | GET | `/api/keys` | 密钥列表，并合并每把密钥的累计 token 用量 |
 | POST | `/api/auth/login`、`/api/auth/logout`、`/api/auth/password` | 登录、退出、修改管理员账号 |
 | POST | `/api/login/start`、`/api/login/poll` | 上游账号授权 |
@@ -149,6 +150,7 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含模型绑定、`reasoning_loop_guard` 开关与 `expires_at` 有效期）、删除 |
 | POST | `/api/keys/copy` | 管理员按 ID 读取完整密钥用于复制，响应禁止缓存 |
 | POST | `/api/update/check`、`/api/update/apply` | 检查远端版本、触发一次热更新 |
+| POST | `/api/features/reasoning-loop` | 热切换重复推理保护的「命中即停止」，改完立即生效 |
 
 所有 POST 接口（包括登录和退出）都需要 `Content-Type: application/json`、`X-Admin-Request: 1` 和有效的 JSON 对象；携带 `Origin` 时必须同源。管理动作还需要登录 Cookie。请求长度必须明确且合法，不接受分块请求体；密钥与热更新请求上限为 8 KiB，其他 POST 为 64 KiB。开关必须是 JSON 布尔值，不能用字符串 `"false"`。热更新的 `tag` 字段只允许字母、数字、点、下划线和短横线。
 
