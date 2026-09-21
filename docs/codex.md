@@ -102,7 +102,7 @@ model_instructions_file = "/opt/workbuddy2api/examples/codex-instructions.md"
 
 ### 推理反复重复
 
-指定 DeepSeek 模型持续重复少量短行时，网关默认会先在同一账号上重发一次；重发仍循环才中止该次请求。推理侧返回 `upstream_reasoning_loop`，正文侧返回 `upstream_output_loop`。看到此错误后可整理上下文再重试；业务本来就需要大量重复短行时，可以关闭这项保护。它可能误报，也不能覆盖所有循环，设置与用量边界见 [重复推理保护](configuration.md#重复推理保护)。
+指定 DeepSeek 模型持续重复少量短行时，网关默认会立即中止该次请求并如实回报错误，不做同账号重发。推理侧返回 `upstream_reasoning_loop`，正文侧返回 `upstream_output_loop`。看到此错误后可整理上下文再重试；业务本来就需要大量重复短行时，可以关闭这项保护。它可能误报，也不能覆盖所有循环，设置与用量边界见 [重复推理保护](configuration.md#重复推理保护)。
 
 ### 预告文字与回合结束
 

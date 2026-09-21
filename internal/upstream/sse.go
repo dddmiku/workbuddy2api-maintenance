@@ -8,6 +8,8 @@
 // 2026-09-18：拒绝错误形状的工具列表，并在流结束时校验工具终态确有调用，避免预告正文静默收尾。
 // 2026-09-18：逐 choice 隔离工具名称与聚合输出，拒绝被静默忽略的非法正文、delta 和 choices 形状。
 // 2026-09-19：累计用量按已出现字段合并，末尾 credit-only 或详细字段不再抹掉前帧 token。
+// 2026-09-21：重复短行保护退回「命中即停止」：不再把错误标成可重发、不再由调用方同账号
+// 重发。写出闸门保留——命中时压住的重复文本整段丢弃，客户端只会收到一次明确的循环错误。
 package upstream
 
 import (
@@ -33,9 +35,6 @@ type StreamError struct {
 	Cause    error
 	// 合法 error 对象的原始 JSON 信封，仅 Stream 使用；保留信封外的 requestId 等诊断字段。
 	rawFrame json.RawMessage
-	// Retryable 表示这次失败发生时客户端**还没有收到任何字节**（仅 Stream 设置）。
-	// 调用方据此可以在同一账号上整段重发，而不会让用户看到半截输出或重复内容。
-	Retryable bool
 }
 
 func (e *StreamError) Error() string { return e.Message }
@@ -234,39 +233,12 @@ type streamState struct {
 	choices          map[int]*streamChoice
 	done             bool
 	loopGuardEnabled bool
-	// loopRetryAvailable 由 StreamOptions 传入：调用方还会重发时才压制错误帧。
-	loopRetryAvailable bool
 }
 
 func validFinishReason(reason string) bool {
 	switch reason {
 	case "stop", "length", "tool_calls", "content_filter", "function_call":
 		return true
-	}
-	return false
-}
-
-// hasVisibleProgress reports whether any choice has produced content, refusal or
-// tool activity. Reasoning-only output deliberately does not count: the loop
-// guard watches reasoning, so a run that never produces content must stay
-// eligible for detection.
-func (s *streamState) hasVisibleProgress() bool {
-	for _, choice := range s.choices {
-		if choice.progress > 0 || choice.finishReason != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// hasNonContentProgress reports whether any choice has produced refusal text or
-// tool activity. 这类进展不是被监控的载荷，一出现就必须放行：不能因为另一个
-// choice 的正文还在压制区里，就把用户可见的 refusal 或工具调用也一起压住。
-func (s *streamState) hasNonContentProgress() bool {
-	for _, choice := range s.choices {
-		if choice.nonContentProgress > 0 {
-			return true
-		}
 	}
 	return false
 }
@@ -863,10 +835,8 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // 上游错误/读错误/截断先发 error 再发 [DONE] 并返回 *StreamError。
 // [DONE] 只关闭传输，不覆盖已有 error；客户端写失败直接返回原始错误。
 //
-// 重复推理保护命中时：若 options.LoopRetryAvailable 为 true，说明调用方还会在同一
-// 账号上重发，本次不向客户端写任何字节（连 error 帧与 [DONE] 都不写），只把错误标成
-// Retryable 返回；调用方重发失败而无法继续时，必须用 WriteStreamError 补上错误帧，
-// 否则客户端会既收不到内容也看不到失败原因。
+// 重复短行保护命中时：压住的这段就是那串重复文本，整段丢弃，然后按普通失败写出
+// error 帧与 [DONE] 并返回 *StreamError。命中即停止，不换号、不重发。
 func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -888,51 +858,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 
 	state := newStreamState(options)
 
-	// ── 写出闸门（仅在重复推理保护启用时生效）────────────────────────────
-	//
-	// 保护命中时我们想「整段重发」而让用户完全无感，但流式一旦写出去就收不回。
-	// 因此先把帧压在内存里，直到能确认不是这条规则能抓的循环：
-	//   - 纯推理阶段一直压住，直到推理字符上限、缓冲上限或时间上限（长推理不能无限等）；
-	//   - 正文阶段压到出现长行、空行、第三种短行或正文上限为止（正常回答通常一行就放行）；
-	//   - refusal 与工具进展立即放行，它们不是被监控的载荷；
-	//   - 在压制期间命中循环 → 客户端零字节，错误标记 Retryable，由 handler 整段重发。
-	// 保护未启用时不进这个分支，行为与引入前完全一致。
-	var pending []byte
-	released := !state.loopGuardEnabled
-	holdBackDeadline := time.Now().Add(ReasoningLoopHoldBackTimeout)
-	// 正文压制期的独立时限：从第一帧正文开始计时，比推理侧短得多，避免「没有换行的
-	// 短回答」被闸门压到推理侧的 60 秒上限。holdingContent 记录当前是否正处于正文
-	// 压制期：一次工具调用会把正文窗口清零，之后若又出现可疑正文，时限要重新起算，
-	// 不能用上一段的旧期限把它立刻放行。
-	var contentDeadline time.Time
-	holdingContent := false
-	releasePending := func() error {
-		if released {
-			return nil
-		}
-		released = true
-		if len(pending) == 0 {
-			return nil
-		}
-		if _, werr := w.Write(pending); werr != nil {
-			return werr
-		}
-		pending = nil
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
-	}
 	// 正常帧和错误帧共享一个写出口，任何客户端断开均向上传递。
 	writeRaw := func(payload string) error {
 		frame := "data: " + payload + "\n\n"
-		if !released {
-			pending = append(pending, frame...)
-			if len(pending) >= ReasoningLoopHoldBackBytes {
-				return releasePending()
-			}
-			return nil
-		}
 		if _, werr := io.WriteString(w, frame); werr != nil {
 			return werr
 		}
@@ -954,35 +882,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		if err := state.observe(obj); err != nil {
 			return true, err
 		}
-		// 先判定这一帧是否命中循环，再决定要不要放行：命中帧本身必须留在压制区里，
-		// 否则客户端会先看到一段重复推理，再收到错误。
+		// 判定这一帧是否命中循环。命中即返回错误：Stream 随后写出 error 帧与 [DONE]，
+		// 调用方不再重发。检测本身不改动正文、工具或用量。
 		guardErr := state.observeReasoningLoops(obj)
-		// 命中帧本身必须留在压制区里：先放行再报错，客户端就会看到一段重复文本。
-		// 未命中时按下面几条出口决定要不要继续压住：
-		//   - refusal 与工具进展一出现就放行，它们不是被监控的载荷；
-		//   - 纯推理阶段（还没有正文）继续压住，让推理循环有机会被整段丢弃后重发；
-		//   - 正文阶段只要还不能排除短行循环就继续压住（holdOutput），一旦出现长行、
-		//     短行种类变多或字符超限就放行；
-		//   - 推理累计到压制字符上限、或压制超时 → 放行（长推理不能无限等）。
-		if guardErr == nil {
-			// 纯推理阶段（hasVisibleProgress 为假）继续压住；一旦出现正文或其它可见
-			// 进展，就只按正文闸门与「非正文进展」决定。
-			contentHeld := !state.hasNonContentProgress() && state.holdOutput()
-			if contentHeld && !holdingContent {
-				holdingContent = true
-				contentDeadline = time.Now().Add(ContentLoopHoldBackTimeout)
-			} else if !contentHeld {
-				holdingContent = false
-			}
-			keepHolding := !state.hasVisibleProgress() || contentHeld
-			if !keepHolding || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
-				!time.Now().Before(holdBackDeadline) ||
-				(contentHeld && !time.Now().Before(contentDeadline)) {
-				if releaseErr := releasePending(); releaseErr != nil {
-					return true, releaseErr
-				}
-			}
-		}
 		if value, ok := obj["usage"].(map[string]any); ok {
 			usage = MergeUsage(usage, value)
 			obj["usage"] = usage
@@ -1016,17 +918,6 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		}
 		return guardErr != nil, guardErr
 	}, func(line string) error {
-		// SSE 注释行同样要过闸门：压制期间若直接写出，客户端就不是零字节了，
-		// 命中循环时便无法整段重发。
-		if !released {
-			pending = append(pending, line+"\n\n"...)
-			// 注释行也要受同样的约束：上游只发 keepalive 时既不能让缓冲无限增长，
-			// 也不能让客户端一直看不到任何响应。
-			if len(pending) >= ReasoningLoopHoldBackBytes || !time.Now().Before(holdBackDeadline) {
-				return releasePending()
-			}
-			return nil
-		}
 		if _, err := io.WriteString(w, line+"\n\n"); err != nil {
 			return err
 		}
@@ -1040,23 +931,6 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	}
 	if err == nil {
 		err = state.end()
-	}
-	// 命中循环且客户端零字节时，整段压住的帧直接丢弃：调用方会在同一账号上重发，
-	// 客户端不该先看到半截推理再收到错误。
-	var heldErr *StreamError
-	heldLoop := err != nil && IsLoopGuardError(err) && !released && errors.As(err, &heldErr)
-	// 只有在调用方明确还会重发时（LoopRetryAvailable）才压制错误帧；否则按原有方式
-	// 把错误如实写给客户端，避免"既不重发也不报错"的黑洞。
-	retryPending := heldLoop && state.loopRetryAvailable
-	if heldLoop {
-		// 压住的这一段本身就是那串重复文本：重发时整段丢弃；重发用尽后同样丢弃，
-		// 只把错误写给客户端。否则用户会先看到一屏重复输出、再看到失败，正是这项
-		// 保护要消除的现象。直接清空缓冲并把闸门标记为已放行，让下面的错误帧照常写出。
-		pending = nil
-		released = true
-	} else if releaseErr := releasePending(); releaseErr != nil {
-		// 其余情况（正常收尾、上游截断等）把压住的帧原样放行，让客户端看到真实行为。
-		return errors.Join(err, releaseErr)
 	}
 	if err == nil {
 		indexes := make([]int, 0, len(state.choices))
@@ -1088,12 +962,6 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		if !errors.As(err, &streamErr) {
 			return err
 		}
-		// 循环命中、尚未放行任何字节、且调用方还会重发 → 客户端什么都没看到，
-		// 这里不写 error 帧与 [DONE]，只把错误标成 Retryable 返回。
-		if retryPending {
-			streamErr.Retryable = true
-			return err
-		}
 		var raw []byte
 		var marshalErr error
 		if len(streamErr.rawFrame) > 0 {
@@ -1115,43 +983,4 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		return errors.Join(err, writeErr)
 	}
 	return err
-}
-
-// WriteStreamError 把一次未交付给客户端的流式失败补写成 SSE error 帧 + [DONE]。
-//
-// 用于 Stream 因「客户端零字节、调用方准备重发」而压制了错误帧、但重发最终没能建立
-// 的场景：那时必须把失败如实交给客户端，不能静默结束。
-// 返回是否真的写出了错误（未写出时调用方应改用普通错误响应）。
-func WriteStreamError(w http.ResponseWriter, err error) bool {
-	var streamErr *StreamError
-	if !errors.As(err, &streamErr) {
-		return false
-	}
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("X-Accel-Buffering", "no")
-	var raw []byte
-	var marshalErr error
-	if len(streamErr.rawFrame) > 0 {
-		var compact bytes.Buffer
-		marshalErr = json.Compact(&compact, streamErr.rawFrame)
-		raw = compact.Bytes()
-	} else {
-		raw, marshalErr = json.Marshal(map[string]any{"error": streamErr.ErrorObject()})
-	}
-	if marshalErr != nil {
-		return false
-	}
-	fl, _ := w.(http.Flusher)
-	if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
-		return false
-	}
-	if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr != nil {
-		return false
-	}
-	if fl != nil {
-		fl.Flush()
-	}
-	return true
 }
