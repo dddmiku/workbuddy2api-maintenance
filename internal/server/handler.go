@@ -61,6 +61,10 @@ type Config struct {
 	// ReasoningLoopGuard is the server default (nil = enabled). An authenticated
 	// key can override it without changing the requested model or reasoning effort.
 	ReasoningLoopGuard *bool
+	// ReasoningLoopStopOnly 命中重复短行时只停止该次请求，不做同账号重发。
+	// 缺省 false = 命中后先在同一账号上重发一次（用户侧无感）；显式 true = 命中即
+	// 停止并如实回报，把是否重试交回调用方。只影响「命中之后怎么办」，不影响检测本身。
+	ReasoningLoopStopOnly bool
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -1165,7 +1169,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//   - 机会用尽 → Stream 按原有方式把错误如实写给客户端，不会出现"既不重发也不报错"。
 			// 重发上限 maxReasoningLoopRetries，避免持续循环时无限重试。
 			for {
-				streamOptions.LoopRetryAvailable = loopRetries < maxReasoningLoopRetries
+				// 单项停止开关打开时不给重发额度：Stream 会把错误如实写给客户端，
+				// handler 这里也就不会进入下面的重发分支。
+				streamOptions.LoopRetryAvailable = !h.cfg.ReasoningLoopStopOnly &&
+					loopRetries < maxReasoningLoopRetries
 				streamErr = upstream.Stream(w, stats, streamOptions)
 				if streamErr == nil || !upstream.IsLoopGuardError(streamErr) ||
 					!errors.As(streamErr, &loopErr) || !loopErr.Retryable ||
@@ -1254,6 +1261,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp, err = upstream.Aggregate(stats, streamOptions)
 			if err == nil || !upstream.IsLoopGuardError(err) ||
 				!errors.As(err, &loopErr) || loopRetries >= maxReasoningLoopRetries ||
+				h.cfg.ReasoningLoopStopOnly ||
 				r.Context().Err() != nil {
 				break
 			}

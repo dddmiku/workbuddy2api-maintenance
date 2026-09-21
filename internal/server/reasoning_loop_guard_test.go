@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：补「单项停止」开关回归：打开时命中循环只停不重发并如实报错，默认仍
+//
+//	同账号重发一次保持用户无感；两种模式都不改账号健康与粘性绑定。
+//
 // 2026-09-20：正文重复短行纳入保护：补「正文循环同账号重发、用户无感」回归，并把
 //
 //	「重复正文放行」的旧断言改为按闸门边界断言（长行立即放行才不重发）。
@@ -38,6 +42,17 @@ func reasoningGuardFrame(delta map[string]any) string {
 
 func reasoningGuardLines(count int) string {
 	return strings.Repeat("checking the same step once more\n", count)
+}
+
+// reasoningGuardDistinctLines 生成 count 条彼此不同的短行。需要「不构成循环」的
+// 场景（例如验证进展会重置窗口）必须用它，不能用 reasoningGuardLines——后者是
+// 同一条短行重复，本身就是循环。
+func reasoningGuardDistinctLines(count int) string {
+	var builder strings.Builder
+	for index := 0; index < count; index++ {
+		fmt.Fprintf(&builder, "distinct reasoning step %04d\n", index)
+	}
+	return builder.String()
 }
 
 func reasoningGuardTool(index int, id, name, arguments string) string {
@@ -289,8 +304,13 @@ func TestReasoningLoopGuardNormalOutputAndProgress(t *testing.T) {
 		fmt.Fprintf(&unique, "different reasoning item %04d\n", i)
 	}
 	longLine := strings.Repeat("推", 12000)
-	before := reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(200)})
-	after := reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(200)})
+	// 重置类用例的每段推理都必须短于检测窗口：这样单独一段永远凑不满窗口，
+	// 「进展会重置窗口」才是唯一的阻断因素。若用满窗口的重复行，保护会在
+	// 进展事件到达之前就命中，测的就不是重置语义了。
+	// 这里写死一个远小于 upstream 包窗口长度（32）的值，避免把内部常量暴露成 API。
+	const half = 8
+	before := reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(half)})
+	after := reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(half)})
 	cases := []struct {
 		name, payload, finish, preserve string
 		tools                           bool
@@ -511,6 +531,70 @@ func TestReasoningLoopGuardNoRetryAfterVisibleOutput(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// TestReasoningLoopGuardStopOnlyDisablesRetry 验证「单项停止」开关：打开后命中循环
+// 只调上游一次，不再同账号重发，并把循环如实回报给客户端。默认（关闭）仍保持用户
+// 无感的重发行为，两种模式都不改变账号健康与粘性绑定。
+func TestReasoningLoopGuardStopOnlyDisablesRetry(t *testing.T) {
+	loopPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"reasoning_content": reasoningGuardLines(400)}), "stop")
+	cleanPayload := reasoningGuardFinish(reasoningGuardFrame(map[string]any{"content": "after-guard-marker"}), "stop")
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, streaming := range []bool{false, true} {
+			for _, stopOnly := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stream=%t/stopOnly=%t", path, streaming, stopOnly), func(t *testing.T) {
+					model := "global:deepseek-v4.1-flash"
+					h, _, bodies, calls, bindings := reasoningGuardFixtureSequence(t, []string{loopPayload, cleanPayload}, model)
+					h.cfg.ReasoningLoopStopOnly = stopOnly
+					beforeFirst, _ := h.cfg.Pool.Status("guard-first")
+					beforeSecond, _ := h.cfg.Pool.Status("guard-second")
+					recorder := httptest.NewRecorder()
+					h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+					if stopOnly {
+						// 只停不重发：客户端必须收到明确的循环错误，而不是静默结束。
+						assertReasoningGuardFailure(t, recorder, path, streaming)
+						if *calls != 1 {
+							t.Errorf("stop-only mode must not retry upstream: calls=%d", *calls)
+						}
+					} else {
+						// 默认模式：第一次循环被丢弃，第二次干净输出，用户无感。
+						output := recorder.Body.String()
+						if recorder.Code != http.StatusOK || strings.Contains(output, `"code":"upstream_reasoning_loop"`) ||
+							!strings.Contains(output, "after-guard-marker") {
+							t.Fatalf("default mode did not retry into a clean success: status=%d", recorder.Code)
+						}
+						if *calls != 2 {
+							t.Errorf("default mode should retry exactly once: calls=%d", *calls)
+						}
+					}
+					afterFirst, firstPresent := h.cfg.Pool.Status("guard-first")
+					afterSecond, secondPresent := h.cfg.Pool.Status("guard-second")
+					if !firstPresent || !secondPresent {
+						t.Fatal("loop guard removed an account from the pool")
+					}
+					if stopOnly {
+						// 只停不重发时，循环不算账号错误，健康度与计数必须原样。
+						assertReasoningGuardAccountUnchanged(t, beforeFirst, afterFirst)
+						assertReasoningGuardAccountUnchanged(t, beforeSecond, afterSecond)
+					} else {
+						// 默认模式重发成功后按正常成功路径记账，只要求账号没有被熔断或禁用。
+						if afterFirst.Disabled || afterFirst.Cooling || afterSecond.Disabled || afterSecond.Cooling ||
+							afterFirst.BreakerFails != 0 || afterSecond.BreakerFails != 0 {
+							t.Errorf("loop retry marked an account unhealthy: first=%+v second=%+v", afterFirst, afterSecond)
+						}
+					}
+					if uid, ok := bindings.lastUID("reasoning-guard-session"); !ok || uid != "guard-first" {
+						t.Error("stop-only switch invalidated the existing sticky binding")
+					}
+					for i, body := range bodies[:min(*calls, len(bodies))] {
+						if body.closed == 0 {
+							t.Errorf("upstream body %d was not closed", i)
+						}
+					}
+				})
+			}
 		}
 	}
 }

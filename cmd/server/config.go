@@ -119,6 +119,11 @@ type Config struct {
 		// SanitizeBlacklistFingerprints 兼容旧配置；已废弃，不再改写任何业务内容。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 		ReasoningLoopGuard            bool `json:"reasoning_loop_guard"`
+		// ReasoningLoopStopOnly 命中重复短行时只停止该次请求，不做同账号重发。
+		// 缺省 false = 命中后先在同一账号上重发一次（用户侧无感，重发仍循环才回报错误）。
+		// 显式 true = 命中即停止并如实回报，把是否重试交回调用方。
+		// 只影响「命中之后怎么办」，不影响检测本身。
+		ReasoningLoopStopOnly bool `json:"reasoning_loop_stop_only"`
 	} `json:"features"`
 
 	Prompt struct {

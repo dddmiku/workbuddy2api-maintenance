@@ -1,4 +1,14 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：修掉「明明在抽风却检测不到」的根因，并取消按推理字符量判定。
+// 旧实现把每一条非空行都算成一个窗口格位，可长行（>32 字符）永远不可能重复，
+// 于是覆盖率被结构性压住：实测两份真实循环里长行分别占 19.2% 与 42.9% 的格位，
+// 覆盖率天花板被压到约 81% 与 57%，95% 这条线只能等整段输出快结束才勉强达标。
+// 现在长行不再占窗口格位，窗口只统计「可重复的短行」，判定纯看重复形态；
+// 窗口同时从 256 行缩到 32 行，命中点从整段的 99% 提前到重复真正开始的时刻。
+// 推理侧的字符下限（8000→5500）一并删除：它只会再造一次「参数挡住检测」的问题。
+// 同时新增代码块防线：``` 围栏内的行（以及围栏标记本身）不进入窗口。实测真实
+// 推理里的代码片段会反复出现 `}`、`status = {`、`...` 这类行，窗口缩短后足以
+// 骗过覆盖率判定；排除围栏后本地 4967 段真实推理零误报，两段真实循环仍命中。
 // 2026-09-21：放宽推理侧的漏检阈值。用户两次反馈「模型明显在抽风，但保护没反应」，
 // 拿到的两份真实推理文本分别只有 5993 与 6663 字符、窗口内 12–13 种短行，正好卡在旧的
 // 8000 字符 / 12 种之外。推理侧下限改为 5500 字符、不同短行上限改为 16；正文侧保持
@@ -30,29 +40,37 @@ const (
 )
 
 const (
-	// reasoningLoopMinChars 是推理侧的字符下限。线上真实的「叙述循环」样本落在
-	// 6000–6700 字符之间（模型反复输出 Let me run. / Let me go. / OK. 之类的短句），
-	// 旧的 8000 会在窗口已经凑满、重复覆盖已经达标时仍然不判定，用户侧表现为
-	// 「明明在抽风，但保护没反应」。5500 覆盖已观测到的全部推理循环形态，同时
-	// 仍高于正常推理前几段短输出的量级。
-	reasoningLoopMinChars = 5500
-	// outputLoopMinChars 是正文侧的字符下限。正文循环（例如整段重复「我执行。」）的
-	// 每一行都很短，判定靠的是 256 行窗口而不是字符量。256 行每行至少 1 个非空白
-	// 字符加一个分隔符，最少也有 511 个字符，因此这个下限不会挡住满窗口的真实循环，
-	// 只是明确表达「正文侧不按字符量判断」。
-	outputLoopMinChars  = 256
-	reasoningLoopWindow = 256
+	// reasoningLoopWindow / outputLoopWindow 是滑动窗口的长度，单位是「可重复的短行」。
+	//
+	// 长行（超过 reasoningLoopMaxRepeatedRunes 的行）不再占窗口格位：它们永远不可能
+	// 与任何东西重复，留在窗口里只会稀释覆盖率。线上两份真实循环里长行分别占 19.2%
+	// 与 42.9% 的非空行，旧语义下覆盖率天花板被压到约 81% 与 57%，95% 这条线要等整段
+	// 输出快结束才勉强达标——这就是「明明在抽风，保护却没反应」的根因。
+	//
+	// 窗口取 32 而不是 256：判定只需要看「最近这一小段是不是在重复」，窗口越短，
+	// 命中越早（实测从整段的 99% 提前到重复真正开始的时刻），内存与耗时也更低。
+	// 32 已经远大于任何正常写作里连续出现同一句短行的长度。
+	reasoningLoopWindow = 32
+	// outputLoopWindow 是正文侧的窗口长度。正文直接面向用户，误截代价高，
+	// 因此比推理侧更长（64 行）以换取更保守的判定。
+	outputLoopWindow = 64
 	// reasoningLoopMaxUnique 是窗口内允许的「不同短行数」上限。真实叙述循环用的
-	// 是十来句口头禅轮换（实测窗口内 12–13 种），旧的 12 会把这些样本卡在门外；
-	// 16 覆盖已观测形态，同时远低于正常推理的不同行数（实测正常样本都在 200+）。
+	// 是十来句口头禅轮换（实测窗口内 12–13 种）；16 覆盖已观测形态，同时远低于
+	// 正常推理的不同行数（实测正常样本都在 200+，几乎不可能撞上）。
 	reasoningLoopMaxUnique = 16
 	// outputLoopMaxUnique 是正文侧的不同短行上限。正文直接面向用户，比推理侧保守，
 	// 沿用放宽前的 12：正文侧另有「一行必须占多数」的要求，两个条件一起把表格、
 	// 状态行这类合法重复挡在外面。
-	outputLoopMaxUnique           = 12
+	outputLoopMaxUnique = 12
+
 	reasoningLoopCoveragePercent  = 95
 	reasoningLoopMaxRepeatedRunes = 32
 	reasoningLoopLineBufferRunes  = 4096
+
+	// reasoningLoopMaxFencedLines 是代码围栏的兜底上限。围栏内的行不进入检测窗口，
+	// 但上游如果输出了一个始终不闭合的 ```，检测就会被无限期关掉。超过这个行数后
+	// 强制退出围栏状态，把后续短行重新纳入检测；正常代码块远达不到这个量级。
+	reasoningLoopMaxFencedLines = 512
 
 	// outputLoopHoldMaxUnique 是正文写出闸门允许压住的「不同短行数」上限。正常回答
 	// 只要出现第 3 种不同的短行就被认定为不是循环并立即放行；真正的循环只有一两种
@@ -166,30 +184,35 @@ func IsLoopGuardError(err error) bool {
 
 type reasoningLineKey struct {
 	digest [sha256.Size]byte
-	unique uint64
 }
 
 type reasoningLoopGuard struct {
 	// output 区分被监控的文本流：false = reasoning_content，true = content。
-	// 只影响字符下限、错误码与文案，检测规则本身一致。
+	// 只影响窗口长度、错误码与文案，检测规则本身一致。
 	output     bool
 	characters int
 	line       []rune
 	overlong   bool
-	// longLine 记录本段是否出现过超过 reasoningLoopMaxRepeatedRunes 的行。超过上限的
-	// 行永远不会被计为重复，因此它的出现就足以证明当前输出不是短行循环。行未结束但
-	// 已超过上限时同样置位，避免「整段无换行」的长正文被一直压住。
+	// longLine 记录本段是否出现过超过 reasoningLoopMaxRepeatedRunes 的行。这类行永远
+	// 不会被计为重复，因此不占窗口格位；它们只用于正文写出闸门的放行判断。
 	longLine bool
 	// blankLine 记录本段是否出现过空行（段落分隔）。已观测到的循环是连续的单行重复，
-	// 没有空行；正常中文回答与代码块常有空行，因此它的出现足以放行。
+	// 没有空行；正常中文回答与代码块常有空行，因此它的出现足以放行正文闸门。
 	blankLine bool
 	nonempty  bool
 	pendingCR bool
-	serial    uint64
-	window    [reasoningLoopWindow]reasoningLineKey
-	position  int
-	size      int
-	counts    map[reasoningLineKey]int
+	// fenced 记录当前行是否位于 ``` 代码围栏内部。围栏内的行（以及围栏标记本身）
+	// 不进入窗口：真实推理里的代码片段会反复出现 `}`、`status = {`、`...` 这类行，
+	// 它们天然重复，但属于合法输出，不是循环。
+	fenced bool
+	// fencedLines 记录当前围栏已经跳过了多少行，用于兜住始终不闭合的围栏。
+	fencedLines int
+	// window 只保存「可重复的短行」。长度由 windowSize() 决定，按流类型取
+	// reasoningLoopWindow 或 outputLoopWindow。
+	window   []reasoningLineKey
+	position int
+	size     int
+	counts   map[reasoningLineKey]int
 }
 
 func (g *reasoningLoopGuard) reset() {
@@ -198,15 +221,18 @@ func (g *reasoningLoopGuard) reset() {
 	g.overlong, g.nonempty, g.pendingCR = false, false, false
 	g.longLine = false
 	g.blankLine = false
-	g.serial = 0
+	g.fenced = false
+	g.fencedLines = 0
+	g.window = g.window[:0]
 	clear(g.counts)
 }
 
-func (g *reasoningLoopGuard) minChars() int {
+// windowSize 返回该流使用的窗口长度（单位：可重复的短行）。
+func (g *reasoningLoopGuard) windowSize() int {
 	if g.output {
-		return outputLoopMinChars
+		return outputLoopWindow
 	}
-	return reasoningLoopMinChars
+	return reasoningLoopWindow
 }
 
 // maxUnique 是窗口内允许的不同短行数上限。推理侧放宽到 16 以覆盖真实叙述循环，
@@ -221,12 +247,12 @@ func (g *reasoningLoopGuard) maxUnique() int {
 // holdOutput 报告正文是否仍可能是「短行循环」，从而必须先压在内存里不发。
 //
 // 压住的意义：命中时客户端还是零字节，可以整段丢弃并在同一账号上重发，用户看不到
-// 那 256 行重复文本。放行条件（任一成立即说明不是这条规则能抓的循环）：
+// 那几十行重复文本。放行条件（任一成立即说明不是这条规则能抓的循环）：
 //   - 出现过超过 32 字符的行——这种行永远不会计为重复；
 //   - 不同短行超过 2 个——正常的列表、代码、表格很快就会超过；
 //   - 出现过空行（段落分隔）——循环不会产生空行。
 //
-// 已结束的行数一旦超过窗口长度，窗口就只反映最近 256 行；此前的行已被移出，因此
+// 已结束的行数一旦超过窗口长度，窗口就只反映最近 64 条短行；此前的行已被移出，因此
 // 不能再用「已结束行数」判断是否还处于不确定区，必须等出现第三种短行或其它上限。
 //
 // 正文从第一帧就压住，而不是等到「看起来重复」再压：只有零字节才谈得上整段重发，
@@ -248,16 +274,16 @@ func (g *reasoningLoopGuard) holdOutput() bool {
 
 // loopError 生成命中错误。正文侧的文案与错误码都与推理侧区分：正文已经可能发给
 // 客户端，调用方需要据此判断「能不能整段重发」。
-func (g *reasoningLoopGuard) loopError(repeated int) *StreamError {
+func (g *reasoningLoopGuard) loopError(repeated, window int) *StreamError {
 	code := ReasoningLoopErrorCode
 	var message string
 	if g.output {
 		code = OutputLoopErrorCode
 		message = fmt.Sprintf("检测到重复输出循环，已停止该次请求；可整理上下文后重试（本段正文%d字符，窗口%d行，唯一行%d，重复覆盖%d/%d）。",
-			g.characters, g.size, len(g.counts), repeated, reasoningLoopWindow)
+			g.characters, g.size, len(g.counts), repeated, window)
 	} else {
 		message = fmt.Sprintf("检测到重复推理循环，已停止该次请求；可整理上下文后重试（本段推理%d字符，窗口%d行，唯一行%d，重复覆盖%d/%d）。",
-			g.characters, g.size, len(g.counts), repeated, reasoningLoopWindow)
+			g.characters, g.size, len(g.counts), repeated, window)
 	}
 	return &StreamError{Code: code, Message: message, Upstream: map[string]any{
 		"code": code, "type": "invalid_request_error", "message": message,
@@ -344,24 +370,51 @@ func (g *reasoningLoopGuard) completeLine() error {
 	}
 	key := reasoningLineKey{}
 	text := ""
-	if !g.overlong {
+	// 超过行缓冲上限的行文本已不再保留，必须在清标记前记住，否则所有超长行都会
+	// 塌缩成空串、互相「重复」，反而制造出假循环。
+	overlong := g.overlong
+	if !overlong {
 		text = strings.TrimFunc(string(g.line), reasoningSpace)
-	}
-	if g.overlong || utf8.RuneCountInString(text) > reasoningLoopMaxRepeatedRunes {
-		// Long lines still occupy the window, but never increase repetition.
-		// Neither their text nor their unbounded length is retained in the detector.
-		g.serial++
-		key.unique = g.serial
-		g.longLine = true
-	} else {
-		key.digest = sha256.Sum256([]byte(text))
 	}
 	g.line = g.line[:0]
 	g.overlong, g.nonempty = false, false
-	if g.counts == nil {
-		g.counts = make(map[reasoningLineKey]int, reasoningLoopWindow)
+
+	if overlong {
+		g.longLine = true
+		return nil
 	}
-	if g.size == reasoningLoopWindow {
+
+	// 代码围栏：标记行本身与围栏内部的行都不进入窗口。围栏内的代码天然带重复
+	// 结构（`}`、`...`、`status = {`），把它们算进覆盖率会误伤正常推理。
+	if strings.HasPrefix(text, "```") {
+		g.fenced = !g.fenced
+		g.fencedLines = 0
+		return nil
+	}
+	if g.fenced {
+		// 兜底：始终不闭合的围栏不能把检测永久关掉。
+		g.fencedLines++
+		if g.fencedLines > reasoningLoopMaxFencedLines {
+			g.fenced = false
+			g.fencedLines = 0
+		}
+		return nil
+	}
+
+	// 长行（含超出行缓冲上限的行）永远不可能与任何东西重复，因此不进入窗口：
+	// 让它们占格位只会稀释覆盖率，把真正的循环挡在判定线之外。它们只用于正文
+	// 写出闸门的「看起来不像循环就放行」判断。
+	if utf8.RuneCountInString(text) > reasoningLoopMaxRepeatedRunes {
+		g.longLine = true
+		return nil
+	}
+	key.digest = sha256.Sum256([]byte(text))
+
+	if g.counts == nil {
+		g.counts = make(map[reasoningLineKey]int, g.windowSize())
+	}
+	size := g.windowSize()
+	if g.size == size {
 		old := g.window[g.position]
 		g.counts[old]--
 		if g.counts[old] == 0 {
@@ -370,10 +423,14 @@ func (g *reasoningLoopGuard) completeLine() error {
 	} else {
 		g.size++
 	}
-	g.window[g.position] = key
-	g.position = (g.position + 1) % reasoningLoopWindow
+	if g.size > len(g.window) {
+		g.window = append(g.window, key)
+	} else {
+		g.window[g.position] = key
+	}
+	g.position = (g.position + 1) % size
 	g.counts[key]++
-	if g.characters < g.minChars() || g.size != reasoningLoopWindow || len(g.counts) > g.maxUnique() {
+	if g.size != size || len(g.counts) > g.maxUnique() {
 		return nil
 	}
 	repeated := 0
@@ -382,7 +439,7 @@ func (g *reasoningLoopGuard) completeLine() error {
 			repeated += count
 		}
 	}
-	if repeated*100 < reasoningLoopCoveragePercent*reasoningLoopWindow {
+	if repeated*100 < reasoningLoopCoveragePercent*size {
 		return nil
 	}
 	// 推理侧：不同短行很少时（两行、三行交替）额外要求一行占主导，避免把表格、状态行
@@ -395,7 +452,7 @@ func (g *reasoningLoopGuard) completeLine() error {
 				top = count
 			}
 		}
-		if top*100 < reasoningLoopMinTopSharePercent*reasoningLoopWindow {
+		if top*100 < reasoningLoopMinTopSharePercent*size {
 			return nil
 		}
 	}
@@ -407,11 +464,11 @@ func (g *reasoningLoopGuard) completeLine() error {
 				top = count
 			}
 		}
-		if top*100 < outputLoopMinTopSharePercent*reasoningLoopWindow {
+		if top*100 < outputLoopMinTopSharePercent*size {
 			return nil
 		}
 	}
-	return g.loopError(repeated)
+	return g.loopError(repeated, size)
 }
 
 func newStreamState(options []StreamOptions) *streamState {

@@ -53,7 +53,8 @@
   },
   "features": {
     "sanitize_blacklist_fingerprints": false,
-    "reasoning_loop_guard": true
+    "reasoning_loop_guard": true,
+    "reasoning_loop_stop_only": false
   },
   "prompt": {
     "mode": "passthrough",

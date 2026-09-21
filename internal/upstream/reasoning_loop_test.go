@@ -21,22 +21,13 @@ import (
 )
 
 func TestReasoningLoopGuardExactCRLFThresholdAcrossChunks(t *testing.T) {
-	// 夹具精确卡在字符下限：每行 8 个「甲」+ CRLF = 10 个计数单位，
-	// reasoningLoopMinChars/10 行正好等于下限，且行数远多于窗口长度。
-	// 判定必须落在最后一行跨分片的换行上，不能提前也不能延后。
-	perLine := 10
-	lines := reasoningLoopMinChars / perLine
-	if lines*perLine != reasoningLoopMinChars {
-		t.Fatalf("threshold is not a whole number of fixture lines: %d", reasoningLoopMinChars)
-	}
-	if lines <= reasoningLoopWindow {
-		t.Fatal("fixture must exceed the detection window")
-	}
-	text := strings.Repeat(strings.Repeat("甲", perLine-2)+"\r\n", lines)
+	// 判定只看重复形态，不再有字符下限：窗口刚凑满 reasoningLoopWindow 条短行时
+	// 就应命中。夹具每条短行都相同，因此判定点正好落在第 reasoningLoopWindow 行
+	// 跨分片的换行上，不能提前也不能延后。
+	perLine := 8
+	lines := reasoningLoopWindow
+	text := strings.Repeat(strings.Repeat("甲", perLine)+"\r\n", lines)
 	runes := []rune(text)
-	if len(runes) != reasoningLoopMinChars {
-		t.Fatalf("fixture must land exactly on the threshold: %d", len(runes))
-	}
 	for _, width := range []int{1, 2, 7, 31, 4096} {
 		t.Run(fmt.Sprint(width), func(t *testing.T) {
 			guard := &reasoningLoopGuard{}
@@ -54,7 +45,7 @@ func TestReasoningLoopGuardExactCRLFThresholdAcrossChunks(t *testing.T) {
 					break
 				}
 			}
-			if !IsReasoningLoopError(observed) || guard.characters != reasoningLoopMinChars || guard.size != reasoningLoopWindow {
+			if !IsReasoningLoopError(observed) || guard.size != reasoningLoopWindow {
 				t.Fatalf("threshold mismatch: chars=%d size=%d err=%v", guard.characters, guard.size, observed)
 			}
 			if strings.Contains(observed.Error(), strings.Repeat("甲", 10)) {
@@ -67,11 +58,11 @@ func TestReasoningLoopGuardExactCRLFThresholdAcrossChunks(t *testing.T) {
 func TestReasoningLoopGuardEOFCompletesLastLogicalLine(t *testing.T) {
 	line := strings.Repeat("x", 32)
 	guard := &reasoningLoopGuard{}
-	if err := guard.add(strings.Repeat(line+"\n", 255) + line); err != nil {
+	if err := guard.add(strings.Repeat(line+"\n", reasoningLoopWindow-1) + line); err != nil {
 		t.Fatalf("unterminated last line was counted too early: %v", err)
 	}
-	if guard.size != 255 || !IsReasoningLoopError(guard.finish()) {
-		t.Fatalf("EOF did not complete the 256th line: size=%d", guard.size)
+	if guard.size != reasoningLoopWindow-1 || !IsReasoningLoopError(guard.finish()) {
+		t.Fatalf("EOF did not complete the final window line: size=%d", guard.size)
 	}
 }
 
@@ -89,7 +80,7 @@ func TestReasoningLoopGuardLongAndDiverseControlsRemainUnchanged(t *testing.T) {
 			if err := guard.finish(); err != nil {
 				t.Fatal(err)
 			}
-			if guard.characters != utf8.RuneCountInString(tc.text) || cap(guard.line) > 4096 || guard.size > 256 || len(guard.counts) > 256 {
+			if guard.characters != utf8.RuneCountInString(tc.text) || cap(guard.line) > 4096 || guard.size > reasoningLoopWindow || len(guard.counts) > reasoningLoopWindow {
 				t.Fatalf("detector lost characters or exceeded its memory bound: chars=%d cap=%d window=%d unique=%d", guard.characters, cap(guard.line), guard.size, len(guard.counts))
 			}
 		})
@@ -99,9 +90,41 @@ func TestReasoningLoopGuardLongAndDiverseControlsRemainUnchanged(t *testing.T) {
 		if err := guard.add(fmt.Sprintf("独立步骤 %d\n", index)); err != nil {
 			t.Fatal(err)
 		}
-		if len(guard.counts) > 256 {
+		if len(guard.counts) > reasoningLoopWindow {
 			t.Fatal("line identities grew beyond the window")
 		}
+	}
+}
+
+// TestReasoningLoopGuardOverlongLinesAreNotCollapsed 回归一个长行处理缺陷：超过行缓冲
+// 上限（4096 字符）的行，其文本在 completeLine 里已经不再保留，若仍按空串取哈希就会
+// 让所有超长行塌缩成同一个「重复行」。这样连续多条长行会被误判成循环。超长行必须和
+// 其它长行一样直接放行，既不进窗口，也不制造重复。
+func TestReasoningLoopGuardOverlongLinesAreNotCollapsed(t *testing.T) {
+	for _, tc := range []struct{ name, text string }{
+		// 每条都超过 4096 字符，但彼此内容不同。
+		{"distinct_overlong_lines", func() string {
+			var builder strings.Builder
+			for index := 0; index < 3*reasoningLoopWindow; index++ {
+				fmt.Fprintf(&builder, "%s-%06d\n", strings.Repeat("长", 4100), index)
+			}
+			return builder.String()
+		}()},
+		// 同一条超长行重复出现：也不该按「重复短行」判定。
+		{"repeated_overlong_line", strings.Repeat(strings.Repeat("长", 4200)+"\n", 200)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			guard := &reasoningLoopGuard{}
+			if err := guard.add(tc.text); err != nil {
+				t.Fatalf("overlong lines were mistaken for a loop: %v", err)
+			}
+			if err := guard.finish(); err != nil {
+				t.Fatalf("EOF finalization turned overlong lines into a loop: %v", err)
+			}
+			if guard.size != 0 || len(guard.counts) != 0 {
+				t.Fatalf("overlong lines entered the repeat window: size=%d unique=%d", guard.size, len(guard.counts))
+			}
+		})
 	}
 }
 
@@ -148,8 +171,14 @@ func (r reasoningGuardCancelledReader) Read(p []byte) (int, error) {
 }
 
 func TestReasoningLoopGuardDoesNotTurnCancellationIntoEOFFinalization(t *testing.T) {
-	line := strings.Repeat("x", 32)
-	partial := reasoningGuardTestFrame(strings.Repeat(line+"\n", 255) + line)
+	// 夹具必须是「各不相同」的短行：这条测试考察的是取消语义，不能顺带命中
+	// 重复保护。最后一行故意不带换行，用来覆盖 EOF 收尾与取消的优先级。
+	var text strings.Builder
+	for index := 0; index < 300; index++ {
+		fmt.Fprintf(&text, "独立推理步骤 %04d\n", index)
+	}
+	text.WriteString("未结束的最后一行")
+	partial := reasoningGuardTestFrame(text.String())
 	options := StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true}
 	_, err := Aggregate(reasoningGuardCancelledReader{strings.NewReader(partial)}, options)
 	if !errors.Is(err, context.Canceled) || IsReasoningLoopError(err) {
@@ -210,18 +239,16 @@ func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 }
 
 // TestReasoningLoopGuardStreamHoldsLateLoop 复现线上观测到的循环形态：先有一段很长的
-// 正常推理，之后才滑进重复短行。判定点在 18000–34000 字符之间，压制必须能撑到那时，
-// 否则客户端先看到重复文本、重发就失去意义。
+// 正常推理（大量各不相同、且混有长行），之后才滑进重复短行。长行不占窗口格位之后，
+// 判定应落在重复真正开始的位置，而不是等整段输出结束。
 func TestReasoningLoopGuardStreamHoldsLateLoop(t *testing.T) {
 	var text strings.Builder
 	for index := 0; index < 2000; index++ {
 		fmt.Fprintf(&text, "分析第 %04d 个独立步骤\n", index)
 	}
+	normalChars := utf8.RuneCountInString(text.String())
 	for index := 0; index < 400; index++ {
 		text.WriteString("检查同一步骤\n")
-	}
-	if chars := utf8.RuneCountInString(text.String()); chars < reasoningLoopMinChars*3 {
-		t.Fatalf("fixture no longer reproduces a late loop: %d characters", chars)
 	}
 	raw := reasoningGuardTestFrame(text.String()) + "data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
@@ -233,6 +260,11 @@ func TestReasoningLoopGuardStreamHoldsLateLoop(t *testing.T) {
 	}
 	if body := rec.Body.String(); body != "" {
 		t.Fatalf("client saw %d bytes before the late-loop retry decision", len(body))
+	}
+	// 判定点必须落在重复开始之后、且远早于整段结束：正常推理部分就有两万多字符，
+	// 如果实现退回到「按字符量判定」，这里会一直等到整段结束才命中。
+	if chars := utf8.RuneCountInString(text.String()); chars <= normalChars {
+		t.Fatalf("fixture no longer reproduces a late loop: %d characters", chars)
 	}
 }
 
@@ -254,15 +286,20 @@ func (r *reasoningGuardSlowReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestReasoningLoopGuardStreamReleasesOnTimeout 验证时间上限：推理量远没到字符上限、
-// 却迟迟没有新内容时，客户端不能一直等下去，到点必须放行并转为实时透传。
+// TestReasoningLoopGuardStreamReleasesOnTimeout 验证时间上限：推理迟迟没有新内容、
+// 也凑不满窗口时，客户端不能一直等下去，到点必须放行并转为实时透传。
 func TestReasoningLoopGuardStreamReleasesOnTimeout(t *testing.T) {
 	previous := ReasoningLoopHoldBackTimeout
 	ReasoningLoopHoldBackTimeout = 40 * time.Millisecond
 	t.Cleanup(func() { ReasoningLoopHoldBackTimeout = previous })
 
-	text := strings.Repeat("还在想\n", 40)
-	raw := reasoningGuardTestFrame(text) + "data: [DONE]\n\n"
+	// 只发少量、彼此不同的短行：凑不满窗口，也不会命中重复保护，
+	// 因此只能靠时间上限放行。
+	var text strings.Builder
+	for index := 0; index < 8; index++ {
+		fmt.Fprintf(&text, "还在想第 %d 个分支\n", index)
+	}
+	raw := reasoningGuardTestFrame(text.String()) + "data: [DONE]\n\n"
 	chunks := make([]string, 0, len(raw))
 	for offset := 0; offset < len(raw); offset += 8 {
 		end := offset + 8
