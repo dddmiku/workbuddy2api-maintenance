@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：新增 features.reasoning_loop_stop_only（命中循环只停不重发），缺省 false；
+//
+//	非法类型或 null 直接拒绝，避免静默改变重发语义。
+//
 // 2026-09-19：重复推理保护默认开启，可由features.reasoning_loop_guard显式关闭；不修改模型或思考档位。
 // 2026-09-19：退役输入倍率配置，合法旧值仅告警并忽略，Responses 恢复上游原始用量。
 // 2026-09-19：校验输入估计倍率的格式与有限范围，防止非法环境变量静默关闭估计或产生负用量。
@@ -271,7 +275,8 @@ func Load(path string) (*Config, error) {
 				InputTokenScale json.RawMessage `json:"input_token_scale"`
 			} `json:"server"`
 			Features struct {
-				ReasoningLoopGuard json.RawMessage `json:"reasoning_loop_guard"`
+				ReasoningLoopGuard    json.RawMessage `json:"reasoning_loop_guard"`
+				ReasoningLoopStopOnly json.RawMessage `json:"reasoning_loop_stop_only"`
 			} `json:"features"`
 		}
 		if err := json.Unmarshal(raw, &retired); err != nil {
@@ -282,6 +287,9 @@ func Load(path string) (*Config, error) {
 		}
 		if strings.TrimSpace(string(retired.Features.ReasoningLoopGuard)) == "null" {
 			return nil, fmt.Errorf("features.reasoning_loop_guard must be true or false")
+		}
+		if strings.TrimSpace(string(retired.Features.ReasoningLoopStopOnly)) == "null" {
+			return nil, fmt.Errorf("features.reasoning_loop_stop_only must be true or false")
 		}
 		legacyScaleConfigured = legacyScaleConfigured || retired.Server.InputTokenScale != nil
 	}
