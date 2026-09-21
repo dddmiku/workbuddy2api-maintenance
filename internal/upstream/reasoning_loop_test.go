@@ -1,9 +1,10 @@
 // ═══ 更新日志 ═══
-// 2026-09-21：保护退回「命中即停止」：去掉写出闸门与可重发断言，改为断言命中后错误帧
-// 如实写出、客户端不会收到成功终态，且正常正文/长推理仍实时透传。
-// 2026-09-20：补正文（content）重复短行的检测回归：正文循环必须被识别并按正文侧
-// 错误码中止；正常正文、长行、多短行必须原样透传。
+// 2026-09-20：补正文（content）重复短行的检测与写出闸门回归：正文循环必须在客户端
+//
+//	零字节时被按住并标记可重发；正常正文、长行、多短行必须实时放行。
+//
 // 2026-09-19：回归短行循环阈值、Unicode/CRLF分片、EOF/取消、模型范围及有界检测内存。
+// 2026-09-20：补「压制期命中→客户端零字节且错误可重发」与「长推理按字符上限放行」两条回归。
 package upstream
 
 import (
@@ -15,14 +16,26 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
 func TestReasoningLoopGuardExactCRLFThresholdAcrossChunks(t *testing.T) {
-	text := strings.Repeat(strings.Repeat("甲", 30)+"\r\n", 64) + strings.Repeat(strings.Repeat("乙", 29)+"\r\n", 192)
+	// 夹具精确卡在字符下限：每行 8 个「甲」+ CRLF = 10 个计数单位，
+	// reasoningLoopMinChars/10 行正好等于下限，且行数远多于窗口长度。
+	// 判定必须落在最后一行跨分片的换行上，不能提前也不能延后。
+	perLine := 10
+	lines := reasoningLoopMinChars / perLine
+	if lines*perLine != reasoningLoopMinChars {
+		t.Fatalf("threshold is not a whole number of fixture lines: %d", reasoningLoopMinChars)
+	}
+	if lines <= reasoningLoopWindow {
+		t.Fatal("fixture must exceed the detection window")
+	}
+	text := strings.Repeat(strings.Repeat("甲", perLine-2)+"\r\n", lines)
 	runes := []rune(text)
-	if len(runes) != 8000 {
-		t.Fatal("fixture no longer reaches the exact character threshold")
+	if len(runes) != reasoningLoopMinChars {
+		t.Fatalf("fixture must land exactly on the threshold: %d", len(runes))
 	}
 	for _, width := range []int{1, 2, 7, 31, 4096} {
 		t.Run(fmt.Sprint(width), func(t *testing.T) {
@@ -41,7 +54,7 @@ func TestReasoningLoopGuardExactCRLFThresholdAcrossChunks(t *testing.T) {
 					break
 				}
 			}
-			if !IsReasoningLoopError(observed) || guard.characters != 8000 || guard.size != 256 {
+			if !IsReasoningLoopError(observed) || guard.characters != reasoningLoopMinChars || guard.size != reasoningLoopWindow {
 				t.Fatalf("threshold mismatch: chars=%d size=%d err=%v", guard.characters, guard.size, observed)
 			}
 			if strings.Contains(observed.Error(), strings.Repeat("甲", 10)) {
@@ -149,32 +162,36 @@ func TestReasoningLoopGuardDoesNotTurnCancellationIntoEOFFinalization(t *testing
 	}
 }
 
-// TestReasoningLoopGuardStreamStopsAndReports 验证「命中即停止」：循环命中时 Stream
-// 把错误码如实写给客户端并结束该次请求，不再压住错误帧等待调用方重发。
-func TestReasoningLoopGuardStreamStopsAndReports(t *testing.T) {
+// TestReasoningLoopGuardStreamHoldsBackUntilRetryDecision 验证写出闸门：命中循环时
+// Stream 在 LoopRetryAvailable 下不向客户端写任何字节，并把错误标成 Retryable，
+// 让 handler 能在同一账号上整段重发而不让用户看到半截推理。
+func TestReasoningLoopGuardStreamHoldsBackUntilRetryDecision(t *testing.T) {
 	text := strings.Repeat(strings.Repeat("x", 32)+"\n", 300)
 	raw := reasoningGuardTestFrame(text) + "data: [DONE]\n\n"
-	options := StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true}
+	options := StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true}
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader(raw), options)
 	if !IsReasoningLoopError(err) {
 		t.Fatalf("guard did not trigger: %v", err)
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, ReasoningLoopErrorCode) {
-		t.Fatalf("loop error was not delivered to the client: %d bytes", len(body))
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("loop error was not marked retryable: %+v", streamErr)
 	}
-	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
-		t.Fatal("loop stop did not close the stream with [DONE]")
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision: %q", len(body), body)
 	}
-	// 命中即停止：不能给客户端一个成功终态，否则调用方会以为这一轮正常结束。
-	if strings.Contains(body, `"finish_reason":"stop"`) {
-		t.Fatal("loop stop emitted a successful finish")
+
+	// 没有重发额度时必须如实回报，不能既不给内容也不给错误。
+	rec = httptest.NewRecorder()
+	err = Stream(rec, strings.NewReader(raw), StreamOptions{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true})
+	if !IsReasoningLoopError(err) || strings.Contains(rec.Body.String(), ReasoningLoopErrorCode) == false {
+		t.Fatalf("exhausted retries did not surface the loop error: %v", err)
 	}
 }
 
-// TestReasoningLoopGuardStreamReleasesLongReasoning 验证长且多样的推理原样透传：
-// 没有写出闸门之后，推理必须实时到达客户端，不能因为启用了保护而被压住。
+// TestReasoningLoopGuardStreamReleasesLongReasoning 验证长推理不会因为保护而无限压制：
+// 纯推理超过压制上限仍未命中时立即放行，客户端能实时看到这段推理。
 func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 	var unique strings.Builder
 	for index := 0; index < 4000; index++ {
@@ -183,7 +200,7 @@ func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 	raw := reasoningGuardTestFrame(unique.String()) + "data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader(raw), StreamOptions{
-		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true})
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
 	if err != nil {
 		t.Fatalf("diverse reasoning was rejected: %v", err)
 	}
@@ -192,10 +209,10 @@ func TestReasoningLoopGuardStreamReleasesLongReasoning(t *testing.T) {
 	}
 }
 
-// TestReasoningLoopGuardStreamStopsLateLoop 复现线上观测到的循环形态：先有一段很长的
-// 正常推理，之后才滑进重复短行。判定点在 18000–34000 字符之间，命中后必须中止并
-// 按推理侧错误码如实回报。
-func TestReasoningLoopGuardStreamStopsLateLoop(t *testing.T) {
+// TestReasoningLoopGuardStreamHoldsLateLoop 复现线上观测到的循环形态：先有一段很长的
+// 正常推理，之后才滑进重复短行。判定点在 18000–34000 字符之间，压制必须能撑到那时，
+// 否则客户端先看到重复文本、重发就失去意义。
+func TestReasoningLoopGuardStreamHoldsLateLoop(t *testing.T) {
 	var text strings.Builder
 	for index := 0; index < 2000; index++ {
 		fmt.Fprintf(&text, "分析第 %04d 个独立步骤\n", index)
@@ -209,12 +226,59 @@ func TestReasoningLoopGuardStreamStopsLateLoop(t *testing.T) {
 	raw := reasoningGuardTestFrame(text.String()) + "data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader(raw), StreamOptions{
-		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true})
-	if !IsReasoningLoopError(err) {
-		t.Fatalf("late loop was not stopped: %v", err)
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsReasoningLoopError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("late loop was not held back for retry: %v", err)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, ReasoningLoopErrorCode) {
-		t.Fatalf("late loop was not reported to the client: %d bytes", len(body))
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the late-loop retry decision", len(body))
+	}
+}
+
+// reasoningGuardSlowReader 每次只交付一小段，并在片段之间停顿，用来复现「想得慢、
+// 每次只吐几个字」的流。
+type reasoningGuardSlowReader struct {
+	chunks []string
+	delay  time.Duration
+	index  int
+}
+
+func (r *reasoningGuardSlowReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	return n, nil
+}
+
+// TestReasoningLoopGuardStreamReleasesOnTimeout 验证时间上限：推理量远没到字符上限、
+// 却迟迟没有新内容时，客户端不能一直等下去，到点必须放行并转为实时透传。
+func TestReasoningLoopGuardStreamReleasesOnTimeout(t *testing.T) {
+	previous := ReasoningLoopHoldBackTimeout
+	ReasoningLoopHoldBackTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { ReasoningLoopHoldBackTimeout = previous })
+
+	text := strings.Repeat("还在想\n", 40)
+	raw := reasoningGuardTestFrame(text) + "data: [DONE]\n\n"
+	chunks := make([]string, 0, len(raw))
+	for offset := 0; offset < len(raw); offset += 8 {
+		end := offset + 8
+		if end > len(raw) {
+			end = len(raw)
+		}
+		chunks = append(chunks, raw[offset:end])
+	}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, &reasoningGuardSlowReader{chunks: chunks, delay: 15 * time.Millisecond}, StreamOptions{
+		Model: "deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	if err != nil {
+		t.Fatalf("slow but valid reasoning was rejected: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "还在想") {
+		t.Fatal("timeout did not release the held-back reasoning")
 	}
 }
 
@@ -244,28 +308,32 @@ func TestOutputLoopGuardDetectsRepeatedContent(t *testing.T) {
 	}
 }
 
-// TestOutputLoopGuardStopsAndReportsContentLoop 验证正文循环命中即停止：错误帧按正文侧
-// 错误码写给客户端，且不附带成功终态。
-func TestOutputLoopGuardStopsAndReportsContentLoop(t *testing.T) {
+// TestOutputLoopGuardHoldsContentUntilRetryDecision 验证正文循环也能整段重发：
+// 命中时客户端必须还是零字节，错误标记 Retryable 供 handler 同账号重发。
+func TestOutputLoopGuardHoldsContentUntilRetryDecision(t *testing.T) {
 	text := strings.Repeat("我执行。\n", 400)
 	raw := outputGuardTestFrame(text) + "data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader(raw), StreamOptions{
-		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
-	if !IsLoopGuardError(err) {
-		t.Fatalf("content loop was not stopped: %v", err)
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsLoopGuardError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("content loop was not held back for retry: %v", err)
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, OutputLoopErrorCode) {
-		t.Fatalf("content loop was not reported to the client: %d bytes", len(body))
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision: %q", len(body), body)
 	}
-	if strings.Contains(body, `"finish_reason":"stop"`) {
-		t.Fatal("content loop stop emitted a successful finish")
+
+	// 没有重发额度时必须如实回报，不能既不给内容也不给错误。
+	rec = httptest.NewRecorder()
+	err = Stream(rec, strings.NewReader(raw), StreamOptions{Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
+	if !IsLoopGuardError(err) || !strings.Contains(rec.Body.String(), OutputLoopErrorCode) {
+		t.Fatalf("exhausted retries did not surface the content loop: %v", err)
 	}
 }
 
-// TestOutputLoopGuardReleasesNormalContent 验证正常正文不被误判：散文、代码块、列表、
-// 表格、单行长文本、短回复都必须原样透传，且不出现循环错误码。
+// TestOutputLoopGuardReleasesNormalContent 验证正文闸门不会拖慢正常回答：散文、代码块、
+// 列表、表格、单行长文本都必须在第一帧之后立刻放行。
 func TestOutputLoopGuardReleasesNormalContent(t *testing.T) {
 	var list strings.Builder
 	for index := 0; index < 400; index++ {
@@ -285,16 +353,13 @@ func TestOutputLoopGuardReleasesNormalContent(t *testing.T) {
 			raw := outputGuardTestFrame(tc.text) + "data: [DONE]\n\n"
 			rec := httptest.NewRecorder()
 			err := Stream(rec, strings.NewReader(raw), StreamOptions{
-				Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
+				Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
 			if err != nil {
 				t.Fatalf("normal content was rejected: %v", err)
 			}
 			// 帧是 JSON，正文里的换行会被转义，因此断言用一个不含换行的片段。
 			if !strings.Contains(rec.Body.String(), tc.needle) {
 				t.Fatal("normal content never reached the client")
-			}
-			if strings.Contains(rec.Body.String(), OutputLoopErrorCode) {
-				t.Fatal("normal content was reported as a loop")
 			}
 		})
 	}
@@ -316,10 +381,16 @@ func TestOutputLoopGuardIgnoresNonTargetModel(t *testing.T) {
 	}
 }
 
-// TestOutputLoopGuardPassesAmbiguousShortLines 验证「两行交替重复」不会被误截：每行
-// 8 个字符、只有两种短行交替，没有任何一行占多数（各 50%，低于正文侧的 75% 门槛），
-// 必须原样透传。这条边界不能因为退回单项停止而放松。
-func TestOutputLoopGuardPassesAmbiguousShortLines(t *testing.T) {
+// TestOutputLoopGuardReleasesOnContentTimeout 验证正文压制期有独立的时间上限：一段
+// 没有换行、始终只有一两种短行的输出既不可能构成短行循环，也不该被压到推理侧的
+// 60 秒上限。到点必须放行，客户端能看到这段正文。
+func TestOutputLoopGuardReleasesOnContentTimeout(t *testing.T) {
+	previous := ContentLoopHoldBackTimeout
+	ContentLoopHoldBackTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { ContentLoopHoldBackTimeout = previous })
+
+	// 每行 8 个字符、只有两种短行交替：不会命中（没有占多数的一行），也不会因为长行、
+	// 空行或第三种短行而放行，只能靠时间上限出去。
 	var text strings.Builder
 	for index := 0; index < 200; index++ {
 		if index%2 == 0 {
@@ -329,23 +400,36 @@ func TestOutputLoopGuardPassesAmbiguousShortLines(t *testing.T) {
 		}
 	}
 	raw := outputGuardTestFrame(text.String()) + "data: [DONE]\n\n"
+	chunks := make([]string, 0, len(raw))
+	for offset := 0; offset < len(raw); offset += 64 {
+		end := offset + 64
+		if end > len(raw) {
+			end = len(raw)
+		}
+		chunks = append(chunks, raw[offset:end])
+	}
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader(raw), StreamOptions{
-		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
+	err := Stream(rec, &reasoningGuardSlowReader{chunks: chunks, delay: 8 * time.Millisecond}, StreamOptions{
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
 	if err != nil {
 		t.Fatalf("ambiguous but non-looping content was rejected: %v", err)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "思考中") || strings.Contains(body, OutputLoopErrorCode) {
-		t.Fatalf("ambiguous short lines were mishandled: %d bytes", len(body))
+	if !strings.Contains(rec.Body.String(), "思考中") {
+		t.Fatal("content timeout did not release the held-back content")
 	}
 }
 
-// TestReasoningLoopGuardStopsThroughTinyFrames 复现线上真实的碎帧形态：上游把推理切成
-// 约 220 字节的小帧、每帧只带一两个字符（实测 124–222 字节/字符）。检测按字符与行计数，
-// 不受分帧粒度影响：两万多字符处滑进重复短行后，必须命中并按推理侧错误码中止。
-func TestReasoningLoopGuardStopsThroughTinyFrames(t *testing.T) {
+// TestReasoningLoopGuardHoldsThroughTinyFrames 复现线上真实的碎帧形态：上游把推理切成
+// 约 220 字节的小帧、每帧只带一两个字符（实测 124–222 字节/字符）。此时字节上限比字符
+// 上限更早触发，2 MiB 只折合一万多字符——缓冲会在 256 行窗口凑满之前放行，客户端先看到
+// 一屏重复文本、再收到 422，重发保护形同虚设。这正是 devin 那把密钥反复断流的原因。
+//
+// 夹具前半是一条极长的「非重复」推理（单字符帧，永不构成 256 行重复窗口），后半是重复
+// 短行。判定点落在两万多字符，字节量已超过旧的 2 MiB 上限，但远低于新的字符上限 64K。
+func TestReasoningLoopGuardHoldsThroughTinyFrames(t *testing.T) {
 	var payload strings.Builder
-	// 前半：32000 个单字符帧，拼成一条长行，永远不会被计为重复，不会提前触发判定。
+	// 前半：32000 个单字符帧。每帧约 70 字节，因此这部分已经超过 2 MiB；单字符
+	// 拼成一条长行，永远不会被计为重复，不会提前触发判定。
 	for index := 0; index < 32000; index++ {
 		payload.WriteString(reasoningGuardTestFrame(string(rune('a' + index%26))))
 	}
@@ -355,13 +439,18 @@ func TestReasoningLoopGuardStopsThroughTinyFrames(t *testing.T) {
 		payload.WriteString(reasoningGuardTestFrame("\n"))
 	}
 	raw := payload.String() + "data: [DONE]\n\n"
+	// 夹具必须超过旧的 2 MiB 上限，否则它测不到这个回归。
+	if len(raw) <= 2<<20 {
+		t.Fatalf("fixture must exceed the previous 2 MiB byte cap: %d bytes", len(raw))
+	}
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader(raw), StreamOptions{
-		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
-	if !IsLoopGuardError(err) {
-		t.Fatalf("tiny-frame loop was not stopped: %v", err)
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
+	var streamErr *StreamError
+	if !IsLoopGuardError(err) || !errors.As(err, &streamErr) || !streamErr.Retryable {
+		t.Fatalf("tiny-frame loop was not held back for retry: %v", err)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, ReasoningLoopErrorCode) {
-		t.Fatalf("tiny-frame loop was not reported to the client: %d bytes", len(body))
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision", len(body))
 	}
 }

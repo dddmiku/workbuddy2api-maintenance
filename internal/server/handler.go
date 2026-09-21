@@ -43,6 +43,11 @@ import (
 	"workbuddy2api/internal/version"
 )
 
+// maxReasoningLoopRetries 单请求内「重复推理循环 + 客户端零字节」的同账号重发上限。
+// 循环是上游模型行为，重发一次通常就能拿到干净的一轮；持续循环时必须收手并如实
+// 回报错误，不能无限重试。
+const maxReasoningLoopRetries = 1
+
 // Config handler 依赖。
 type Config struct {
 	Pool      *pool.Pool
@@ -823,6 +828,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	tried := map[string]bool{}
 	var lastErr error
+	// loopRetries 统计本次请求内「重复推理循环 + 客户端零字节」的重发次数（同账号重发）。
+	// 上限见 maxReasoningLoopRetries：循环是上游模型行为，重发通常能拿到干净的一轮，
+	// 但持续循环时必须收手并如实回报错误，不能无限重试。
+	loopRetries := 0
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
@@ -1013,8 +1022,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var status int
 		var respBody []byte
 		var terr error
-		// 同一账号内的重发轮次：仅 14017 注册地补交走这里（补交是配置修复，修完同号即可用）。
-		// 重复短行保护不在此列：命中即中止该次请求并如实回报错误码，不重发。
+		// 同一账号内的重发轮次：14017 注册地补交（一次）与重复推理循环（有界）都走这里。
+		// 循环重发必须是**同一个账号**：换号会丢掉刚建立的上下文缓存，而循环是模型行为、
+		// 与账号无关，换号解决不了问题。
 		regionRepaired := false
 		for {
 			st.upstreamStarted = true
@@ -1148,10 +1158,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
+			var streamErr error
 			var loopErr *upstream.StreamError
-			// 重复短行保护命中即停止：Stream 已经写完 error 帧与 [DONE] 并返回错误，
-			// 这里只如实记录失败结果，不再在同一账号上重发。
-			streamErr := upstream.Stream(w, stats, streamOptions)
+			// 同一账号内的循环重发循环。每轮先告诉 Stream「还剩几次重发机会」：
+			//   - 还有机会 → 命中循环且客户端零字节时 Stream 不写任何字节，返回 Retryable；
+			//   - 机会用尽 → Stream 按原有方式把错误如实写给客户端，不会出现"既不重发也不报错"。
+			// 重发上限 maxReasoningLoopRetries，避免持续循环时无限重试。
+			for {
+				streamOptions.LoopRetryAvailable = loopRetries < maxReasoningLoopRetries
+				streamErr = upstream.Stream(w, stats, streamOptions)
+				if streamErr == nil || !upstream.IsLoopGuardError(streamErr) ||
+					!errors.As(streamErr, &loopErr) || !loopErr.Retryable ||
+					loopRetries >= maxReasoningLoopRetries || r.Context().Err() != nil {
+					break
+				}
+				// 被丢弃的这一轮上游确实生成并计费了（保护是在读到循环后才截断的），
+				// 用量照实累计，不能因为重发就把它抹掉。
+				st.absorbUsage(stats)
+				rc.Close()
+				loopRetries++
+				log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
+					loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
+				// 重发前重建读取器与用量观测：上一次被截断的观测已随重发作废，
+				// 只保留客户端最终真正收到的那一轮用量。
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+				if terr != nil || status >= 400 {
+					// 重发没能建立（传输层失败或上游直接报错）：Stream 已经压制了上一次
+					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
+					if !upstream.WriteStreamError(w, streamErr) {
+						writeOpenAIError(w, http.StatusBadGateway, loopErrorCode(streamErr), streamErr.Error())
+					}
+					st.unreported = true
+					st.status = http.StatusBadGateway
+					if r.Context().Err() != nil {
+						st.status = 499
+					}
+					return
+				}
+				st.upstreamStarted = true
+				stats = newChatStatsReaderSince(rc, st.start)
+			}
 			if checker, ok := w.(interface{ CompletionError() error }); ok && streamErr == nil {
 				streamErr = checker.CompletionError()
 			}
@@ -1199,8 +1245,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		// 非流式：Aggregate 读完才返回；循环命中直接回 422，不做同账号重发。
-		resp, err := upstream.Aggregate(stats, streamOptions)
+		// 非流式同理：Aggregate 只在**读完**之后才返回，出错时客户端一个字节都没收到，
+		// 因此循环命中也能在同一账号上重发，用户同样无感。
+		var resp map[string]any
+		var err error
+		var loopErr *upstream.StreamError
+		for {
+			resp, err = upstream.Aggregate(stats, streamOptions)
+			if err == nil || !upstream.IsLoopGuardError(err) ||
+				!errors.As(err, &loopErr) || loopRetries >= maxReasoningLoopRetries ||
+				r.Context().Err() != nil {
+				break
+			}
+			// 同流式：被丢弃的那一轮上游已经产生并计费，用量照实累计。
+			st.absorbUsage(stats)
+			rc.Close()
+			loopRetries++
+			log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
+				loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			if terr != nil || status >= 400 {
+				// 重发没能建立：把失败如实回报，不能静默结束。
+				st.unreported = true
+				st.status = http.StatusBadGateway
+				writeOpenAIError(w, st.status, loopErrorCode(err), err.Error())
+				if r.Context().Err() != nil {
+					st.status = 499
+				}
+				return
+			}
+			st.upstreamStarted = true
+			stats = newChatStatsReaderSince(rc, st.start)
+		}
 		st.absorbUsage(stats)
 		rc.Close()
 		if err != nil {

@@ -1,5 +1,4 @@
 // ═══ 更新日志 ═══
-// 2026-09-21：保护退回「命中即停止」，夹具改为断言错误码与计数，不再断言可重发标记。
 // 2026-09-20：用线上真实抓包的循环字节做回归，替代纯合成夹具，锁定「正文循环」形态。
 package upstream
 
@@ -22,20 +21,22 @@ func TestOutputLoopGuardRealCaptureFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("real capture fixture missing: %v", err)
 	}
-	// 真实循环必须在读到正文循环时命中，并按正文侧错误码中止这次请求。
+	// 闸门必须在客户端零字节时命中，才能整段丢弃并在同账号上重发。
 	rec := httptest.NewRecorder()
 	streamErr := Stream(rec, strings.NewReader(string(raw)), StreamOptions{
-		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true})
+		Model: "global:deepseek-v4.1-flash", ReasoningLoopGuard: true, LoopRetryAvailable: true})
 	var detailed *StreamError
 	if !errors.As(streamErr, &detailed) || detailed.Code != OutputLoopErrorCode {
 		t.Fatalf("real capture did not trip the content guard: %v", streamErr)
 	}
+	if !detailed.Retryable {
+		t.Fatal("real capture was not held back for a same-account retry")
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("client saw %d bytes before the retry decision", len(body))
+	}
 	// 错误信息里只能有计数，不能回显那串重复正文。
 	if strings.Contains(streamErr.Error(), "我执行") {
 		t.Fatal("real capture error exposed output text")
-	}
-	// 命中即停止：客户端只收到一次明确的循环错误，不会拿到成功终态。
-	if body := rec.Body.String(); !strings.Contains(body, OutputLoopErrorCode) {
-		t.Fatalf("client was not told about the content loop: %d bytes", len(body))
 	}
 }
