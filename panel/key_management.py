@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
-# 2026-09-22：api_keys_file 未配置时按默认路径解析（与网关同口径），修掉新装用户
-#             照抄 config.example.json 时密钥页报「密钥管理尚未启用」。
+# 2026-09-22：密钥管理默认启用——api_keys_file 留空（含历史示例里的空串）时按默认
+#             路径解析，只有显式 api_keys_enabled=false 才关闭；修掉新装用户照抄
+#             config.example.json 时密钥页报「密钥管理尚未启用」、建不了密钥。
 # 2026-09-16：通过权限受限的本机 Unix socket 调用网关管理接口，避免使用可分发的调用密钥作为管理凭证。
 """Private transport shared by the authenticated panel and gateway."""
 
@@ -30,20 +31,23 @@ def socket_path(config_path, base):
 
 
 def _api_keys_file(config):
-    """解析生效的密钥库路径；None/空串表示多密钥管理未启用。
+    """解析生效的密钥库路径；None 表示多密钥管理被显式关闭。
 
     与网关 applyAPIKeysDefault 保持同一口径：
-    - 显式写了路径 → 用它；
-    - 显式写 "" → 管理员主动关闭；
-    - 没写（或 null）→ 默认启用，但仅当 api_key 非空。api_key 也为空时网关会
-      保持旧的不鉴权模式（否则空密钥库会把原本免鉴权的部署锁成全部 401），
-      面板必须跟着报「未启用」，不能显示成可用。
+    - 显式 `api_keys_enabled=false` → 关闭；
+    - 写了路径 → 用它；
+    - 其余（没写、写空串、null）→ 默认路径。
+
+    空串按「没配」处理是有意的：历史 config.example.json 里这一项就是空串，
+    照抄它的部署很多，把它当成关闭信号正是「密钥管理尚未启用」这条提示的来源。
+    启动时库里一把密钥都没有不是问题，用户随后在面板里创建即可。
     """
-    if "api_keys_file" in config and config["api_keys_file"] is not None:
-        return config["api_keys_file"]
-    if str(config.get("api_key") or "").strip():
-        return DEFAULT_API_KEYS_FILE
-    return None
+    if config.get("api_keys_enabled") is False:
+        return None
+    path = config.get("api_keys_file")
+    if isinstance(path, str) and path.strip():
+        return path
+    return DEFAULT_API_KEYS_FILE
 
 
 def request(path, method, endpoint, body=None, timeout=15):

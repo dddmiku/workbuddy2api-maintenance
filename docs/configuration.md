@@ -8,7 +8,8 @@
 |---|---|---|
 | `listen` | `:7863` | 容器内监听地址；宿主机映射由 Compose 控制 |
 | `api_key` | 空 | 单密钥模式的调用密钥；多密钥模式首次建库时用于迁移 |
-| `api_keys_file` | `./data/api_keys.json` | 持久化密钥库路径，默认启用；显式写 `""` 关闭多密钥管理 |
+| `api_keys_file` | `./data/api_keys.json` | 持久化密钥库路径；留空即用默认值 |
+| `api_keys_enabled` | `true` | 密钥管理总开关；显式写 `false` 才关闭，回到单密钥 / 免鉴权模式 |
 | `api_keys_socket` | 密钥库同目录下 `api_keys.sock` | 多密钥管理通道 |
 | `usage_file` | 密钥库同目录下 `usage.json`（无密钥库时为不启用） | 按 API key 累计的 token 用量账本 |
 | `auth_dir` | `./auths` | 启动时加载 `workbuddy*.json` |
@@ -113,11 +114,9 @@
 
 ## 单密钥与多密钥
 
-持久化密钥库默认启用，路径 `./data/api_keys.json`。没写 `api_keys_file` 时按这个默认值走，管理台可以直接建密钥，不需要先改配置。
+持久化密钥库默认启用，路径 `./data/api_keys.json`。`api_keys_file` 留空（包括没写这一项、写成空串、写成 `null`）都按这个默认值走，管理台可以直接建密钥，不需要先改配置。**启动时库里一把密钥都没有是正常状态**：库文件会自动创建，用户随后在管理台创建第一把即可。
 
-只有一种情况例外：既没写 `api_keys_file`、`api_key` 也是空的。这种部署本来完全不做普通 HTTP 鉴权，套上默认值会建出一个空密钥库，而空库拒绝一切调用——等于把免鉴权的部署静默锁死成全 401。因此这一组合保持原样，并在启动日志里给出提示；需要密钥功能时显式写上 `api_keys_file` 即可。
-
-显式写 `"api_keys_file": ""` 是主动关闭多密钥管理，不会被默认值覆盖回来。关闭后 `api_key` 为空即关闭普通 HTTP 鉴权。
+要关闭密钥管理只有一种写法：显式 `"api_keys_enabled": false`。此时回到单密钥模式（`api_key` 非空）或免鉴权模式（`api_key` 也为空）。之所以不用「把 `api_keys_file` 写成空串」当关闭信号，是因为历史 `config.example.json` 里这一项就是空串，照抄它的部署很多——把空串解释成关闭，这些用户就会继续看到「密钥管理尚未启用」而建不了密钥。
 
 启用密钥库后由它负责鉴权：
 
@@ -134,6 +133,15 @@
 {
   "api_keys_file": "./data/api_keys.json",
   "api_keys_socket": "./data/api_keys.sock"
+}
+```
+
+不需要密钥库的部署：
+
+```json
+{
+  "api_keys_enabled": false,
+  "api_key": "自己的调用密钥"
 }
 ```
 

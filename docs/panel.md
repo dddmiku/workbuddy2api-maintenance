@@ -164,7 +164,7 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | 现象 | 处理 |
 |---|---|
 | 页面返回 502 / 连接被拒绝 | `docker compose ps` 看 `wb2api-admin` 是否运行；`docker compose logs wb2api-admin` 看启动错误 |
-| 密钥页提示未启用 | 密钥库默认启用，正常不该出现。先确认 `config.json` 没有显式写 `"api_keys_file": ""`，再确认 `data/api_keys.sock` 存在（网关重启后才会创建）。只有「没写 `api_keys_file` 且 `api_key` 也为空」的免鉴权部署会保持关闭 |
+| 密钥页提示未启用 | 密钥库默认启用，正常不该出现。先确认 `config.json` 没有显式写 `"api_keys_enabled": false`，再确认 `data/api_keys.sock` 存在（网关重启后才会创建）。空串路径不再表示关闭 |
 | 添加账号后网关看不到 | 检查 `auths/` 文件属主是否为 `10001:10001`；面板会自行 chown，手工拷入的文件需自行处理 |
 | 登录一直失败 | 连续失败 6 次会锁定 5 分钟。若代理不在默认私网网段内，需把它的网段加进 `WB2API_TRUSTED_PROXIES`，否则所有人共用一个限流桶；反之代理不在列表里时转发头会被忽略，属预期行为 |
 | 忘记管理员密码 | 删除 `panel-data/credentials.json` 后重启容器，会重新继承 htpasswd 或生成新的初始密码 |

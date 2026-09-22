@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
-# 2026-09-22：密钥管理默认启用：api_keys_file 未配置时按默认路径解析，不再对新装
-#             用户报「密钥管理尚未启用」（口径与网关 applyAPIKeysDefault 一致）。
+# 2026-09-22：密钥管理默认启用：api_keys_file 留空也按默认路径解析，只有显式
+#             api_keys_enabled=false 才关闭；修掉新装用户建不了密钥的问题。
 # 2026-09-22：模型绑定收紧为「完整模型名逐字相等」，创建与编辑都在表单侧拒掉裸名，
 #             与网关的写入校验对齐（绑定必须是 cn:/global: 开头的完整模型名）。
 # 2026-09-22：登录限流分桶只采信可信代理（WB2API_TRUSTED_PROXIES）转发的 IP，
@@ -101,7 +101,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.20"
+PANEL_VERSION = "2.1.21"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

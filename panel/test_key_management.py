@@ -269,27 +269,39 @@ class KeyManagementDefaultTests(unittest.TestCase):
         handle.close()
         return handle.name
 
-    def test_missing_field_defaults_to_enabled_when_api_key_present(self):
+    def test_missing_field_defaults_to_enabled(self):
         """核心回归：没写 api_keys_file 也要能管理密钥（此前直接报未启用）。"""
-        path = self.write_config({"api_key": "k"})
-        self.assertEqual(key_management.socket_path(path, "/srv"),
-                         os.path.normpath("/srv/data/api_keys.sock"))
+        for payload in ({"api_key": "k"}, {"listen": ":9999"}, {}):
+            with self.subTest(payload=payload):
+                path = self.write_config(payload)
+                self.assertEqual(key_management.socket_path(path, "/srv"),
+                                 os.path.normpath("/srv/data/api_keys.sock"))
 
     def test_explicit_path_wins(self):
         path = self.write_config({"api_keys_file": "./custom/keys.json"})
         self.assertEqual(key_management.socket_path(path, "/srv"),
                          os.path.normpath("/srv/custom/api_keys.sock"))
 
-    def test_explicit_empty_stays_disabled(self):
-        """显式空串是管理员的主动关闭动作，默认值不能把它覆盖回启用。"""
-        path = self.write_config({"api_keys_file": "", "api_key": "k"})
+    def test_explicit_empty_still_enables(self):
+        """空串按「没配」处理：历史 config.example.json 里就是空串，照抄它的部署
+        很多，把它当成关闭信号正是「密钥管理尚未启用」这条提示的来源。"""
+        for payload in ({"api_keys_file": "", "api_key": "k"},
+                        {"api_keys_file": ""},
+                        {"api_keys_file": "   "}):
+            with self.subTest(payload=payload):
+                path = self.write_config(payload)
+                self.assertEqual(key_management.socket_path(path, "/srv"),
+                                 os.path.normpath("/srv/data/api_keys.sock"))
+
+    def test_enabled_false_disables(self):
+        """显式关闭是唯一能让密钥库不启用的写法。"""
+        path = self.write_config({"api_keys_enabled": False, "api_key": "k"})
         self.assertIsNone(key_management.socket_path(path, "/srv"))
 
-    def test_open_auth_deployment_stays_disabled(self):
-        """既没密钥库也没 api_key = 本来免鉴权。网关会保持原样，面板必须跟着报未启用，
-        否则会引导用户去建一个空密钥库，把原本开放的部署锁成全部 401。"""
-        path = self.write_config({"listen": ":9999"})
-        self.assertIsNone(key_management.socket_path(path, "/srv"))
+    def test_enabled_true_keeps_default_path(self):
+        path = self.write_config({"api_keys_enabled": True})
+        self.assertEqual(key_management.socket_path(path, "/srv"),
+                         os.path.normpath("/srv/data/api_keys.sock"))
 
     def test_null_treated_as_unset(self):
         """显式 null 与「没写」同义，走默认启用。"""

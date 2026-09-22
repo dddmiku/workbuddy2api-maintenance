@@ -1,6 +1,6 @@
 {
   "listen": ":7863",
-  "api_key": "test_key",
+  "api_key": "",
   "api_keys_file": "./data/api_keys.json",
   "api_keys_socket": "./data/api_keys.sock",
   "usage_file": "",

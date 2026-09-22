@@ -1,8 +1,9 @@
 // ═══ 更新日志 ═══
-// 2026-09-22：密钥管理默认启用：api_keys_file 缺省走 ./data/api_keys.json，修掉新装
+// 2026-09-22：密钥管理默认启用：api_keys_file 留空（含历史示例里的空串）都走
 //
-//	用户照抄 config.example.json 时管理台报「密钥管理尚未启用」；显式空串仍关闭，
-//	且「没写 api_keys_file + api_key 也为空」的免鉴权部署保持原样不被锁死。
+//	./data/api_keys.json，修掉新装用户照抄 config.example.json 时管理台报
+//	「密钥管理尚未启用」而建不了密钥。启动时库里 0 把是正常起点；只有显式
+//	api_keys_enabled=false 才关闭。
 //
 // 2026-09-22：新增 features.reasoning_loop_stop_only（命中循环只停不重发），缺省 false；
 //
@@ -46,8 +47,12 @@ const DefaultAPIKeysFile = "./data/api_keys.json"
 type Config struct {
 	Listen        string `json:"listen"`          // ":7863"
 	APIKey        string `json:"api_key"`         // 空 = 不鉴权
-	APIKeysFile   string `json:"api_keys_file"`   // 密钥库路径；缺省用 DefaultAPIKeysFile（默认启用），显式 "" 表示关闭多密钥管理。
+	APIKeysFile   string `json:"api_keys_file"`   // 密钥库路径；留空即用 DefaultAPIKeysFile（密钥管理默认启用）。
 	APIKeysSocket string `json:"api_keys_socket"` // 本机管理 socket，默认位于密钥文件同目录。
+	// APIKeysEnabled 是否启用持久化密钥库。缺省（未写）为 true——库里可以一把密钥
+	// 都没有，那是正常起点，用户随后在管理台创建即可；「没有密钥」不等于「关掉功能」。
+	// 显式 false 才回到单密钥 / 免鉴权模式。
+	APIKeysEnabled *bool `json:"api_keys_enabled"`
 	// UsageFile 按调用密钥累计的 token 用量账本；留空且启用了密钥库时默认落在
 	// 密钥文件同目录的 usage.json。空 + 无密钥库 = 不记账（/usage 报未启用）。
 	UsageFile string `json:"usage_file"`
@@ -281,7 +286,6 @@ func updateDir(c *Config) string {
 func Load(path string) (*Config, error) {
 	c := Default()
 	legacyScaleConfigured := os.Getenv("WB2A_INPUT_TOKEN_SCALE") != ""
-	apiKeysFileConfigured := false
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -290,17 +294,6 @@ func Load(path string) (*Config, error) {
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
-		// 这一项是否在文件里显式出现，决定默认值能不能兜底（见 applyAPIKeysDefault）。
-		// 用 RawMessage 而不是 string，才能把「没写」「显式 null」与「显式写空串」
-		// 区分开：前两者按未配置处理，后者是管理员主动关闭。
-		var keyPresence struct {
-			APIKeysFile json.RawMessage `json:"api_keys_file"`
-		}
-		if err := json.Unmarshal(raw, &keyPresence); err != nil {
-			return nil, fmt.Errorf("parse api_keys_file presence: %w", err)
-		}
-		apiKeysFileConfigured = len(strings.TrimSpace(string(keyPresence.APIKeysFile))) > 0 &&
-			strings.TrimSpace(string(keyPresence.APIKeysFile)) != "null"
 		var retired struct {
 			Server struct {
 				InputTokenScale json.RawMessage `json:"input_token_scale"`
@@ -327,7 +320,7 @@ func Load(path string) (*Config, error) {
 	if err := applyEnv(c); err != nil {
 		return nil, err
 	}
-	applyAPIKeysDefault(c, apiKeysFileConfigured)
+	applyAPIKeysDefault(c)
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -337,27 +330,26 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
-// applyAPIKeysDefault 决定「配置文件没写 api_keys_file」时要不要走默认启用。
+// applyAPIKeysDefault 决定要不要走默认的密钥库路径。
 //
-// 默认启用是为了让新装用户不必再手工加这一段就能在管理台建密钥。但有一类既有
-// 部署必须原样保留：既没配密钥库、也没配 api_key，也就是完全不做普通 HTTP 鉴权
-// （见 docs/configuration.md「单密钥与多密钥」）。若把默认值套上去，网关会新建
-// 一个空密钥库，而空库拒绝一切调用——等于把「本来免鉴权」的部署静默锁死成全 401。
-// 所以只有「没写 api_keys_file 但写了 api_key」才启用默认路径，此时 api_key 会
-// 作为既有密钥迁移进库里，原有客户端继续可用。
-func applyAPIKeysDefault(c *Config, configured bool) {
-	if configured || c.APIKeysFile == "" {
-		return
-	}
-	if strings.TrimSpace(c.APIKey) == "" {
+// 规则很简单：没写 api_keys_enabled 或写了 true 就启用，路径为空时落到默认位置。
+// 启动时库里一把密钥都没有是正常状态——用户随后在管理台创建即可，「还没有密钥」
+// 不等于「关掉密钥功能」。只有显式写 `"api_keys_enabled": false` 才回到单密钥 /
+// 免鉴权模式。
+//
+// 这里刻意不再把「api_keys_file 为空」当成关闭信号：历史 config.example.json 里
+// 这一项就是空串，照抄它的部署很多，把空串解释成关闭会让这些用户继续看到
+// 「密钥管理尚未启用」而建不了密钥，正是这次要修的问题。
+func applyAPIKeysDefault(c *Config) {
+	if c.APIKeysEnabled != nil && !*c.APIKeysEnabled {
 		c.APIKeysFile = ""
-		log.Printf("WARN: [config] 未配置 api_keys_file 与 api_key，保持不鉴权模式；" +
-			"如需管理台密钥功能，请显式设置 api_keys_file（例如 ./data/api_keys.json）")
+		log.Printf("[config] api_keys_enabled=false，不启用持久化密钥库")
 		return
 	}
-	c.APIKeysFile = DefaultAPIKeysFile
-	log.Printf("[config] api_keys_file 未配置，按默认启用：%s（现有 api_key 将迁移为库内密钥）",
-		c.APIKeysFile)
+	if strings.TrimSpace(c.APIKeysFile) == "" {
+		c.APIKeysFile = DefaultAPIKeysFile
+	}
+	log.Printf("[config] 密钥管理已启用：%s", c.APIKeysFile)
 }
 
 func applyEnv(c *Config) error {

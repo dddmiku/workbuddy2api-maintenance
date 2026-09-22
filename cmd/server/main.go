@@ -343,7 +343,13 @@ func main() {
 				log.Printf("[api-keys] admin server: %v", err)
 			}
 		}()
-		log.Printf("API key management enabled (%d keys)", len(keyStore.List()))
+		// 库里 0 把密钥是全新部署的正常起点：库文件已建好，用户在管理台创建第一把
+		// 即可。日志里点明这一点，免得运维看到 0 以为功能没开。
+		if count := len(keyStore.List()); count == 0 {
+			log.Printf("API key management enabled (0 keys); create the first key in the admin console")
+		} else {
+			log.Printf("API key management enabled (%d keys)", count)
+		}
 	}
 	shutdownAdmin := func(ctx context.Context) error {
 		adminMu.Lock()

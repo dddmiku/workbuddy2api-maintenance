@@ -20,33 +20,49 @@ func TestDefault(t *testing.T) {
 	}
 }
 
-// TestAPIKeysDefaultEnabled 锁定密钥管理默认启用：配置文件没写 api_keys_file、
-// 但配了 api_key 时，网关应落到默认密钥库路径，管理台才不会报「密钥管理尚未启用」。
+// TestAPIKeysDefaultEnabled 锁定密钥管理默认启用：配置文件里没有可用的 api_keys_file
+// 时都落到默认路径，管理台才不会报「密钥管理尚未启用」而建不了密钥。
+//
+// 覆盖的写法包含历史 config.example.json 里的空串与显式 null——照抄那份配置的部署
+// 很多，这些写法都必须按「没配」处理。
 func TestAPIKeysDefaultEnabled(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(fp, []byte(`{"api_key":"k"}`), 0o600); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"字段缺席且有 api_key", `{"api_key":"k"}`},
+		{"字段缺席且无 api_key", `{"listen":":9999"}`},
+		{"显式空串", `{"api_key":"k","api_keys_file":""}`},
+		{"显式空串且无 api_key", `{"api_keys_file":""}`},
+		{"显式 null", `{"api_key":"k","api_keys_file":null}`},
+		{"只有空白", `{"api_keys_file":"   "}`},
+		{"api_keys_enabled 为 true", `{"api_keys_enabled":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := filepath.Join(t.TempDir(), "c.json")
+			if err := os.WriteFile(fp, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := Load(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.APIKeysFile != DefaultAPIKeysFile {
+				t.Fatalf("api_keys_file=%q want %q", c.APIKeysFile, DefaultAPIKeysFile)
+			}
+		})
 	}
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.APIKeysFile != DefaultAPIKeysFile {
-		t.Fatalf("api_keys_file=%q want %q", c.APIKeysFile, DefaultAPIKeysFile)
-	}
-	// 没写这一项时 Default() 也应已带上默认值（纯 env 启动、配置文件缺失走这条路）。
+	// 纯 env 启动（配置文件缺失）走 Default()，也要带上默认路径。
 	if got := Default().APIKeysFile; got != DefaultAPIKeysFile {
 		t.Fatalf("Default().APIKeysFile=%q want %q", got, DefaultAPIKeysFile)
 	}
 }
 
-// TestAPIKeysExplicitEmptyStillDisables 显式写空串是管理员的主动关闭动作，
-// 默认值不能把它覆盖回启用。
-func TestAPIKeysExplicitEmptyStillDisables(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(fp, []byte(`{"api_key":"k","api_keys_file":""}`), 0o600); err != nil {
+// TestAPIKeysEnabledFalseDisables 显式关闭是唯一能让密钥库不启用的写法。
+// 用它而不是「把路径写成空串」，是因为空串是历史示例配置里的默认值。
+func TestAPIKeysEnabledFalseDisables(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "c.json")
+	if err := os.WriteFile(fp, []byte(`{"api_keys_enabled":false,"api_key":"k"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := Load(fp)
@@ -54,44 +70,7 @@ func TestAPIKeysExplicitEmptyStillDisables(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.APIKeysFile != "" {
-		t.Fatalf("explicit empty api_keys_file was overridden: %q", c.APIKeysFile)
-	}
-}
-
-// TestAPIKeysDefaultKeepsOpenAuthOpen 是这次改动最需要防住的回归：
-// 既没配密钥库、也没配 api_key 的部署本来是完全不做普通 HTTP 鉴权的。
-// 若默认值套上去，网关会建一个空密钥库，而空库拒绝一切调用——等于把免鉴权的
-// 部署静默锁死成全 401。这一组合必须保持原样。
-func TestAPIKeysDefaultKeepsOpenAuthOpen(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.APIKeysFile != "" {
-		t.Fatalf("open-auth deployment got a key store: api_keys_file=%q", c.APIKeysFile)
-	}
-}
-
-// TestAPIKeysExplicitNullTreatedAsUnset 显式 null 与「没写」同义：都走默认启用。
-// Go 的 json 把 null 解到 string 字段是 no-op，保留 Default() 的值，所以这里
-// 主要锁定「存在性判定把 null 当未配置」这一条，避免以后误判成主动关闭。
-func TestAPIKeysExplicitNullTreatedAsUnset(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(fp, []byte(`{"api_key":"k","api_keys_file":null}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.APIKeysFile != DefaultAPIKeysFile {
-		t.Fatalf("null api_keys_file=%q want default %q", c.APIKeysFile, DefaultAPIKeysFile)
+		t.Fatalf("api_keys_enabled=false still got a key store: %q", c.APIKeysFile)
 	}
 }
 
