@@ -136,7 +136,7 @@ func reasoningGuardTestFrame(text string) string {
 func TestReasoningLoopGuardModelScopeAndDisabledCompatibility(t *testing.T) {
 	text := strings.Repeat(strings.Repeat("x", 32)+"\n", 300)
 	raw := reasoningGuardTestFrame(text) + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-	for _, model := range []string{"deepseek-v4.1-flash", "cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash", "sg:deepseek-v4.1-flash", " CN:DEEPSEEK-V4.1-FLASH "} {
+	for _, model := range []string{"deepseek-v4.1-flash", "cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash", " CN:DEEPSEEK-V4.1-FLASH "} {
 		t.Run(model, func(t *testing.T) {
 			result, err := Aggregate(strings.NewReader(raw), StreamOptions{Model: model, ReasoningLoopGuard: true})
 			if result != nil || !IsReasoningLoopError(err) {
@@ -148,6 +148,8 @@ func TestReasoningLoopGuardModelScopeAndDisabledCompatibility(t *testing.T) {
 		{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: false},
 		{Model: "deepseek-v3", ReasoningLoopGuard: true},
 		{Model: "other:deepseek-v4.1-flash", ReasoningLoopGuard: true},
+		// 未知前缀（非 cn/global/sg）按裸名处理，不触发保护。
+		{Model: "us:deepseek-v4.1-flash", ReasoningLoopGuard: true},
 		{Model: "deepseek-v4.1-flash-other", ReasoningLoopGuard: true},
 	} {
 		result, err := Aggregate(strings.NewReader(raw), options)

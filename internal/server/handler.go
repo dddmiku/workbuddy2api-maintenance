@@ -252,7 +252,16 @@ func requestKeyInfo(r *http.Request) (apikeys.Info, bool) {
 
 // modelAllowedByKey 判断请求模型是否在密钥白名单内。
 //
-// 匹配按「realm + 裸名」比较：白名单项可写裸名（两个域通用）或带前缀的全名。
+// 匹配按解析后的「realm + 裸名」整体比较，两边都必须相等：
+//   - 绑定 `cn:glm-5.2` 只放行 cn 域的 glm-5.2，不放行 `global:glm-5.2`；
+//   - 绑定裸名 `glm-5.2` 按 resolveModel 的既有口径解析为 cn 域，因此放行
+//     `glm-5.2` 与 `cn:glm-5.2`（同一 realm、同一账号池），但不放行
+//     `global:glm-5.2`——那是另一个上游域，计费与合规口径都不同。
+//
+// 此前只比较裸名、且仅当绑定项自带 ":" 时才校验 realm，于是裸名绑定会跨域放行
+// （一把打算只给 CN 池用的密钥能打到 global 池）。要同时放开两个域就在绑定里
+// 各写一条。
+//
 // 白名单为空表示不限制，保持旧密钥行为。
 func modelAllowedByKey(info apikeys.Info, requestModel string) bool {
 	if len(info.Models) == 0 {
@@ -261,13 +270,9 @@ func modelAllowedByKey(info apikeys.Info, requestModel string) bool {
 	realm, bare := resolveModel(requestModel)
 	for _, allowed := range info.Models {
 		allowedRealm, allowedBare := resolveModel(allowed)
-		if allowedBare != bare {
-			continue
+		if allowedBare == bare && allowedRealm == realm {
+			return true
 		}
-		if allowedRealm != realm && strings.Contains(allowed, ":") {
-			continue
-		}
-		return true
 	}
 	return false
 }
