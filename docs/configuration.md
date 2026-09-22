@@ -8,7 +8,7 @@
 |---|---|---|
 | `listen` | `:7863` | 容器内监听地址；宿主机映射由 Compose 控制 |
 | `api_key` | 空 | 单密钥模式的调用密钥；多密钥模式首次建库时用于迁移 |
-| `api_keys_file` | 空 | 非空时启用持久化密钥库 |
+| `api_keys_file` | `./data/api_keys.json` | 持久化密钥库路径，默认启用；显式写 `""` 关闭多密钥管理 |
 | `api_keys_socket` | 密钥库同目录下 `api_keys.sock` | 多密钥管理通道 |
 | `usage_file` | 密钥库同目录下 `usage.json`（无密钥库时为不启用） | 按 API key 累计的 token 用量账本 |
 | `auth_dir` | `./auths` | 启动时加载 `workbuddy*.json` |
@@ -113,14 +113,20 @@
 
 ## 单密钥与多密钥
 
-未配置 `api_keys_file` 时，`api_key` 为空会关闭普通 HTTP 鉴权。
+持久化密钥库默认启用，路径 `./data/api_keys.json`。没写 `api_keys_file` 时按这个默认值走，管理台可以直接建密钥，不需要先改配置。
 
-配置 `api_keys_file` 后，密钥库负责鉴权：
+只有一种情况例外：既没写 `api_keys_file`、`api_key` 也是空的。这种部署本来完全不做普通 HTTP 鉴权，套上默认值会建出一个空密钥库，而空库拒绝一切调用——等于把免鉴权的部署静默锁死成全 401。因此这一组合保持原样，并在启动日志里给出提示；需要密钥功能时显式写上 `api_keys_file` 即可。
+
+显式写 `"api_keys_file": ""` 是主动关闭多密钥管理，不会被默认值覆盖回来。关闭后 `api_key` 为空即关闭普通 HTTP 鉴权。
+
+启用密钥库后由它负责鉴权：
 
 1. 文件不存在时创建密钥库；非空 `api_key` 迁移为现有密钥。
 2. 文件已存在时加载原有内容，不再次导入或覆盖。
 3. 空库拒绝调用，不能通过清空 `api_key` 恢复免鉴权。
 4. 配置文件损坏、密钥库不可读或 socket 不可用会阻止正常启动，应根据日志修复。
+
+管理台读的是原始 `config.json`，网关读的是归一化后的配置，两边对「没写这一项」的判定必须一致（`panel/key_management.py` 的 `DEFAULT_API_KEYS_FILE` 对应 `cmd/server/config.go` 的 `DefaultAPIKeysFile`）。分叉的表现就是网关已经能用密钥、面板却报「密钥管理尚未启用」。
 
 推荐布局：
 

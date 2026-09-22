@@ -1,4 +1,9 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：密钥管理默认启用：api_keys_file 缺省走 ./data/api_keys.json，修掉新装
+//
+//	用户照抄 config.example.json 时管理台报「密钥管理尚未启用」；显式空串仍关闭，
+//	且「没写 api_keys_file + api_key 也为空」的免鉴权部署保持原样不被锁死。
+//
 // 2026-09-22：新增 features.reasoning_loop_stop_only（命中循环只停不重发），缺省 false；
 //
 //	非法类型或 null 直接拒绝，避免静默改变重发语义。
@@ -26,11 +31,22 @@ import (
 	"workbuddy2api/internal/prompt"
 )
 
+// DefaultAPIKeysFile 是密钥库的默认位置（相对容器工作目录 /app，即挂载出来的 data 卷）。
+//
+// 密钥管理默认启用：新装用户照抄 config.example.json、或干脆不写这一项，都能直接
+// 在管理台里建密钥，不会再看到「密钥管理尚未启用」。显式写 `"api_keys_file": ""`
+// 仍然表示关闭多密钥管理，回到单密钥（或免鉴权）模式。
+//
+// 管理台面板侧有一份等价常量（panel/key_management.py 的 DEFAULT_API_KEYS_FILE），
+// 两边必须一致：面板读的是原始 config.json，网关读的是归一化后的配置，默认值一旦
+// 分叉，就会出现「网关已启用、面板说未启用」的分裂。
+const DefaultAPIKeysFile = "./data/api_keys.json"
+
 // Config 顶层配置。
 type Config struct {
 	Listen        string `json:"listen"`          // ":7863"
 	APIKey        string `json:"api_key"`         // 空 = 不鉴权
-	APIKeysFile   string `json:"api_keys_file"`   // 非空时启用多密钥管理，api_key 仅作首次迁移。
+	APIKeysFile   string `json:"api_keys_file"`   // 密钥库路径；缺省用 DefaultAPIKeysFile（默认启用），显式 "" 表示关闭多密钥管理。
 	APIKeysSocket string `json:"api_keys_socket"` // 本机管理 socket，默认位于密钥文件同目录。
 	// UsageFile 按调用密钥累计的 token 用量账本；留空且启用了密钥库时默认落在
 	// 密钥文件同目录的 usage.json。空 + 无密钥库 = 不记账（/usage 报未启用）。
@@ -198,10 +214,13 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
-		APIKey:    "",
-		AuthDir:   "./auths",
-		StateFile: "./data/state.json",
+		Listen: ":7863",
+		APIKey: "",
+		// 密钥管理默认启用：新装用户照抄 config.example.json、或自己写一份最小配置
+		// 漏掉这一项，都能直接在管理台里建密钥。显式写 "" 仍然表示关闭。
+		APIKeysFile: DefaultAPIKeysFile,
+		AuthDir:     "./auths",
+		StateFile:   "./data/state.json",
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
@@ -262,6 +281,7 @@ func updateDir(c *Config) string {
 func Load(path string) (*Config, error) {
 	c := Default()
 	legacyScaleConfigured := os.Getenv("WB2A_INPUT_TOKEN_SCALE") != ""
+	apiKeysFileConfigured := false
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -270,6 +290,17 @@ func Load(path string) (*Config, error) {
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
+		// 这一项是否在文件里显式出现，决定默认值能不能兜底（见 applyAPIKeysDefault）。
+		// 用 RawMessage 而不是 string，才能把「没写」「显式 null」与「显式写空串」
+		// 区分开：前两者按未配置处理，后者是管理员主动关闭。
+		var keyPresence struct {
+			APIKeysFile json.RawMessage `json:"api_keys_file"`
+		}
+		if err := json.Unmarshal(raw, &keyPresence); err != nil {
+			return nil, fmt.Errorf("parse api_keys_file presence: %w", err)
+		}
+		apiKeysFileConfigured = len(strings.TrimSpace(string(keyPresence.APIKeysFile))) > 0 &&
+			strings.TrimSpace(string(keyPresence.APIKeysFile)) != "null"
 		var retired struct {
 			Server struct {
 				InputTokenScale json.RawMessage `json:"input_token_scale"`
@@ -296,6 +327,7 @@ func Load(path string) (*Config, error) {
 	if err := applyEnv(c); err != nil {
 		return nil, err
 	}
+	applyAPIKeysDefault(c, apiKeysFileConfigured)
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -303,6 +335,29 @@ func Load(path string) (*Config, error) {
 		log.Printf("WARN: [config] server.input_token_scale / WB2A_INPUT_TOKEN_SCALE 已退役并被忽略；Responses usage 保留上游原值，请移除旧配置。")
 	}
 	return c, nil
+}
+
+// applyAPIKeysDefault 决定「配置文件没写 api_keys_file」时要不要走默认启用。
+//
+// 默认启用是为了让新装用户不必再手工加这一段就能在管理台建密钥。但有一类既有
+// 部署必须原样保留：既没配密钥库、也没配 api_key，也就是完全不做普通 HTTP 鉴权
+// （见 docs/configuration.md「单密钥与多密钥」）。若把默认值套上去，网关会新建
+// 一个空密钥库，而空库拒绝一切调用——等于把「本来免鉴权」的部署静默锁死成全 401。
+// 所以只有「没写 api_keys_file 但写了 api_key」才启用默认路径，此时 api_key 会
+// 作为既有密钥迁移进库里，原有客户端继续可用。
+func applyAPIKeysDefault(c *Config, configured bool) {
+	if configured || c.APIKeysFile == "" {
+		return
+	}
+	if strings.TrimSpace(c.APIKey) == "" {
+		c.APIKeysFile = ""
+		log.Printf("WARN: [config] 未配置 api_keys_file 与 api_key，保持不鉴权模式；" +
+			"如需管理台密钥功能，请显式设置 api_keys_file（例如 ./data/api_keys.json）")
+		return
+	}
+	c.APIKeysFile = DefaultAPIKeysFile
+	log.Printf("[config] api_keys_file 未配置，按默认启用：%s（现有 api_key 将迁移为库内密钥）",
+		c.APIKeysFile)
 }
 
 func applyEnv(c *Config) error {

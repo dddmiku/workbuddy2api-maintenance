@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：补密钥管理默认启用的口径回归：api_keys_file 未配置时按默认路径解析
+#             （与网关同口径），显式空串仍关闭，且 api_key 也为空时不能显示成可用。
 # 2026-09-20：覆盖有效期字段的透传、显式 null 与非法值拒绝，以及密钥列表合并累计用量。
 # 2026-09-20：复制接口和逐密钥保护开关必须经过管理员会话、来源和字段校验。
 # 2026-09-16：验证密钥管理的管理员登录、请求来源、大小和字段限制，使用本地服务与合成会话。
@@ -10,11 +12,14 @@
 
 import http.client
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 import app
+import key_management
 
 
 class Handler(app.Handler):
@@ -247,6 +252,63 @@ class KeyManagementTests(unittest.TestCase):
         # 旧格式没有 key= 列：归一化成 "-"，前端按同一列渲染。
         self.assertEqual(rows[0]["key"], "-")
         self.assertEqual(other, [])
+
+
+class KeyManagementDefaultTests(unittest.TestCase):
+    """api_keys_file 的默认值必须与网关 cmd/server 的 applyAPIKeysDefault 同口径。
+
+    这一层是「密钥管理尚未启用」这条提示的真正来源：面板读的是原始 config.json，
+    网关读的是归一化后的配置。两边默认值一旦分叉，用户就会看到网关明明能用、
+    面板却说未启用。
+    """
+
+    def write_config(self, payload):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+        self.addCleanup(os.unlink, handle.name)
+        json.dump(payload, handle)
+        handle.close()
+        return handle.name
+
+    def test_missing_field_defaults_to_enabled_when_api_key_present(self):
+        """核心回归：没写 api_keys_file 也要能管理密钥（此前直接报未启用）。"""
+        path = self.write_config({"api_key": "k"})
+        self.assertEqual(key_management.socket_path(path, "/srv"),
+                         os.path.normpath("/srv/data/api_keys.sock"))
+
+    def test_explicit_path_wins(self):
+        path = self.write_config({"api_keys_file": "./custom/keys.json"})
+        self.assertEqual(key_management.socket_path(path, "/srv"),
+                         os.path.normpath("/srv/custom/api_keys.sock"))
+
+    def test_explicit_empty_stays_disabled(self):
+        """显式空串是管理员的主动关闭动作，默认值不能把它覆盖回启用。"""
+        path = self.write_config({"api_keys_file": "", "api_key": "k"})
+        self.assertIsNone(key_management.socket_path(path, "/srv"))
+
+    def test_open_auth_deployment_stays_disabled(self):
+        """既没密钥库也没 api_key = 本来免鉴权。网关会保持原样，面板必须跟着报未启用，
+        否则会引导用户去建一个空密钥库，把原本开放的部署锁成全部 401。"""
+        path = self.write_config({"listen": ":9999"})
+        self.assertIsNone(key_management.socket_path(path, "/srv"))
+
+    def test_null_treated_as_unset(self):
+        """显式 null 与「没写」同义，走默认启用。"""
+        path = self.write_config({"api_keys_file": None, "api_key": "k"})
+        self.assertEqual(key_management.socket_path(path, "/srv"),
+                         os.path.normpath("/srv/data/api_keys.sock"))
+
+    def test_absolute_path_kept(self):
+        path = self.write_config({"api_keys_file": "/var/lib/wb2api/keys.json"})
+        # 期望值同样过一遍 normpath：面板跑在 Linux 容器里，但测试也会在 Windows
+        # 开发机上执行，分隔符由平台决定，不该让测试把这条算成失败。
+        self.assertEqual(key_management.socket_path(path, "/srv"),
+                         os.path.normpath("/var/lib/wb2api/api_keys.sock"))
+
+    def test_container_prefixed_path_remapped_to_base(self):
+        """容器内写成 /app/... 的路径，在宿主机/面板侧要换到 BASE 下解析。"""
+        path = self.write_config({"api_keys_file": "/app/data/api_keys.json"})
+        self.assertEqual(key_management.socket_path(path, "/opt/workbuddy2api"),
+                         os.path.normpath("/opt/workbuddy2api/data/api_keys.sock"))
 
 
 if __name__ == "__main__":
