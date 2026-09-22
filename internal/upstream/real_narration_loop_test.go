@@ -183,10 +183,12 @@ func TestReasoningLoopGuardDoesNotFireOnLegitimateRepetition(t *testing.T) {
 		return builder.String()
 	}
 	cases := map[string]string{
-		// 两行/三行交替：不同短行很少，靠「一行必须占多数」这道兜底挡住。
-		"two_line_table":    repeat(400, func(i int) string { return []string{"| a | b |", "| --- | --- |"}[i%2] }),
-		"three_line_table":  repeat(399, func(i int) string { return []string{"| a | b |", "| --- | --- |", "| x | y |"}[i%3] }),
-		"short_alternating": repeat(400, func(i int) string { return []string{"思考中", "等待中"}[i%2] }),
+		// 两行/三行交替的表格：不同短行很少，但行长超过 loopCycleMaxRunes，
+		// 因此既过不了「一行占多数」，也不构成「极短行严格周期」，必须放行。
+		"two_line_table":   repeat(400, func(i int) string { return []string{"| a | b |", "| --- | --- |"}[i%2] }),
+		"three_line_table": repeat(399, func(i int) string { return []string{"| a | b |", "| --- | --- |", "| x | y |"}[i%3] }),
+		// 交替行的长度超过 6 个字符：同样属于表格/状态类合法重复。
+		"long_alternating": repeat(400, func(i int) string { return []string{"检查数据一致性", "等待上游返回结果"}[i%2] }),
 		// 每一行取值不同的正常表格与数据行：不同项远超上限，天然安全。
 		"real_table":  repeat(400, func(i int) string { return fmt.Sprintf("| sensor_%03d | %.2f |", i, float64(i)/3) }),
 		"csv_rows":    repeat(400, func(i int) string { return fmt.Sprintf("%d,%.3f,ok", i, float64(i)/7) }),

@@ -421,21 +421,22 @@ func TestOutputLoopGuardIgnoresNonTargetModel(t *testing.T) {
 }
 
 // TestOutputLoopGuardReleasesOnContentTimeout 验证正文压制期有独立的时间上限：一段
-// 没有换行、始终只有一两种短行的输出既不可能构成短行循环，也不该被压到推理侧的
-// 60 秒上限。到点必须放行，客户端能看到这段正文。
+// 始终只有一两种短行、但行长超过「极短行」上限的输出既不构成循环，也不该被压到
+// 推理侧的 60 秒上限。到点必须放行，客户端能看到这段正文。
 func TestOutputLoopGuardReleasesOnContentTimeout(t *testing.T) {
 	previous := ContentLoopHoldBackTimeout
 	ContentLoopHoldBackTimeout = 40 * time.Millisecond
 	t.Cleanup(func() { ContentLoopHoldBackTimeout = previous })
 
-	// 每行 8 个字符、只有两种短行交替：不会命中（没有占多数的一行），也不会因为长行、
-	// 空行或第三种短行而放行，只能靠时间上限出去。
+	// 每行 7 个字符（超过 loopCycleMaxRunes 的 6）、两种短行交替：不会命中
+	// （没有占多数的一行，也不属于极短行周期），也不会因为长行、空行或第四种短行
+	// 而放行，只能靠时间上限出去。
 	var text strings.Builder
 	for index := 0; index < 200; index++ {
 		if index%2 == 0 {
-			text.WriteString("思考中\n")
+			text.WriteString("思考中等待结果\n")
 		} else {
-			text.WriteString("等待中\n")
+			text.WriteString("等待中继续处理\n")
 		}
 	}
 	raw := outputGuardTestFrame(text.String()) + "data: [DONE]\n\n"
@@ -453,7 +454,7 @@ func TestOutputLoopGuardReleasesOnContentTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ambiguous but non-looping content was rejected: %v", err)
 	}
-	if !strings.Contains(rec.Body.String(), "思考中") {
+	if !strings.Contains(rec.Body.String(), "思考中等待结果") {
 		t.Fatal("content timeout did not release the held-back content")
 	}
 }

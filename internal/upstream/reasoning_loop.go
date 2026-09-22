@@ -75,7 +75,26 @@ const (
 	// outputLoopHoldMaxUnique 是正文写出闸门允许压住的「不同短行数」上限。正常回答
 	// 只要出现第 3 种不同的短行就被认定为不是循环并立即放行；真正的循环只有一两种
 	// 重复行，会一直被压到命中或触发其它上限。
+	//
+	// 三行极短行交替（同属循环形态）另有一条放宽：见 holdOutput 的 tiny 判据——
+	// 只有当窗口里每一种行都短到 loopCycleMaxRunes 以内时才多压一种，避免让正常的
+	// 三行表格白白多等一个正文压制期。
 	outputLoopHoldMaxUnique = 2
+
+	// loopCycleMaxRunes 与 loopCycleMaxLength 是「极短行严格周期循环」的判据上限：
+	// 窗口内每种短行都不超过 6 个字符，且不同短行数在 2–3 之间。
+	//
+	// 存在的理由：主导性兜底挡住了两行/三行交替，而线上确实出现了「好。」(2 字) 与
+	// 「执行。」(3 字) 的严格交替。这类输出信息量趋近于零，不可能是有意义的正文；
+	// 真正的表格/状态行（如 `| a | b |`、`| --- | --- |`）行长都在 9 字以上，天然被
+	// 行长上限挡在外面，因此这条判据与「保护合法重复」并不冲突。
+	loopCycleMaxRunes  = 6
+	loopCycleMaxLength = 3
+
+	// loopCycleMinRepeats 是周期至少重复多少轮才判定为循环。64 行窗口配 2 行周期即
+	// 32 轮，这里取 8 轮：远高于任何正常写作里连续出现的同句数量，又能让判定在窗口
+	// 刚填满时就落地，不必等到正文闸门的字符上限。
+	loopCycleMinRepeats = 8
 
 	// outputLoopHoldBackChars 是正文压制期的字符上限。真实循环在 256 行窗口填满时
 	// 就命中，短行循环通常只积累一两千字符，因此这个上限只对「一直是两种短行、却
@@ -213,6 +232,9 @@ type reasoningLoopGuard struct {
 	position int
 	size     int
 	counts   map[reasoningLineKey]int
+	// lengths 记录窗口内每种短行的字符数，供「极短行严格周期循环」判定使用。
+	// 与 counts 同步增删。
+	lengths map[reasoningLineKey]int
 }
 
 func (g *reasoningLoopGuard) reset() {
@@ -225,6 +247,7 @@ func (g *reasoningLoopGuard) reset() {
 	g.fencedLines = 0
 	g.window = g.window[:0]
 	clear(g.counts)
+	clear(g.lengths)
 }
 
 // windowSize 返回该流使用的窗口长度（单位：可重复的短行）。
@@ -265,15 +288,75 @@ func (g *reasoningLoopGuard) holdOutput() bool {
 	if g.characters == 0 {
 		return false
 	}
-	if g.longLine || g.blankLine || len(g.counts) > outputLoopHoldMaxUnique ||
+	if g.longLine || g.blankLine || len(g.counts) > g.holdUniqueLimit() ||
 		g.characters >= outputLoopHoldBackChars {
 		return false
 	}
 	return true
 }
 
+// holdUniqueLimit 是正文闸门允许压住的「不同短行数」上限。默认 outputLoopHoldMaxUnique；
+// 当窗口里每一种行都短到 loopCycleMaxRunes 以内时放宽到 loopCycleMaxLength，让三行极短行
+// 交替也能被整段重发。表格行普遍更长，因此不会被这条放宽牵连。
+func (g *reasoningLoopGuard) holdUniqueLimit() int {
+	if len(g.counts) == 0 || len(g.counts) > loopCycleMaxLength {
+		return outputLoopHoldMaxUnique
+	}
+	for key := range g.counts {
+		if length, ok := g.lengths[key]; !ok || length > loopCycleMaxRunes {
+			return outputLoopHoldMaxUnique
+		}
+	}
+	return loopCycleMaxLength
+}
+
 // loopError 生成命中错误。正文侧的文案与错误码都与推理侧区分：正文已经可能发给
 // 客户端，调用方需要据此判断「能不能整段重发」。
+// isTinyStrictCycle 判定窗口是否为「极短行严格周期循环」：窗口由 2–3 种极短行组成，
+// 且整段输出是同一段周期原样重复，而不是随机混排。
+//
+// 这条判据补的是主导性兜底的缺口：两行交替时各占 50%、三行交替约 34%，都过不了
+// 「一行必须占 75%」这条线，于是保护完全不触发（线上「好。」/「执行。」即此形态）。
+//
+// 两道限定让它与「合法重复」分开：
+//   - 行长上限 loopCycleMaxRunes：表格行（`| a | b |`、`| --- | --- |`）与状态行
+//     普遍在 9 字以上，直接出局；
+//   - 严格周期：窗口必须能整除成同一段周期反复，随机混排的两种短行不算。
+func (g *reasoningLoopGuard) isTinyStrictCycle() bool {
+	distinct := len(g.counts)
+	if distinct < 2 || distinct > loopCycleMaxLength {
+		return false
+	}
+	if g.size < loopCycleMinRepeats*distinct {
+		return false
+	}
+	for key := range g.counts {
+		if length, ok := g.lengths[key]; !ok || length > loopCycleMaxRunes {
+			return false
+		}
+	}
+	// 环形窗口里最旧的一行在 g.position（写满后它就是要被覆盖的槽位）。
+	ordered := make([]reasoningLineKey, 0, g.size)
+	for offset := 0; offset < g.size; offset++ {
+		ordered = append(ordered, g.window[(g.position+offset)%g.size])
+	}
+	// 周期性判定用不变式 s[i] == s[i+period]，对环形窗口的起始相位不敏感；
+	// 不能用「窗口长度整除周期」那种写法——窗口 32 遇上三行周期会永远判不出来。
+	for period := 1; period <= distinct; period++ {
+		cyclic := true
+		for index := 0; index+period < g.size; index++ {
+			if ordered[index] != ordered[index+period] {
+				cyclic = false
+				break
+			}
+		}
+		if cyclic {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *reasoningLoopGuard) loopError(repeated, window int) *StreamError {
 	code := ReasoningLoopErrorCode
 	var message string
@@ -413,12 +496,16 @@ func (g *reasoningLoopGuard) completeLine() error {
 	if g.counts == nil {
 		g.counts = make(map[reasoningLineKey]int, g.windowSize())
 	}
+	if g.lengths == nil {
+		g.lengths = make(map[reasoningLineKey]int, g.windowSize())
+	}
 	size := g.windowSize()
 	if g.size == size {
 		old := g.window[g.position]
 		g.counts[old]--
 		if g.counts[old] == 0 {
 			delete(g.counts, old)
+			delete(g.lengths, old)
 		}
 	} else {
 		g.size++
@@ -430,6 +517,7 @@ func (g *reasoningLoopGuard) completeLine() error {
 	}
 	g.position = (g.position + 1) % size
 	g.counts[key]++
+	g.lengths[key] = utf8.RuneCountInString(text)
 	if g.size != size || len(g.counts) > g.maxUnique() {
 		return nil
 	}
@@ -441,6 +529,11 @@ func (g *reasoningLoopGuard) completeLine() error {
 	}
 	if repeated*100 < reasoningLoopCoveragePercent*size {
 		return nil
+	}
+	// 极短行严格周期循环：两行/三行交替，每行都很短、每轮完全一致。这类输出没有
+	// 信息量，必须命中；否则会被下面的主导性兜底挡住（两行各占 50%）。
+	if g.isTinyStrictCycle() {
+		return g.loopError(repeated, size)
 	}
 	// 推理侧：不同短行很少时（两行、三行交替）额外要求一行占主导，避免把表格、状态行
 	// 这类合法重复当成循环。达到 reasoningLoopMinUniqueWithoutDominance 种之后不再要求，

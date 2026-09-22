@@ -1,4 +1,9 @@
 // ═══ 更新日志 ═══
+// 2026-09-23：新增「两行极短行交替」的 handler 级回归。线上截图里的正文是「好。」与
+//
+//	「执行。」严格交替：窗口内只有 2 种短行、覆盖率 100%，但两行各占 50%，过不了
+//	「一行占多数」的兜底，旧规则下既不停止也不重发，网页被数千行重复文本顶死。
+//
 // 2026-09-22：开关改为运行期状态，补管理通道热切换回归：改完立即作用于后续请求，
 //
 //	非法请求体被拒绝，且该端点只对本机管理通道开放。
@@ -285,6 +290,48 @@ func TestOutputLoopGuardReportsContentCode(t *testing.T) {
 				// 正文循环的错误里只能有计数，不能把重复正文回显给调用方。
 				if strings.Contains(recorder.Body.String(), "我执行") {
 					t.Error("content loop error exposed output text")
+				}
+			})
+		}
+	}
+}
+
+// TestOutputLoopGuardRetriesTinyAlternatingContent 复现线上漏检形态：正文是「好。」与
+// 「执行。」严格交替。第一次上游循环必须被拦住并在同账号重发，客户端最终只看到第二次
+// 的干净输出；用户不会先收到几千行重复文本、更不会把网页顶死。
+func TestOutputLoopGuardRetriesTinyAlternatingContent(t *testing.T) {
+	var alternating strings.Builder
+	for index := 0; index < 400; index++ {
+		if index%2 == 0 {
+			alternating.WriteString("好。\n")
+		} else {
+			alternating.WriteString("执行。\n")
+		}
+	}
+	loopPayload := reasoningGuardFinish(
+		reasoningGuardFrame(map[string]any{"content": alternating.String()}), "stop")
+	cleanPayload := reasoningGuardFinish(
+		reasoningGuardFrame(map[string]any{"content": "tiny-cycle-clean-marker"}), "stop")
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", path, streaming), func(t *testing.T) {
+				model := "global:deepseek-v4.1-flash"
+				h, _, _, calls, bindings := reasoningGuardFixtureSequence(
+					t, []string{loopPayload, cleanPayload}, model)
+				recorder := httptest.NewRecorder()
+				h.ServeHTTP(recorder, reasoningGuardRequest(path, model, streaming, false))
+				output := recorder.Body.String()
+				if recorder.Code != http.StatusOK || !strings.Contains(output, "tiny-cycle-clean-marker") {
+					t.Fatalf("tiny alternating loop was not retried into a clean success: status=%d", recorder.Code)
+				}
+				if strings.Contains(output, `"code":"upstream_output_loop"`) {
+					t.Error("client received a loop error even though the retry succeeded")
+				}
+				if *calls != 2 {
+					t.Errorf("tiny alternating loop was not retried on the same account: calls=%d", *calls)
+				}
+				if uid, ok := bindings.lastUID("reasoning-guard-session"); !ok || uid != "guard-first" {
+					t.Error("tiny alternating loop invalidated the existing sticky binding")
 				}
 			})
 		}
