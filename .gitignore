@@ -60,3 +60,7 @@ SPEC.md
 # Admin panel runtime data and bytecode
 /panel-data/
 /panel/__pycache__/
+# 面板在源码目录里直接运行时会把凭证与初始密码落在 panel/ 下（默认 AUTH_DIR=源码目录）。
+# 两者都是机密，绝不能入库。
+/panel/credentials.json
+/panel/initial-password.txt

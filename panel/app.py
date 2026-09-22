@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：登录限流分桶只采信可信代理（WB2API_TRUSTED_PROXIES）转发的 IP，
+#             并对分桶表加上限——此前转发头无条件采信，轮换一个头就换一个桶，
+#             限流可被绕过且桶表能被撑到任意大小。
 # 2026-09-22：新增 /api/features/reasoning-loop，转发网关的「命中循环只停不重发」热切换；
 #             GET 读当前值，POST 改值，改完立即作用于后续请求，不需要重启网关。
 # 2026-09-20：2.1.9 重复推理保护扩到正文（上游修复同步到面板文案）。
@@ -40,6 +43,7 @@
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -77,7 +81,20 @@ PBKDF2_ROUNDS = 200000
 PBKDF2_PREFIX = "pbkdf2_sha256"
 LOGIN_MAX_FAILS = 6              # 同一 IP 在窗口内的失败次数
 LOGIN_WINDOW = 300.0
+# 登录限流分桶表的容量上限。分桶键来自转发头，未鉴权的攻击者能造出任意多的键，
+# 没有上限就是一条内存增长面；超过后清掉最旧的一批，宁可短暂放宽限流也不被撑爆。
+LOGIN_BUCKET_LIMIT = 10000
 COOKIE_NAME = "wb2a_admin"
+
+# 可信反向代理网段（CIDR，逗号分隔）。只有直连对端落在这些网段内，才采信
+# X-Real-IP / CF-Connecting-IP / X-Forwarded-For —— 这些头客户端能自己伪造，
+# 不做来源校验就等于把限流分桶键交给攻击者（轮换一个头就换一个桶）。
+#
+# 默认覆盖回环与私网：文档推荐的部署是「nginx 在同一台机器或同一个 Compose 网络
+# 里转发到面板」，那种形态下对端必然是回环或容器网段。代理在别的地址时加进来。
+TRUSTED_PROXIES_RAW = os.environ.get(
+    "WB2API_TRUSTED_PROXIES",
+    "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
 PANEL_VERSION = "2.1.17"
@@ -366,35 +383,93 @@ def _client_ip(handler):
     """真实客户端 IP。
 
     线上是 Cloudflare -> nginx -> 面板：nginx 用 real_ip 模块把 $remote_addr
-    还原成访客 IP 并写进 X-Real-IP，这个头由 nginx 覆盖、客户端伪造不了，所以
-    优先取它。CF-Connecting-IP 只在 real_ip 模块没生效时兜底——它属于客户端
-    可自行携带的头，绕过 Cloudflare 直连源站时能伪造，不能当第一顺位。
+    还原成访客 IP 并写进 X-Real-IP，这个头由 nginx 覆盖、客户端伪造不了。
+
+    但这三个头本身都是普通请求头：只要直连对端不是可信代理，客户端就能自带任意值。
+    因此这里先看直连对端（client_address）是否落在 WB2API_TRUSTED_PROXIES 内——
+    不在就一律用直连地址分桶，转发头完全忽略。否则攻击者轮换一个 X-Real-IP /
+    CF-Connecting-IP 就换一个限流桶，登录限流形同虚设。
+
     登录限流按这里分桶：取错会把不相干的人关进同一个小黑屋，或者让人随便换头
     就绕开限流。
     """
+    peer = handler.client_address[0] if handler.client_address else ""
+    if not _is_trusted_proxy(peer):
+        return peer or "?"
     for header in ("X-Real-IP", "CF-Connecting-IP", "X-Forwarded-For"):
         raw = handler.headers.get(header)
         if raw:
-            return raw.split(",")[0].strip()
-    return handler.client_address[0] if handler.client_address else "?"
+            candidate = raw.split(",")[0].strip()
+            if candidate:
+                return candidate
+    return peer or "?"
+
+
+def _trusted_proxies():
+    """解析 WB2API_TRUSTED_PROXIES 为网段列表；非法项跳过并在启动日志里提示。"""
+    networks = []
+    for item in (TRUSTED_PROXIES_RAW or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            sys.stderr.write("忽略无法解析的可信代理网段: %r" % item + chr(10))
+    return networks
+
+
+_TRUSTED_PROXY_NETWORKS = _trusted_proxies()
+
+
+def _is_trusted_proxy(peer):
+    """直连对端是否落在可信代理网段内。空/非法地址按不可信处理。"""
+    if not peer:
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    for network in _TRUSTED_PROXY_NETWORKS:
+        if address.version == network.version and address in network:
+            return True
+    return False
 
 
 def login_blocked(ip):
     now = time.time()
     with _cred_lock:
         hits = [t for t in _fails.get(ip, []) if now - t < LOGIN_WINDOW]
-        _fails[ip] = hits
+        if hits:
+            _fails[ip] = hits
+        else:
+            # 窗口内没有失败记录：把桶删掉而不是留一个空列表。
+            # 此前是 `_fails[ip] = hits`，于是每个出现过的 IP 都会永久留下一个空桶，
+            # 未鉴权的登录端点可以被用来把这张表撑到任意大小。
+            _fails.pop(ip, None)
         return len(hits) >= LOGIN_MAX_FAILS, len(hits)
 
 
 def login_failed(ip):
     with _cred_lock:
+        _trim_login_buckets_locked()
         _fails.setdefault(ip, []).append(time.time())
 
 
 def login_ok(ip):
     with _cred_lock:
         _fails.pop(ip, None)
+
+
+def _trim_login_buckets_locked():
+    """桶数超过上限时，按「最后失败时间」丢掉最旧的一批（调用方须持 _cred_lock）。"""
+    if len(_fails) <= LOGIN_BUCKET_LIMIT:
+        return
+    ordered = sorted(_fails.items(), key=lambda item: max(item[1]) if item[1] else 0.0)
+    # 一次清掉 1/8，避免刚好卡在上限时每个请求都排一次序。
+    drop = max(1, LOGIN_BUCKET_LIMIT // 8)
+    for key, _ in ordered[:drop]:
+        _fails.pop(key, None)
 
 
 def api_key():

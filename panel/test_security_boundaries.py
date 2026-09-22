@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：补登录限流分桶回归：转发头只从可信代理采信，不可信直连一律按对端
+#             地址分桶（此前轮换 X-Real-IP 就能绕过限流），并给桶表加上限。
 # 2026-09-22：补 /api/features/reasoning-loop 的边界回归：必须登录、必须同源+管理标记、
 #             开关值必须是显式布尔，且失败时不落到「静默成功」。
 # 2026-09-18：通过隔离 HTTP 服务复现管理写操作来源校验、JSON 输入、退出续期和凭证损坏边界。
@@ -11,6 +13,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from http.cookies import SimpleCookie
@@ -250,6 +253,73 @@ class SessionBoundaryTests(unittest.TestCase):
                 with self.assertRaises((OSError, ValueError)):
                     app.load_credentials()
                 self.assertEqual(self.path.read_bytes(), original)
+
+
+class LoginThrottleBucketTests(unittest.TestCase):
+    """登录限流的分桶键必须来自可信来源，否则等于把限流交给攻击者。"""
+
+    def setUp(self):
+        app._fails.clear()
+        self.addCleanup(app._fails.clear)
+
+    def handler(self, peer, headers):
+        class H:
+            def __init__(self):
+                self.headers = headers
+                self.client_address = (peer, 1234)
+        return H()
+
+    def test_untrusted_peer_ignores_forwarded_headers(self):
+        """直连对端不可信时，伪造的转发头一律不采信——轮换头也换不掉桶。"""
+        for headers in ({"X-Real-IP": "203.0.113.1"},
+                        {"CF-Connecting-IP": "203.0.113.2"},
+                        {"X-Forwarded-For": "203.0.113.3, 10.0.0.1"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(app._client_ip(self.handler("198.51.100.7", headers)),
+                                 "198.51.100.7")
+
+    def test_spoofed_header_cannot_reset_the_bucket(self):
+        """核心回归：此前每个伪造 IP 各占一个桶，6 次锁定形同虚设。"""
+        for i in range(app.LOGIN_MAX_FAILS + 3):
+            ip = app._client_ip(self.handler("198.51.100.7", {"X-Real-IP": "203.0.113.%d" % i}))
+            app.login_failed(ip)
+        blocked, hits = app.login_blocked("198.51.100.7")
+        self.assertTrue(blocked, "spoofing X-Real-IP bypassed the login throttle")
+        self.assertEqual(hits, app.LOGIN_MAX_FAILS + 3)
+        self.assertEqual(len(app._fails), 1, "spoofed headers created extra buckets")
+
+    def test_trusted_peer_honours_forwarded_ip(self):
+        """可信代理转发时必须按真实访客分桶，否则所有访客共用一个桶。"""
+        self.assertEqual(app._client_ip(self.handler("127.0.0.1", {"X-Real-IP": "203.0.113.9"})),
+                         "203.0.113.9")
+        self.assertEqual(app._client_ip(self.handler("172.17.0.1", {"X-Real-IP": "203.0.113.10"})),
+                         "203.0.113.10")
+        self.assertEqual(app._client_ip(self.handler("127.0.0.1", {"X-Forwarded-For": "1.2.3.4, 10.0.0.1"})),
+                         "1.2.3.4")
+
+    def test_trusted_peer_without_headers_falls_back_to_peer(self):
+        self.assertEqual(app._client_ip(self.handler("127.0.0.1", {})), "127.0.0.1")
+
+    def test_expired_bucket_is_evicted_not_emptied(self):
+        """窗口内无失败记录时删掉键，而不是留一个空列表。"""
+        app.login_failed("stale")
+        app._fails["stale"] = [time.time() - app.LOGIN_WINDOW - 1]
+        blocked, hits = app.login_blocked("stale")
+        self.assertFalse(blocked)
+        self.assertEqual(hits, 0)
+        self.assertNotIn("stale", app._fails)
+
+    def test_bucket_table_is_bounded(self):
+        """桶表必须有上限：这是未鉴权可达的路径。"""
+        for i in range(app.LOGIN_BUCKET_LIMIT + 2000):
+            app.login_failed("198.51.100.%d" % i)
+        self.assertLessEqual(len(app._fails), app.LOGIN_BUCKET_LIMIT)
+        self.assertGreater(len(app._fails), 0)
+
+    def test_unparsable_peer_is_treated_as_untrusted(self):
+        self.assertFalse(app._is_trusted_proxy(""))
+        self.assertFalse(app._is_trusted_proxy("not-an-ip"))
+        self.assertTrue(app._is_trusted_proxy("127.0.0.1"))
 
 
 if __name__ == "__main__":

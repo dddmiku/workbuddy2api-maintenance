@@ -65,6 +65,9 @@ Cookie 路径为 `/`，同时兼容根路径与 `/admin/` 部署；发放或清�
 | `WB2API_GATEWAY_URL` | `http://wb2api:7863` | 网关 HTTP 地址 |
 | `WB2API_CONTAINER` | `workbuddy2api` | 网关容器名 |
 | `WB2API_HTPASSWD_PATH` | `/etc/nginx/.htpasswd_wb2admin` | 旧口令继承文件（可选） |
+| `WB2API_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` | 可信反向代理网段（CIDR，逗号分隔）。只有直连对端落在这些网段内，登录限流才采信 `X-Real-IP` / `CF-Connecting-IP` / `X-Forwarded-For` |
+
+登录限流按客户端 IP 分桶，而这三个转发头本身是普通请求头，客户端可以自带任意值。面板先看**直连对端**是否落在 `WB2API_TRUSTED_PROXIES` 内：不在就一律按直连地址分桶，转发头完全忽略。默认值覆盖回环与私网，正好对应「nginx 在同一台机器或同一个 Compose 网络里转发」这种推荐部署；代理在别的地址时必须把它加进来，否则限流会退化成「所有访客共用一个桶」。分桶表还有容量上限，超过后淘汰最旧的一批，避免被大量伪造键撑爆内存。
 
 在宿主机直接运行（systemd 或前台进程）时，`WB2API_ADMIN_DIR` 建议设为 `/opt/wb2api-admin`，并把 `WB2API_GATEWAY_DIR` 指向 `/opt/workbuddy2api`。
 
@@ -163,7 +166,7 @@ Responses、Chat、日志与账本都采用上游原始观测口径，不乘输�
 | 页面返回 502 / 连接被拒绝 | `docker compose ps` 看 `wb2api-admin` 是否运行；`docker compose logs wb2api-admin` 看启动错误 |
 | 密钥页提示未启用 | 网关 `config.json` 需要 `api_keys_file`，且 `data/api_keys.sock` 存在 |
 | 添加账号后网关看不到 | 检查 `auths/` 文件属主是否为 `10001:10001`；面板会自行 chown，手工拷入的文件需自行处理 |
-| 登录一直失败 | 连续失败 6 次会锁定 5 分钟；确认反向代理传递的 `X-Real-IP` 可信 |
+| 登录一直失败 | 连续失败 6 次会锁定 5 分钟。若代理不在默认私网网段内，需把它的网段加进 `WB2API_TRUSTED_PROXIES`，否则所有人共用一个限流桶；反之代理不在列表里时转发头会被忽略，属预期行为 |
 | 忘记管理员密码 | 删除 `panel-data/credentials.json` 后重启容器，会重新继承 htpasswd 或生成新的初始密码 |
 
 面板内部接口与更细的排障说明见 [panel/README.md](../panel/README.md)。
