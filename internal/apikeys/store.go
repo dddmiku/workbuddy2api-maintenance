@@ -299,7 +299,7 @@ func normalizeModels(models []string) []string {
 	return out
 }
 
-// fullModelNames 在 validModels 之上要求每一项都是带 realm 前缀的完整模型名。
+// fullModelNames 要求每一项都是带 realm 前缀的完整模型名。
 //
 // 绑定值就是鉴权时逐字比较的对象，写裸名只能匹配裸名请求，而网关的模型列表
 // 里一个裸名都没有——那样的绑定看起来配了模型，实际谁也用不了，等调用方撞上
@@ -307,10 +307,9 @@ func normalizeModels(models []string) []string {
 //
 // 只用于写入路径：读取旧文件时不做这个检查，否则一份历史上存过裸名的密钥库
 // 会让整个 Store 打不开，把「少一条绑定」升级成「所有密钥都鉴权失败」。
+//
+// 调用方先跑 validModels，格式错误走 ErrInvalidModels，这里只管前缀。
 func fullModelNames(models []string) bool {
-	if !validModels(models) {
-		return false
-	}
 	for _, model := range models {
 		realm, bare := splitRealm(model)
 		if realm == "" || bare == "" {
