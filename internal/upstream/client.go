@@ -1,6 +1,10 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-22：新增 ErrUpstreamGateway：上游代理层（APISIX/openresty）HTML 授权页单独
+//
+//	分类，不再落进 ErrClient 兜底被当作「请求参数被拒」把整段 HTML 回显给调用方。
+//
 // 2026-09-18：错误响应正文也遵守聊天空闲超时，避免已收到错误响应头后永久阻塞读体及账号租约。
 // 2026-09-16：请求全程使用同一凭据快照，同账号刷新合并并由 Auth 原子提交，消除刷新与聊天/模型/计费的竞争。
 // 2026-09-16：把明确的未批准渠道错误与内容策略拦截分开，避免伪造违禁词原因。
@@ -44,6 +48,7 @@ const (
 	ErrContextTooLong                 // 上下文超限（11115 prompt is too long）→ 请求终态，不轮转、透传原文
 	ErrChannelRejected                // 明确拒绝未批准的调用渠道：请求终态，不推断为内容违规
 	ErrUpstreamWAF                    // 上游 WAF 拦截页（403 HTML，按正文特征判定）：请求终态，不轮转、不回显 HTML
+	ErrUpstreamGateway                // 上游代理层 HTML 授权页（APISIX/openresty 等）：请求终态，不回显 HTML、不罚账号
 )
 
 func (k ErrKind) String() string {
@@ -74,6 +79,8 @@ func (k ErrKind) String() string {
 		return "channel_rejected"
 	case ErrUpstreamWAF:
 		return "upstream_waf"
+	case ErrUpstreamGateway:
+		return "upstream_gateway"
 	default:
 		return "none"
 	}
@@ -182,6 +189,34 @@ var wafBlockRule = errorRule{kind: ErrUpstreamWAF, mode: matchLower, patterns: [
 	"waf block page",
 	"waf-intl.qq.com",
 }}
+
+// gatewayPageMarkers 上游**代理层**（APISIX / openresty 等）HTML 页面上的特征词。
+//
+// 2026-09-22 实测：上游国际版入口在风控收紧期间对全部 global 账号返回
+// `401 + <html>…<title>401 Authorization Required</title>…openresty…APISIX…`。
+// 它不是 WAF 拦截页（正文里没有 waf 字样），也不是账号令牌失效（同一账号刷新
+// 令牌后仍被拒，且几分钟后自行恢复），更不是「请求参数被拒」——但此前它落在
+// ErrClient 兜底分支，被 handler 当作 bad params 处理，把整段 HTML 原样回显给
+// 调用方（客户端只能看到一坨 `<html>`，既没法排查也没法自动重试）。
+var gatewayPageMarkers = []string{"openresty", "apisix", "authorization required"}
+
+// isUpstreamGatewayPage 判断响应体是不是上游代理层的 HTML 页面。
+//
+// 必须先确认是 HTML 再匹配特征词：`apisix` 这类字样完全可能出现在正常的 JSON
+// 错误体里（例如上游把代理名写进 msg），只按词匹配会把普通业务错误误判成代理页。
+func isUpstreamGatewayPage(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	if !strings.HasPrefix(trimmed, "<") || !strings.Contains(strings.ToLower(trimmed), "<html") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, marker := range gatewayPageMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
 // [关键词] 填分类词（色情 / nsfw / 暴力 等），绝不填业务 code、账号、冷却、upstream 前缀。
@@ -473,6 +508,11 @@ func Classify(status int, body string) ErrKind {
 	// content_blocked），也不是请求参数错误（不得原样回显 HTML 给调用方）。
 	if wafBlockRule.hit(body, lower) {
 		return ErrUpstreamWAF
+	}
+	// 上游代理层 HTML 授权页：判在 ErrClient 兜底之前，否则会被当成「请求参数
+	// 被拒」把整段 HTML 回显给调用方（见 isUpstreamGatewayPage 注释）。
+	if isUpstreamGatewayPage(body) {
+		return ErrUpstreamGateway
 	}
 	if hardRule.hit(body, lower) {
 		return ErrHardCredit

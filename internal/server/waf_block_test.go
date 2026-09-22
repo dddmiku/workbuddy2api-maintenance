@@ -98,3 +98,56 @@ func TestChatUpstreamWAFBlockPageIsTerminal(t *testing.T) {
 		t.Errorf("message should name the upstream WAF: %q", e.Error.Message)
 	}
 }
+
+// TestChatUpstreamGatewayPageIsNotEchoed 锁住 2026-09-22 实测的上游代理层授权页：
+// 国际版风控收紧期间整域返回 401 + APISIX/openresty HTML。
+//
+// 期望三件事：
+//   - 不回显 HTML（此前它落进 bad params 分支，客户端只看到一坨 `<html>`）；
+//   - 报 503 可重试语义，而不是 400 请求终态（它几分钟后自行恢复）；
+//   - 不罚账号（拒绝发生在代理层，同一账号刷新令牌后仍被拒）。
+func TestChatUpstreamGatewayPageIsNotEchoed(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusUnauthorized, apisixGatewayPage, false
+	})
+	handler := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		),
+		Upstream: up,
+	})
+	payload, err := json.Marshal(map[string]any{
+		// 用 CN 模型：本测试的池里只有一个 CN 账号，写 global: 会在选号阶段就 503，
+		// 走不到上游分类那一步（那样测的就不是本分支了）。
+		"model":    "glm-5.2",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(payload))))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status=%d want 503 (retryable, not a terminal 400); body=%s", rec.Code, rec.Body)
+	}
+	if !assertJSONErrorCode(t, rec.Body.String(), "upstream_gateway_unavailable") {
+		t.Fatalf("wrong error code: %s", rec.Body)
+	}
+	body := rec.Body.String()
+	for _, leaked := range []string{"<html", "<title", "openresty", "APISIX", "Authorization Required"} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("proxy page leaked into the client response (%q): %s", leaked, body)
+		}
+	}
+	if strings.Contains(body, "upstream rejected request params") {
+		t.Errorf("proxy page reported as a params error: %s", body)
+	}
+}
+
+// apisixGatewayPage 上游国际版入口的真实响应体（逐字复制）。
+const apisixGatewayPage = "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n" +
+	"<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n" +
+	"<hr><center>openresty</center>\r\n" +
+	"<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p>\r\n" +
+	"</body>\r\n</html>\r\n"

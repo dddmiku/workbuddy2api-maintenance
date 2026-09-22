@@ -19,6 +19,14 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// apisixAuthPage 是 2026-09-22 上游国际版风控收紧期间的真实响应体（逐字复制，
+// 含 CRLF 与 openresty/APISIX 署名），用于锁住代理页分类。
+const apisixAuthPage = "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n" +
+	"<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n" +
+	"<hr><center>openresty</center>\r\n" +
+	"<p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p>\r\n" +
+	"</body>\r\n</html>\r\n"
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		status int
@@ -88,6 +96,17 @@ func TestClassify(t *testing.T) {
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
 		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 上游代理层 HTML 授权页（2026-09-22 实测形态）：必须单独分类，不能落进
+		// ErrClient 兜底——那会被 handler 当作「请求参数被拒」把整段 HTML 回显给
+		// 调用方。见 isUpstreamGatewayPage。
+		{401, apisixAuthPage, ErrUpstreamGateway},
+		{403, apisixAuthPage, ErrUpstreamGateway},
+		{502, apisixAuthPage, ErrUpstreamGateway},
+		// 只要不是 HTML 页面，同样的字样不得误判（正常 JSON 里出现 apisix 很常见）。
+		{400, `{"code":1,"msg":"apisix upstream said no"}`, ErrClient},
+		{400, `{"code":1,"msg":"authorization required"}`, ErrClient},
+		// 普通 HTML（非代理页特征）仍按原语义走，不扩大匹配面。
+		{403, `<html><body>plain error</body></html>`, ErrClient},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {

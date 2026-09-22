@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：上游代理层 HTML 授权页（APISIX/openresty）不再被当作「请求参数被拒」
+// 回显整段 HTML；改为 503 可重试语义、不罚账号、不解绑会话粘性。
 // 2026-09-22：密钥模型绑定改为「完整模型名逐字相等」，不再按 resolveModel 解析后比较；
 // 此前裸名绑定会被静默扩成 cn: 域的两个名字，实际可用范围大于管理员写下的那一条。
 // 2026-09-22：重复推理保护改为「命中后重发 / 命中即停止」可在管理台热切换；开关值
@@ -1155,6 +1157,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"upstream WAF rejected this request even after the gateway broke the matching "+
 						"patterns; start a new conversation, or remove the HTML/script/SQL-looking part")
 				st.status = http.StatusBadRequest
+				return
+			}
+			// 上游代理层 HTML 授权页（APISIX / openresty 等）：2026-09-22 实测的形态是
+			// 风控收紧期间整域返回 401 HTML，几分钟后自行恢复。
+			//
+			// 三件事都不能做：不把 HTML 回显给调用方（此前它落进 bad params 分支，
+			// 客户端只能看到一坨 `<html>`）；不罚账号（同一时段该账号刷新令牌后仍被拒，
+			// 说明拒绝发生在代理层而不是账号上）；不当作请求终态直接失败——它是**可重试**
+			// 的临时状态，回 503 让客户端稍后重试，与「无健康账号」同口径。
+			//
+			// 这里刻意不调 fail(acct.UID)：fail 会顺带解绑会话粘性，而拒绝是整域级别的、
+			// 与这个账号无关，解绑只会让下一轮无谓地重新选号。在途租约由函数出口的
+			// defer 释放，不依赖 fail。
+			if kind == upstream.ErrUpstreamGateway {
+				log.Printf("WARN: [server] upstream gateway page uid=%s status=%d — upstream proxy rejected the request; account untouched",
+					logfmt.UID8(acct.UID), status)
+				st.status = http.StatusServiceUnavailable
+				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_gateway_unavailable",
+					"upstream proxy temporarily refused the request (not an account or request problem); retry in a moment")
 				return
 			}
 			// 上游内容拒绝属于当前请求；直接返回，不修改其他会话或替换正文重试。
