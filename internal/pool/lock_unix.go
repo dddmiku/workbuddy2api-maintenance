@@ -10,6 +10,7 @@ import (
 )
 
 func lockPoolState(path string) (func(), error) {
+	// #nosec G304 -- 锁文件路径由 state.json 路径推导，来自管理员配置，非请求输入
 	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err

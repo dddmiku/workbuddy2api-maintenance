@@ -14,6 +14,7 @@ func lockKeyStore(path string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
+	// #nosec G304 -- 锁文件路径由密钥库路径推导，来自管理员配置，非请求输入
 	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err

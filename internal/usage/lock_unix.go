@@ -15,6 +15,7 @@ import (
 // 锁加在 <path>.lock 上而不是账本本身：账本是 tmp + rename 原子替换的，
 // rename 之后 inode 会变，锁在被替换掉的旧 inode 上就失去意义。
 func lockLedger(path string) (func(), error) {
+	// #nosec G304 -- 锁文件路径由账本路径推导，来自管理员配置，非请求输入
 	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
