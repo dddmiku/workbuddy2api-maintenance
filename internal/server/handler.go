@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：密钥模型绑定改为「完整模型名逐字相等」，不再按 resolveModel 解析后比较；
+// 此前裸名绑定会被静默扩成 cn: 域的两个名字，实际可用范围大于管理员写下的那一条。
 // 2026-09-22：重复推理保护改为「命中后重发 / 命中即停止」可在管理台热切换；开关值
 // 存进 handler 的原子字段，改完立即作用于后续请求，不需要重启，在途请求不受影响。
 // 2026-09-20：无会话标识的客户端（narrafork 形态）按正文派生对话级回退键补上会话粘性；此前这类请求每轮换号、上游提示缓存整段失效。
@@ -252,25 +254,25 @@ func requestKeyInfo(r *http.Request) (apikeys.Info, bool) {
 
 // modelAllowedByKey 判断请求模型是否在密钥白名单内。
 //
-// 匹配按解析后的「realm + 裸名」整体比较，两边都必须相等：
-//   - 绑定 `cn:glm-5.2` 只放行 cn 域的 glm-5.2，不放行 `global:glm-5.2`；
-//   - 绑定裸名 `glm-5.2` 按 resolveModel 的既有口径解析为 cn 域，因此放行
-//     `glm-5.2` 与 `cn:glm-5.2`（同一 realm、同一账号池），但不放行
-//     `global:glm-5.2`——那是另一个上游域，计费与合规口径都不同。
+// 匹配是「完整模型名逐字相等」，不做任何前缀解析或降级：
+//   - 绑定 `cn:glm-5.2` 只放行请求里的 `cn:glm-5.2`，不放行 `global:glm-5.2`，
+//     也不放行裸名 `glm-5.2`；
+//   - 绑定裸名同样只放行裸名请求，不会因为 resolveModel 把裸名归到 cn 域
+//     就顺带放行 `cn:glm-5.2`。
 //
-// 此前只比较裸名、且仅当绑定项自带 ":" 时才校验 realm，于是裸名绑定会跨域放行
-// （一把打算只给 CN 池用的密钥能打到 global 池）。要同时放开两个域就在绑定里
-// 各写一条。
+// 绑定值应当直接取自 `GET /v1/models` 的完整模型名，管理台的下拉框就是按这个
+// 列表给的。此前的两种写法都属降级匹配：最初只比裸名、仅在绑定项自带 ":" 时
+// 才校验 realm，裸名绑定会跨域放行；改成按 resolveModel 解析后再比较，又会把
+// 裸名绑定静默扩成 `cn:` 域的两个名字。两者都会让实际可用范围大于管理员写下
+// 的那一条，所以现在一律按字面比对，白名单里写什么就只放行什么。
 //
 // 白名单为空表示不限制，保持旧密钥行为。
 func modelAllowedByKey(info apikeys.Info, requestModel string) bool {
 	if len(info.Models) == 0 {
 		return true
 	}
-	realm, bare := resolveModel(requestModel)
 	for _, allowed := range info.Models {
-		allowedRealm, allowedBare := resolveModel(allowed)
-		if allowedBare == bare && allowedRealm == realm {
+		if allowed == requestModel {
 			return true
 		}
 	}

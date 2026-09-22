@@ -174,6 +174,9 @@ func replyError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrInvalidModels):
 		code = 400
 		message = err.Error()
+	case errors.Is(err, ErrBindingRealm):
+		code = 400
+		message = err.Error()
 	case errors.Is(err, ErrInvalidExpiry):
 		code = 400
 		message = err.Error()

@@ -208,6 +208,11 @@ $('#keyForm').addEventListener('submit', async function(event){
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
   if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
+  // 绑定按完整模型名逐字比对，裸名一条也匹配不上（模型列表里没有裸名）。
+  // 手填时先在这里拦住，免得保存成功却调用全 403。
+  if (body.models.some(function(item){return !/^(cn|global):.+/.test(item);})){
+    keyFormError('模型绑定必须选完整模型名（cn: 或 global: 开头），请从模型列表添加');$('#keyModels').focus();return;
+  }
   var expiry = selectedExpiry();
   if (expiry.error){keyFormError(expiry.error);return;}
   body.expires_at = expiry.value;

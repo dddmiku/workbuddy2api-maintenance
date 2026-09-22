@@ -1,8 +1,13 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：模型绑定写入侧要求完整模型名（带 cn:/global: 前缀），裸名返回
+//
+//	ErrBindingRealm；读取旧文件仍放行，避免存量密钥库整体打不开。
+//
 // 2026-09-18：只在支持 POSIX 权限位的平台断言 0600，Windows 继续执行完整密钥生命周期回归。
 package apikeys
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -20,6 +25,10 @@ func TestModelBindingValidationAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, key, err := s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "glm-5.2"})
+	if !errors.Is(err, ErrBindingRealm) {
+		t.Fatalf("bare binding accepted on create: err=%v", err)
+	}
+	info, key, err = s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "global:glm-5.2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,12 +43,16 @@ func TestModelBindingValidationAndPersistence(t *testing.T) {
 	}
 	too := make([]string, MaxBoundModels+1)
 	for i := range too {
-		too[i] = "m" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		too[i] = "cn:m" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 	}
 	if _, _, err := s.Create("x", "", too); !errors.Is(err, ErrInvalidModels) {
 		t.Error("oversize model list accepted")
 	}
-	updated := []string{"glm-5.2"}
+	// 裸名同样不能在更新时写进去。
+	if _, err := s.Update(info.ID, nil, nil, nil, &[]string{"glm-5.2"}); !errors.Is(err, ErrBindingRealm) {
+		t.Errorf("bare binding accepted on update: err=%v", err)
+	}
+	updated := []string{"global:glm-5.2"}
 	if _, err := s.Update(info.ID, nil, nil, nil, &updated); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +61,7 @@ func TestModelBindingValidationAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry, ok := reopened.Resolve(key)
-	if !ok || len(entry.Models) != 1 || entry.Models[0] != "glm-5.2" {
+	if !ok || len(entry.Models) != 1 || entry.Models[0] != "global:glm-5.2" {
 		t.Fatalf("binding not persisted: %+v", entry.Models)
 	}
 	empty := []string{}
@@ -58,6 +71,59 @@ func TestModelBindingValidationAndPersistence(t *testing.T) {
 	cleared, _ := reopened.Resolve(key)
 	if len(cleared.Models) != 0 {
 		t.Fatalf("binding not cleared: %+v", cleared.Models)
+	}
+}
+
+// TestLegacyBareBindingStillLoads 锁定读取侧的宽松：历史文件里存过裸名绑定
+// 时整个密钥库必须照常打开，否则写入侧一收紧，存量密钥会全部鉴权失败——
+// 那是把「一条绑定要改」放大成「所有人断网」。裸名在鉴权时只匹配裸名请求，
+// 不会顺带放行 cn: 请求。
+func TestLegacyBareBindingStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api_keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, key, err := s.Create("legacy", "", []string{"cn:deepseek-v4.1-flash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range doc["keys"].([]any) {
+		entry := item.(map[string]any)
+		if entry["name"] == "legacy" {
+			entry["models"] = []string{"deepseek-v4.1-flash"}
+		}
+	}
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, "")
+	if err != nil {
+		t.Fatalf("legacy bare binding made the store unreadable: %v", err)
+	}
+	entry, ok := reopened.Resolve(key)
+	if !ok {
+		t.Fatal("legacy key stopped authenticating")
+	}
+	if len(entry.Models) != 1 || entry.Models[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("legacy binding changed on load: %+v", entry.Models)
+	}
+	// 无关字段仍可修改：否则管理员没法把这条旧绑定改对。
+	note := "fixed"
+	if _, err := reopened.Update(entry.ID, nil, &note, nil, nil); err != nil {
+		t.Fatalf("unrelated update rejected on a legacy bare binding: %v", err)
 	}
 }
 

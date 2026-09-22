@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：模型绑定写入侧要求完整模型名（cn:/global: 前缀），裸名返回 ErrBindingRealm；
+//
+//	读取旧文件不做该校验，避免存量裸名绑定让整个密钥库打不开。
+//
 // 2026-09-20：密钥增加可选有效期，未设置即无限制且既有记录零迁移；到期后鉴权按已过期拒绝并可被调用方区分。
 // 2026-09-20：密钥加密保存以支持管理员再次复制，旧密钥在有效鉴权时补齐；增加逐密钥重复推理保护覆盖。
 // 2026-09-16：增加持久化多密钥管理，保留原密钥并使启停、删除立即生效，只保存随机密钥的 SHA-256。
@@ -36,6 +40,7 @@ var (
 	ErrNotFound      = errors.New("密钥不存在或已删除")
 	ErrInvalid       = errors.New("名称需为 1—64 字，备注不超过 256 字，且不能包含控制字符")
 	ErrInvalidModels = errors.New("模型绑定需为 1—64 个字符、不含空白或控制字符，且不能重复，最多 64 项")
+	ErrBindingRealm  = errors.New("模型绑定必须填完整模型名（带 cn: 或 global: 前缀），请从模型列表中选择")
 	ErrInvalidExpiry = errors.New("有效期需为将来时间，且不超过 10 年；留空表示无限制")
 	ErrLimit         = errors.New("密钥数量已达上限，请先删除不再使用的密钥")
 )
@@ -294,6 +299,38 @@ func normalizeModels(models []string) []string {
 	return out
 }
 
+// fullModelNames 在 validModels 之上要求每一项都是带 realm 前缀的完整模型名。
+//
+// 绑定值就是鉴权时逐字比较的对象，写裸名只能匹配裸名请求，而网关的模型列表
+// 里一个裸名都没有——那样的绑定看起来配了模型，实际谁也用不了，等调用方撞上
+// 403 才发现。所以在写入这一侧直接拒掉，让管理员从 /v1/models 里选完整名。
+//
+// 只用于写入路径：读取旧文件时不做这个检查，否则一份历史上存过裸名的密钥库
+// 会让整个 Store 打不开，把「少一条绑定」升级成「所有密钥都鉴权失败」。
+func fullModelNames(models []string) bool {
+	if !validModels(models) {
+		return false
+	}
+	for _, model := range models {
+		realm, bare := splitRealm(model)
+		if realm == "" || bare == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// splitRealm 只做字面前缀识别，不参与任何解析或补全：前缀不是 cn:/global: 时
+// 返回空 realm，调用方据此判定「这不是一个完整模型名」。
+func splitRealm(model string) (realm, bare string) {
+	for _, candidate := range []string{"cn:", "global:"} {
+		if strings.HasPrefix(model, candidate) {
+			return strings.TrimSuffix(candidate, ":"), model[len(candidate):]
+		}
+	}
+	return "", model
+}
+
 // Authenticate 只判断密钥是否可用；需要密钥策略时用 Resolve。
 func (s *Store) Authenticate(key string) bool {
 	_, ok := s.Resolve(key)
@@ -368,6 +405,9 @@ func (s *Store) Create(name, note string, models []string, options ...Options) (
 	if !validModels(models) {
 		return Info{}, "", ErrInvalidModels
 	}
+	if !fullModelNames(models) {
+		return Info{}, "", ErrBindingRealm
+	}
 	var raw [32]byte
 	var id [12]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -432,6 +472,11 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		}
 		if models != nil {
 			next[i].Models = normalizeModels(*models)
+			// 只在显式改写绑定时报错：否则一把历史上存了裸名的密钥会因为改备注
+			// 这类无关操作被拒，管理员反而没法把它的绑定改对。
+			if !fullModelNames(next[i].Models) {
+				return Info{}, ErrBindingRealm
+			}
 		}
 		if len(options) > 0 && options[0].ReasoningLoopGuard != nil {
 			next[i].ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)

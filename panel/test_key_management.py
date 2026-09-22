@@ -89,10 +89,23 @@ class KeyManagementTests(unittest.TestCase):
             '{"id":"legacy","models":["a b"]}',
             '{"id":"legacy","models":["dup","dup"]}',
             '{"id":"legacy","models":["' + "x" * 65 + '"]}',
+            # 裸名绑定按完整名逐字比对时一条都匹配不上，面板这一层就要拦住，
+            # 不能保存成功却让调用方全撞 403。
+            '{"id":"legacy","models":["deepseek-v4.1-flash"]}',
+            '{"id":"legacy","models":["cn:deepseek-v4.1-flash","glm-5.2"]}',
+            '{"id":"legacy","models":["us:deepseek-v4.1-flash"]}',
         ]
         for body in bad_update:
             with self.subTest(body=body[:40]), patch.object(app.key_management, "request") as upstream:
                 self.assertEqual(self.request("/api/keys/update", body)[0], 400)
+                upstream.assert_not_called()
+
+    def test_rejects_bare_model_binding_on_create(self):
+        """创建路径同样拦裸名：这是手填最容易踩的写法。"""
+        for models in (["deepseek-v4.1-flash"], ["cn:hy3", "glm-5.2"], ["global:"]):
+            with self.subTest(models=models), patch.object(app.key_management, "request") as upstream:
+                code, result = self.request(body=json.dumps({"name": "c", "models": models}))
+                self.assertEqual(code, 400, result)
                 upstream.assert_not_called()
 
     def test_copy_requires_admin_and_valid_origin(self):

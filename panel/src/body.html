@@ -411,7 +411,7 @@
       <div id="keyFields">
         <label class="fld"><span class="k">名称</span><input id="keyName" name="name" maxlength="64" required placeholder="例如：工作电脑 codex" autocomplete="off"></label>
         <label class="fld"><span class="k">备注 <span class="sub">（可选）</span></span><input id="keyNote" name="note" maxlength="256" placeholder="记录用途，方便日后管理" autocomplete="off"></label>
-        <label class="fld"><span class="k">绑定模型 <span class="sub">（留空表示不限制）</span></span><input id="keyModels" name="models" placeholder="例如 cn:deepseek-v4.1-flash，多个用逗号分隔" autocomplete="off" spellcheck="false"></label>
+        <label class="fld"><span class="k">绑定模型 <span class="sub">（留空表示不限制；必须填完整模型名）</span></span><input id="keyModels" name="models" placeholder="例如 cn:deepseek-v4.1-flash，多个用逗号分隔" autocomplete="off" spellcheck="false"></label>
         <div class="key-model-pick">
           <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
           <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>

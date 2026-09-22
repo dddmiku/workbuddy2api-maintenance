@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-22：模型绑定收紧为「完整模型名逐字相等」，创建与编辑都在表单侧拒掉裸名，
+#             与网关的写入校验对齐（绑定必须是 cn:/global: 开头的完整模型名）。
 # 2026-09-22：登录限流分桶只采信可信代理（WB2API_TRUSTED_PROXIES）转发的 IP，
 #             并对分桶表加上限——此前转发头无条件采信，轮换一个头就换一个桶，
 #             限流可被绕过且桶表能被撑到任意大小。
@@ -97,7 +99,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.18"
+PANEL_VERSION = "2.1.19"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -1267,6 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             if "expires_at" in body and not self._valid_expiry(body["expires_at"]):
                 return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
+            problem = self._model_binding_error(body.get("models"))
+            if problem:
+                return self._json(400, {"ok": False, "message": problem})
             return self.keys_request("POST", "/keys", body)
         key_id = body.get("id")
         if not isinstance(key_id, str) or not re.fullmatch(r"legacy|key_[0-9a-f]{24}", key_id):
@@ -1285,13 +1290,30 @@ class Handler(BaseHTTPRequestHandler):
         if "expires_at" in changes and not self._valid_expiry(changes["expires_at"]):
             return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
         if "models" in changes:
-            models = changes["models"]
-            if not isinstance(models, list) or len(models) > 64 or any(
-                    not isinstance(item, str) or not item or len(item) > 64 or
-                    item.strip() != item or any(ch.isspace() or ord(ch) < 32 for ch in item)
-                    for item in models) or len(set(models)) != len(models):
-                return self._json(400, {"ok": False, "message": "模型绑定需为最多 64 个不重复的模型名"})
+            problem = self._model_binding_error(changes["models"])
+            if problem:
+                return self._json(400, {"ok": False, "message": problem})
         return self.keys_request("PATCH", "/keys/" + key_id, changes)
+
+    @staticmethod
+    def _model_binding_error(models):
+        """校验模型绑定，返回错误文案；None 表示通过。
+
+        绑定按完整模型名逐字比对，裸名一条也匹配不上——模型列表里只有带
+        cn:/global: 前缀的名字。网关侧也会拒裸名，这里先拦一道，是为了让
+        手填的场景在表单上就得到明确提示，而不是保存成功却发现调用全 403。
+        """
+        if models is None:
+            return None
+        if not isinstance(models, list) or len(models) > 64 or any(
+                not isinstance(item, str) or not item or len(item) > 64 or
+                item.strip() != item or any(ch.isspace() or ord(ch) < 32 for ch in item)
+                for item in models) or len(set(models)) != len(models):
+            return "模型绑定需为最多 64 个不重复的模型名"
+        # 前缀后必须还有模型名：`cn:` / `global:` 这种只有前缀的写法同样匹配不上。
+        if any(not re.fullmatch(r"(cn|global):.+", item) for item in models):
+            return "模型绑定必须选完整模型名（cn: 或 global: 开头），请从模型列表添加"
+        return None
 
     @staticmethod
     def _valid_expiry(value):
