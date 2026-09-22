@@ -955,6 +955,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	pathCount := len(c.chatPaths(a))
+	// contextTrimLevel 上下文超限的裁剪档位：上游预检硬墙（1,048,576）比模型元数据
+	// 声明的窗口更紧，客户端估算又低于上游口径，实测失败样本只超出几十到几百 token。
+	// 命中 11115 时丢一段最旧历史后重发，用户侧无感；档位用尽仍超限才把错误交回。
+	// 计数跨路径累计，避免 404 fallback 场景下重复裁剪同一请求。
+	contextTrimLevel := 0
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
 		// wafLevel：WAF 断词升级档位。0 = 原样重发前；1 = 模式级断词；
@@ -1046,6 +1051,22 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				if attempt < pathCount-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 					observeChatRetry(ctx, raw)
 					break retry
+				}
+				// 上下文超限：按档位丢掉最旧的一部分历史后同路径重发一次。
+				// 上游在生成前就拒了这次请求，因此没有用量可记；这里只做裁剪与重发，
+				// 不改账号状态（换号也是同一堵墙）。
+				if kind == ErrContextTooLong && contextTrimLevel < ContextTrimLevels() {
+					ratio := contextTrimKeepRatios[contextTrimLevel]
+					if trimmed, changed := TrimOldestContext(prepared, ratio); changed {
+						contextTrimLevel++
+						prepared = trimmed
+						lastSent = prepared
+						log.Printf("WARN: [upstream] context too long: dropped oldest turns "+
+							"(keep_ratio=%.2f level=%d/%d) and retrying uid=%s path=%s",
+							ratio, contextTrimLevel, ContextTrimLevels(), logfmt.UID8(a.UID), path)
+						observeChatRetry(ctx, raw)
+						continue retry
+					}
 				}
 				return nil, resp.StatusCode, raw, nil
 			}

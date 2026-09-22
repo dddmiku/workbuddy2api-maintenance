@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-23：补日志窗口回归：60/120/300/600 是「请求条数」而不是原始日志行数，
+#             取窗口时要按噪声比例放大 tail，并按请求行裁到目标条数。
 # 2026-09-22：补密钥管理默认启用的口径回归：api_keys_file 未配置时按默认路径解析
 #             （与网关同口径），显式空串仍关闭，且 api_key 也为空时不能显示成可用。
 # 2026-09-20：覆盖有效期字段的透传、显式 null 与非法值拒绝，以及密钥列表合并累计用量。
@@ -252,6 +254,33 @@ class KeyManagementTests(unittest.TestCase):
         # 旧格式没有 key= 列：归一化成 "-"，前端按同一列渲染。
         self.assertEqual(rows[0]["key"], "-")
         self.assertEqual(other, [])
+
+
+class LogWindowTests(unittest.TestCase):
+    """日志页的 60/120/300/600 是「请求条数」语义，不是 docker --tail 的原始行数。
+
+    日志里请求行与 WARN/ERR 行混排，噪声重时请求约占一半——直接拿按钮数字去 tail，
+    按钮写 60 就只能出 ~30 条请求。这里锁住「按比例放大再裁到目标条数」的口径。
+    """
+
+    def test_window_is_larger_than_the_request_count(self):
+        """取窗口必须大于目标请求数，否则噪声会把请求行挤掉。"""
+        for want in (60, 120, 300, 600):
+            with self.subTest(want=want):
+                self.assertGreater(app.request_window_size(want), want)
+
+    def test_window_is_capped(self):
+        """放大后要封顶，避免一次拉出过长的 docker logs。"""
+        self.assertLessEqual(app.request_window_size(1000), app.LOG_TAIL_MAX)
+        self.assertLessEqual(app.request_window_size(10_000), app.LOG_TAIL_MAX)
+
+    def test_window_survives_heavy_noise(self):
+        """噪声占 3/4 时，放大后的窗口仍要够拿到目标条数请求。"""
+        want = 120
+        tail = app.request_window_size(want)
+        # 极端情况：每 4 行里只有 1 行是请求。
+        request_lines = tail // 4
+        self.assertGreaterEqual(request_lines, want)
 
 
 class KeyManagementDefaultTests(unittest.TestCase):

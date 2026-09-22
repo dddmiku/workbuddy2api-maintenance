@@ -70,6 +70,24 @@ stream_idle_timeout_ms = 90000
 | `model_auto_compact_token_limit` | Codex 客户端 | 触发自动历史压缩的 token 阈值；未设置时使用该客户端版本的模型默认行为 |
 | `/v1/models` 中的 `context_length` | 网关模型目录 | 提供模型元数据，不能代替客户端配置或证明客户端已经采用该值 |
 
+### 上游硬墙与网关自动裁剪
+
+上游 deepseek 系模型的实际硬墙是 **1,048,576**（1 MiB），比模型元数据声明的 `context_length` / `max_allowed_size`（1,000,000）更紧。客户端按 `min(auto_compact_token_limit, 9/10 × context_window)` 触发压缩，这个阈值本身低于硬墙；但客户端侧的 token 估算与上游预检口径不同，实测出现过「客户端认为 664,841、上游预检 1,048,691」的偏差，压缩还没来得及触发，请求就已经被拒。
+
+实测失败样本都只超出硬墙几十到几百 token：
+
+| 上游原文 | 超出 |
+|---|---|
+| `prompt is too long: 1048684 tokens > 1048576 maximum` | 108 |
+| `prompt is too long: 1048691 tokens > 1048576 maximum` | 115 |
+| `prompt is too long: 1048868 tokens > 1048576 maximum` | 292 |
+| `prompt is too long: 1048892 tokens > 1048576 maximum` | 316 |
+| `prompt is too long: 1048992 tokens > 1048576 maximum` | 416 |
+
+这类「差一点点」不需要让调用方看到 400。网关收到 `context_too_long`（11115）后，会按轮丢掉最旧的一部分历史并在同一账号、同一路径上重发，逐级裁剪（保留 75% → 50% → 25% 的轮次）；三轮仍超限才把上游原文交回调用方。裁剪只删除整轮，`assistant.tool_calls` 与其后的 `tool` 结果始终成对，前导 system 消息保留。重发对调用方无感，也不会因为这次失败冷却或解绑账号。
+
+上游在生成前就拒了超限请求，因此这些重试不产生用量；重发成功的那一轮按上游原值记账。
+
 模型目录里 `auto_compact_token_limit` 与 `context_window` 的关系要一起看：客户端实际生效的阈值是两者的较小值，且不超过 `context_window` 的 9/10。`global:deepseek-v4.1-flash` 与 `cn:deepseek-v4.1-flash` 的窗口是 1000000，因此把 `auto_compact_token_limit` 设成 900000 就取到客户端允许的上限；设得更大不会提高阈值，反而会让配置与实际生效值不一致。网关不写这个字段，它由客户端配置决定。
 
 若发现会话「远没到临界就被压缩」，先核对实际生效值：早期按 1.5 倍输入估计留下的 466666 会比真实阈值早很多触发。网关侧的 `input_token_scale` 已退役，用量按上游原值传递，客户端的压缩阈值应当按真实窗口设置。

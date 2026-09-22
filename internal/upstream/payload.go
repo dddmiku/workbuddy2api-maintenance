@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 
 	"workbuddy2api/internal/jsonutil"
 )
@@ -89,6 +90,25 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, effort
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
+// effortAdjustOnce 让「档位被改写」每个 (模型, 原档 → 新档) 只打一次日志。
+//
+// 这类改写是**常态**而非异常：客户端普遍请求 max，而多数模型只支持到 high，
+// 于是每个请求都会改写一次。此前每次改写都打一条 WARN，实测在 5000 行日志窗口里
+// 2302 条改写日志对 2442 条请求行——日志一半是重复噪声，把请求行挤下去，面板按
+// 行数取窗口时实际能看到的请求数只有一半。改成每个组合报一次，既能说明「网关确实
+// 在按模型能力收敛档位」，又不淹没真正的请求记录。
+var effortAdjustOnce sync.Map
+
+// logEffortAdjust 首次遇到某个 (模型, 原档 → 新档) 组合时打一条，之后静默。
+func logEffortAdjust(verb, model, from, to string) {
+	key := verb + "\x00" + model + "\x00" + from + "\x00" + to
+	if _, loaded := effortAdjustOnce.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("WARN: [upstream] reasoning_effort %s model=%s %s -> %s (logged once per model and level)",
+		verb, model, from, to)
+}
+
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
@@ -134,7 +154,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("WARN: [upstream] reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			logEffortAdjust("downgraded", model, reqStr, best)
 		}
 		return
 	}
@@ -148,7 +168,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("WARN: [upstream] reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		logEffortAdjust("floored", model, reqStr, lowest)
 	}
 }
 

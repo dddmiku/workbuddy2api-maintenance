@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-23：版本号提升到 2.1.24（网关侧新增上下文超限自动裁剪重发）。
+# 2026-09-23：日志页的 60/120/300/600 改为「请求条数」语义：按请求行数取窗口，
+#             不再是 docker --tail 的原始行数（日志里 WARN 行会占掉一半，按钮写
+#             60 实际只出 ~30 条请求）。
 # 2026-09-22：密钥管理默认启用：api_keys_file 留空也按默认路径解析，只有显式
 #             api_keys_enabled=false 才关闭；修掉新装用户建不了密钥的问题。
 # 2026-09-22：模型绑定收紧为「完整模型名逐字相等」，创建与编辑都在表单侧拒掉裸名，
@@ -101,7 +105,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.23"
+PANEL_VERSION = "2.1.24"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -129,6 +133,19 @@ def parse_request_log(text):
             item[field] = (item.get(field) or "").strip() or "-"
         rows.append(item)
     return rows, other[-60:]
+
+
+# LOG_TAIL_FACTOR 决定为了拿到 N 条请求要往回取多少原始行。
+# 请求行与 WARN/ERR 行混排，比例不固定；实测噪声重时请求约占一半，
+# 取 4 倍再留 200 行余量，既能凑够目标条数又不会把 tail 拉得过大。
+LOG_TAIL_FACTOR = 4
+LOG_TAIL_HEADROOM = 200
+LOG_TAIL_MAX = 5000
+
+
+def request_window_size(want):
+    """want 条请求需要往回取多少原始日志行。"""
+    return min(want * LOG_TAIL_FACTOR + LOG_TAIL_HEADROOM, LOG_TAIL_MAX)
 GATEWAY = os.environ.get("WB2API_GATEWAY_URL", "http://127.0.0.1:7863")
 LISTEN_HOST = os.environ.get("WB2API_ADMIN_HOST", "127.0.0.1")
 try:
@@ -1091,13 +1108,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "message": (payload.get("error") or {}).get("message", "")})
 
         if path == "/api/logs":
-            lines = 120
+            # 这里收到的 lines= 是「要多少条**请求**」，不是 docker --tail 的原始行数。
+            # 日志里请求行与 WARN/ERR 行混在一起，比例不固定，所以先多取一段原始行，
+            # 解析后按请求行裁到目标条数；日志本身不够长时就给多少算多少。
+            want = 120
             m = re.search(r"lines=(\d{1,4})", query)
             if m:
-                lines = min(int(m.group(1)), 1000)
-            rc, out, err = docker(["logs", "--tail", str(lines), CONTAINER], timeout=40)
+                want = min(max(int(m.group(1)), 1), 1000)
+            rc, out, err = docker(["logs", "--tail", str(request_window_size(want)), CONTAINER], timeout=40)
             raw = "\n".join(part for part in (out, err) if part)
             rows, other = parse_request_log(raw)
+            rows = rows[-want:]
             return self._json(200, {"ok": rc == 0, "logs": raw, "rows": rows, "other": other,
                                     "count": len(rows), "rc": rc})
 
