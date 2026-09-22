@@ -244,6 +244,7 @@ func main() {
 	}
 	defer mainLn.Close()
 	if inherited {
+		// #nosec G706 -- fd 号来自本进程继承的监听套接字环境变量，不是外部输入
 		log.Printf("[update] inherited listening socket from the previous instance (fd=%s)",
 			os.Getenv(hotupdate.EnvListenFD))
 	}
@@ -258,6 +259,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("inherit API key admin socket: %v", err)
 			}
+			// #nosec G706 -- 同上：管理 socket 的 fd 号
 			log.Printf("[update] inherited admin socket from the previous instance (fd=%s)", os.Getenv(hotupdate.EnvAdminFD))
 		} else {
 			adminLn, err = apikeys.ListenUnix(cfg.APIKeysSocket)

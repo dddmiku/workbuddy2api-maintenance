@@ -301,14 +301,14 @@ func (h *Handler) requireInternal(next http.HandlerFunc) http.HandlerFunc {
 // usageStats 返回按密钥累计的 token 用量（管理台「用量统计」页数据源）。
 func (h *Handler) usageStats(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Usage == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
+		_ = writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      false,
 			"message": "用量账本未启用：config 里设置 usage_file 后重启网关",
 		})
 		return
 	}
 	snapshot := h.cfg.Usage.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"file":       h.cfg.Usage.Path(),
 		"since":      snapshot.Since,
@@ -333,7 +333,7 @@ func (h *Handler) recordUsage(st *chatStat, model string) {
 // updateStatus 返回热更新状态（当前版本、远端最新版本、最近错误）。
 // reasoningLoopFeature 返回重复推理保护的运行期设置（供管理台渲染开关）。
 func (h *Handler) reasoningLoopFeature(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"ok":        true,
 		"stop_only": h.reasoningLoopStopOnly(),
 		"default":   h.cfg.ReasoningLoopStopOnly,
@@ -350,43 +350,43 @@ func (h *Handler) setReasoningLoopFeature(w http.ResponseWriter, r *http.Request
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "请求体需为 {\"stop_only\": true|false}"})
+		_ = writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "请求体需为 {\"stop_only\": true|false}"})
 		return
 	}
 	if body.StopOnly == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "stop_only 必须是 true 或 false"})
+		_ = writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "stop_only 必须是 true 或 false"})
 		return
 	}
 	h.SetReasoningLoopStopOnly(*body.StopOnly)
 	log.Printf("INFO: [server] reasoning loop stop-only set to %t via admin channel", *body.StopOnly)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stop_only": *body.StopOnly})
+	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stop_only": *body.StopOnly})
 }
 
 func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Update == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
+		_ = writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "enabled": false,
 			"message": "热更新未启用：config 里设置 update.enabled=true 后重启网关",
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cfg.Update.Status()})
+	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cfg.Update.Status()})
 }
 
 // updateCheck 查询远端最新版本（只读，不改动任何东西）。
 func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Update == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	status, err := h.cfg.Update.Check(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error(), "status": status})
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error(), "status": status})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
 }
 
 // updateApply 触发一次热更新。
@@ -395,7 +395,7 @@ func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) {
 // 由 main 的优雅停机路径把在途请求跑完。前端用 /update 轮询进度。
 func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Update == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
 		return
 	}
 	var body struct {
@@ -406,16 +406,16 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		// 否则一次手滑的请求会静默变成"升到最新版"。
 		raw, readErr := io.ReadAll(io.LimitReader(r.Body, (1<<12)+1))
 		if readErr != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "读取请求体失败"})
+			_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "读取请求体失败"})
 			return
 		}
 		if len(raw) > 1<<12 {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体过大"})
+			_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体过大"})
 			return
 		}
 		if len(bytes.TrimSpace(raw)) > 0 {
 			if err := json.Unmarshal(raw, &body); err != nil {
-				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体不是合法 JSON"})
+				_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体不是合法 JSON"})
 				return
 			}
 		}
@@ -423,14 +423,14 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 	status := h.cfg.Update.Status()
 	switch status.State {
 	case hotupdate.StateChecking, hotupdate.StateDownloading, hotupdate.StateHandover:
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "已有更新任务在进行中", "status": status})
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "已有更新任务在进行中", "status": status})
 		return
 	}
 	target := strings.TrimSpace(body.Tag)
 	// 只有「已经查过远端、且确认没有新版本」才直接拒绝。没查过就交给 Apply 自己去查，
 	// 否则管理台必须先点一次「检查更新」才能升级，用户看到的是莫名其妙的"已经是最新"。
 	if !status.UpdateReady && target == "" && !status.CheckedAt.IsZero() {
-		writeJSON(w, http.StatusOK, map[string]any{
+		_ = writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "message": fmt.Sprintf("已经是最新版本（当前 %s，远端 %s）", status.Current, status.LatestTag),
 			"status": status,
 		})
@@ -444,7 +444,7 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 			log.Printf("ERROR: [update] apply failed: %v", err)
 		}
 	}()
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "message": "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出",
 		"status": h.cfg.Update.Status(),
 	})
@@ -466,7 +466,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
-	writeJSON(w, status, map[string]any{
+	_ = writeJSON(w, status, map[string]any{
 		"healthy":        healthy,
 		"total":          total,
 		"service":        ServiceName,
@@ -488,7 +488,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -542,7 +542,7 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 		}
 		list = filtered
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   list,
 	})
@@ -1252,13 +1252,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 被丢弃的这一轮上游确实生成并计费了（保护是在读到循环后才截断的），
 				// 用量照实累计，不能因为重发就把它抹掉。
 				st.absorbUsage(stats)
-				rc.Close()
+				// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
+				_ = rc.Close()
 				loopRetries++
 				log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
 					loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
 				// 重发前重建读取器与用量观测：上一次被截断的观测已随重发作废，
 				// 只保留客户端最终真正收到的那一轮用量。
-				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+				// 重发只关心能不能建立（rc/status/terr）：下一轮由 Stream 直接读 rc，
+				// 这一轮的响应体在两条失败分支里都不读，用 _ 省掉一次死赋值。
+				rc, status, _, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
 				if terr != nil || status >= 400 {
 					// 重发没能建立（传输层失败或上游直接报错）：Stream 已经压制了上一次
 					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
@@ -1280,7 +1283,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			st.absorbUsage(stats)
 			if streamErr != nil {
-				rc.Close()
+				// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
+				_ = rc.Close()
 				if upstream.IsLoopGuardError(streamErr) {
 					// The stream was stopped before final usage could be established.
 					// Preserve observed counts but do not label them as a complete bill.
@@ -1319,7 +1323,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
 			}
 			st.failed = false
-			rc.Close()
+			// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
+			_ = rc.Close()
 			return
 		}
 		// 非流式同理：Aggregate 只在**读完**之后才返回，出错时客户端一个字节都没收到，
@@ -1337,11 +1342,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 同流式：被丢弃的那一轮上游已经产生并计费，用量照实累计。
 			st.absorbUsage(stats)
-			rc.Close()
+			// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
+			_ = rc.Close()
 			loopRetries++
 			log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
 				loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
-			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			// 同流式：重发只判断能否建立，响应体在失败分支里不读。
+			rc, status, _, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
 			if terr != nil || status >= 400 {
 				// 重发没能建立：把失败如实回报，不能静默结束。
 				st.unreported = true
@@ -1356,7 +1363,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			stats = newChatStatsReaderSince(rc, st.start)
 		}
 		st.absorbUsage(stats)
-		rc.Close()
+		// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
+		_ = rc.Close()
 		if err != nil {
 			if upstream.IsLoopGuardError(err) {
 				st.unreported = true
@@ -1551,7 +1559,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, map[string]any{
+	_ = writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
 			"type":    "api_error",

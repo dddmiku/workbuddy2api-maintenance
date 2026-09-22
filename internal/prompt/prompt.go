@@ -60,6 +60,7 @@ func Load(mode, file string) (string, error) {
 	if file == "" {
 		return defaultPrompt, nil
 	}
+	// #nosec G304 -- 提示词文件路径来自管理员配置
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		return "", fmt.Errorf("prompt file %s: %w", file, err)

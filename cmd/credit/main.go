@@ -111,6 +111,7 @@ func collectWithConcurrency(authDir string, up *upstream.Client, workers int) []
 	}
 	tasks := make([]task, 0, len(files))
 	for index, f := range files {
+		// #nosec G304,G703 -- auth 文件路径来自命令行参数
 		raw, err := os.ReadFile(f)
 		if err != nil {
 			continue

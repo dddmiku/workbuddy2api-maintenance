@@ -41,6 +41,7 @@ import (
 // 管理台面板侧有一份等价常量（panel/key_management.py 的 DEFAULT_API_KEYS_FILE），
 // 两边必须一致：面板读的是原始 config.json，网关读的是归一化后的配置，默认值一旦
 // 分叉，就会出现「网关已启用、面板说未启用」的分裂。
+// #nosec G101 -- 这是密钥库的文件路径常量，不是凭据
 const DefaultAPIKeysFile = "./data/api_keys.json"
 
 // Config 顶层配置。
@@ -287,6 +288,7 @@ func Load(path string) (*Config, error) {
 	c := Default()
 	legacyScaleConfigured := os.Getenv("WB2A_INPUT_TOKEN_SCALE") != ""
 	if path != "" {
+		// #nosec G304 -- 配置文件路径来自命令行参数
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)

@@ -124,16 +124,6 @@ func (r errorRule) hit(body, lower string) bool {
 	return false
 }
 
-// firstHit 返回第一条命中的 marker 原文（供「哪个词命中」的场景）；无命中返回 ""。
-func (r errorRule) firstHit(body, lower string) string {
-	for _, p := range r.patterns {
-		if matchPattern(p, r.mode, body, lower) {
-			return p
-		}
-	}
-	return ""
-}
-
 // Error 带分类的上游错误。
 type Error struct {
 	Kind   ErrKind
@@ -883,18 +873,6 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	})
 }
 
-// chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /v2/chat/completions（404/405 时由 ChatStream fallback /console/chat/completions）；
-// cn → /v2/chat/completions（现状逐字，零回归）。
-//
-// 2026-09-17 国际版客户端抓包：官方 CLI host 实发 /v2/chat/completions（同域其它接口走
-// /v2/…、/console/as/… 混排，chat 只走 /v2）。global 早前优先 /console 是上游新旧
-// 路径分叉期的兼容顺序，与官方客户端不一致；WAF 按路径分规则，非官方路径更易被判。
-// 现改为官方顺序：先 /v2，仅 404/405 才回落 /console。
-func (c *Client) chatPath(a *auth.Auth) string {
-	return chatCompletionsPath
-}
-
 // 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
 const (
 	chatCompletionsPath   = "/v2/chat/completions"
@@ -967,7 +945,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			if resp.StatusCode >= 400 {
 				errorBody := monitorBody(resp.Body, c.IdleTimeout, cancel)
 				raw, rerr := io.ReadAll(io.LimitReader(errorBody, 1<<20))
-				errorBody.Close()
+				// 正文已经读完，关闭失败不改变下面的判定。
+				_ = errorBody.Close()
 				cancel()
 				// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 				// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。

@@ -27,14 +27,14 @@ type TaskController interface {
 // 比一个错误码对使用者更有用。
 func (h *Handler) tasks(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Tasks == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"available": false, "tasks": []any{}})
+		_ = writeJSON(w, http.StatusOK, map[string]any{"available": false, "tasks": []any{}})
 		return
 	}
 	snap := h.cfg.Tasks.TaskSnapshot()
 	if snap == nil {
 		snap = []scheduler.TaskInfo{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"available": true, "tasks": snap})
+	_ = writeJSON(w, http.StatusOK, map[string]any{"available": true, "tasks": snap})
 }
 
 // taskLog 返回某类任务最近一次执行的日志行。
@@ -56,7 +56,7 @@ func (h *Handler) taskLog(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, status, "task_log_failed", msg)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"key": key, "lines": lines, "count": len(lines),
 	})
 }
@@ -84,7 +84,7 @@ func (h *Handler) taskRun(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, status, "task_trigger_failed", msg)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	_ = writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "key": key, "message": "已触发，结果见容器日志",
 	})
 }

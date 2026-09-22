@@ -238,9 +238,7 @@ func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, seconda
 	var outInfos []ModelInfo
 	if primaryInfos != nil {
 		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
-		for _, mi := range primaryInfos {
-			outInfos = append(outInfos, mi)
-		}
+		outInfos = append(outInfos, primaryInfos...)
 	}
 	for _, id := range secondaryNames {
 		if id == "" || seen[id] {

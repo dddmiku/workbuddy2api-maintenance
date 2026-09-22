@@ -142,6 +142,7 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 	}
 	defer readPipe.Close()
 
+	// #nosec G204 -- binary 是本进程自己下载并校验过 sha256 的更新产物路径，args 来自本进程启动参数
 	cmd := exec.Command(binary, args...)
 	env := append(stripHandoverEnv(os.Environ()),
 		fmt.Sprintf("%s=%d", EnvListenFD, inheritedFDBase),

@@ -296,32 +296,6 @@ func completionTokens(resp map[string]any) int {
 	return v
 }
 
-// promptTokens 从聚合响应提取 usage.prompt_tokens；缺失返回 -1（缺失≠0）。
-func promptTokens(resp map[string]any) int {
-	u, ok := resp["usage"].(map[string]any)
-	if !ok {
-		return -1
-	}
-	v, ok := upstream.UsageCount(u["prompt_tokens"])
-	if !ok {
-		return -1
-	}
-	return v
-}
-
-// cachedTokens 从聚合响应提取输入缓存命中数：优先上游的 prompt_cache_hit_tokens，
-// 其次 OpenAI 形状的 prompt_tokens_details.cached_tokens；都缺失返回 -1（缺失≠0）。
-func cachedTokens(resp map[string]any) int {
-	u, ok := resp["usage"].(map[string]any)
-	if !ok {
-		return -1
-	}
-	if value, ok := upstream.CachedInputTokens(u); ok {
-		return value
-	}
-	return -1
-}
-
 // usageCreditTotal 从聚合响应提取本次真实扣费与总 token 数（供成本账本）。
 // ok=false 表示 usage 缺失或字段类型不符——此时不记录观测，避免污染账本。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {

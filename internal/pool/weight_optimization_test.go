@@ -459,6 +459,3 @@ func writeState(t *testing.T, fp, content string) {
 		t.Fatalf("write state.json: %v", err)
 	}
 }
-
-// pickWeightedScale 暴露定点放大常数给测试对齐（P1-B 断言定点值用）。
-const pickWeightedScale = 1_000_000

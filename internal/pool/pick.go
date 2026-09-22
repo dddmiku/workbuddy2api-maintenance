@@ -148,6 +148,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			}
 		}
 		if eq {
+			// #nosec G404 -- 选号时对等权重候选做洗牌，本就是非安全用途；加权抽签另有注入的随机源
 			shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
 			shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
 		}

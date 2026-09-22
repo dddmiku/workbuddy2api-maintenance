@@ -78,6 +78,7 @@ func main() {
 	var rows []trialRow
 	for _, f := range files {
 		r := trialRow{uid: filepath.Base(f)}
+		// #nosec G304,G703 -- auth 文件路径来自命令行参数
 		raw, err := os.ReadFile(f)
 		if err != nil {
 			r.status, r.detail = trialFailed, "load: "+err.Error()

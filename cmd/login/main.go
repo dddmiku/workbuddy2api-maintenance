@@ -232,6 +232,7 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
 func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
+	// #nosec G304 -- state 文件路径由登录流程内部生成
 	raw, err := os.ReadFile(statePath)
 	if err != nil {
 		fatal("read state: %v (先跑 login url)", err)
@@ -278,7 +279,8 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	}
 	oraw, _ := json.Marshal(buildLoginOutput(tok, realm, acct))
 	fmt.Fprintln(out, string(oraw))
-	os.Remove(statePath)
+	// 用完即清的临时 state 文件：删不掉不影响已经打印的登录结果。
+	_ = os.Remove(statePath)
 }
 
 // buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。

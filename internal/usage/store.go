@@ -518,6 +518,7 @@ func (s *Store) persistDocument(doc document, merge bool) error {
 // persistDocument 在持有文件锁时完成全部读改写，读取失败保留原文件与待写增量。
 func readLedger(path string) (document, error) {
 	empty := document{Version: Version, Keys: map[string]*keyRecord{}}
+	// #nosec G304 -- 账本路径来自管理员配置，非请求输入
 	file, err := os.Open(path)
 	if err != nil {
 		return empty, err

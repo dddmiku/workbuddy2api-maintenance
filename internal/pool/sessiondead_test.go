@@ -92,8 +92,12 @@ func TestSessionDeadFailsClearPersists(t *testing.T) {
 		t.Errorf("清零后重启 sessionDeadFails=%d want 0", fails)
 	}
 	// 清零持久化后：重启需重新计满 3 次。
-	if p2.NoteSessionDead("u1") || p2.NoteSessionDead("u1") {
-		t.Fatal("清零后前 2 次不应禁用")
+	// 分两次显式调用：写成 `a || b` 时 b 会被 a 为真短路掉，第二次根本没记上，
+	// 于是后面的第 3 次断言就不再验证「三次才禁用」这件事。
+	for i := 1; i <= 2; i++ {
+		if p2.NoteSessionDead("u1") {
+			t.Fatalf("清零后第 %d 次不应禁用", i)
+		}
 	}
 	if !p2.NoteSessionDead("u1") {
 		t.Fatal("清零后第 3 次应禁用")

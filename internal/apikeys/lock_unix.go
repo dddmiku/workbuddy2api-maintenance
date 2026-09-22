@@ -19,7 +19,8 @@ func lockKeyStore(path string) (func(), error) {
 		return nil, err
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		file.Close()
+		// 加锁失败：要报的是 Flock 的错误，关闭失败不改变结论。
+		_ = file.Close()
 		return nil, err
 	}
 	return func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN); _ = file.Close() }, nil

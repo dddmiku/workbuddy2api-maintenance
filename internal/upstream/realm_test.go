@@ -323,9 +323,3 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 		t.Errorf("cn reasoning_effort=%v want medium (cn bucket still applies within realm)", m["reasoning_effort"])
 	}
 }
-
-func cloneBody(r *http.Request) []byte {
-	raw, _ := io.ReadAll(r.Body)
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	return raw
-}

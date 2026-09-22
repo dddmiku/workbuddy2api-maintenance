@@ -72,6 +72,7 @@ func readTrimmedFile(path string, maxLen int) (string, error) {
 	if info.Size() > int64(maxLen) {
 		return "", errDeviceTokenTooLarge
 	}
+	// #nosec G304 -- 设备令牌文件路径来自管理员配置
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

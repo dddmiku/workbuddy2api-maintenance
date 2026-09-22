@@ -347,11 +347,12 @@ func (a *Auth) SaveAtomic() error {
 	tmp := file.Name()
 	defer os.Remove(tmp)
 	if _, err := file.Write(raw); err != nil {
-		file.Close()
+		// 写失败时先把要报的错误原样返回；临时文件由上面的 defer 清掉。
+		_ = file.Close()
 		return err
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
+		_ = file.Close()
 		return err
 	}
 	if err := file.Close(); err != nil {
@@ -393,6 +394,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
+		// #nosec G304 -- 账号文件路径由 auth_dir 推导，非请求输入
 		raw, err := os.ReadFile(f)
 		if err != nil {
 			continue

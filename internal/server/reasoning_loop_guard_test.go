@@ -48,17 +48,6 @@ func reasoningGuardLines(count int) string {
 	return strings.Repeat("checking the same step once more\n", count)
 }
 
-// reasoningGuardDistinctLines 生成 count 条彼此不同的短行。需要「不构成循环」的
-// 场景（例如验证进展会重置窗口）必须用它，不能用 reasoningGuardLines——后者是
-// 同一条短行重复，本身就是循环。
-func reasoningGuardDistinctLines(count int) string {
-	var builder strings.Builder
-	for index := 0; index < count; index++ {
-		fmt.Fprintf(&builder, "distinct reasoning step %04d\n", index)
-	}
-	return builder.String()
-}
-
 func reasoningGuardTool(index int, id, name, arguments string) string {
 	return reasoningGuardFrame(map[string]any{"tool_calls": []any{map[string]any{
 		"index": index, "id": id, "type": "function",

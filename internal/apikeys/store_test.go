@@ -24,11 +24,11 @@ func TestModelBindingValidationAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, key, err := s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "glm-5.2"})
-	if !errors.Is(err, ErrBindingRealm) {
+	// 先断言裸名被拒：这一把不产生可用记录，返回的 info/key 直接丢弃。
+	if _, _, err := s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "glm-5.2"}); !errors.Is(err, ErrBindingRealm) {
 		t.Fatalf("bare binding accepted on create: err=%v", err)
 	}
-	info, key, err = s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "global:glm-5.2"})
+	info, key, err := s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "global:glm-5.2"})
 	if err != nil {
 		t.Fatal(err)
 	}

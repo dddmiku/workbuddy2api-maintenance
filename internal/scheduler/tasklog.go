@@ -36,7 +36,9 @@ type teeWriter struct {
 
 func (t *teeWriter) Write(p []byte) (int, error) {
 	n, err := t.base.Write(p)
-	t.ring.Write(p)
+	// 环这一侧是尽力而为的旁路：它写失败不能改变 base 的写入结果，
+	// 也不该在这里额外报错（否则每次写日志都会多一条失败噪音）。
+	_, _ = t.ring.Write(p)
 	return n, err
 }
 

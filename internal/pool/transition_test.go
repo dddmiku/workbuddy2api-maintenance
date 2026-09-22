@@ -112,7 +112,14 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 		t.Fatal("precondition: 应处于软冷却")
 	}
 
-	if p.NoteSessionDead("u1") || p.NoteSessionDead("u1") || !p.NoteSessionDead("u1") {
+	// 逐次断言：写成 `a || b || !c` 会在前两次任一为真时短路，后面对第 3 次的
+	// 判断就不会执行，测试也就测不到「第 3 次才达阈值」。
+	for i := 1; i <= 2; i++ {
+		if p.NoteSessionDead("u1") {
+			t.Fatalf("第 %d 次 NoteSessionDead 不应达阈值", i)
+		}
+	}
+	if !p.NoteSessionDead("u1") {
 		t.Fatal("第 3 次 NoteSessionDead 应达阈值禁用")
 	}
 	st, _ := p.Status("u1")

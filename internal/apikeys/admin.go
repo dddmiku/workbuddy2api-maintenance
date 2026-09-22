@@ -212,7 +212,8 @@ func ListenUnix(path string) (net.Listener, error) {
 		}
 		conn, dialErr := net.DialTimeout("unix", path, 300*time.Millisecond)
 		if dialErr == nil {
-			conn.Close()
+			// 探测用的连接：这里正要报「socket 已被占用」，关闭失败没有可做的补救。
+			_ = conn.Close()
 			return nil, ErrSocketBusy
 		}
 		if err := os.Remove(path); err != nil {
@@ -226,7 +227,8 @@ func ListenUnix(path string) (net.Listener, error) {
 		return nil, err
 	}
 	if err := os.Chmod(path, 0600); err != nil {
-		listener.Close()
+		// 权限收紧失败：下面要报的是这个错误，listener 顺手关掉即可。
+		_ = listener.Close()
 		return nil, err
 	}
 	return listener, nil

@@ -73,6 +73,7 @@ func TestChatStreamContextNilFallback(t *testing.T) {
 		}, nil
 	})
 	// 传 nil ctx(显式断言不 panic 且正常返回)。
+	//lint:ignore SA1012 这条测试的目的就是锁住 nil ctx 的回落行为，必须真的传 nil
 	rc, status, _, err := c.ChatStreamContext(nil, &auth.Auth{AccessToken: "at"}, []byte(`{}`), "", ChatMeta{ConversationRequestID: "req-nil-ctx"})
 	if err != nil || status != 200 {
 		t.Fatalf("nil ctx: status=%d err=%v", status, err)

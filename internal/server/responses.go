@@ -1318,11 +1318,6 @@ func (rw *responsesWriter) beginStream() {
 	rw.emit(evInProgress, map[string]any{"response": rw.responseObject("in_progress")})
 }
 
-// produced 判断是否已经产出过实质内容（用于区分「真失败」与「只是没内容」）。
-func (rw *responsesWriter) produced() bool {
-	return rw.text.Len() > 0 || rw.refusal.Len() > 0 || rw.reason.Len() > 0 || len(rw.order) > 0
-}
-
 func (rw *responsesWriter) emit(evType string, payload map[string]any) {
 	payload["type"] = evType
 	payload["sequence_number"] = rw.seq

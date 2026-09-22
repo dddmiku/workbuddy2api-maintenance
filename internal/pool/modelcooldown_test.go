@@ -105,7 +105,7 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+	if rem := time.Until(mc.Until); rem <= 0 || rem > 10*time.Minute+time.Second {
 		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
@@ -508,7 +508,8 @@ func TestModelCooldownsPersistRoundTrip(t *testing.T) {
 	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("恢复后 model until=%v want ~reset=%v (diff %v)", mc.Until, reset, d)
 	}
-	if mc.ResetAt != mc.ResetAt || !mc.ResetAt.Equal(reset) {
+	// ResetAt 是 time.Time，不存在 NaN 形态；只断言恢复后与原始墙钟相等。
+	if !mc.ResetAt.Equal(reset) {
 		t.Errorf("恢复后 model reset_at=%v want %v", mc.ResetAt, reset)
 	}
 	if mc.Reason != "6004 model rate limit" {

@@ -659,27 +659,6 @@ func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 	return resp, nil
 }
 
-// mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：
-// id/type/function.name 直覆盖（后续分片通常缺省），function.arguments 拼接。
-func mergeToolCallDelta(merged, delta map[string]any) {
-	if v, ok := delta["id"].(string); ok && v != "" {
-		merged["id"] = v
-	}
-	if v, ok := delta["type"].(string); ok && v != "" {
-		merged["type"] = v
-	}
-	df, _ := delta["function"].(map[string]any)
-	if df == nil {
-		return
-	}
-	mf, _ := merged["function"].(map[string]any)
-	if mf == nil {
-		mf = map[string]any{}
-		merged["function"] = mf
-	}
-	mergeFunctionDelta(mf, df)
-}
-
 func mergeFunctionDelta(merged, delta map[string]any) {
 	if value, ok := delta["name"].(string); ok && value != "" {
 		merged["name"] = value

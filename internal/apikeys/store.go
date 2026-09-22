@@ -142,6 +142,7 @@ func Open(path, existingKey string) (*Store, error) {
 }
 
 func readKeyRecords(path string) ([]record, os.FileInfo, error) {
+	// #nosec G304 -- 密钥库路径来自管理员配置，非请求输入
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -566,6 +567,7 @@ func (s *Store) write(doc document) error {
 	if err = os.Rename(tmp, s.path); err != nil {
 		return err
 	}
+	// #nosec G304 -- 目录路径由密钥库路径推导，非请求输入
 	if d, e := os.Open(dir); e == nil {
 		_ = d.Sync()
 		_ = d.Close()

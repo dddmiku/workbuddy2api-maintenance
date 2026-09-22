@@ -251,7 +251,10 @@ func (p *Pool) saveLocked() {
 		return
 	}
 	if dir := filepath.Dir(p.stateFp); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		// 0700 与密钥库（internal/apikeys）和用量账本（internal/usage）的建目录口径一致：
+		// 这个目录里放的是 state.json 等运行数据，不该让同机其他用户能列目录。
+		// MkdirAll 对已存在的目录是空操作，所以存量部署的权限不受影响。
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			p.notePersistFail(err)
 			return
 		}

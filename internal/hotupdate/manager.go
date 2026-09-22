@@ -280,6 +280,7 @@ func writeCurrentPointer(dir, binaryPath string) error {
 
 // CurrentBinary 返回 current 指针指向的二进制（不存在时返回空串）。
 func CurrentBinary(dir string) string {
+	// #nosec G304 -- current 指针位于更新目录，非请求输入
 	raw, err := os.ReadFile(filepath.Join(dir, "current"))
 	if err != nil {
 		return ""
@@ -288,6 +289,7 @@ func CurrentBinary(dir string) string {
 	if path == "" {
 		return ""
 	}
+	// #nosec G703 -- 同上：current 指针内容由本进程写入
 	if info, err := os.Stat(path); err != nil || info.IsDir() {
 		return ""
 	}

@@ -158,11 +158,6 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.UID8(a.UID), ts.RecordID, reward)
 }
 
-// travelAdopt 旅行巡检时领养：受 adoptTriedToday 当日防抖约束。
-func (s *Scheduler) travelAdopt(a *auth.Auth) {
-	s.adoptBuddy(context.Background(), a, false)
-}
-
 // travelAdoptForce 活跃上报补满对话量后领养：豁免 adoptTriedToday 当日防抖。
 // 背景：旅行排程 09 点已领养且因对话量未达 skip，10 点活跃上报 5 连发把
 // 对话量补满——此时是「门槛刚达成」的新状态，不算对上游重试轰炸，放行重试。

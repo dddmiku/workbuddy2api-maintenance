@@ -71,6 +71,7 @@ func (s *Store) vaultCipher(create bool) (cipher.AEAD, error) {
 		if _, err := rand.Read(key); err != nil {
 			return nil, err
 		}
+		// #nosec G304 -- 主密钥路径 = 密钥库路径 + .enc-key，非请求输入
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err != nil {
 			return nil, ErrSecretUnavailable
@@ -135,6 +136,7 @@ func (s *Store) vaultKeyLocked(path string, info os.FileInfo) ([]byte, error) {
 		s.vaultInfo.Size() == info.Size() && s.vaultInfo.ModTime() == info.ModTime() {
 		return s.vaultKey, nil
 	}
+	// #nosec G304 -- 同上：读取主密钥
 	f, err := os.Open(path)
 	if err != nil {
 		s.vaultKey, s.vaultInfo = nil, nil

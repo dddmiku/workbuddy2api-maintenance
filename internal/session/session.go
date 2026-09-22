@@ -286,12 +286,19 @@ func expired(e entry, now time.Time, ttl time.Duration) bool {
 }
 
 // hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
+//
+// n <= 0 直接返回 0：调用点虽然已经先判空池，但这里是取模的除数，
+// 一旦将来有人把调用顺序改掉就会变成除零 panic，不值得把安全性押在调用顺序上。
 func hashIndex(key string, n int) int {
+	if n <= 0 {
+		return 0
+	}
 	var h uint32 = 2166136261
 	for i := 0; i < len(key); i++ {
 		h ^= uint32(key[i])
 		h *= 16777619
 	}
+	// #nosec G115 -- n 是账号池长度，调用点已保证 > 0，且远小于 uint32 上限
 	return int(h % uint32(n))
 }
 

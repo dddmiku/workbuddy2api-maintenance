@@ -64,6 +64,7 @@ func (c *scriptCmd) Run() error {
 func (c *scriptCmd) RunContext(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
+	// #nosec G204 -- 脚本路径由内置清单给出，非请求输入
 	cmd := exec.CommandContext(ctx, c.cmd.Path, c.cmd.Args[1:]...)
 	cmd.Dir, cmd.Env, cmd.Stdin = c.cmd.Dir, c.cmd.Env, c.cmd.Stdin
 	cmd.Stdout, cmd.Stderr = scriptSink{}, scriptSink{}
@@ -74,6 +75,7 @@ func (c *scriptCmd) RunContext(ctx context.Context) error {
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
 // 工作目录由调用方 SetDir 显式设置仓库根。
 var newScriptCmd = func(program string, args ...string) scriptRunner {
+	// #nosec G204 -- 同上：内置脚本命令
 	return &scriptCmd{cmd: exec.Command(program, args...)}
 }
 
@@ -94,12 +96,8 @@ func pythonCmd() string {
 	return "python3"
 }
 
-// runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
+// runScriptContext 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
 // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
-func runScript(name, root string, commands [][]string) {
-	runScriptContext(context.Background(), name, root, commands)
-}
-
 func runScriptContext(ctx context.Context, name, root string, commands [][]string) {
 	for _, cmdArgs := range commands {
 		if ctx.Err() != nil {

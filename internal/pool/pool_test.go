@@ -1202,7 +1202,7 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 	}
 	row := st.RateLimitedModels[0]
 	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
-	if rem := row.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+	if rem := time.Until(row.Until); rem <= 0 || rem > 10*time.Minute+time.Second {
 		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
 	}
 	// 6004 模型级冷却不写账号级 until：st.Until 为零值。

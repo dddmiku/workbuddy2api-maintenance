@@ -139,6 +139,7 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
+	// #nosec G118 -- cancel 存进 Scheduler.cancel，由 Run 在退出时调用（见同文件 defer cancel()），不是漏调用
 	lifecycle, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		cfg:           cfg,
@@ -272,6 +273,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		if base == nil {
 			base = context.Background()
 		}
+		// #nosec G118 -- 同上：懒初始化的 cancel 同样由 Run 的 defer 收尾
 		s.lifecycle, s.cancel = context.WithCancel(base)
 	}
 	if s.taskLast == nil {
@@ -718,13 +720,9 @@ func growthEligibleTier(days int, rs *upstream.GrowthRedemptionStatus) string {
 	return ""
 }
 
-// claimGrowthLottery 消耗连登奖励赠与的抽奖次数。仅抽 balance>0 的次数；无次数跳过
+// claimGrowthLotteryContext 消耗连登奖励赠与的抽奖次数。仅抽 balance>0 的次数；无次数跳过
 // （400 insufficient 正常态静默）；抽奖未开启（400 lottery disabled）静默。
 // client_token 每次 draw 必须新键（security-relevant，见 upstream.GrowthLotteryDraw）。
-func (s *Scheduler) claimGrowthLottery(a *auth.Auth) {
-	s.claimGrowthLotteryContext(context.Background(), a)
-}
-
 func (s *Scheduler) claimGrowthLotteryContext(ctx context.Context, a *auth.Auth) {
 	if ctx.Err() != nil {
 		return

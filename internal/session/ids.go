@@ -68,6 +68,7 @@ func NewMessageID() string {
 		return hex.EncodeToString(b)
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
+	// #nosec G404 -- crypto/rand 已在上一行先行；这里是它理论上失败时的兜底，仅用于生成对客户端可见的 ID，不做安全凭据
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
 }
 
