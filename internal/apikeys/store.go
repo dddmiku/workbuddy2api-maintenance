@@ -96,6 +96,15 @@ type Store struct {
 	persist        func(document) error
 	fileInfo       os.FileInfo
 	copyRetryAfter time.Time
+	// vaultKey/vaultInfo 缓存已加载的副本主密钥。鉴权热路径（Lookup）每次都要判断
+	// 密钥是否可复制，而判断要走 vaultCipher —— 不缓存就是每请求读一次密钥文件。
+	// vaultCheckedAt 是上次核对密钥文件的时间：TTL 内直接复用，连 stat 都不做。
+	// 主密钥只在轮换时变化，且换了之后用旧密钥解密会直接失败（AEAD 认证不通过），
+	// 表现为「副本暂不可读」而不是放行，因此这点延迟不构成安全边界。
+	// 仅由持 s.mu 的调用方读写（vaultCipher 的全部调用点都已持锁）。
+	vaultKey       []byte
+	vaultInfo      os.FileInfo
+	vaultCheckedAt time.Time
 }
 
 func Open(path, existingKey string) (*Store, error) {

@@ -50,8 +50,16 @@ func (s *Store) Secret(id string) (string, error) {
 
 // create=true is only called while holding the key registry's cross-process
 // lock. A missing key must not be replaced while encrypted records still exist.
+//
+// 调用方须持 s.mu（全部调用点都已持锁），因此可以直接复用/更新缓存字段。
 func (s *Store) vaultCipher(create bool) (cipher.AEAD, error) {
 	path := s.path + ".enc-key"
+	// 热路径：TTL 内直接用缓存，连 stat 都省掉。副本校验在每次 Lookup 都会走这里，
+	// 而主密钥只在轮换时变化；轮换后用旧密钥解密会 AEAD 认证失败（表现为副本暂不可
+	// 读），不会误放行，所以这点延迟不构成安全边界。
+	if !create && len(s.vaultKey) == 32 && time.Since(s.vaultCheckedAt) < vaultKeyTTL {
+		return s.vaultAEAD()
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) && create {
 		for _, entry := range s.keys {
@@ -79,6 +87,12 @@ func (s *Store) vaultCipher(create bool) (cipher.AEAD, error) {
 			_ = d.Sync()
 			_ = d.Close()
 		}
+		// 刚建好的主密钥同样进缓存，省掉紧随其后的第一次读盘。
+		s.vaultKey, s.vaultInfo = append([]byte(nil), key...), nil
+		if fresh, statErr := os.Lstat(path); statErr == nil {
+			s.vaultInfo = fresh
+		}
+		s.vaultCheckedAt = time.Now()
 		block, err := aes.NewCipher(key)
 		if err != nil {
 			return nil, err
@@ -86,22 +100,54 @@ func (s *Store) vaultCipher(create bool) (cipher.AEAD, error) {
 		return cipher.NewGCM(block)
 	}
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		s.vaultKey, s.vaultInfo = nil, nil
 		return nil, ErrSecretUnavailable
 	}
-	f, err := os.Open(path)
+	key, err := s.vaultKeyLocked(path, info)
 	if err != nil {
-		return nil, ErrSecretUnavailable
+		return nil, err
 	}
-	defer f.Close()
-	key, err := io.ReadAll(io.LimitReader(f, 33))
-	if err != nil || len(key) != 32 {
-		return nil, ErrSecretUnavailable
-	}
+	s.vaultCheckedAt = time.Now()
+	return s.vaultAEADFor(key)
+}
+
+// vaultKeyTTL 是副本主密钥文件的核对间隔。主密钥轮换后最多这么久才会被重新读取；
+// 期间旧密钥解密会 AEAD 认证失败（副本暂不可读），不会误放行任何密钥。
+const vaultKeyTTL = 30 * time.Second
+
+// vaultAEAD 用缓存的主密钥构造 AEAD（调用方须持 s.mu 且缓存有效）。
+func (s *Store) vaultAEAD() (cipher.AEAD, error) {
+	return s.vaultAEADFor(s.vaultKey)
+}
+
+func (s *Store) vaultAEADFor(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, ErrSecretUnavailable
 	}
 	return cipher.NewGCM(block)
+}
+
+// vaultKeyLocked 返回副本主密钥，命中缓存时不做任何 I/O。
+// 判据与 refreshLocked 一致：同一 inode、同大小、同 mtime 才复用。
+func (s *Store) vaultKeyLocked(path string, info os.FileInfo) ([]byte, error) {
+	if len(s.vaultKey) == 32 && s.vaultInfo != nil && os.SameFile(s.vaultInfo, info) &&
+		s.vaultInfo.Size() == info.Size() && s.vaultInfo.ModTime() == info.ModTime() {
+		return s.vaultKey, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		s.vaultKey, s.vaultInfo = nil, nil
+		return nil, ErrSecretUnavailable
+	}
+	defer f.Close()
+	key, err := io.ReadAll(io.LimitReader(f, 33))
+	if err != nil || len(key) != 32 {
+		s.vaultKey, s.vaultInfo = nil, nil
+		return nil, ErrSecretUnavailable
+	}
+	s.vaultKey, s.vaultInfo = key, info
+	return key, nil
 }
 
 func secretAAD(entry record) []byte {

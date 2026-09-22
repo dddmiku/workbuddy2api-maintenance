@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-22：补副本主密钥缓存的边界回归：轮换/删除主密钥后不能被缓存掩盖，
+//
+//	鉴权与复制仍按磁盘真实状态判定。
+//
 // 2026-09-20：验证完整密钥按需复制、加密持久化、旧密钥补齐及跨实例撤销边界。
 package apikeys
 
@@ -11,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func copyKeyResponse(t *testing.T, s *Store, id string) (int, map[string]any) {
@@ -148,6 +153,91 @@ func TestMissingEncryptionKeyDoesNotBreakAuthentication(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".enc-key"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("missing master key was silently replaced")
+	}
+}
+
+// TestVaultCacheDoesNotMaskRotatedOrRemovedKey 锁定缓存的两个边界：
+//   - 主密钥被换掉后，旧缓存不能继续解密成功（否则会误报「可复制」）；
+//   - 主密钥被删掉后，缓存不能让复制继续成功。
+//
+// 缓存只省 I/O，不改变判定口径：换掉主密钥后 AEAD 认证必然失败。
+func TestVaultCacheDoesNotMaskRotatedOrRemovedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, secret, err := s.Create("cached", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先跑一次让缓存填充并确认可复制。
+	if status, result := copyKeyResponse(t, s, info.ID); status != 200 || result["key"] != secret {
+		t.Fatalf("baseline copy failed: HTTP %d", status)
+	}
+
+	// 1) 换掉主密钥：缓存必须失效（AEAD 认证失败），不能继续报「可复制」。
+	rotated := make([]byte, 32)
+	for i := range rotated {
+		rotated[i] = byte(i + 1)
+	}
+	if err := os.WriteFile(path+".enc-key", rotated, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// 绕过 TTL 直接推进核对时间，模拟 TTL 到期后的重新读盘。
+	s.mu.Lock()
+	s.vaultCheckedAt = time.Time{}
+	s.mu.Unlock()
+	if status, result := copyKeyResponse(t, s, info.ID); status != 409 || result["key"] != nil {
+		t.Fatalf("rotated master key still decrypted a copy: HTTP %d %v", status, result["key"])
+	}
+	// 鉴权走摘要，不受副本损坏影响。
+	if !s.Authenticate(secret) {
+		t.Fatal("rotated copy key broke digest authentication")
+	}
+
+	// 2) 删掉主密钥：缓存不能让它继续复制成功。
+	if err := os.Remove(path + ".enc-key"); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.vaultCheckedAt = time.Time{}
+	s.mu.Unlock()
+	if status, result := copyKeyResponse(t, s, info.ID); status != 409 || result["key"] != nil {
+		t.Fatalf("removed master key still decrypted a copy: HTTP %d", status)
+	}
+	if !s.Authenticate(secret) {
+		t.Fatal("removed copy key broke digest authentication")
+	}
+}
+
+// TestVaultCacheSurvivesRepeatedAuthWithoutStaleData 验证缓存不会返回陈旧策略：
+// 反复鉴权后再改密钥，副本与模型绑定都必须立刻反映最新状态。
+func TestVaultCacheSurvivesRepeatedAuthWithoutStaleData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, secret, err := s.Create("cached", "", []string{"cn:before"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, ok := s.Resolve(secret); !ok {
+			t.Fatal("cached lookup lost a valid key")
+		}
+	}
+	models := []string{"cn:after"}
+	if _, err := s.Update(info.ID, nil, nil, nil, &models); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Resolve(secret)
+	if !ok || len(got.Models) != 1 || got.Models[0] != "cn:after" {
+		t.Fatalf("cached lookup returned stale policy: %+v", got.Models)
+	}
+	if status, result := copyKeyResponse(t, s, info.ID); status != 200 || result["key"] != secret {
+		t.Fatalf("cached lookup broke copying: HTTP %d", status)
 	}
 }
 
