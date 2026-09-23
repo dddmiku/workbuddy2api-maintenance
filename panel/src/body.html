@@ -169,8 +169,8 @@
           </div>
           <div class="tblwrap">
             <table class="tbl key-table">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>状态</th><th>重复推理保护</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="9"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>状态</th><th>重复推理保护</th><th>CN 回落</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="10"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -417,6 +417,7 @@
           <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
         </div>
         <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复输出（推理或正文）时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
+        <label class="key-guard-field"><input type="checkbox" id="keyGlobalFallback"><span><b>global 全部限流时回落同名 CN 模型</b><small>仅当此密钥的 global: 请求在对应模型上、所有 global 号都被限流时，改用同名 CN 模型继续。存在其它不可用原因（熔断、在途占满）时不回落。</small></span></label>
         <label class="fld"><span class="k">有效期 <span class="sub">（默认无限制）</span></span>
           <select id="keyExpiry" aria-label="选择密钥有效期">
             <option value="none">无限制</option>

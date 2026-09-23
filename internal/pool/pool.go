@@ -53,6 +53,11 @@ type Pool struct {
 	// costExploration only advances on ordinary selection with both free and
 	// unknown candidates. Sticky requests and other models do not consume it.
 	costExploration map[[32]byte]*explorationState
+	// sourceRateGates 来源级限流闸门（见 sourcerate.go）：按 realm 记录「无重置时间的
+	// 429」在窗口内打中的不同账号集合，达到阈值即暂停该 realm 的选号一段时间。
+	// 挂在 Pool 实例上而不是包级变量：闸门是这一池账号的观测，跨 Pool 实例（含测试）
+	// 共享会让互不相关的场景互相干扰。
+	sourceRateGates map[string]*sourceRateGate
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh      chan struct{}

@@ -68,6 +68,11 @@ type Info struct {
 	CopyAvailable bool      `json:"copy_available,omitempty"`
 	// nil follows the server default; a bool overrides it for this key.
 	ReasoningLoopGuard *bool `json:"reasoning_loop_guard,omitempty"`
+	// GlobalFallbackToCN 允许该密钥的 global: 请求在**所有 global 账号都被限流**时，
+	// 回落到同名 CN 模型（裸名相同）。nil/false = 不回退（既有行为，零回归）。
+	// 只在 global 域确实无可服务号、且不可用的号全部因限流或禁用时生效；存在熔断、
+	// 在途占满等其它原因时一律不回退（那些状态不该被静默改道到另一个域）。
+	GlobalFallbackToCN *bool `json:"global_fallback_to_cn,omitempty"`
 	// Models 该密钥允许调用的模型白名单（裸名或带 realm 前缀）。
 	// 空列表表示不限制模型，保持旧密钥零回归。
 	Models []string `json:"models"`
@@ -83,6 +88,8 @@ type record struct {
 
 type Options struct {
 	ReasoningLoopGuard *bool
+	// GlobalFallbackToCN 同 Info.GlobalFallbackToCN；nil = 不改动。
+	GlobalFallbackToCN *bool
 	// ExpiresAt 与 ExpiresAtSet 一起使用：ExpiresAtSet 为 false 表示不改动有效期，
 	// 为 true 时 ExpiresAt 为 nil 表示改为无限制。
 	ExpiresAt    *time.Time
@@ -207,6 +214,7 @@ func (s *Store) lockAndRefresh() (func(), error) {
 func copyInfo(info Info) Info {
 	info.Models = append([]string(nil), info.Models...)
 	info.ReasoningLoopGuard = copyBool(info.ReasoningLoopGuard)
+	info.GlobalFallbackToCN = copyBool(info.GlobalFallbackToCN)
 	if info.ExpiresAt != nil {
 		expiry := *info.ExpiresAt
 		info.ExpiresAt = &expiry
@@ -420,6 +428,7 @@ func (s *Store) Create(name, note string, models []string, options ...Options) (
 	entry := record{Info: Info{ID: "key_" + hex.EncodeToString(id[:]), Name: name, Note: note, MaskedKey: mask(key), Enabled: true, CreatedAt: time.Now().UTC(), Models: models}, Digest: digest(key)}
 	if len(options) > 0 {
 		entry.ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+		entry.GlobalFallbackToCN = copyBool(options[0].GlobalFallbackToCN)
 		if options[0].ExpiresAtSet {
 			if !validExpiry(options[0].ExpiresAt, time.Now()) {
 				return Info{}, "", ErrInvalidExpiry
@@ -480,6 +489,9 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		}
 		if len(options) > 0 && options[0].ReasoningLoopGuard != nil {
 			next[i].ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
+		}
+		if len(options) > 0 && options[0].GlobalFallbackToCN != nil {
+			next[i].GlobalFallbackToCN = copyBool(options[0].GlobalFallbackToCN)
 		}
 		if len(options) > 0 && options[0].ExpiresAtSet {
 			if !validExpiry(options[0].ExpiresAt, time.Now()) {

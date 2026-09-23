@@ -848,6 +848,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 
+	// global → 同名 CN 模型回落（按密钥开关，见 apikeys.Info.GlobalFallbackToCN）：
+	// 仅当该密钥开启、请求带 global: 前缀、且 global 域在**这个模型**上确实一个可服务的
+	// 号都没有（不可用的号全部因限流或禁用）时，才把域切到 cn 用同名裸模型选号。
+	// 存在熔断、在途占满等其它不可用原因时不回落——那些是暂时状态或与限流无关，
+	// 静默改道到另一个域会让调用方看到与预期不符的模型行为。
+	// 回落只改选号域与出站路由：模型名（裸名）与请求体都不变，账本仍记在调用方请求的名字上。
+	if realm == "global" && h.cfg.Pool != nil {
+		if info, ok := requestKeyInfo(r); ok && info.GlobalFallbackToCN != nil && *info.GlobalFallbackToCN {
+			if state := h.cfg.Pool.RealmRateStateForModel("global", bareModel); state.AllRateLimited() {
+				if cnState := h.cfg.Pool.RealmRateStateForModel("cn", bareModel); cnState.Available > 0 {
+					log.Printf("INFO: [server] global realm rate limited for model=%s — falling back to cn by key request", bareModel)
+					realm = "cn"
+				}
+			}
+		}
+	}
+
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
@@ -974,6 +991,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			stickyUID = ""
 		}
 	}
+
 	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
 	fail := func(uid string) {
 		releaseHeld()
@@ -1022,6 +1040,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			st.status = 499
 			return
+		}
+		// 来源级限流闸门（见 pool/sourcerate.go）：本轮已经确认上游在按来源限流时，
+		// 继续换号只是把更多账号送去撞墙（实测一次客户端请求烧掉 3 个号，最后以
+		// `exceeded retry limit, last status: 429` 收场）。这里提前收手并如实回 429。
+		// 只在**轮转循环内**判定：新请求的首个尝试不拦（上游限流通常很短，一刀切拒绝
+		// 新请求反而伤可用性），由第一次尝试自己去探测上游是否已恢复。
+		if i > 0 {
+			if limited, remaining := h.cfg.Pool.SourceRateGate(realm); limited {
+				st.status = http.StatusTooManyRequests
+				writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+					fmt.Sprintf("upstream is rate limiting this gateway's source; retry in about %ds",
+						int(remaining.Seconds())+1))
+				return
+			}
 		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -1235,6 +1267,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_invalid_request", "upstream rejected request params: "+detail)
 				st.status = http.StatusBadRequest
 				return
+			}
+			// 来源级限流判定（见 pool/sourcerate.go）：无重置时间的 429 实测会在
+			// 2 分钟内打中十余个不同账号，是出口/来源限流而非账号问题。先记账，
+			// 达到阈值即开闸门，后续请求在选号前就被拦住，不再逐号送死。
+			// 带重置时间的 6004 不参与：那是模型级限额，按既有模型豁免切号即可。
+			if kind == upstream.ErrSoftRate {
+				if _, hasReset := upstream.ParseRateReset(string(respBody)); !hasReset {
+					if h.cfg.Pool.NoteSourceRateLimit(realm, acct.UID) {
+						log.Printf("WARN: [server] source-level rate limit detected uid=%s realm=%s — pausing selection for this realm",
+							logfmt.UID8(acct.UID), realm)
+					}
+				}
 			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)

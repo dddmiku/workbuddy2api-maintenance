@@ -1,5 +1,7 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-23：密钥新增「global 全部限流时回落同名 CN 模型」开关：表单、列表与提交
+//             三处同步，未设置按关闭处理（既有密钥零回归）。
 // 2026-09-20：密钥列表增加累计 token 用量列与有效期列；创建/编辑可选有效期，留空表示无限制。
 // 2026-09-20：列表可再次复制完整密钥并单独切换重复推理保护；剪贴板失败时降级，关闭窗口立即清除明文。
 // 2026-09-16：实现密钥创建、编辑、启停、删除与一次性显示，沿用控制台交互与主题。
@@ -11,6 +13,12 @@ var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, ac
 
 function keyGuardEnabled(key){
   return key && typeof key.reasoning_loop_guard === 'boolean' ? key.reasoning_loop_guard : KS.guardDefault;
+}
+
+// keyGlobalFallbackEnabled 读取密钥的 global→CN 回落开关。未设置（null/缺失）
+// 一律按关闭处理：这是新增能力，不能让既有密钥因为字段缺失而改变行为。
+function keyGlobalFallbackEnabled(key){
+  return !!(key && key.global_fallback_to_cn === true);
 }
 
 function keyModels(value){
@@ -110,7 +118,7 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="9">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="10">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
@@ -129,6 +137,9 @@ function renderKeys(){
       '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
       '" title="发现持续重复输出（推理或正文）时结束该次请求；只影响此密钥后续请求">' + (keyGuardEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
+      '<td data-l="CN 回落"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGlobalFallbackEnabled(key) +
+      '" aria-label="' + esc(key.name) + '的 CN 回落" data-key-action="fallback" data-id="' + esc(key.id) +
+      '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">' + (keyGlobalFallbackEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
       '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
       '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
@@ -149,6 +160,7 @@ function openKeyEditor(key){
   $('#keyNote').value = key ? (key.note || '') : '';
   fillModelInput(key ? keyModels((key.models || []).join(',')) : []);
   $('#keyGuard').checked = keyGuardEnabled(key);
+  $('#keyGlobalFallback').checked = keyGlobalFallbackEnabled(key);
   // 有效期默认「无限制」：既有密钥和新密钥都保持这个默认，只有显式选择才设置。
   // 编辑一把已经设过有效期的密钥时回填原值，避免保存时把有效期无声清掉。
   var preset = key && key.expires_at ? expiryToInput(key.expires_at) : '';
@@ -204,7 +216,7 @@ $('#keyExpiry').addEventListener('change', function(){
 
 $('#keyForm').addEventListener('submit', async function(event){
   event.preventDefault(); if (KD.busy || KD.secret) return;
-  var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value), reasoning_loop_guard:$('#keyGuard').checked};
+  var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value), reasoning_loop_guard:$('#keyGuard').checked, global_fallback_to_cn:$('#keyGlobalFallback').checked};
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
   if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
@@ -299,6 +311,18 @@ $('#keyRows').addEventListener('click', function(event){
         KS.keys = KS.keys.map(function(item){return item.id === key.id ? result.entry : item;}); renderKeys();
       }
       toast('重复推理保护已' + (desired ? '开启' : '关闭') + '，对后续请求生效','ok');
+      return loadKeys();
+    }).catch(function(error){toast(error.message || '设置失败','err');}).finally(function(){button.disabled = false;});
+    return;
+  }
+  if (action === 'fallback'){
+    var wantFallback = !keyGlobalFallbackEnabled(key); button.disabled = true;
+    api('api/keys/update', {id:key.id, global_fallback_to_cn:wantFallback}).then(function(result){
+      KS.revision++;
+      if (result.entry && result.entry.id === key.id){
+        KS.keys = KS.keys.map(function(item){return item.id === key.id ? result.entry : item;}); renderKeys();
+      }
+      toast('CN 回落已' + (wantFallback ? '开启' : '关闭') + '，对后续请求生效','ok');
       return loadKeys();
     }).catch(function(error){toast(error.message || '设置失败','err');}).finally(function(){button.disabled = false;});
     return;

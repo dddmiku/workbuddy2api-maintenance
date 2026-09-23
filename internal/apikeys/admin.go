@@ -59,6 +59,7 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			Note               string   `json:"note"`
 			Models             []string `json:"models"`
 			ReasoningLoopGuard *bool    `json:"reasoning_loop_guard"`
+			GlobalFallbackToCN *bool    `json:"global_fallback_to_cn"`
 			ExpiresAt          *string  `json:"expires_at"`
 		}
 		if !readBody(w, r, &body) {
@@ -70,7 +71,9 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			return
 		}
 		entry, key, err := s.Create(body.Name, body.Note, body.Models,
-			Options{ReasoningLoopGuard: body.ReasoningLoopGuard, ExpiresAt: expiresAt, ExpiresAtSet: true})
+			Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
+				GlobalFallbackToCN: body.GlobalFallbackToCN,
+				ExpiresAt:          expiresAt, ExpiresAtSet: true})
 		if err != nil {
 			replyError(w, err)
 			return
@@ -84,6 +87,7 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			Enabled            *bool     `json:"enabled"`
 			Models             *[]string `json:"models"`
 			ReasoningLoopGuard *bool     `json:"reasoning_loop_guard"`
+			GlobalFallbackToCN *bool     `json:"global_fallback_to_cn"`
 			// ExpiresAt 用 RawMessage 区分「没提这个字段」与「显式传 null」：
 			// 前者保持现状，后者表示改成无限制。
 			ExpiresAt json.RawMessage `json:"expires_at"`
@@ -92,11 +96,12 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			return
 		}
 		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil &&
-			body.ReasoningLoopGuard == nil && len(body.ExpiresAt) == 0 {
+			body.ReasoningLoopGuard == nil && body.GlobalFallbackToCN == nil && len(body.ExpiresAt) == 0 {
 			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
 			return
 		}
-		options := Options{ReasoningLoopGuard: body.ReasoningLoopGuard}
+		options := Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
+			GlobalFallbackToCN: body.GlobalFallbackToCN}
 		if len(body.ExpiresAt) > 0 {
 			if string(bytes.TrimSpace(body.ExpiresAt)) != "null" {
 				var raw string

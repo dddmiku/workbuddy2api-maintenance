@@ -384,6 +384,68 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return p.servableLocked(realm)
 }
 
+// RealmRateState 描述某 realm 在指定模型上的可达性与限流占用，供 global→CN 同名模型回落判定。
+//
+// 语义分工：
+//   - Accounts：该 realm 的账号总数（判定「这个域到底有没有号」）。
+//   - Available：真正可服务（healthyForModel 且未占满在途名额）的账号数。
+//   - RateLimited：因**限流**不可用的账号数——账号级软冷却（429），或该模型的
+//     6004 模型级冷却。
+//   - Disabled：已禁用（永远不会服务）的账号数。
+//
+// 回落的充分条件（见 handler）：Accounts>0、Available==0、
+// 且 RateLimited+Disabled==Accounts —— 即「这个域一个能用的号都没有，且所有不能用的
+// 号要么被限流、要么已禁用」。只要存在因熔断/在途占满而不可用的号，就不满足该等式，
+// 回落不会发生：那些是暂时或与限流无关的状态，不该被静默改道到另一个域。
+type RealmRateState struct {
+	Accounts    int
+	Available   int
+	RateLimited int
+	Disabled    int
+}
+
+// AllRateLimited 报告是否满足「该域无可服务号、且不可用的号全部因限流或禁用」。
+func (s RealmRateState) AllRateLimited() bool {
+	if s.Accounts == 0 || s.Available != 0 || s.RateLimited == 0 {
+		return false
+	}
+	return s.RateLimited+s.Disabled == s.Accounts
+}
+
+// RealmRateStateForModel 统计某 realm 在指定模型上的可达性与限流占用。
+// realm=="" 统计全池；model=="" 时模型级冷却不参与判定（退化为账号级口径）。
+func (p *Pool) RealmRateStateForModel(realm, model string) RealmRateState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var state RealmRateState
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		state.Accounts++
+		if e.disabled {
+			state.Disabled++
+			continue
+		}
+		if e.healthyForModel(now, model) {
+			if !p.inFlightFull(e) {
+				state.Available++
+			}
+			continue
+		}
+		// 不可用：区分「限流」与「熔断」等其它原因——只有限流计入 RateLimited。
+		if e.modelCooled(now, model) {
+			state.RateLimited++
+			continue
+		}
+		if e.coolKind == CoolSoft && !e.until.IsZero() && now.Before(e.until) {
+			state.RateLimited++
+		}
+	}
+	return state
+}
+
 // servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
 // 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态）的账号即 true。
 // realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。

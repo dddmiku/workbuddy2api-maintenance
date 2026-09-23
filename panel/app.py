@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-23：版本号提升到 2.1.26（来源级限流收敛 + 密钥级 global→CN 回落 +
+#             加号写入权限竞态修复）。
+# 2026-09-23：修掉加号后「账号没加载」的权限竞态：先把临时文件 chown/chmod 再
+#             os.replace 落地，避免落地瞬间文件仍是 root:0600、网关（uid 10001）
+#             读不到而被静默跳过（实测 15:52:05 只加载 23 个账号，10 秒后恢复 24）。
+#             chown 失败不再静默吞掉：写成 stderr 告警，避免同类问题再次无声。
 # 2026-09-23：版本号提升到 2.1.25（网关侧修复两行/三行极短行交替循环漏检）。
 # 2026-09-23：版本号提升到 2.1.24（网关侧新增上下文超限自动裁剪重发）。
 # 2026-09-23：日志页的 60/120/300/600 改为「请求条数」语义：按请求行数取窗口，
@@ -106,7 +112,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.25"
+PANEL_VERSION = "2.1.26"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -624,14 +630,20 @@ def set_task_enabled(key, enabled):
 
 
 def chown_app(path):
+    """把网关侧文件归属到运行网关的 uid/gid（10001）并收紧权限。
+
+    失败不再静默：写文件路径上先 chown 再 rename，落地瞬间就应是网关可读的形态；
+    这里若失败，说明容器能力或挂载卷有变，账号会加载不到，必须留下痕迹而不是
+    让「加号成功但号没生效」再次无解释地发生。
+    """
     try:
         shutil.chown(path, user=10001, group=10001)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - 记录后继续，不阻断调用方
+        sys.stderr.write("chown %s failed: %s\n" % (path, exc))
     try:
         os.chmod(path, 0o600)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write("chmod %s failed: %s\n" % (path, exc))
 
 
 def list_auth_files():
@@ -715,8 +727,11 @@ def write_auth_file(poll_result):
             json.dump(doc, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
+        # 先改属主与权限，再原子替换：文件一落地就是网关可读的形态。
+        # 反过来（先 replace 再 chown）会留下一个窗口，期间文件属 root:0600，
+        # 网关以 uid 10001 运行读不到，会静默跳过该账号（实测只加载 23 个）。
+        chown_app(tmp)
         os.replace(tmp, final_path)
-        chown_app(final_path)
         if os.path.exists(stale):
             os.remove(stale)
     finally:
@@ -1288,8 +1303,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(error.status, {"ok": False, "message": str(error)})
         if "reasoning_loop_guard" in body and type(body["reasoning_loop_guard"]) is not bool:
             return self._json(400, {"ok": False, "message": "重复推理保护必须为开启或关闭"})
+        if "global_fallback_to_cn" in body and type(body["global_fallback_to_cn"]) is not bool:
+            return self._json(400, {"ok": False, "message": "CN 回落必须为开启或关闭"})
         if path == "/api/keys":
-            if set(body) - {"name", "note", "models", "reasoning_loop_guard", "expires_at"}:
+            if set(body) - {"name", "note", "models", "reasoning_loop_guard",
+                            "global_fallback_to_cn", "expires_at"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             if "expires_at" in body and not self._valid_expiry(body["expires_at"]):
                 return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
@@ -1309,7 +1327,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             return self.keys_request("DELETE", "/keys/" + key_id)
         changes = {k: v for k, v in body.items() if k != "id"}
-        if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard", "expires_at"}:
+        if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard",
+                                          "global_fallback_to_cn", "expires_at"}:
             return self._json(400, {"ok": False, "message": "没有有效的修改字段"})
         if "expires_at" in changes and not self._valid_expiry(changes["expires_at"]):
             return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
