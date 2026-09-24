@@ -18,6 +18,13 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// TestContextTooLongRetriesSmallTurnCounts 小幅超限（真实上游形状：带 N tokens >
+// M maximum）时，轮数少也能按档位裁掉最旧轮并重发成功。
+//
+// 夹具必须带数字：上游真实 11115 一直是
+// "prompt is too long: 1048691 tokens > 1048576 maximum" 这个形状，而自动裁剪要
+// 依据这个数字判断超限幅度、并把原始体积回真给客户端。不带数字的合成体走另一条
+// 分支（见 TestContextTooLongWithoutCountsIsNotSilentlyTrimmed）。
 func TestContextTooLongRetriesSmallTurnCounts(t *testing.T) {
 	for _, turns := range []int{1, 2, 3} {
 		t.Run(strings.Repeat("u", turns), func(t *testing.T) {
@@ -37,7 +44,8 @@ func TestContextTooLongRetriesSmallTurnCounts(t *testing.T) {
 				attempts.Add(1)
 				if users >= turns {
 					w.WriteHeader(http.StatusBadRequest)
-					_, _ = io.WriteString(w, `{"code":11115,"msg":"prompt is too long"}`)
+					_, _ = io.WriteString(w,
+						`{"code":11115,"msg":"prompt is too long: 1048691 tokens > 1048576 maximum"}`)
 					return
 				}
 				w.Header().Set("Content-Type", "text/event-stream")

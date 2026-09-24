@@ -1056,6 +1056,24 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				// 上下文超限：按档位丢掉最旧的一部分历史后同路径重发一次。
 				// 上游在生成前就拒了这次请求，因此没有用量可记；这里只做裁剪与重发，
 				// 不改账号状态（换号也是同一堵墙）。
+				//
+				// 只对「小幅超限」裁剪：客户端自己的估算低于上游预检口径，实测需要
+				// 裁剪的场景只超出几十到几百 token（1048684/1048691/1048868 对 1048576）。
+				// 超出幅度过大（实测见过 2015759，约 1.92 倍）时必须把 11115 原样交回，
+				// 让客户端走自己的压缩流程——那种情况下裁剪要丢掉大半对话，
+				// 用残存的一小部分历史回答用户，答案本身已经不可信。
+				if kind == ErrContextTooLong {
+					tokens, maximum, ok := PromptTooLongCounts(string(raw))
+					if !ok || !WithinTrimOvershootLimit(tokens, maximum) {
+						log.Printf("WARN: [upstream] context too long beyond the auto-trim limit "+
+							"(tokens=%d maximum=%d overshoot=%s) — returning the upstream error to the client uid=%s path=%s",
+							tokens, maximum, trimOvershootDescription(tokens, maximum), logfmt.UID8(a.UID), path)
+						return nil, resp.StatusCode, raw, nil
+					}
+					// 首个 11115 的原始体积记进观测槽：handler 据此把真实上下文大小
+					// 回传给客户端，否则客户端只看到裁剪后的体积、永远不触发压缩。
+					recordContextTrim(ctx, tokens, maximum)
+				}
 				for kind == ErrContextTooLong && contextTrimLevel < ContextTrimLevels() {
 					ratio := contextTrimKeepRatios[contextTrimLevel]
 					contextTrimLevel++

@@ -1049,6 +1049,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
+	// 上下文裁剪观测槽：上游 11115 被自动裁剪时，把**原始**体积记下来，
+	// 再回真给客户端（见 upstream/context_trim_usage.go）。不回真的后果实测过：
+	// 客户端只看到裁剪后的 74k，以为上下文很小，压缩机制永远不触发，
+	// 每轮重发两百万 token，网关每轮再裁三轮。
+	chatContext, trimInfo := upstream.WithContextTrimRecorder(chatContext)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {
@@ -1304,6 +1309,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		streamOptions := upstream.StreamOptions{
 			Model:              peek.Model,
 			ReasoningLoopGuard: reasoningLoopGuard,
+			TrimInfo:           trimInfo,
 		}
 		// 本次请求一开始就快照「命中后是否只停不重发」：管理台在请求进行中切换开关时，
 		// 已经在跑的这一轮沿用开始时的语义，不会出现重发到一半忽然改判。

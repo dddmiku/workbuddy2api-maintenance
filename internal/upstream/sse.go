@@ -592,6 +592,7 @@ func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 		created   float64
 		usage     map[string]any
 	)
+	trimInfo := streamTrimInfo(options)
 	state := newStreamState(options)
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
 		chunk, done, err := decodeSSEEvent(ev)
@@ -615,7 +616,7 @@ func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 			created = value
 		}
 		if value, ok := chunk["usage"].(map[string]any); ok {
-			usage = MergeUsage(usage, value)
+			usage = MergeUsage(usage, trimInfo.override(value))
 		}
 		if err := state.observeReasoningLoops(chunk); err != nil {
 			return true, err
@@ -865,6 +866,7 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	var usage map[string]any
 	terminalMeta := map[string]any{}
 
+	trimInfo := streamTrimInfo(options)
 	state := newStreamState(options)
 
 	// ── 写出闸门（仅在重复推理保护启用时生效）────────────────────────────
@@ -963,7 +965,7 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 			}
 		}
 		if value, ok := obj["usage"].(map[string]any); ok {
-			usage = MergeUsage(usage, value)
+			usage = MergeUsage(usage, trimInfo.override(value))
 			obj["usage"] = usage
 		}
 		// Text, argument deltas and observed usage continue streaming. A finish

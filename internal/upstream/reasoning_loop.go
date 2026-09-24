@@ -164,6 +164,9 @@ var ContentLoopHoldBackTimeout = 8 * time.Second
 type StreamOptions struct {
 	Model              string
 	ReasoningLoopGuard bool
+	// TrimInfo 上下文裁剪观测槽（可选）：客户端裁剪发生时写入，调用方据此把
+	// 上游原始体积回真给客户端。nil = 不观测（既有调用方零改动）。
+	TrimInfo *ContextTrimInfo
 	// LoopRetryAvailable 告诉 Stream：命中循环且客户端零字节时，调用方**还会**在同一
 	// 账号上重发，因此这次不要向客户端写 error 帧与 [DONE]（避免用户看到半截失败），
 	// 只把错误标成 Retryable 返回。
