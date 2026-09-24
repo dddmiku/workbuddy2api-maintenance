@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：单对象工具结果仅识别明确协议标签，泛型业务type保留完整JSON，防止误拒及丢失额外字段。
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
 // 2026-09-17：接受 Responses 的命名空间工具分组，并把命名空间名字写回函数调用历史。
 // 2026-09-18：内置工具按前缀接受并丢弃（补齐 tool_search 等新类型），避免客户端升级即不可用。
@@ -585,12 +586,14 @@ func requestValidationResponsesInput(value any) error {
 	return nil
 }
 
-// Recognize protocol content objects without claiming arbitrary business JSON.
+// Only explicit protocol labels change the shape of a single-object tool
+// result. Generic types such as file/text/refusal are also common business JSON
+// and must retain every field. Their content aliases remain valid inside a
+// content-part array, where the caller has already selected that wire format.
 func responsesContentObject(object map[string]any) bool {
 	kind, _ := object["type"].(string)
 	switch kind {
-	case "input_text", "output_text", "text", "summary_text", "refusal", "input_image", "image_url",
-		"input_file", "input_audio", "file", "audio", "image", "document":
+	case "input_text", "output_text", "input_image", "image_url", "input_file", "input_audio":
 		return true
 	}
 	return false

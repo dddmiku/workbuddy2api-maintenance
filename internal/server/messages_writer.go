@@ -1,6 +1,8 @@
 // ═══ 更新日志 ═══
 // 2026-09-25：将已校验的Chat结果转为Anthropic消息与流事件，错误不产生成功终态，缓存用量避免重复相加。
 // 2026-09-25：流式工具保留参数增量并延迟完成，透传心跳与写失败，保留上下文错误类别和缓存创建用量。
+// 2026-09-25：按官方 SDK 合同在全量校验后顺序交付工具块，避免并行完成回调错位；首帧不写会残留的临时用量扩展标记。
+// 2026-09-25：缓冲长工具期间按实际片段进展补标准心跳，防止下游空闲超时，不提前交付未验证工具。
 package server
 
 import (
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/upstream"
@@ -22,9 +25,6 @@ const messagesBufferLimit = 16 << 20
 type messagesTool struct {
 	id, name  string
 	arguments strings.Builder
-	index     int
-	started   bool
-	sent      int
 }
 
 type messagesWriter struct {
@@ -41,6 +41,7 @@ type messagesWriter struct {
 	block                  string
 	stop                   string
 	err                    error
+	lastEvent              time.Time
 }
 
 func newMessagesWriter(w http.ResponseWriter) *messagesWriter {
@@ -252,21 +253,12 @@ func (m *messagesWriter) toolDelta(call map[string]any) error {
 	if m.toolBytes > messagesBufferLimit {
 		return fmt.Errorf("tool metadata exceeds the adapter limit")
 	}
-	if strings.TrimSpace(tool.id) == "" || strings.TrimSpace(tool.name) == "" {
-		return nil
+	// The official SDK's contentBlock callback assumes one open block at a
+	// time. Buffer tools until all arguments validate, then deliver complete
+	// blocks sequentially; early stops could make an invalid tool executable.
+	if m.started && time.Since(m.lastEvent) >= 10*time.Second {
+		m.event("ping", map[string]any{})
 	}
-	if !tool.started {
-		m.closeBlock()
-		m.index++
-		tool.index, tool.started = m.index, true
-		m.event("content_block_start", map[string]any{"index": tool.index, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name, "input": map[string]any{}}})
-	}
-	if tool.arguments.Len() > tool.sent {
-		m.event("content_block_delta", map[string]any{"index": tool.index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tool.arguments.String()[tool.sent:]}})
-		tool.sent = tool.arguments.Len()
-	}
-	// A partial tool remains open until every tool validates at the response
-	// boundary. A client may display progress, but it must not execute yet.
 	return m.err
 }
 
@@ -294,6 +286,9 @@ func (m *messagesWriter) event(kind string, payload map[string]any) {
 	data, err := json.Marshal(payload)
 	if err == nil {
 		_, err = fmt.Fprintf(m.inner, "event: %s\ndata: %s\n\n", kind, data)
+		if err == nil {
+			m.lastEvent = time.Now()
+		}
 	}
 	m.err = err
 	m.Flush()
@@ -309,7 +304,12 @@ func (m *messagesWriter) begin() {
 	m.inner.Header().Set("X-Accel-Buffering", "no")
 	m.inner.WriteHeader(200)
 	m.started = true
-	m.event("message_start", map[string]any{"message": map[string]any{"id": m.id, "type": "message", "role": "assistant", "model": m.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": anthropicUsage(m.usage)}})
+	usage := anthropicUsage(m.usage)
+	// Initial counters are provisional. Official SDKs update standard counters
+	// from message_delta but do not merge extension fields, so an early true
+	// flag would incorrectly survive even after complete usage was reported.
+	delete(usage, "gateway_usage_incomplete")
+	m.event("message_start", map[string]any{"message": map[string]any{"id": m.id, "type": "message", "role": "assistant", "model": m.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": usage}})
 }
 
 func (m *messagesWriter) closeBlock() {
@@ -361,7 +361,10 @@ func (m *messagesWriter) complete() {
 	m.closeBlock()
 	for _, index := range indices {
 		tool := m.tools[index]
-		m.event("content_block_stop", map[string]any{"index": tool.index})
+		m.index++
+		m.event("content_block_start", map[string]any{"index": m.index, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name, "input": map[string]any{}}})
+		m.event("content_block_delta", map[string]any{"index": m.index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tool.arguments.String()}})
+		m.event("content_block_stop", map[string]any{"index": m.index})
 	}
 	m.event("message_delta", map[string]any{"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": anthropicUsage(m.usage)})
 	m.event("message_stop", map[string]any{})

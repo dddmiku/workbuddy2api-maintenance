@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：CI资产契约改为双架构完整运行包及校验文件，保留旧裸二进制选取的独立兼容测试。
 // 2026-09-17：锁定自更新取件契约：按架构挑资产、下载逐字节校验 SHA-256、
 //
 //	摘要不符时不留残留文件、超大资产直接拒绝。
@@ -182,16 +183,17 @@ func TestUpdateAvailableComparesVersions(t *testing.T) {
 	}
 }
 
-// TestReleaseAssetNamesMatchWorkflow 资产名是 release.go 与发布流水线之间的硬契约。
+// TestReleaseAssetNamesMatchWorkflow 固定私有 CI 的完整运行包及校验文件输出。
+// CI 保存构建 artifact；裸二进制兼容性由 Latest 测试覆盖，不要求 CI 重复产出。
 func TestReleaseAssetNamesMatchWorkflow(t *testing.T) {
 	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "build.yml"))
 	if err != nil {
-		t.Skipf("workflow not in this tree: %v", err)
+		t.Fatalf("cannot verify release workflow: %v", err)
 	}
 	text := string(workflow)
-	for _, name := range []string{"wb2api-linux-amd64", "wb2api-linux-arm64"} {
+	for _, name := range []string{"dist/wb2api-runtime-linux-amd64.tar.gz", "dist/wb2api-runtime-linux-arm64.tar.gz", "dist/SHA256SUMS.txt"} {
 		if !strings.Contains(text, name) {
-			t.Fatalf("build.yml must publish %s", name)
+			t.Fatalf("build.yml must save the private build artifact %s", name)
 		}
 	}
 }

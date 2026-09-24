@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-25：锁定 messages 参数、工具增量、上下文错误与缓存口径的实际回归，避免协议转换伪装成功。
+// 2026-09-25：官方 SDK 要求内容块顺序完成，工具回归改为全量校验后交付，并区分首帧临时计量与末帧扩展标记。
 package server
 
 import (
@@ -107,7 +108,7 @@ func TestMessagesReviewContextFailureRetainsClassification(t *testing.T) {
 	}
 }
 
-func TestMessagesReviewToolsStreamBeforeTerminalValidation(t *testing.T) {
+func TestMessagesReviewToolsWaitForTerminalValidation(t *testing.T) {
 	w := httptest.NewRecorder()
 	m := newMessagesWriter(w)
 	m.stream = true
@@ -127,8 +128,8 @@ func TestMessagesReviewToolsStreamBeforeTerminalValidation(t *testing.T) {
 			t.Fatal("incomplete tool identity became executable")
 		}
 	}
-	if !strings.Contains(w.Body.String(), `"type":"input_json_delta"`) || strings.Count(w.Body.String(), `"type":"tool_use"`) != 2 {
-		t.Fatalf("tool progress was buffered until the request ended: %s", w.Body.String())
+	if strings.Contains(w.Body.String(), `"type":"input_json_delta"`) || strings.Contains(w.Body.String(), `"type":"tool_use"`) {
+		t.Fatalf("tools were delivered before the whole response validated: %s", w.Body.String())
 	}
 	if strings.Contains(w.Body.String(), "event: content_block_stop") || strings.Contains(w.Body.String(), "event: message_stop") {
 		t.Fatal("tools became complete before the upstream terminal validation")
@@ -139,6 +140,45 @@ func TestMessagesReviewToolsStreamBeforeTerminalValidation(t *testing.T) {
 	}
 	if strings.Count(w.Body.String(), "event: message_stop") != 1 || strings.Count(w.Body.String(), "event: content_block_stop") != 2 || strings.Count(w.Body.String(), `"type":"tool_use"`) != 2 {
 		t.Fatalf("invalid parallel tool lifecycle: %s", w.Body.String())
+	}
+	message := messagesReviewAssemble(t, w.Body.String())
+	content := message["content"].([]any)
+	if content[0].(map[string]any)["id"] != "one" || content[1].(map[string]any)["id"] != "two" {
+		t.Fatalf("tool order changed: %v", content)
+	}
+}
+
+func TestMessagesReviewIncompleteUsageOnlyAtTerminal(t *testing.T) {
+	w := httptest.NewRecorder()
+	m := newMessagesWriter(w)
+	m.stream = true
+	m.Header().Set("Content-Type", "text/event-stream")
+	_, _ = m.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+	if strings.Contains(w.Body.String(), "gateway_usage_incomplete") {
+		t.Fatalf("provisional extension would remain in SDK final usage: %s", w.Body.String())
+	}
+	_, err := m.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	if err != nil || strings.Count(w.Body.String(), `"gateway_usage_incomplete":true`) != 1 {
+		t.Fatalf("unknown usage lost its raw terminal marker: %v %s", err, w.Body.String())
+	}
+}
+
+func TestMessagesReviewBufferedToolProgressKeepsStreamAlive(t *testing.T) {
+	w := httptest.NewRecorder()
+	m := newMessagesWriter(w)
+	m.stream = true
+	m.Header().Set("Content-Type", "text/event-stream")
+	_, _ = m.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"one\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}}]}}]}\n\n"))
+	// Move only the last-write timestamp; no wall-clock wait or fake upstream
+	// heartbeat hides the case where tools alone keep making progress.
+	m.lastEvent = time.Now().Add(-11 * time.Second)
+	_, _ = m.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"x\\\":\"}}]}}]}\n\n"))
+	if strings.Count(w.Body.String(), "event: ping") != 1 || strings.Contains(w.Body.String(), `"type":"tool_use"`) {
+		t.Fatalf("active tool generation lost liveness or bypassed validation: %s", w.Body.String())
+	}
+	_, _ = m.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n"))
+	if strings.Count(w.Body.String(), "event: ping") != 1 {
+		t.Fatal("each small tool fragment produced an unnecessary heartbeat")
 	}
 }
 
@@ -193,7 +233,7 @@ func messagesReviewAssemble(t *testing.T, stream string) map[string]any {
 				message, _ = event["message"].(map[string]any)
 				starts++
 			case "content_block_start":
-				if i != len(content) || open[i] {
+				if i != len(content) || len(open) != 0 {
 					t.Fatalf("invalid start index %d: %s", i, stream)
 				}
 				content = append(content, event["content_block"])
@@ -370,11 +410,11 @@ func TestMessagesReviewClientCancellationStopsUpstream(t *testing.T) {
 	defer resp.Body.Close()
 	var received strings.Builder
 	buf := make([]byte, 256)
-	for !strings.Contains(received.String(), "input_json_delta") {
+	for !strings.Contains(received.String(), "message_start") {
 		n, err := resp.Body.Read(buf)
 		received.Write(buf[:n])
 		if err != nil {
-			t.Fatalf("no tool progress before cancellation: %v body=%s", err, received.String())
+			t.Fatalf("no message started before cancellation: %v body=%s", err, received.String())
 		}
 	}
 	cancel()
@@ -383,7 +423,7 @@ func TestMessagesReviewClientCancellationStopsUpstream(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("client cancellation left the upstream request running")
 	}
-	if strings.Contains(received.String(), "message_stop") {
-		t.Fatal("canceled response reported success")
+	if strings.Contains(received.String(), "message_stop") || strings.Contains(received.String(), `"type":"tool_use"`) {
+		t.Fatal("canceled response delivered an unvalidated tool or reported success")
 	}
 }
