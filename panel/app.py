@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：控制台版本同步上下文恢复修复 2.1.29。
 # 2026-09-24：版本号提升到 2.1.28（上下文裁剪回真体积 + 超限幅度上限）。
 # 2026-09-24：提前拒绝后限时丢弃迟到的小请求体，保留403响应并避免未读字节触发连接重置。
 # 2026-09-24：登录、续期和改密绑定已验证的凭据版本；并发登录先占用尝试预算，避免绕过限流。
@@ -115,7 +116,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.28"
+PANEL_VERSION = "2.1.29"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

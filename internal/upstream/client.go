@@ -1,6 +1,8 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-25：上下文超限直接返回上游原文，移除自动删历史重发，交由客户端完成真正的压缩。
+// 2026-09-25：首次拒绝与重试共用精确超限码识别，避免格式差异漏判与普通错误文案误判。
 // 2026-09-24：上下文首档裁剪不改变两三轮历史时继续尝试后续档位，不重复发送未缩短请求。
 // 2026-09-22：新增 ErrUpstreamGateway：上游代理层（APISIX/openresty）HTML 授权页单独
 //
@@ -259,7 +261,7 @@ func contentBlockedKeyword(body string) string {
 	return contentBlockedFallbackKeyword
 }
 
-// contextTooLongRule 上下文超限关键词（上游 code 11115）。
+// 上下文超限（上游 code 11115）由 ContextTooLongHTTPDetail 按错误码识别。
 //
 // 定位：请求体 token 数超过模型上限，上游返回 HTTP 400 +
 // "prompt is too long: N tokens > M maximum"（extError.code=context_length_exceeded）。
@@ -292,12 +294,6 @@ func ContextTooLongDetail(body string) string {
 	}
 	return b
 }
-
-var contextTooLongRule = errorRule{kind: ErrContextTooLong, mode: matchExact, patterns: []string{
-	"prompt is too long",
-	`"code":11115`,
-	"context_length_exceeded",
-}}
 
 // badParamsRule 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
@@ -490,6 +486,12 @@ func isUnapprovedChannel(body string) bool {
 //  5. status==429 —— body 无文案时的兜底识别。
 //  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
 func Classify(status int, body string) ErrKind {
+	// The explicit context error code is authoritative, even if its message
+	// also contains rate/credit vocabulary. Initial calls and retries must
+	// make the same decision without treating quoted code names as signals.
+	if _, contextFailure := ContextTooLongHTTPDetail(status, []byte(body)); contextFailure {
+		return ErrContextTooLong
+	}
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
 	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
@@ -546,9 +548,6 @@ func Classify(status int, body string) ErrKind {
 	if status >= 400 {
 		if contentBlockedRule.hit(body, lower) {
 			return ErrContentBlocked
-		}
-		if contextTooLongRule.hit(body, lower) {
-			return ErrContextTooLong
 		}
 		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
@@ -956,11 +955,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	pathCount := len(c.chatPaths(a))
-	// contextTrimLevel 上下文超限的裁剪档位：上游预检硬墙（1,048,576）比模型元数据
-	// 声明的窗口更紧，客户端估算又低于上游口径，实测失败样本只超出几十到几百 token。
-	// 命中 11115 时丢一段最旧历史后重发，用户侧无感；档位用尽仍超限才把错误交回。
-	// 计数跨路径累计，避免 404 fallback 场景下重复裁剪同一请求。
-	contextTrimLevel := 0
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
 		// wafLevel：WAF 断词升级档位。0 = 原样重发前；1 = 模式级断词；
@@ -1003,6 +997,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				kind := Classify(resp.StatusCode, string(raw))
 				log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+				// 上下文超限是请求终态：保留全部历史和原始错误，让客户端压缩后再请求。
+				// 数字大小与 JSON 转义方式均不影响此行为，也不触发路径回落。
+				if kind == ErrContextTooLong {
+					return nil, resp.StatusCode, raw, nil
+				}
 				// 国际版 WAF 按正文特征拦截（脚本、命令注入、路径穿越等），返回的是前置
 				// WAF 的拦截页而非模型答复。按两级做零宽断词后同路径重发：一级按已知模式
 				// 断词，二级按 token 断词覆盖命令注入/路径穿越族。零宽字符不参与词义，
@@ -1052,40 +1051,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				if attempt < pathCount-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 					observeChatRetry(ctx, raw)
 					break retry
-				}
-				// 上下文超限：按档位丢掉最旧的一部分历史后同路径重发一次。
-				// 上游在生成前就拒了这次请求，因此没有用量可记；这里只做裁剪与重发，
-				// 不改账号状态（换号也是同一堵墙）。
-				//
-				// 只对「小幅超限」裁剪：客户端自己的估算低于上游预检口径，实测需要
-				// 裁剪的场景只超出几十到几百 token（1048684/1048691/1048868 对 1048576）。
-				// 超出幅度过大（实测见过 2015759，约 1.92 倍）时必须把 11115 原样交回，
-				// 让客户端走自己的压缩流程——那种情况下裁剪要丢掉大半对话，
-				// 用残存的一小部分历史回答用户，答案本身已经不可信。
-				if kind == ErrContextTooLong {
-					tokens, maximum, ok := PromptTooLongCounts(string(raw))
-					if !ok || !WithinTrimOvershootLimit(tokens, maximum) {
-						log.Printf("WARN: [upstream] context too long beyond the auto-trim limit "+
-							"(tokens=%d maximum=%d overshoot=%s) — returning the upstream error to the client uid=%s path=%s",
-							tokens, maximum, trimOvershootDescription(tokens, maximum), logfmt.UID8(a.UID), path)
-						return nil, resp.StatusCode, raw, nil
-					}
-					// 首个 11115 的原始体积记进观测槽：handler 据此把真实上下文大小
-					// 回传给客户端，否则客户端只看到裁剪后的体积、永远不触发压缩。
-					recordContextTrim(ctx, tokens, maximum)
-				}
-				for kind == ErrContextTooLong && contextTrimLevel < ContextTrimLevels() {
-					ratio := contextTrimKeepRatios[contextTrimLevel]
-					contextTrimLevel++
-					if trimmed, changed := TrimOldestContext(prepared, ratio); changed {
-						prepared = trimmed
-						lastSent = prepared
-						log.Printf("WARN: [upstream] context too long: dropped oldest turns "+
-							"(keep_ratio=%.2f level=%d/%d) and retrying uid=%s path=%s",
-							ratio, contextTrimLevel, ContextTrimLevels(), logfmt.UID8(a.UID), path)
-						observeChatRetry(ctx, raw)
-						continue retry
-					}
 				}
 				return nil, resp.StatusCode, raw, nil
 			}

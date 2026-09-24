@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：移除上下文裁剪用量选项，流处理保持上游实际用量与推理保护独立。
 // 2026-09-22：修掉「明明在抽风却检测不到」的根因，并取消按推理字符量判定。
 // 旧实现把每一条非空行都算成一个窗口格位，可长行（>32 字符）永远不可能重复，
 // 于是覆盖率被结构性压住：实测两份真实循环里长行分别占 19.2% 与 42.9% 的格位，
@@ -164,9 +165,6 @@ var ContentLoopHoldBackTimeout = 8 * time.Second
 type StreamOptions struct {
 	Model              string
 	ReasoningLoopGuard bool
-	// TrimInfo 上下文裁剪观测槽（可选）：客户端裁剪发生时写入，调用方据此把
-	// 上游原始体积回真给客户端。nil = 不观测（既有调用方零改动）。
-	TrimInfo *ContextTrimInfo
 	// LoopRetryAvailable 告诉 Stream：命中循环且客户端零字节时，调用方**还会**在同一
 	// 账号上重发，因此这次不要向客户端写 error 帧与 [DONE]（避免用户看到半截失败），
 	// 只把错误标成 Retryable 返回。

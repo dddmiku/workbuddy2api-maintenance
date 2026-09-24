@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：超限保持历史及会话绑定，成本统计统一读取上游实际用量，不再给客户端补写未处理的token。
+// 2026-09-25：流内超限与循环重试后的超限保持真实错误信号，不解绑会话、不覆盖已观测用量。
 // 2026-09-24：多密钥模式隔离账号与排程管理端点，调用密钥不再具备全局管理权限。
 // 2026-09-22：上游代理层 HTML 授权页（APISIX/openresty）不再被当作「请求参数被拒」
 // 回显整段 HTML；改为 503 可重试语义、不罚账号、不解绑会话粘性。
@@ -997,6 +999,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			heldUID = ""
 		}
 	}
+	writeContextFailure := func(detail string) {
+		releaseHeld()
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", detail)
+	}
 	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
@@ -1049,11 +1056,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
-	// 上下文裁剪观测槽：上游 11115 被自动裁剪时，把**原始**体积记下来，
-	// 再回真给客户端（见 upstream/context_trim_usage.go）。不回真的后果实测过：
-	// 客户端只看到裁剪后的 74k，以为上下文很小，压缩机制永远不触发，
-	// 每轮重发两百万 token，网关每轮再裁三轮。
-	chatContext, trimInfo := upstream.WithContextTrimRecorder(chatContext)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {
@@ -1251,12 +1253,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 立即回客户端并透传上游原文（含真实 token 数与上限），不轮转、不罚账号。
 				// 让调用方看到 "prompt is too long: N tokens > M maximum" 自行压缩或开新会话。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
-				fail(acct.UID)
 				// 不再额外加 "prompt is too long: " 前缀——上游 msg 本身就以它开头，
 				// 硬加会得到 "prompt is too long: prompt is too long: N tokens > M maximum"。
-				writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded",
-					upstream.ContextTooLongDetail(string(respBody)))
-				st.status = http.StatusBadRequest
+				writeContextFailure(upstream.ContextTooLongDetail(string(respBody)))
 				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
@@ -1309,7 +1308,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		streamOptions := upstream.StreamOptions{
 			Model:              peek.Model,
 			ReasoningLoopGuard: reasoningLoopGuard,
-			TrimInfo:           trimInfo,
 		}
 		// 本次请求一开始就快照「命中后是否只停不重发」：管理台在请求进行中切换开关时，
 		// 已经在跑的这一轮沿用开始时的语义，不会出现重发到一半忽然改判。
@@ -1344,9 +1342,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
 				// 重发前重建读取器与用量观测：上一次被截断的观测已随重发作废，
 				// 只保留客户端最终真正收到的那一轮用量。
-				// 重发只关心能不能建立（rc/status/terr）：下一轮由 Stream 直接读 rc，
-				// 这一轮的响应体在两条失败分支里都不读，用 _ 省掉一次死赋值。
-				rc, status, _, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+				// 重发若被上下文预检拒绝，返回这次真实错误，不能用上一轮循环错误覆盖它。
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+				if detail, contextFailure := upstream.ContextTooLongHTTPDetail(status, respBody); terr == nil && contextFailure {
+					st.absorbJSONUsage(respBody)
+					st.unreported = true
+					writeContextFailure(detail)
+					return
+				}
 				if terr != nil || status >= 400 {
 					// 重发没能建立（传输层失败或上游直接报错）：Stream 已经压制了上一次
 					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
@@ -1381,6 +1384,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					if errors.As(streamErr, &loopErr) {
 						log.Printf("WARN: [server] %s", loopErr.Message)
 					}
+					return
+				}
+				if _, contextFailure := upstream.ContextTooLongStreamDetail(streamErr); contextFailure {
+					// Stream 已将失败发给客户端；这里只记失败并释放租约，不重复写入或解绑。
+					st.status = http.StatusBadRequest
+					releaseHeld()
 					return
 				}
 				if r.Context().Err() != nil {
@@ -1432,8 +1441,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			loopRetries++
 			log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
 				loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
-			// 同流式：重发只判断能否建立，响应体在失败分支里不读。
-			rc, status, _, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			// 与流式一致：保留重发时才出现的上下文错误与它实际报告的用量。
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			if detail, contextFailure := upstream.ContextTooLongHTTPDetail(status, respBody); terr == nil && contextFailure {
+				st.absorbJSONUsage(respBody)
+				st.unreported = true
+				writeContextFailure(detail)
+				return
+			}
 			if terr != nil || status >= 400 {
 				// 重发没能建立：把失败如实回报，不能静默结束。
 				st.unreported = true
@@ -1455,6 +1470,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.unreported = true
 				st.status = http.StatusUnprocessableEntity
 				writeOpenAIError(w, st.status, loopErrorCode(err), err.Error())
+				return
+			}
+			if detail, contextFailure := upstream.ContextTooLongStreamDetail(err); contextFailure {
+				writeContextFailure(detail)
 				return
 			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
@@ -1483,9 +1502,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		st.status = http.StatusOK
 		st.failed = false
-		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
-		if credit, total, ok := usageCreditTotal(resp); ok {
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+		// 与流式共用原始观测，展示层的响应转换不能改变选号的成本分母。
+		if credit, ok := stats.Credit(); ok && stats.CompleteUsage() {
+			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
 		}
 		return
 	}

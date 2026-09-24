@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：拒绝无法解读的原生压缩历史与服务端压缩配置，防止丢上下文后仍返回成功。
+// 2026-09-25：流式上下文超限返回标准失败事件，供客户端标记窗口已满并在下一轮压缩；不伪造用量。
+// 2026-09-25：流内厂商超限码统一为标准失败码，保留已发正文与真实用量，未观测用量保持为空。
+// 2026-09-25：错误帧同时携带的真实用量先合并再收尾，保留最后更新且不补写未处理的输入。
 // 2026-09-19：在请求上下文保留原始会话键供隔离路由使用，client_metadata 不再因转换而丢失线程亲和。
 // 2026-09-19：推理条目跨正文和工具增量保持打开，在最终状态确定后收尾，避免重复added、重用ID和旧摘要重放。
 // 2026-09-19：删除输入/缓存倍率计算，流式与非流式 Responses 均返回上游原始用量。
@@ -193,6 +197,15 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if err := validateResponsesOptions(object, &req); err != nil {
 		return nil, nil, err
 	}
+	if raw, present := object["context_management"]; present {
+		var directives []json.RawMessage
+		if err := json.Unmarshal(raw, &directives); err != nil {
+			return nil, nil, fmt.Errorf("context_management must be an array or null")
+		}
+		if len(directives) > 0 {
+			return nil, nil, fmt.Errorf("context_management is not supported; use client-side summarization and send the resulting text in input")
+		}
+	}
 	if req.PreviousResponseID != "" {
 		return nil, nil, fmt.Errorf("previous_response_id is not supported; include the complete input history")
 	}
@@ -331,13 +344,15 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			pending = nil
 		}
 	}
-	for _, it := range items {
+	for index, it := range items {
 		var m map[string]any
 		if jsonutil.Decode(it, &m) != nil {
 			continue
 		}
 		typ, _ := m["type"].(string)
 		switch typ {
+		case "compaction":
+			return nil, stats, fmt.Errorf("input[%d].type %q is not supported; include full message history or a client-generated text summary", index, typ)
 		case "function_call":
 			name, _ := m["name"].(string)
 			name = upstreamToolName(toolNames, namespaceOf(m), name)
@@ -1249,6 +1264,9 @@ func (rw *responsesWriter) finish() {
 	rw.closed = true
 	switch rw.mode {
 	case 3:
+		if rw.writeContextWindowFailure() {
+			return
+		}
 		ct := rw.hdr.Get("Content-Type")
 		if ct == "" {
 			ct = "application/json"
@@ -1264,6 +1282,28 @@ func (rw *responsesWriter) finish() {
 		}
 		rw.finishStream()
 	}
+}
+
+// A streaming caller needs the typed failed event to enter its context recovery
+// path. Other HTTP errors retain their status, and failed input has no usage.
+func (rw *responsesWriter) writeContextWindowFailure() bool {
+	if rw.req == nil || !rw.req.Stream || rw.begun || rw.status != http.StatusBadRequest {
+		return false
+	}
+	var failure struct {
+		Error struct{ Code, Message string }
+	}
+	if json.Unmarshal(rw.buf, &failure) != nil || failure.Error.Code != "context_length_exceeded" {
+		return false
+	}
+	rw.mode = 1
+	rw.streamErr = map[string]any{"code": failure.Error.Code, "message": failure.Error.Message}
+	rw.beginStream()
+	rw.terminalStatus = "failed"
+	response := rw.responseObject("failed")
+	response["usage"] = nil
+	rw.emit(evFailed, map[string]any{"response": response})
+	return true
 }
 
 // finishJSON 把缓冲的 chat completion 翻成 Responses 对象。
@@ -1369,7 +1409,13 @@ func (rw *responsesWriter) handleFrame(frame string) {
 			continue
 		}
 		if e, ok := chunk["error"].(map[string]any); ok {
+			if usage, ok := chunk["usage"].(map[string]any); ok {
+				rw.usage = upstream.MergeUsage(rw.usage, usage)
+			}
 			rw.streamErr = e
+			if detail, contextFailure := upstream.ContextTooLongErrorDetail(e); contextFailure {
+				rw.streamErr = map[string]any{"code": "context_length_exceeded", "message": detail}
+			}
 			continue
 		}
 		rw.handleChunk(chunk)
@@ -1989,6 +2035,9 @@ func (rw *responsesWriter) responseObject(status string) map[string]any {
 		obj["error"] = map[string]any{
 			"code":    rw.streamErr["code"],
 			"message": rw.streamErr["message"],
+		}
+		if rw.streamErr["code"] == "context_length_exceeded" && rw.usage == nil {
+			obj["usage"] = nil
 		}
 	}
 	if status == "incomplete" {

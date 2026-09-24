@@ -1,5 +1,7 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-25：厂商错误事件包装成标准 error 时保留同帧顶层 usage，避免下游漏掉真实用量更新。
+// 2026-09-25：移除裁剪记录对用量的覆盖，流式和聚合仅合并上游实际报告的累计值。
 // 2026-09-19：工具参数允许在早到的结束标记后补齐；传输收尾统一校验，成功终态延迟到校验通过后发送。
 // 2026-09-19：可选重复推理保护共享流/聚合入口，保留已观察帧并以明确错误终止，真实正文/工具进展重置窗口。
 // 2026-09-16：统一 SSE 事件解析与结束校验，保留上游错误并防止断流和残缺工具参数伪装成功。
@@ -136,7 +138,22 @@ func decodeSSEEvent(ev sseEvent) (obj map[string]any, done bool, err error) {
 				}
 				return nil, false, failure
 			}
-			return nil, false, upstreamEventError(obj)
+			failure := upstreamEventError(obj)
+			if _, ok := obj["usage"].(map[string]any); ok {
+				// The vendor event has no error envelope. Keep the whole error
+				// object and expose its observed usage beside it, as in ordinary
+				// Chat frames. Raw JSON preserves the original numeric values.
+				var fields map[string]json.RawMessage
+				if json.Unmarshal([]byte(ev.data), &fields) == nil {
+					frame, err := json.Marshal(map[string]json.RawMessage{
+						"error": json.RawMessage(ev.data), "usage": fields["usage"],
+					})
+					if err == nil {
+						failure.rawFrame = frame
+					}
+				}
+			}
+			return nil, false, failure
 		}
 		return nil, false, upstreamEventError(ev.data)
 	}
@@ -592,7 +609,6 @@ func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 		created   float64
 		usage     map[string]any
 	)
-	trimInfo := streamTrimInfo(options)
 	state := newStreamState(options)
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
 		chunk, done, err := decodeSSEEvent(ev)
@@ -616,7 +632,7 @@ func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 			created = value
 		}
 		if value, ok := chunk["usage"].(map[string]any); ok {
-			usage = MergeUsage(usage, trimInfo.override(value))
+			usage = MergeUsage(usage, value)
 		}
 		if err := state.observeReasoningLoops(chunk); err != nil {
 			return true, err
@@ -866,7 +882,6 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	var usage map[string]any
 	terminalMeta := map[string]any{}
 
-	trimInfo := streamTrimInfo(options)
 	state := newStreamState(options)
 
 	// ── 写出闸门（仅在重复推理保护启用时生效）────────────────────────────
@@ -965,7 +980,7 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 			}
 		}
 		if value, ok := obj["usage"].(map[string]any); ok {
-			usage = MergeUsage(usage, trimInfo.override(value))
+			usage = MergeUsage(usage, value)
 			obj["usage"] = usage
 		}
 		// Text, argument deltas and observed usage continue streaming. A finish
