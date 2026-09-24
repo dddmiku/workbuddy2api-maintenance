@@ -167,7 +167,7 @@ sudo docker compose restart wb2api
 
 ## HTTP 接口
 
-除 `/healthz` 外，下列接口使用 Bearer API key 鉴权。
+`/v1/` 接口使用 Bearer API key 鉴权，`/healthz` 无需鉴权。默认多密钥模式下，账号池与排程接口仅允许本机管理 socket，普通调用密钥不能读取全局账号或触发任务；管理台照常使用。显式关闭密钥库的旧单密钥模式保留原有 Bearer 管理接口。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -175,10 +175,10 @@ sudo docker compose restart wb2api
 | GET | `/v1/models` | 模型列表 |
 | POST | `/v1/chat/completions` | Chat Completions 请求 |
 | POST | `/v1/responses` | Responses 请求 |
-| GET | `/status` | 账号池状态 |
-| GET | `/tasks` | 任务状态 |
-| POST | `/tasks/{key}/run` | 手动运行任务 |
-| GET | `/tasks/{key}/log` | 任务日志 |
+| GET | `/status` | 账号池状态（管理通道） |
+| GET | `/tasks` | 任务状态（管理通道） |
+| POST | `/tasks/{key}/run` | 手动运行任务（管理通道） |
+| GET | `/tasks/{key}/log` | 任务日志（管理通道） |
 
 密钥管理不暴露在 `7863` 的 `/keys` 路由上。详细支持范围和错误语义见 [接口兼容性](docs/compatibility.md)。
 

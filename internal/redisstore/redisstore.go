@@ -8,12 +8,15 @@
 // 上层只打一条启动警告日志。
 // ═══ 更新日志 ═══
 // 2026-09-18：关闭时排空已提交写入，并按键保持镜像写入顺序，避免旧绑定或旧状态倒序覆盖。
+// 2026-09-24：正确转义连接密码并解析 REST 地址；连接串错误不再输出含凭据的原始 URL。
 package redisstore
 
 import (
 	"context"
 	"errors"
 	"log"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +71,8 @@ func New(url, token string) Store {
 	full := normalizeURL(url, token)
 	opt, err := redis.ParseURL(full)
 	if err != nil {
-		log.Printf("[redisstore] 警告: redis 连接串解析失败 (%v)，降级 Noop", err)
+		// URL parse errors can embed the entire credential-bearing connection string.
+		log.Printf("[redisstore] 警告: redis 连接串解析失败，请检查地址格式，降级 Noop")
 		return Noop{}
 	}
 	opt.ReadTimeout = readTimeout
@@ -91,19 +95,36 @@ func New(url, token string) Store {
 }
 
 // normalizeURL 把 url+token 归一化为可直接 ParseURL 的完整 rediss:// URL。
-// 若 url 本身已含 scheme（rediss://、redis://、https://...upstash.io 等）：
-//   - rediss:// 或 redis:// 原样返回（已是完整连接串）
-//   - 其余（如 https://xxx.upstash.io）剥掉 "://" 前缀只取 host，再按
-//     "rediss://default:<token>@<host>:6379" 组装
-func normalizeURL(url, token string) string {
-	if len(url) >= 8 && (url[:8] == "rediss:/" || url[:7] == "redis:/") {
-		return url
+// 完整 Redis URL 保留原有用户信息和数据库；REST 地址只取主机和端口。
+// 密码使用标准 URL 转义，避免其中的 /、@、? 或 % 被当成连接串结构。
+func normalizeURL(endpoint, token string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	parsedEndpoint := endpoint
+	if !strings.Contains(parsedEndpoint, "://") {
+		parsedEndpoint = "//" + parsedEndpoint
 	}
-	host := url
-	if i := strings.Index(host, "://"); i >= 0 {
-		host = host[i+3:]
+	parsed, err := url.Parse(parsedEndpoint)
+	if err != nil {
+		return endpoint // redis.ParseURL reports the invalid configuration in New.
 	}
-	return "rediss://default:" + token + "@" + host + ":6379"
+	switch parsed.Scheme {
+	case "redis", "rediss":
+		return endpoint
+	case "", "http", "https":
+	default:
+		return endpoint
+	}
+	if parsed.Hostname() == "" {
+		return endpoint
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "6379"
+	}
+	return (&url.URL{
+		Scheme: "rediss", User: url.UserPassword("default", token),
+		Host: net.JoinHostPort(parsed.Hostname(), port),
+	}).String()
 }
 
 // Upstash 真实现：redis.Client 封装。

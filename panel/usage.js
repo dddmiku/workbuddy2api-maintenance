@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-24：日期筛选的条形比例、排序、空记录和最近使用时间统一遵循所选范围，避免混入全部历史。
 // 2026-09-19：展示失败和未完整用量的请求，日期汇总保留状态计数，说明实际累计与客户端上下文估算的区别。
 // 2026-09-18：日期筛选使用实际天桶，停止按占比虚构模型明细；全部按钮显示完整历史次数。
 // 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
@@ -85,7 +86,11 @@ function usageIcon(name){
 }
 
 function renderUsageRows(keys, totals){
-  var rows = keys || [];
+  var rows = (keys || []).map(function(item){ return {item:item, totals:usageTotalsFor(item)}; });
+  if (filtered()){
+    rows = rows.filter(function(row){ return Number(row.totals.requests) > 0; });
+    rows.sort(function(a, b){ return (Number(b.totals.total_tokens) || 0) - (Number(a.totals.total_tokens) || 0); });
+  }
   if (!rows.length){
     $('#usageRows').innerHTML = '<tr><td colspan="8" data-l=""><div class="empty">' +
       (filtered() ? '这个时间范围没有用量记录，换个日期或选「全部」看看。' : '还没有用量记录，客户端发一次请求后这里就有数据。') +
@@ -93,9 +98,9 @@ function renderUsageRows(keys, totals){
     return;
   }
   var max = 0;
-  rows.forEach(function(item){ max = Math.max(max, Number(item.totals.total_tokens) || 0); });
-  $('#usageRows').innerHTML = rows.map(function(item){
-    var t = usageTotalsFor(item);
+  rows.forEach(function(row){ max = Math.max(max, Number(row.totals.total_tokens) || 0); });
+  $('#usageRows').innerHTML = rows.map(function(row){
+    var item = row.item, t = row.totals;
     var share = max > 0 ? Math.round((Number(t.total_tokens) || 0) / max * 100) : 0;
     var open = !!US.open[item.key_id];
     var models = usageModelsFor(item).map(function(model){
@@ -163,11 +168,16 @@ function usageTotalsFor(item){
   return sumTotals(selectedDays(days));
 }
 
-// usageLastUsedFor 筛选后仍显示该密钥的最后使用时间：范围包含今天时它就是真实值。
+// 日桶不包含每天最后使用时间。历史总表的时间落在所选范围外时不能冒充范围内的活动。
 function usageLastUsedFor(item){
   if (!filtered()) return item.last_used_at;
   var totals = usageTotalsFor(item);
-  return (Number(totals.requests) || 0) > 0 ? item.last_used_at : '';
+  if (!(Number(totals.requests) > 0) || !item.last_used_at) return '';
+  var date = new Date(item.last_used_at);
+  if (isNaN(date.getTime())) return '';
+  var day = localDayKey(date);
+  if ((US.from && day < US.from) || (US.to && day > US.to)) return '';
+  return item.last_used_at;
 }
 
 // usageModelsFor 仅在全部时间展示模型拆分，现有天桶没有模型维度。

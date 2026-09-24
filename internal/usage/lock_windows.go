@@ -1,18 +1,34 @@
 // ═══ 更新日志 ═══
 // 2026-09-18：Windows 使用文件区域锁保护完整读改写，避免多实例开发与测试互相覆盖。
+// 2026-09-24：短时重试共享冲突的原子替换，避免文件读取或扫描瞬间占用导致用量无法落盘。
 //go:build windows
 
 package usage
 
 import (
+	"errors"
 	"os"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var ledgerKernel = syscall.NewLazyDLL("kernel32.dll")
 var ledgerLockFile = ledgerKernel.NewProc("LockFileEx")
 var ledgerUnlockFile = ledgerKernel.NewProc("UnlockFileEx")
+
+func replaceLedger(source, target string) error {
+	for attempt := 0; ; attempt++ {
+		err := os.Rename(source, target)
+		if err == nil || attempt == 6 {
+			return err
+		}
+		if !errors.Is(err, syscall.ERROR_ACCESS_DENIED) && !errors.Is(err, syscall.Errno(32)) && !errors.Is(err, syscall.Errno(33)) {
+			return err
+		}
+		time.Sleep((5 * time.Millisecond) << attempt)
+	}
+}
 
 func lockLedger(path string) (func(), error) {
 	// #nosec G304 -- 锁文件路径由账本路径推导，来自管理员配置，非请求输入

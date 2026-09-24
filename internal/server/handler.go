@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：多密钥模式隔离账号与排程管理端点，调用密钥不再具备全局管理权限。
 // 2026-09-22：上游代理层 HTML 授权页（APISIX/openresty）不再被当作「请求参数被拒」
 // 回显整段 HTML；改为 503 可重试语义、不罚账号、不解绑会话粘性。
 // 2026-09-22：密钥模型绑定改为「完整模型名逐字相等」，不再按 resolveModel 解析后比较；
@@ -174,11 +175,11 @@ func NewHandler(cfg Config) *Handler {
 	// Responses API 兼容层（NarraFork / Codex 等客户端走这条）：内部委托 chatCompletions。
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /status", h.withAccountAdmin(h.status))
 	// 排程任务自省与手动触发（账户管理面板的「定时任务」页）。
-	h.mux.HandleFunc("GET /tasks", h.withAuth(h.tasks))
-	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAuth(h.taskRun))
-	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAuth(h.taskLog))
+	h.mux.HandleFunc("GET /tasks", h.withAccountAdmin(h.tasks))
+	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAccountAdmin(h.taskRun))
+	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAccountAdmin(h.taskLog))
 	// 用量统计只走本机 Unix socket（管理台「用量统计」页）：普通调用密钥拿不到全量用量，
 	// 单密钥自己的用量在日志与面板里按 key 归属，不需要公开端点。
 	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
@@ -241,6 +242,19 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 type internalAdminContextKey struct{}
+
+// A managed calling key represents a client, not the account administrator.
+// Explicit legacy single-key deployments retain their shared-key management API.
+func (h *Handler) withAccountAdmin(next http.HandlerFunc) http.HandlerFunc {
+	authenticated := h.withAuth(next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.cfg.APIKeys != nil && r.Context().Value(internalAdminContextKey{}) != true {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "internal endpoint")
+			return
+		}
+		authenticated(w, r)
+	}
+}
 
 // apiKeyContextKey 携带本次请求使用的密钥信息（模型白名单等）。
 type apiKeyContextKey struct{}
@@ -987,7 +1001,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(stickyKey)
+			h.cfg.Session.UnbindIfUID(stickyKey, stickyUID)
 			stickyUID = ""
 		}
 	}

@@ -1,6 +1,7 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
 // 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 // ═══ 更新日志 ═══
+// 2026-09-24：余额恢复仅解除余额冷却，探活始终服从账号级冷却与熔断。
 // 2026-09-18：跨实例落盘保留显式复活/清零意图，并以实际扣费增量合并余额，避免旧快照回滚状态。
 // 2026-09-18：持久化扣费保留实际消费量，只有本地余额展示钳零，避免旧余额少记后来可见的消费。
 package pool
@@ -75,11 +76,8 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却域（余额恢复）。
-// 迁移经 transition.reviveCoolingLocked：只清冷却域（until/coolKind/softStreak/
-// modelCooldowns）并更新 credits，不动熔断器（fails/retryCount/breakerUntil）——
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。remain==0 或禁用时只更新 credits（不动冷却/禁用）。
+// ReenableIfCredits 在余额恢复后解除余额不足冷却。余额不证明请求频率或模型配额
+// 已恢复，因此软冷却、模型限制和熔断继续按各自截止生效。禁用账号只更新余额。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -208,8 +206,8 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
-// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除。
+// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却由到期/禁用清理；
+// 11102 负缓存另由对应模型请求成功清除，余额恢复不能清除。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -363,22 +361,14 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
 //
-// 模型级豁免（issue #31 的探活侧补齐）：6004 模型级软冷却中的账号（modelExempt 形态）
-// 对触发模型不可用、对其他模型仍可选，探活与 chat 必须同口径，否则"全号被某模型限流
-// 但换模型可用"时 chat 实际 200 而 /healthz 误报 503。chat 侧按请求模型细粒度判定
-// （healthyForModel：全账号健康且该模型不在独立冷却内才放行，模型豁免作用于选号），
-// 探活侧没有请求模型上下文，取「存在豁免形态」的存在性语义——豁免账号（未禁用、
-// 未熔断、存在模型级冷却条目）至少还剩触发模型之外的模型可用，ServableNow 计入。
-// 注意与 chat 判定在"账号级 until 冷却 + 模型豁免并存"时并不完全重合：modelExempt
-// 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态现实中不可达
-// （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
-// 不构成 chat 选号路径。
+// 单模型限制不改变 healthy，因此仍可服务其他模型；并发错误产生账号冷却与模型
+// 限制并存时，必须服从账号级冷却，不能让模型记录反过来制造可用性。
 func (p *Pool) ServableNow() bool {
 	return p.servableLocked("")
 }
 
 // ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
-// 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
+// 与 ServableNow 同口径（healthy 且未占满在途），仅叠加 Realm()==realm 谓词。
 // realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
 func (p *Pool) ServableForRealm(realm string) bool {
 	return p.servableLocked(realm)
@@ -447,7 +437,7 @@ func (p *Pool) RealmRateStateForModel(realm, model string) RealmRateState {
 }
 
 // servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
-// 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态）的账号即 true。
+// 存在至少一个（realm 匹配、未占满在途名额、healthy）的账号即 true。
 // realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。
 func (p *Pool) servableLocked(realm string) bool {
 	p.mu.RLock()
@@ -460,7 +450,7 @@ func (p *Pool) servableLocked(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) {
 			return true
 		}
 	}

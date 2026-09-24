@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：浮动表头对齐内容滚动区与顶栏下沿，避免固定顶栏遮住表头，并在原表末尾收起。
 // 2026-09-19：固定长表格表头，跟随原表格列宽和水平位置；保留页面自然纵向滚动。
 (function(){
   function initTableHeaders(){
@@ -17,7 +18,11 @@
       if (!table.getClientRects().length){ floating.hidden = true; return; }
       var head = table.tHead, headBox = head.getBoundingClientRect();
       var tableBox = table.getBoundingClientRect(), wrapBox = wrap.getBoundingClientRect();
-      if (headBox.top >= 0 || tableBox.bottom <= 0 || !wrap.clientWidth){
+      var stickyTop = state.scroller ? Math.max(0, state.scroller.getBoundingClientRect().top + state.scroller.clientTop) : 0;
+      if (state.topbar && state.topbar.getClientRects().length){
+        stickyTop = Math.max(stickyTop, state.topbar.getBoundingClientRect().bottom);
+      }
+      if (headBox.top >= stickyTop || tableBox.bottom <= stickyTop || !wrap.clientWidth){
         floating.hidden = true;
         return;
       }
@@ -38,11 +43,12 @@
       floating.style.left = wrapBox.left + 'px';
       floating.style.width = wrap.clientWidth + 'px';
       floating.style.height = headBox.height + 'px';
-      floating.style.top = Math.min(0, tableBox.bottom - headBox.height) + 'px';
+      floating.style.top = Math.min(stickyTop, tableBox.bottom - headBox.height) + 'px';
       floating.hidden = false;
     }
     document.querySelectorAll('table[data-sticky-head]').forEach(function(table){
       var wrap = table.closest('.tblwrap');
+      var scroller = table.closest('.body'), topbar = document.querySelector('.top');
       var floating = document.createElement('div');
       floating.className = 'table-head-float';
       floating.dataset.tableHeadFor = table.dataset.stickyHead;
@@ -53,9 +59,11 @@
       clone.className = table.className;
       floating.appendChild(clone);
       document.body.appendChild(floating);
-      tables.push({table:table, wrap:wrap, floating:floating, clone:clone, markup:null});
+      tables.push({table:table, wrap:wrap, scroller:scroller, topbar:topbar, floating:floating, clone:clone, markup:null});
       new ResizeObserver(schedule).observe(table);
       new ResizeObserver(schedule).observe(wrap);
+      if (scroller) new ResizeObserver(schedule).observe(scroller);
+      if (topbar) new ResizeObserver(schedule).observe(topbar);
       new MutationObserver(schedule).observe(table, {childList:true, subtree:true, characterData:true});
       new MutationObserver(schedule).observe(table.closest('.view'), {attributes:true, attributeFilter:['class']});
     });

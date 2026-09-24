@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：用推理入口验证调用密钥；全账号状态只允许管理通道。
 // 2026-09-20：完整密钥复制接口不能被普通公开 API 访问。
 package server
 
@@ -23,11 +24,11 @@ func TestManagedKeysAuthorizeAndRevokeAllPublicRoutes(t *testing.T) {
 	}
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "test", AccessToken: "test", ExpiresAt: 9999999999}), APIKey: "legacy-original-key", APIKeys: store})
 	for _, token := range []string{key, "legacy-original-key"} {
-		req := httptest.NewRequest("GET", "/status", nil)
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		if rec.Code != 200 {
+		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("valid key rejected: %d", rec.Code)
 		}
 	}

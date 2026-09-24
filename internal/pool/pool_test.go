@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-24：修正余额刷新清理软限流及账号冷却清空模型限制的错误测试契约。
 package pool
 
 import (
@@ -812,9 +814,8 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
-func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+func TestCooldownSoftStreakPreservedByCreditRecovery(t *testing.T) {
+	// 余额查询只证明积分恢复，不能清掉软限流、退避计数或熔断。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -824,18 +825,18 @@ func TestCooldownSoftStreakResetByReenable(t *testing.T) {
 
 	p.ReenableIfCredits("u1", 500)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if st.SoftStreak != 2 {
+		t.Errorf("credit recovery should preserve soft_streak=2, got %d", st.SoftStreak)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if !st.Cooling {
+		t.Errorf("credit recovery should preserve rate-limit cooling: %+v", st)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	wantCoolSec(t, p, "u1", 1200, 3)
 }
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
@@ -1091,10 +1092,9 @@ func TestServableNowExemptButDisabled(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
-// **非模型级**软冷却（plain Cooldown），modelCooldowns 必须被清空——否则上次 6004 的
-// 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
-func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
+// TestModelCooldownsPreservedByPlainCooldown 账号冷却期间所有模型均不可用，
+// 到期后原模型配额仍生效；两级限制并存而非互相清除。
+func TestModelCooldownsPreservedByPlainCooldown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -1111,10 +1111,14 @@ func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
 	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
-	// 3) 换模型请求不得再豁免（modelCooldowns 已清空）。
+	// 3) 换模型请求仍服从账号级冷却。
 	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u2" {
-		t.Fatalf("plain cooldown must clear modelCooldowns (no bypass), got %+v", got)
+		t.Fatalf("plain cooldown must block other models too, got %+v", got)
+	}
+	p.forceSoftExpired("u1")
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u2" {
+		t.Fatalf("model limit must survive shorter account cooldown, got %+v", got)
 	}
 }
 

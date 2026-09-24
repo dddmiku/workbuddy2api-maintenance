@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：下载前严格校验摘要格式，拒绝 sha256: 空摘要绕过校验并覆盖更新文件。
+// 2026-09-24：稳定版本按数字顺序判断更新，避免旧 Release 被重新标为 latest 后误触自动降级。
 // 2026-09-18：发布名称编码为单个文件名，下载使用独占临时文件并在校验后设可执行位，防止越界和符号链接覆盖。
 // 2026-09-17：新增自更新取件：查 GitHub Release 最新版本、按架构挑二进制并校验
 //
@@ -18,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,7 +50,7 @@ type Release struct {
 	Digest      string    `json:"digest"` // 形如 "sha256:xxxx"，发布端未提供时为空
 }
 
-// UpdateAvailable 判断候选版本是否比当前版本新（按标签名比较，非严格 semver）。
+// UpdateAvailable 按稳定版本号判断是否可自动升级；其他自定义标签沿用名称比较。
 func (r Release) UpdateAvailable() bool {
 	current := strings.TrimSpace(version.Version)
 	if r.Tag == "" {
@@ -57,7 +60,33 @@ func (r Release) UpdateAvailable() bool {
 		// 开发构建：只要远端有 tag 就认为可更新，交由使用者判断。
 		return true
 	}
+	if candidate, ok := stableVersion(r.Tag); ok {
+		if running, ok := stableVersion(current); ok {
+			for i := range candidate {
+				if candidate[i] != running[i] {
+					return candidate[i] > running[i]
+				}
+			}
+			return false
+		}
+	}
 	return strings.TrimPrefix(r.Tag, "v") != strings.TrimPrefix(current, "v")
+}
+
+func stableVersion(tag string) ([3]uint64, bool) {
+	var out [3]uint64
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(tag), "v"), ".")
+	if len(parts) != len(out) {
+		return out, false
+	}
+	for i, part := range parts {
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return out, false
+		}
+		out[i] = value
+	}
+	return out, true
 }
 
 // Client 查版本 / 下载用。
@@ -165,6 +194,17 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 	if release.AssetSize > maxReleaseBytes {
 		return "", "", fmt.Errorf("asset too large: %d bytes", release.AssetSize)
 	}
+	want := ""
+	if release.Digest != "" {
+		if !strings.HasPrefix(release.Digest, "sha256:") {
+			return "", "", errors.New("asset digest must use sha256")
+		}
+		want = strings.TrimPrefix(release.Digest, "sha256:")
+		decoded, err := hex.DecodeString(want)
+		if err != nil || len(decoded) != sha256.Size {
+			return "", "", errors.New("asset sha256 digest must contain 64 hexadecimal characters")
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
@@ -202,7 +242,7 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 		return "", "", fmt.Errorf("asset exceeds %d bytes", maxReleaseBytes)
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
-	if want := strings.TrimPrefix(release.Digest, "sha256:"); want != "" && !strings.EqualFold(want, sum) {
+	if want != "" && !strings.EqualFold(want, sum) {
 		return "", "", fmt.Errorf("sha256 mismatch: want %s got %s", want, sum)
 	}
 	if err := file.Chmod(0o755); err != nil {

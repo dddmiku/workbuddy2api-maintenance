@@ -1,9 +1,12 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 // ═══ 更新日志 ═══
+// 2026-09-24：移除绕过账号冷却的旧模型豁免判据，保持模型与账号限制正交。
+// 2026-09-24：11102 到期后有界保留命中计数，使半开重试失败能继续退避。
 // 2026-09-18：状态文件保存账号删除代次，阻止尚未落盘的旧创建意图越过已完成的删除。
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -114,7 +117,7 @@ type entry struct {
 	retryCount   int       // 已熔断次数（指数退避的指数）
 	// softStreak 连续软冷却次数（CoolSoft），独立于熔断器 fails 的**冷却域**计数器：
 	// fails 会被熔断触发清零、且被 hard 冷却与 NoteError 污染，无法表达"连续软限流"。
-	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
+	// NoteSuccess 或禁用清理时归零；余额刷新不能证明限流恢复。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
 	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
@@ -170,19 +173,6 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
-// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
-// 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
-// 本谓词仅供探活侧使用（ServableNow/ServableForRealm）：/healthz 无请求模型
-// 上下文，用「存在豁免形态」表达"该账号还有别的模型可服务"；
-// chat 侧按请求模型细粒度判定（healthyForModel：全账号健康且该模型不在独立
-// 冷却内才放行），探活存在性语义与选号在豁免账号上口径一致。
-// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
-func (e *entry) modelExempt() bool {
-	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
-}
-
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
@@ -219,15 +209,19 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return true
 }
 
-// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
-// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
-// 无需清理。调用方必须已持有 p.mu 写锁。
+// pruneExpiredModelCooldowns 清理过期模型限制。11102 到期后仍保留最多一天的
+// 运行态计数供半开探测继续退避；Until 已过期时不拦截请求，也不展示为限流。
+// 6004 无退避历史需求，到期即删除。调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	if len(e.modelCooldowns) == 0 {
 		return
 	}
 	for m, mc := range e.modelCooldowns {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
+			if !mc.Until.IsZero() && mc.Hits > 0 && strings.HasPrefix(mc.Reason, "11102") &&
+				now.Sub(mc.Until) < modelBlockMaxTTL {
+				continue
+			}
 			delete(e.modelCooldowns, m)
 		}
 	}

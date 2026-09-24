@@ -2,6 +2,8 @@
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
 // 软冷却封顶、熔断失败累计、签到解冻（ReenableIfCredits/reviveCoolingLocked）。
 // ═══ 更新日志 ═══
+// 2026-09-24：首轮软冷却同样遵守封顶，账号级冷却保留独立模型限制，防止短冷却抹掉长配额。
+// 2026-09-24：模型负缓存过期后保留有界退避历史，避免每次半开失败都回到六小时。
 // 2026-09-20：冷却入口补记 last_err。此前只有 5xx 的 NoteError 写「最近活动」，
 //
 //	429 / 14017 / 余额耗尽 / 404 等冷却路径都不写，面板出现「冷却中却
@@ -69,11 +71,8 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = now.Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空 6004 模型级独立冷却表（modelCooldowns），
-		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
-		// （否则换模型请求会错误绕过本次冷却）。
-		e.modelCooldowns = nil
-		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "model_cooldowns")
+		// 账号与模型限制正交；healthyForModel 先判账号冷却，不会被模型状态绕过。
+		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason")
 		p.markCoolErrorLocked(uid, e, now)
 	}
 }
@@ -117,8 +116,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
-			e.modelCooldowns = nil
-			p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak", "model_cooldowns")
+			p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak")
 		}
 		p.markCoolErrorLocked(uid, e, now)
 		p.dirty.Store(true)
@@ -150,6 +148,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
+	e.pruneExpiredModelCooldowns(now)
 	hits := 0
 	if e.modelCooldowns != nil {
 		hits = e.modelCooldowns[model].Hits
@@ -207,8 +206,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 //     CooldownSoftForModel 无解析分支一致——普通账号级限流不该因切模型绕过）。
 //   - resetAt 零值且**不在冷却中**（首次/恢复后的新限流）→ 有界退避：按 softStreak
 //     指数退避并封顶 softRateMax（默认 2h，并经 softDurationLocked 统一封顶）。
-//     softStreak 只在真正进入一次新冷却时计数，由 NoteSuccess/reviveCoolingLocked
-//     清零（既有恢复语义）。
+//     softStreak 只在真正进入一次新冷却时计数，由 NoteSuccess 清零。
 //   - resetAt 零值且**已在软冷却中**（兜底探测再次撞 429）→ 不推进 streak、不延长
 //     until：用户重试/并发兜底探测不得把冷却越堆越厚——这正是旧实现「越重试越冷、
 //     全池被推到 2h 封顶」的元凶（每次探测都 softStreak++ 指数翻倍）。
@@ -227,8 +225,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
-		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
-		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak", "model_cooldowns")
+		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak")
 		p.markCoolErrorLocked(uid, e, now)
 	}
 }
@@ -257,26 +254,28 @@ func (p *Pool) softRateMaxOr() time.Duration {
 }
 
 // softDurationLocked 按连续软冷却次数把基数 d 指数放大：d << (streak-1)，封顶 softRateMax。
-// softRateMax 未注入（<=0）时按 defaultSoftRateMax 算。streak<=1 时原样返回 d。
+// softRateMax 未注入（<=0）时按 defaultSoftRateMax 算，首轮也必须遵守封顶。
 // 左移位数受 softStreakShiftMax 限制，避免 streak 极大时移位溢出。
 // 调用方必须已持有 p.mu。
 func (p *Pool) softDurationLocked(d time.Duration, streak int) time.Duration {
+	max := p.softRateMaxOr()
+	if d >= max {
+		return max
+	}
 	if streak <= 1 {
 		return d
+	}
+	if d <= 0 {
+		return max
 	}
 	shift := streak - 1
 	if shift > softStreakShiftMax {
 		shift = softStreakShiftMax
 	}
-	d <<= shift
-	max := p.softRateMax
-	if max <= 0 {
-		max = defaultSoftRateMax
+	if d > max>>shift {
+		return max
 	}
-	if d > max || d <= 0 { // d<=0：左移溢出成负数/零，同样按封顶兜底
-		d = max
-	}
-	return d
+	return d << shift
 }
 
 // recordBreakerFailureLocked 累计一次熔断失败；达到阈值则按指数退避熔断。
@@ -320,6 +319,6 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
+// ReenableIfCredits 签到后解冻：余额恢复只清余额不足冷却，保留限流和模型限制。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。

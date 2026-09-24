@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-24：上下文首档裁剪不改变两三轮历史时继续尝试后续档位，不重复发送未缩短请求。
 // 2026-09-22：新增 ErrUpstreamGateway：上游代理层（APISIX/openresty）HTML 授权页单独
 //
 //	分类，不再落进 ErrClient 兜底被当作「请求参数被拒」把整段 HTML 回显给调用方。
@@ -1055,10 +1056,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				// 上下文超限：按档位丢掉最旧的一部分历史后同路径重发一次。
 				// 上游在生成前就拒了这次请求，因此没有用量可记；这里只做裁剪与重发，
 				// 不改账号状态（换号也是同一堵墙）。
-				if kind == ErrContextTooLong && contextTrimLevel < ContextTrimLevels() {
+				for kind == ErrContextTooLong && contextTrimLevel < ContextTrimLevels() {
 					ratio := contextTrimKeepRatios[contextTrimLevel]
+					contextTrimLevel++
 					if trimmed, changed := TrimOldestContext(prepared, ratio); changed {
-						contextTrimLevel++
 						prepared = trimmed
 						lastSent = prepared
 						log.Printf("WARN: [upstream] context too long: dropped oldest turns "+

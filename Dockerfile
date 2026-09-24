@@ -3,7 +3,7 @@
 # 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
 # 2026-09-17：注入版本元数据（版本号/提交/构建时间），并改用 PID 1 监督脚本启动，
 #             支撑容器内热更新（交接后容器保持存活，由新实例继续服务）。
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.8-alpine AS build
 WORKDIR /src
 ARG VERSION=dev
 ARG COMMIT=unknown

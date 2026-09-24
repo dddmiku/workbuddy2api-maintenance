@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：自动更新不降级；管理员显式指定当前 latest 的旧标签时保留手动回滚能力。
 // 2026-09-18：新实例就绪后才原子提交重启指针，提交失败终止候选实例，并保留原启动参数。
 // 2026-09-17：新增热更新管理器：查版本、下载校验、监听套接字交接、优雅停机，
 //
@@ -197,8 +198,9 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.fail(err)
 		return m.Status(), err
 	}
-	if !release.UpdateAvailable() {
-		err := fmt.Errorf("当前已是 %s，无需更新", version.Version)
+	sameVersion := strings.TrimPrefix(release.Tag, "v") == strings.TrimPrefix(strings.TrimSpace(version.Version), "v")
+	if sameVersion || (strings.TrimSpace(target) == "" && !release.UpdateAvailable()) {
+		err := fmt.Errorf("没有可自动升级的版本（当前 %s，最新发布 %s）", version.Version, release.Tag)
 		m.fail(err)
 		return m.Status(), err
 	}

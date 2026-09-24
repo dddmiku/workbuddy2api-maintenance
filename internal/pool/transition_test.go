@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-24：余额恢复只清余额冷却，独立的模型限制与熔断继续保留。
 package pool
 
 import (
@@ -13,7 +15,7 @@ import (
 // 锁定迁移原语对这四个维度的边界，特别是旧实现的缺陷点：
 //   - Disable 旧实现只置 disabled+reason，不碰 until/modelCooldowns → 「disabled 但
 //     cooling」杂交态（疑点 4）。新语义：disableLocked 置 disabled 并清冷却域。
-//   - reviveCoolingLocked（签到解冻）只清冷却域、不动熔断器（C5 语义）。
+//   - reviveCoolingLocked（签到解冻）只清余额冷却，保留模型限制与熔断。
 //
 // 与 pool_test.go / modelcooldown_test.go / sessiondead_test.go 的差异：那些测试
 // 锁定各维度的行为，本文件锁定「跨维度」的迁移边界（冷却↔禁用↔熔断互不越界）。
@@ -135,15 +137,13 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	}
 }
 
-// TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
-// 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
-// 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
-func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+// TestTransitionCreditRecoveryClearsHardCooldownKeepsOtherLimits 余额到账只证明
+// 余额不足已恢复，不能覆盖同时存在的模型限制与聊天服务熔断。
+func TestTransitionCreditRecoveryClearsHardCooldownKeepsOtherLimits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
+	// 冷却域：余额不足 + 6004 模型级冷却。
+	p.Cooldown("u1", CoolHard, 600*time.Second, "balance depleted")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	// 熔断域：独立信号，签到不解冻。
 	p.SetBreaker(1, time.Hour, time.Hour)
@@ -156,8 +156,8 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
 		t.Errorf("revive 后 credits=%d want 700", st.Credits)
 	}
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
-	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 1 {
+		t.Errorf("credit recovery must clear only balance cooldown: until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
 			until, kind, reason, streak, mc)
 	}
 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {

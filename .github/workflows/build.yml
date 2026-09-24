@@ -1,8 +1,9 @@
+# ═══ 更新日志 ═══
+# 2026-09-24：发布前增加 Go、管理台和静态产物检查；每日构建使用 dev，稳定版本标签才更新 latest。
 # build.yml 多架构打包发布 ghcr.io（网关 + 管理台）与 amd64 离线 tar.gz artifact。
 # 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
 # 推 v* tag 时额外产出同名版本镜像，部署方可以固定版本而不是跟着 latest 漂。
-# 注意：本仓库的 tag push 实测不会触发本工作流（fork 来源下的限制），发版本时用
-# 手动 dispatch 指定 tag ref：
+# 手动 dispatch 仍可指定 tag ref，沿用对应版本的发布入口：
 #   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches  {"ref":"v1.2.0"}
 name: Build & Publish
 
@@ -20,8 +21,47 @@ permissions:
 
 
 jobs:
+  verify:
+    name: Verify source and panel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Linux 覆盖监听器继承、监督脚本和文件锁；Python/Node 测试均只依赖标准库。
+      - name: Test Go packages
+        run: go test ./...
+
+      - name: Vet Go packages
+        run: go vet ./...
+
+      - name: Verify generated panel matches source
+        run: |
+          python3 panel/build.py
+          git diff --exit-code -- panel/index.html
+
+      - name: Test admin panel and frontend behavior
+        run: |
+          node --version
+          python3 -m unittest discover -s panel -p 'test_*.py' -v
+
   gateway:
     name: Gateway image
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +90,11 @@ jobs:
           name="ghcr.io/${GITHUB_REPOSITORY,,}"
           {
             echo 'tags<<TAGS'
-            echo "${name}:latest"
+            if [[ "${GITHUB_REF_TYPE}" = "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${name}:latest"
+            else
+              echo "${name}:dev"
+            fi
             echo "${name}:${GITHUB_SHA}"
             if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "${name}:${GITHUB_REF_NAME}"; fi
             echo 'TAGS'
@@ -89,6 +133,7 @@ jobs:
 
   panel:
     name: Admin panel image
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +158,11 @@ jobs:
           name="ghcr.io/${GITHUB_REPOSITORY,,}-panel"
           {
             echo 'tags<<TAGS'
-            echo "${name}:latest"
+            if [[ "${GITHUB_REF_TYPE}" = "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${name}:latest"
+            else
+              echo "${name}:dev"
+            fi
             echo "${name}:${GITHUB_SHA}"
             if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "${name}:${GITHUB_REF_NAME}"; fi
             echo 'TAGS'
@@ -146,6 +195,7 @@ jobs:
   # 只在打 tag 时挂到 Release，日常 workflow_dispatch 仅产出 artifact。
   binaries:
     name: Update binaries
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -154,7 +204,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26.8'
 
       - name: Build linux binaries
         run: |

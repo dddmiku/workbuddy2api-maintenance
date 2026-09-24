@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-24：两三轮长对话在首档向上取整不变时仍尝试后续裁剪档位，单轮保持原错误。
 // 2026-09-23：新增「上游 11115 → 网关自动裁剪最旧历史并重发」的端到端回归：
 //
 //	第一次返回 context_too_long，第二次必须收到更短的请求体并成功。
@@ -11,10 +12,53 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"workbuddy2api/internal/auth"
 )
+
+func TestContextTooLongRetriesSmallTurnCounts(t *testing.T) {
+	for _, turns := range []int{1, 2, 3} {
+		t.Run(strings.Repeat("u", turns), func(t *testing.T) {
+			var attempts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				var request struct{ Messages []struct{ Role string } }
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("invalid request: %v", err)
+				}
+				users := 0
+				for _, message := range request.Messages {
+					if message.Role == "user" {
+						users++
+					}
+				}
+				attempts.Add(1)
+				if users >= turns {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"code":11115,"msg":"prompt is too long"}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			client := &Client{ChatBaseCN: srv.URL, HTTP: srv.Client(), ChatHTTP: srv.Client()}
+			rc, status, _, err := client.ChatStreamContext(context.Background(), &auth.Auth{UID: "fixture-trim"}, buildTurns(t, turns), "", ChatMeta{})
+			if rc != nil {
+				_ = rc.Close()
+			}
+			wantStatus, wantAttempts := 200, int32(2)
+			if turns == 1 {
+				wantStatus, wantAttempts = 400, 1
+			}
+			if err != nil || status != wantStatus || attempts.Load() != wantAttempts {
+				t.Fatalf("turns=%d status=%d attempts=%d err=%v; want status=%d attempts=%d", turns, status, attempts.Load(), err, wantStatus, wantAttempts)
+			}
+		})
+	}
+}
 
 // TestContextTooLongTriggersTrimmedRetry 上游首答 11115 时，网关要丢掉最旧轮次重发。
 func TestContextTooLongTriggersTrimmedRetry(t *testing.T) {

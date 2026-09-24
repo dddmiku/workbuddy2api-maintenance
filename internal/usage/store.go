@@ -15,6 +15,8 @@
 // 输入里绝大部分是缓存命中；不单列出来，看总数会误以为「用了很多却只记了这么点」。
 // 2026-09-18：文件锁覆盖整个读改写，隔离快照与在途增量，串行关闭/清零，拒绝覆盖损坏账本并支持合法大账本。
 // 2026-09-19：已调用上游的失败与取消请求保留已知用量，累计失败/未完整上报计数并穿过全部持久化维度。
+// 2026-09-24：跨实例合并只携带真实增量，以磁盘起算时间为准，防止清零后旧密钥和日期复活。
+// 2026-09-24：启动和跨实例快照读取也取得账本锁，避免 Windows 读句柄使原子替换失败。
 package usage
 
 import (
@@ -206,7 +208,7 @@ func Open(path string, interval time.Duration) (*Store, error) {
 
 // load 读取已有账本；文件不存在时保持空账本并落一次盘，保证目录里有可见文件。
 func (s *Store) load() error {
-	doc, err := readLedger(s.path)
+	doc, err := readLedgerSnapshot(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.dirty = true
 		return s.Flush()
@@ -498,7 +500,7 @@ func (s *Store) persistDocument(doc document, merge bool) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := replaceLedger(tmp, s.path); err != nil {
 		return err
 	}
 	s.commit(doc, snapshot, merge)
@@ -546,8 +548,17 @@ func readLedger(path string) (document, error) {
 
 // readDisk 用于只读视图；读盘失败时 Snapshot 保留内存中的已知记录。
 func (s *Store) readDisk() (document, bool) {
-	doc, err := readLedger(s.path)
+	doc, err := readLedgerSnapshot(s.path)
 	return doc, err == nil
+}
+
+func readLedgerSnapshot(path string) (document, error) {
+	unlock, err := lockLedger(path)
+	if err != nil {
+		return document{}, err
+	}
+	defer unlock()
+	return readLedger(path)
 }
 
 // writtenSnapshot 本进程上次提交的累计值（深拷贝，防止后续写入改到它）。
@@ -594,10 +605,14 @@ func deltaDocument(mine, prev document) document {
 		if old := prev.Keys[id]; old != nil {
 			before = *old
 		}
+		totalsDelta := deltaTotals(current.Totals, before.Totals)
+		if totalsDelta == (Totals{}) {
+			continue
+		}
 		item := &keyRecord{
 			Name:        current.Name,
 			MaskedKey:   current.MaskedKey,
-			Totals:      deltaTotals(current.Totals, before.Totals),
+			Totals:      totalsDelta,
 			Models:      make(map[string]*Totals, len(current.Models)),
 			Days:        deltaDays(current.Days, before.Days),
 			FirstUsedAt: current.FirstUsedAt,
@@ -614,7 +629,9 @@ func deltaDocument(mine, prev document) document {
 				}
 			}
 			delta := deltaTotals(*totals, beforeModel)
-			item.Models[model] = &delta
+			if delta != (Totals{}) {
+				item.Models[model] = &delta
+			}
 		}
 		out.Keys[id] = item
 	}
@@ -633,7 +650,9 @@ func deltaDays(mine, prev map[string]*Totals) map[string]*Totals {
 			before = *old
 		}
 		delta := deltaTotals(*totals, before)
-		out[day] = &delta
+		if delta != (Totals{}) {
+			out[day] = &delta
+		}
 	}
 	return out
 }
@@ -642,7 +661,9 @@ func deltaDays(mine, prev map[string]*Totals) map[string]*Totals {
 func addDocument(base, delta document) document {
 	base.Version = Version
 	base.Totals = addTotals(base.Totals, delta.Totals)
-	if !delta.Since.IsZero() && (base.Since.IsZero() || delta.Since.Before(base.Since)) {
+	// The persisted start belongs to the current reset period. An overlapping
+	// process may still carry the previous period in its in-memory baseline.
+	if base.Since.IsZero() {
 		base.Since = delta.Since
 	}
 	if delta.UpdatedAt.After(base.UpdatedAt) {
@@ -860,7 +881,7 @@ func (s *Store) Reset(at time.Time) error {
 		return nil
 	}
 	previous, written, dirty := s.doc, s.written, s.dirty
-	s.doc = document{Version: Version, Since: at.UTC(), Keys: map[string]*keyRecord{}}
+	s.doc = document{Version: Version, Since: at.UTC(), UpdatedAt: at.UTC(), Keys: map[string]*keyRecord{}}
 	s.written = cloneDocument(s.doc)
 	s.dirty = false
 	snapshot := cloneDocument(s.doc)

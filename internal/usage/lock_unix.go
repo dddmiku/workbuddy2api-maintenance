@@ -1,6 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：用量账本的跨进程文件锁（flock）。热更新期间新旧进程同时落盘时，
 //             读-改-写必须互斥，否则一方的新增量会被另一方覆盖。
+// 2026-09-24：原子替换使用平台实现，Unix 保持单次 rename 的原有语义。
 //go:build !windows
 
 package usage
@@ -9,6 +10,8 @@ import (
 	"os"
 	"syscall"
 )
+
+func replaceLedger(source, target string) error { return os.Rename(source, target) }
 
 // lockLedger 对账本旁路文件加排他锁；返回的解锁函数必须调用。
 //

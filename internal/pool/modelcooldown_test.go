@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-24：余额到账不再视为模型配额重置，修正签到后模型限制应保留的契约。
 package pool
 
 import (
@@ -182,8 +184,8 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
-func TestModelCooldownsClearedByRevive(t *testing.T) {
+// TestModelCooldownsPreservedByCreditRecovery 签到余额到账不能证明模型日配额已重置。
+func TestModelCooldownsPreservedByCreditRecovery(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
@@ -191,8 +193,8 @@ func TestModelCooldownsClearedByRevive(t *testing.T) {
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	p.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
+	if n != 1 {
+		t.Errorf("credit recovery must preserve modelCooldowns, got=%d want 1", n)
 	}
 }
 

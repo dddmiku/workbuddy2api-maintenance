@@ -1,5 +1,7 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-24：忽略过时刷新响应，日志按完整行检测更新并补取改变后的条数；修正空成功时间、凭证到期判断和当前页刷新。
+// 2026-09-24：冷却截止时间随数据快照固定，搜索或切页不再重新开始倒计时；同一到期快照仅补取一次。
 // 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
 //             进入页面即拉取当前运行期值，改完立即生效、不需要重启网关。
 // 2026-09-20：按 new-api 面板规范重做外观：顶栏横跨整宽并承载品牌与全局操作，
@@ -67,8 +69,13 @@ function relTime(iso){
   return fmtTime(iso);
 }
 function daysLeft(sec){
-  if (!sec) return null;
-  return Math.round((sec * 1000 - Date.now()) / 86400000);
+  if (!sec || !isFinite(Number(sec))) return null;
+  return Math.ceil((Number(sec) * 1000 - Date.now()) / 86400000);
+}
+function activityTime(iso){
+  if (!iso) return '';
+  var s = String(iso);
+  return s.indexOf('0001-01-01') === 0 || isNaN(new Date(s).getTime()) ? '' : s;
 }
 // coolLeft 把冷却剩余秒数格式化成人读文案。冷却与凭证有效期是两回事，状态列在冷却中
 // 必须显示冷却剩余，否则「冷却中 + 剩 363 天」会被读成冷却要等一年（用户实测反馈）。
@@ -98,21 +105,24 @@ function startCoolTicker(){
 function tickCooldowns(){
   var nodes = document.querySelectorAll('[data-cool-end]');
   if (!nodes.length) return;
-  var now = Date.now(), expired = false;
+  var now = Date.now(), expired = [];
   for (var i = 0; i < nodes.length; i++){
     var node = nodes[i];
     var end = Number(node.getAttribute('data-cool-end')) || 0;
     var left = Math.max(0, Math.round((end - now) / 1000));
     var reason = node.getAttribute('data-cool-reason') || '';
-    if (left <= 0) expired = true;
+    if (left <= 0 && node.getAttribute('data-cool-refreshed') !== '1') expired.push(node);
     node.textContent = coolLeft(left) + (reason ? ' · ' + reason : '');
   }
-  if (!expired || COOL_RELOAD_PENDING) return;
+  if (!expired.length || COOL_RELOAD_PENDING) return;
   // 归零后只补取一次：等后端把这号从冷却里摘掉再渲染，避免每秒重拉。
   // 页面在后台时不补取——用户看不到，等切回来时 30s 定时器自然会拉新数据。
   if (document.hidden) return;
+  expired.forEach(function(node){ node.setAttribute('data-cool-refreshed', '1'); });
   COOL_RELOAD_PENDING = true;
-  setTimeout(function(){ COOL_RELOAD_PENDING = false; loadAll(); }, 1500);
+  setTimeout(async function(){
+    try { await loadAll(); } finally { COOL_RELOAD_PENDING = false; }
+  }, 1500);
 }
 // coolReason 冷却原因转可读文案。上游原始 reason 已是运维可读串（如 "429 rate limit"），
 // 只做英文短语到中文的映射，未知值原样透出，不编造。
@@ -147,7 +157,7 @@ var IC = {
 };
 
 /* ── 状态 ─────────────────────────────────────────── */
-var S = { data:null, tasks:null, filter:'all', q:'', logLines:120 };
+var S = { data:null, tasks:null, filter:'all', q:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', timer:null, tries:0 };
 var modalCb = null;
 var logKey = null, logName = '';
@@ -268,18 +278,26 @@ function busy(on){
 var CREDIT_RETRY = null;
 
 async function loadAll(forceCredit){
+  var revision = ++S.loadRevision;
+  var loadedAt = 0;
   busy(true);
   try{
     var res = await Promise.all([
-      api('api/state' + (forceCredit ? '?refresh_credit=1' : '')),
+      api('api/state' + (forceCredit ? '?refresh_credit=1' : '')).then(function(data){
+        loadedAt = Date.now();
+        return data;
+      }),
       api('api/tasks').catch(function(){ return null; })
     ]);
+    if (revision !== S.loadRevision) return;
     S.data = res[0];
+    S.loadedAt = loadedAt;
     S.tasks = res[1];
     render();
     svc(true);
     scheduleCreditRetry(res[0]);
   }catch(err){
+    if (revision !== S.loadRevision) return;
     svc(false, String(err && err.message || err));
     toast('加载失败：' + (err && err.message || err), 'err');
   }finally{ busy(false); }
@@ -561,7 +579,9 @@ function renderAccounts(){
     return;
   }
   $('#acctRows').innerHTML = list.map(function(a){
-    var st = acctState(a), c = a.credits || {}, p = a.pool || {};
+    var st = acctState(a), c = a.credits || {}, p = Object.assign({}, a.pool || {});
+    var coolEnd = (S.loadedAt || Date.now()) + (Number(p.coolRemaining) || 0) * 1000;
+    p.coolRemaining = Math.max(0, Math.ceil((coolEnd - Date.now()) / 1000));
     var left = daysLeft(a.expiresAt);
     var creditCell = (typeof c.remain === 'number')
       ? '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
@@ -572,8 +592,8 @@ function renderAccounts(){
       : '<span style="color:var(--ink-3)">—</span>';
     // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
     // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
-    var errAt = (p.lastErr && String(p.lastErr).indexOf('0001') !== 0) ? p.lastErr : '';
-    var lastTxt = p.lastSuccess ? relTime(p.lastSuccess) : (errAt ? '无成功记录' : '无记录');
+    var errAt = activityTime(p.lastErr), successAt = activityTime(p.lastSuccess);
+    var lastTxt = successAt ? relTime(successAt) : (errAt ? '无成功记录' : '无记录');
     var lastSub = errAt ? ('最近错误 ' + relTime(errAt))
       : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
     // 状态列：冷却中显示冷却剩余与原因；正常号才显示凭证有效期（两者混在一起会把
@@ -582,7 +602,7 @@ function renderAccounts(){
     // 不必等下一次整页数据拉取。
     var coolReasonTxt = coolReason(p);
     var coolSub = p.cooling
-      ? '<span class="sub" data-cool-end="' + (Date.now() + (Number(p.coolRemaining) || 0) * 1000) +
+      ? '<span class="sub" data-cool-end="' + coolEnd +
         '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
         esc(coolLeft(p.coolRemaining) + (coolReasonTxt ? ' · ' + coolReasonTxt : '')) + '</span>'
       : (left != null
@@ -836,14 +856,16 @@ function statusClass(code){
 
 async function loadLogs(){
   if (LOG.loading) return;
+  var requestedLines = S.logLines;
   LOG.loading = true;
   var btn = $('#btnLogs');
   if (btn) btn.disabled = true;
   try{
-    var r = await api('api/logs?lines=' + S.logLines);
+    var r = await api('api/logs?lines=' + requestedLines);
+    if (requestedLines !== S.logLines) return;
     var rows = r.rows || [];
     // 内容指纹一致时跳过重绘：自动刷新每 5 秒跑一次，没新请求就没必要重建几百行 DOM。
-    var sig = S.logLines + '|' + rows.map(function(it){ return it.seq + it.status + it.total; }).join(',');
+    var sig = requestedLines + '|' + JSON.stringify(rows);
     if (sig !== LOG.sig){
       LOG.sig = sig;
       if (!rows.length){
@@ -883,11 +905,13 @@ async function loadLogs(){
       else { note.textContent = '读取容器日志失败，请检查面板是否有 docker 权限。'; note.classList.remove('hide'); }
     }
   }catch(err){
+    if (requestedLines !== S.logLines) return;
     var note = $('#logError');
     if (note){ note.textContent = '拉取失败：' + (err && err.message || err); note.classList.remove('hide'); }
   }finally{
     LOG.loading = false;
     if (btn) btn.disabled = false;
+    if (requestedLines !== S.logLines && CURRENT_VIEW === 'logs') await loadLogs();
   }
 }
 
@@ -1024,7 +1048,12 @@ function renderDone(r){
 }
 
 /* ── 顶栏动作 ─────────────────────────────────────── */
-$('#btnRefresh').addEventListener('click', function(){ loadAll(true); if (location.hash === '#keys') loadKeys(); });
+$('#btnRefresh').addEventListener('click', function(){
+  loadAll(true);
+  if (CURRENT_VIEW === 'keys' && typeof loadKeys === 'function') loadKeys();
+  if (CURRENT_VIEW === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (CURRENT_VIEW === 'logs') loadLogs();
+});
 $('#btnRestart').addEventListener('click', actRestart);
 $('#btnTaskReload').addEventListener('click', async function(){
   await loadAll(); toast('已刷新', 'ok');

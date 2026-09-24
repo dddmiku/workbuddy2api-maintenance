@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-24：提前拒绝后限时丢弃迟到的小请求体，保留403响应并避免未读字节触发连接重置。
+# 2026-09-24：登录、续期和改密绑定已验证的凭据版本；并发登录先占用尝试预算，避免绕过限流。
 # 2026-09-23：版本号提升到 2.1.26（来源级限流收敛 + 密钥级 global→CN 回落 +
 #             加号写入权限竞态修复）。
 # 2026-09-23：修掉加号后「账号没加载」的权限竞态：先把临时文件 chown/chmod 再
@@ -112,7 +114,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.26"
+PANEL_VERSION = "2.1.27"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -368,9 +370,9 @@ def _unb64u(text):
     return base64.urlsafe_b64decode(text + pad)
 
 
-def issue_session(username, ttl=SESSION_TTL, nonce=None):
+def issue_session(username, ttl=SESSION_TTL, nonce=None, credentials=None):
     """签名会话令牌：payload.nonce + HMAC。key 落盘，面板重启后仍有效。"""
-    doc = load_credentials()
+    doc = load_credentials() if credentials is None else credentials
     nonce = nonce or secrets.token_hex(12)
     payload = {"u": username, "e": int(time.time()) + ttl, "n": nonce}
     body = _b64u(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -379,12 +381,12 @@ def issue_session(username, ttl=SESSION_TTL, nonce=None):
     return body + "." + sig, payload
 
 
-def read_session(token):
+def read_session(token, credentials=None):
     """校验令牌。返回 payload 或 None。"""
     if not token or "." not in token:
         return None
     body, _, sig = token.partition(".")
-    doc = load_credentials()
+    doc = load_credentials() if credentials is None else credentials
     try:
         key = bytes.fromhex(doc["sessionKey"])
         want = hmac.new(key, body.encode("ascii"), hashlib.sha256).digest()
@@ -405,6 +407,11 @@ def read_session(token):
     if payload.get("u") != doc.get("username"):
         return None
     return payload
+
+
+def _same_credentials(first, second):
+    return all(first.get(field) == second.get(field)
+               for field in ('username', 'password', 'sessionKey'))
 
 
 def _client_ip(handler):
@@ -959,6 +966,33 @@ class Handler(BaseHTTPRequestHandler):
     def _html(self, code, text):
         self._send(code, text.encode("utf-8"), "text/html; charset=utf-8")
 
+    def _reject_unread_body(self, code, payload):
+        self.close_connection = True
+        self._json(code, payload, extra=[("Connection", "close")])
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") is not None or len(lengths) != 1:
+            return
+        value = lengths[0].strip()
+        if not re.fullmatch(r"[0-9]{1,10}", value):
+            return
+        remaining = min(int(value), 65536)
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + 0.1
+        try:
+            while remaining:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    break
+                self.connection.settimeout(wait)
+                chunk = self.rfile.read1(min(remaining, 4096))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.connection.settimeout(previous_timeout)
+
     def _redirect(self, target):
         self._send(302, b"", "text/plain; charset=utf-8",
                    [("Location", target)])
@@ -1002,12 +1036,13 @@ class Handler(BaseHTTPRequestHandler):
         morsel = cookie.get(COOKIE_NAME)
         if not morsel:
             return None
-        payload = read_session(morsel.value)
+        credentials = load_credentials()
+        payload = read_session(morsel.value, credentials=credentials)
         if not payload:
             return None
         remaining = int(payload.get("e") or 0) - time.time()
         if renew and remaining < SESSION_TTL / 3.0:
-            token, _ = issue_session(payload["u"], nonce=payload["n"])
+            token, _ = issue_session(payload["u"], nonce=payload["n"], credentials=credentials)
             self._pending = self._cookie_headers(token, SESSION_TTL)
         return payload
 
@@ -1146,8 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.keys_post(path)
         try:
             if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
-                self.close_connection = True
-                return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
+                return self._reject_unread_body(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
             body = self._body(8192 if path.startswith("/api/update/") else 65536)
             self._validate_action_body(path, body)
             if path == "/api/auth/login":
@@ -1291,11 +1325,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def keys_post(self, path):
         if not self._session():
-            self.close_connection = True
-            return self._json(401, {"ok": False, "message": "请先登录管理面板"})
+            return self._reject_unread_body(401, {"ok": False, "message": "请先登录管理面板"})
         if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
-            self.close_connection = True
-            return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
+            return self._reject_unread_body(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
         try:
             body = self._body(8192)
         except RequestBodyError as error:
@@ -1368,7 +1400,10 @@ class Handler(BaseHTTPRequestHandler):
     # ── 登录 / 改密 ────────────────────────────────────────────────────
     def auth_login(self, body):
         ip = _client_ip(self)
-        blocked, hits = login_blocked(ip)
+        with _cred_lock:
+            blocked, hits = login_blocked(ip)
+            if not blocked:
+                login_failed(ip)
         if blocked:
             return self._json(429, {
                 "ok": False,
@@ -1379,21 +1414,24 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("username") or "").strip()
         pw = str(body.get("password") or "")
         if not name or not pw:
-            login_failed(ip)
             return self._json(400, {"ok": False, "message": "请输入用户名和密码"})
 
         name_ok = hmac.compare_digest(name.encode("utf-8"),
                                       str(doc.get("username", "")).encode("utf-8"))
         if not (name_ok and verify_password(pw, doc.get("password"))):
-            login_failed(ip)
             left = max(0, LOGIN_MAX_FAILS - (hits + 1))
             return self._json(401, {
                 "ok": False,
                 "message": "用户名或密码错误" + ("，还可尝试 %d 次" % left if left else ""),
             })
 
-        login_ok(ip)
-        token, payload = issue_session(doc["username"])
+        with _cred_lock:
+            unchanged = _same_credentials(doc, load_credentials())
+            if unchanged:
+                login_ok(ip)
+                token, payload = issue_session(doc["username"], credentials=doc)
+        if not unchanged:
+            return self._json(401, {"ok": False, "message": "登录凭证已更改，请使用新密码重新登录"})
         return self._json(200, {"ok": True, "username": doc["username"],
                                 "expiresAt": payload["e"], "ttl": SESSION_TTL},
                           extra=self._cookie_headers(token, SESSION_TTL))
@@ -1439,25 +1477,33 @@ class Handler(BaseHTTPRequestHandler):
                 "message": "用户名需为 3-32 位字母、数字、下划线、点或连字符",
             })
 
+        replacement_hash = hash_password(new_pw)
+        save_error = None
         with _cred_lock:
-            history = doc.get("history") or []
-            history.append({"password": doc.get("password"), "at": int(time.time())})
-            doc = {
-                "version": 1,
-                "username": new_user,
-                "password": hash_password(new_pw),
-                "sessionKey": secrets.token_hex(32),
-                "updatedAt": int(time.time()),
-                "history": history[-5:],
-                "inherited": False,
-            }
-            try:
-                _save_credentials(doc)
-            except OSError as ex:
-                return self._json(500, {"ok": False, "message": "写入失败：%s" % ex})
+            unchanged = _same_credentials(doc, load_credentials())
+            if unchanged:
+                history = list(doc.get("history") or [])
+                history.append({"password": doc.get("password"), "at": int(time.time())})
+                doc = {
+                    "version": 1,
+                    "username": new_user,
+                    "password": replacement_hash,
+                    "sessionKey": secrets.token_hex(32),
+                    "updatedAt": int(time.time()),
+                    "history": history[-5:],
+                    "inherited": False,
+                }
+                try:
+                    _save_credentials(doc)
+                except OSError as ex:
+                    save_error = ex
+        if not unchanged:
+            return self._json(401, {"ok": False, "message": "登录凭证已更改，请重新登录后修改"})
+        if save_error is not None:
+            return self._json(500, {"ok": False, "message": "写入失败：%s" % save_error})
 
         # 换密即换 sessionKey：所有旧会话（包括当前这条）一并失效，强制重登
-        token, payload = issue_session(doc["username"])
+        token, payload = issue_session(doc["username"], credentials=doc)
         return self._json(200, {
             "ok": True,
             "message": "账号信息已更新，其他设备上的登录已失效",

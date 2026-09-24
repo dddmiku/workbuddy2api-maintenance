@@ -2,6 +2,7 @@
 // 连登兑换 / 成长抽奖 / 补签 —— 多类独立排程，各自独立开关与独立时点。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 // ═══ 更新日志 ═══
+// 2026-09-24：签到预刷新成功清除旧会话失效计数，避免间断 12153 累积成永久禁用。
 // 2026-09-17：保留较新调度上下文及奖励幂等，统一凭据快照读取。
 // 2026-09-16：定时任务的凭据存在性判断改读快照，避免与聊天触发的刷新并发竞争。
 // ═══ 更新日志 ═══
@@ -471,6 +472,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 					continue
 				}
 			} else {
+				s.cfg.Pool.ClearSessionDead(st.UID)
 				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。

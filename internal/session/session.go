@@ -1,14 +1,15 @@
 // Package session 会话粘性路由：同一会话（conversationId / metadata 键）尽量绑定同一账号。
 //
-// 设计参考 antigravityProxyGo internal/session（fast-path RLock / 双段分配 / TTL / 持久化），
+// 设计参考 antigravityProxyGo internal/session（双段分配 / TTL / 持久化），
 // 但改为纯内存 + redisstore 异步镜像：
-//   - 命中走 RLock 快查（绝大多数请求已绑定）；
-//   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+//   - 命中续期与重新分配都在同一写锁内完成，避免旧续期覆盖并发重绑；
 //   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
 //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
 //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
 //
 // ═══ 更新日志 ═══
+// 2026-09-24：绑定续期、重绑和删除统一在锁内提交镜像，防止旧操作覆盖新绑定。
+// 2026-09-24：增加按当前账号条件解绑，旧请求的迟到失败不再删除其他请求的新绑定。
 // 2026-09-20：会话标识缺失时的对话级回退键由 handler 用 ContentKey 派生（见 ids.go）；这里保持 ExtractKey 的识别顺序不变。
 // 2026-09-19：显式会话标识优先于共享缓存键，避免不同会话被缓存提示合并。
 // 2026-09-18：GC 捕获本轮停止信号并等待退出，避免停止/重启后旧协程继续清理会话。
@@ -138,35 +139,28 @@ func (r *Router) LoadFromStore() {
 // 对其他模型仍可用（见 pool.healthyForModel 的模型级冷却豁免）。若只按账号级
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
-	now := time.Now()
-	available := r.availableSet(model)
-
-	// ── Fast path: RLock 快查 ──────────────────────────────
-	r.mu.RLock()
-	e, found := r.entries[key]
-	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
-			return e.uid, true
-		}
-		// 绑定号在该模型上已冷却/占满/被限流 → 失效，落入慢路径重分配。
+	if key == "" {
+		return "", false
 	}
-
-	// ── Slow path: 写锁 re-check 后分配 ────────────────────
+	uids := r.availableSlice(model)
+	available := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		available[uid] = true
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 
-	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
-			return e2.uid, true
+	if e, found := r.entries[key]; found {
+		if !expired(e, now, r.cfg.TTL) && available[e.uid] {
+			r.entries[key] = entry{uid: e.uid, lastActive: now}
+			r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
+			return e.uid, true
 		}
-		delete(r.entries, key) // 失效：清掉再分配
+		delete(r.entries, key)
+		r.cfg.Store.DelBind(key)
 	}
 
-	uids := r.availableSlice(model)
 	if len(uids) == 0 {
 		return "", false
 	}
@@ -174,7 +168,9 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
 	bound := map[string]bool{}
 	for _, v := range r.entries {
-		bound[v.uid] = true
+		if !expired(v, now, r.cfg.TTL) {
+			bound[v.uid] = true
+		}
 	}
 	var idle []string
 	for _, u := range uids {
@@ -188,21 +184,9 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	}
 	uid := pool2[hashIndex(key, len(pool2))]
 
-	prev, existed := r.entries[key]
 	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
-		r.cfg.Store.DelBind(key)
-	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	return uid, true
-}
-
-// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-func (r *Router) touch(key, uid string, now time.Time) {
-	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -212,25 +196,41 @@ func (r *Router) Bind(key, uid string) {
 	if key == "" || uid == "" {
 		return
 	}
-	now := time.Now()
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	r.entries[key] = entry{uid: uid, lastActive: time.Now()}
+	// Store 只提交异步写入；在锁内提交让镜像顺序与内存变更保持一致。
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
-// Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
+// Unbind 无条件解除会话绑定，返回是否存在。请求失败时应使用 UnbindIfUID，
+// 避免旧请求清掉其他请求已更新的绑定。
 func (r *Router) Unbind(key string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
-	}
-	r.mu.Unlock()
-	if found {
 		r.cfg.Store.DelBind(key)
 	}
 	return found
+}
+
+// UnbindIfUID 仅在会话仍绑定到指定账号时解除绑定，返回本次是否删除。
+// 校验和删除共用一把锁，失败请求携带的旧账号不能删除其他请求已换到的新账号。
+func (r *Router) UnbindIfUID(key, uid string) bool {
+	if key == "" || uid == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, found := r.entries[key]
+	if !found || e.uid != uid {
+		return false
+	}
+	delete(r.entries, key)
+	r.cfg.Store.DelBind(key)
+	return true
 }
 
 // Count 返回当前绑定数（供 /status 观测）。
@@ -243,6 +243,7 @@ func (r *Router) Count() int {
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	var expiredKeys []string
 	for key, e := range r.entries {
 		if now.Sub(e.lastActive) > r.cfg.TTL {
@@ -251,22 +252,9 @@ func (r *Router) gcOnce(now time.Time) int {
 	}
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
-	}
-	r.mu.Unlock()
-	for _, key := range expiredKeys {
 		r.cfg.Store.DelBind(key)
 	}
 	return len(expiredKeys)
-}
-
-// availableSet 把可用账号列表转集合（快路径命中校验用）。
-func (r *Router) availableSet(model string) map[string]bool {
-	uids := r.availableSlice(model)
-	set := make(map[string]bool, len(uids))
-	for _, u := range uids {
-		set[u] = true
-	}
-	return set
 }
 
 // availableSlice 安全调用可用账号函数（nil 函数视空池）。
