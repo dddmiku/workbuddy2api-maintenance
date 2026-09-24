@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
 # ═══ 更新日志 ═══
+# 2026-09-25：统一网关与内嵌面板为非root单容器，移除docker.sock依赖并使用完整运行包与目录配置挂载。
 # 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
 # 2026-09-17：注入版本元数据（版本号/提交/构建时间），并改用 PID 1 监督脚本启动，
 #             支撑容器内热更新（交接后容器保持存活，由新实例继续服务）。
@@ -21,11 +22,13 @@ RUN CGO_ENABLED=0 go build -trimpath \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
 
-FROM alpine:3.20
+FROM alpine:3.23
+ARG VERSION=dev
+ARG TARGETARCH
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
 RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
- && mkdir -p /app/auths /app/data \
+ && mkdir -p /app/auths /app/auths-trash /app/data /app/config /app/panel-data \
  && chown -R app:app /app
 WORKDIR /app
 # 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
@@ -45,13 +48,20 @@ COPY scripts/task_common.py /app/scripts/task_common.py
 COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
 COPY scripts/growth_center.py /app/scripts/growth_center.py
+COPY scripts/runtime_bundle.py /app/scripts/runtime_bundle.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
-COPY config.example.json /app/config.json
+COPY config.example.json /app/config.example.json
+RUN python3 /app/scripts/runtime_bundle.py --stage /app --version "${VERSION}" --arch "${TARGETARCH:-$(uname -m)}"
+ENV WB2API_PANEL_ENABLED=1 \
+    WB2API_GATEWAY_DIR=/app \
+    WB2API_ADMIN_DIR=/app/panel-data \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 USER app
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["-config", "/app/config.json"]
+CMD ["-config", "/app/config/config.json"]

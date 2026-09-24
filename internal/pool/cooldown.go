@@ -2,6 +2,7 @@
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
 // 软冷却封顶、熔断失败累计、签到解冻（ReenableIfCredits/reviveCoolingLocked）。
 // ═══ 更新日志 ═══
+// 2026-09-25：迟到的在途错误只记录活动，不覆盖禁用状态；软冷却不能解除仍有效的余额不足限制。
 // 2026-09-24：首轮软冷却同样遵守封顶，账号级冷却保留独立模型限制，防止短冷却抹掉长配额。
 // 2026-09-24：模型负缓存过期后保留有界退避历史，避免每次半开失败都回到六小时。
 // 2026-09-20：冷却入口补记 last_err。此前只有 5xx 的 NoteError 写「最近活动」，
@@ -68,12 +69,15 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
+		p.markCoolErrorLocked(uid, e, now)
+		if e.disabled || (kind == CoolSoft && e.coolKind == CoolHard && now.Before(e.until)) {
+			return
+		}
 		e.until = now.Add(d)
 		e.coolKind = kind
 		e.reason = reason
 		// 账号与模型限制正交；healthyForModel 先判账号冷却，不会被模型状态绕过。
 		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason")
-		p.markCoolErrorLocked(uid, e, now)
 	}
 }
 
@@ -95,6 +99,10 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
+		p.markCoolErrorLocked(uid, e, now)
+		if e.disabled || (resetAt.IsZero() && e.coolKind == CoolHard && now.Before(e.until)) {
+			return
+		}
 		if !resetAt.IsZero() {
 			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
 			if e.modelCooldowns == nil {
@@ -118,7 +126,6 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			e.reason = reason
 			p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak")
 		}
-		p.markCoolErrorLocked(uid, e, now)
 		p.dirty.Store(true)
 	}
 }
@@ -148,6 +155,10 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
+	p.markCoolErrorLocked(uid, e, now)
+	if e.disabled {
+		return
+	}
 	e.pruneExpiredModelCooldowns(now)
 	hits := 0
 	if e.modelCooldowns != nil {
@@ -169,7 +180,6 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		Hits:   hits,
 	}
 	p.markStateModelLocked(uid, model)
-	p.markCoolErrorLocked(uid, e, now)
 }
 
 // BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测或正常
@@ -215,6 +225,10 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
+		p.markCoolErrorLocked(uid, e, now)
+		if e.disabled || (e.coolKind == CoolHard && now.Before(e.until)) {
+			return
+		}
 		if !resetAt.IsZero() {
 			e.until = p.cappedSoftUntilLocked(now, resetAt)
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
@@ -226,7 +240,6 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		e.coolKind = CoolSoft
 		e.reason = reason
 		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak")
-		p.markCoolErrorLocked(uid, e, now)
 	}
 }
 

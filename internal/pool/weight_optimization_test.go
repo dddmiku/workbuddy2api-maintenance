@@ -3,6 +3,8 @@
 // P2-C 成功率 EMA 衰减、P2-D costTier 缓存（以行为回归覆盖）、P3-E 防御修补
 // （creditsExpiring 恢复钳制、粘性路径 usedSeq 推进、洗牌 epsilon、total<=0 死分支）。
 // GREEN 之前这些测试全部/大部分失败（RED），修复后全绿。
+// ═══ 更新日志 ═══
+// 2026-09-25：收紧近期成功率恢复/退化的边界，捕获只累加不衰减导致永久停在 50% 的错误实现。
 package pool
 
 import (
@@ -227,8 +229,8 @@ func TestSuccessEMAReduces(t *testing.T) {
 	ema, errEMA := e.successEMA, e.errorEMA
 	p.mu.RUnlock()
 	rate := ema / (ema + errEMA)
-	if rate > 0.5 {
-		t.Errorf("100 失败后 EMA 成功率=%.4f want <= 0.5（历史故障不应永久压低/抬高）", rate)
+	if rate > 0.05 {
+		t.Errorf("100 失败后 EMA 成功率=%.4f want <= 0.05（近期持续失败必须压过旧成功记录）", rate)
 	}
 }
 
@@ -259,8 +261,8 @@ func TestSuccessEMARecoverable(t *testing.T) {
 	if after <= before {
 		t.Errorf("20 次连续成功后 EMA 成功率应显著恢复: before=%.4f after=%.4f", before, after)
 	}
-	if after < 0.5 {
-		t.Errorf("20 次连续成功后 EMA 成功率=%.4f want >= 0.5（α=0.1 时恢复已充分）", after)
+	if after < 0.85 {
+		t.Errorf("20 次连续成功后 EMA 成功率=%.4f want >= 0.85（近期恢复不能永久受旧错误压制）", after)
 	}
 }
 

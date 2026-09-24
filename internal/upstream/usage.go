@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：忽略类型错误的 token 明细占位值，保留此前有效的缓存与推理用量。
 // 2026-09-19：按字段合并上游累计用量，保留未知与显式零的区别，统一缓存与数值校验。
 // 2026-09-19：提供请求局部的内部重试观测回调，公开调用签名和返回的最终响应保持兼容。
 package upstream
@@ -109,6 +110,10 @@ func MergeUsage(previous, next map[string]any) map[string]any {
 			continue
 		}
 		switch key {
+		case "prompt_tokens_details", "completion_tokens_details":
+			if _, ok := value.(map[string]any); !ok {
+				continue
+			}
 		case "prompt_tokens", "completion_tokens", "total_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "completion_thinking_tokens", "cached_tokens", "reasoning_tokens":
 			if _, ok := UsageCount(value); !ok {
 				continue

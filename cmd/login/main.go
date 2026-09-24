@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-25：登录状态按区域和流程ID隔离并原子写入，避免多人扫码互相覆盖或读取过期状态。
 // login.go — WorkBuddy OAuth 登录（设备授权流程，CN realm；--realm=global 供国际版）。
 //
 // 两个子命令，由 login.sh 顺序驱动：
@@ -27,6 +29,8 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,11 +46,6 @@ const (
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
-
-// 登录 state 落盘路径（var 便于测试替换临时文件）。
-// 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
-// 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
-var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit
@@ -206,7 +205,7 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 }
 
 // runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
-// state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
+// state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；statePath 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
 	headers := commonHeaders(origin)
@@ -222,7 +221,7 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 		fatal("auth state: missing state or authUrl")
 	}
 	raw, _ := json.Marshal(loginState{State: st.State, Realm: realm})
-	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+	if err := writeLoginState(statePath, raw); err != nil {
 		fatal("write state: %v", err)
 	}
 	fmt.Fprintln(out, st.AuthURL)
@@ -309,7 +308,11 @@ func buildLoginOutput(tok struct {
 }
 
 func main() {
-	realm, rest, err := parseRealmArgs(os.Args[1:])
+	args, flow, err := parseSessionArgs(os.Args[1:])
+	if err != nil {
+		fatal("%v", err)
+	}
+	realm, rest, err := parseRealmArgs(args)
 	if err != nil {
 		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
 	}
@@ -321,13 +324,21 @@ func main() {
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 
 	base, origin := realmConfig(realm)
+	statePath, err := loginStatePath(realm, flow)
+	if err != nil {
+		fatal("login state: %v", err)
+	}
 
 	switch rest[0] {
 	case "url":
-		runURL(base, origin, realm, stateFile, client, os.Stdout)
+		runURL(base, origin, realm, statePath, client, os.Stdout)
 
 	case "poll":
-		runPoll(base, origin, realm, stateFile, client, os.Stdout)
+		if info, err := os.Stat(statePath); err != nil || time.Since(info.ModTime()) > 15*time.Minute {
+			fatal("login request has expired; request a new authorization URL")
+		}
+		runPoll(base, origin, realm, statePath, client, os.Stdout)
+		_ = os.Remove(statePath)
 
 	case "realm":
 		// 交互式选域（login.sh 无 --realm 传参且 stdin 为 tty 时调用）。
@@ -338,4 +349,66 @@ func main() {
 	default:
 		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
 	}
+}
+
+var loginSessionPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+func parseSessionArgs(args []string) ([]string, string, error) {
+	rest := make([]string, 0, len(args))
+	flow := ""
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--session=") {
+			value := strings.TrimPrefix(arg, "--session=")
+			if flow != "" || !loginSessionPattern.MatchString(value) {
+				return nil, "", fmt.Errorf("invalid login session id")
+			}
+			flow = value
+		} else {
+			rest = append(rest, arg)
+		}
+	}
+	return rest, flow, nil
+}
+
+func loginStatePath(realm, flow string) (string, error) {
+	dir := os.Getenv("WB2API_LOGIN_STATE_DIR")
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "wb2api-login-"+strconv.Itoa(os.Getuid()))
+	}
+	// #nosec G703 -- directory is the administrator's runtime setting; flow ids are validated before path construction.
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	// #nosec G703 -- inspect the configured directory to reject a symlink before storing any OAuth state.
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("invalid login state directory")
+	}
+	if flow == "" {
+		flow = "cli"
+	}
+	return filepath.Join(dir, realm+"-"+flow+".json"), nil
+}
+
+func writeLoginState(path string, data []byte) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".login-state-*")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

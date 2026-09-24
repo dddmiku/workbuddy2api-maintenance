@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：每次扫码使用独立登录流程ID，原生重载按进程就绪确认，不把账号冷却误报成重启失败。
+# 2026-09-25：管理台支持网关托管的私有Unix监听与原生运行接口，配置和账号路径由网关统一传入。
+# 2026-09-25：请求日志保留网关生成的请求标识，便于对应客户端错误与上游请求。
 # 2026-09-25：控制台版本同步上下文恢复修复 2.1.29。
 # 2026-09-24：版本号提升到 2.1.28（上下文裁剪回真体积 + 超限幅度上限）。
 # 2026-09-24：提前拒绝后限时丢弃迟到的小请求体，保留403响应并避免未读字节触发连接重置。
@@ -72,8 +75,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import socketserver
+import signal
 import time
 import key_management
+from file_lock import document_lock
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -85,9 +91,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # BASE 之外的目录都随 BASE 走，容器里把网关目录整体挂到 /gateway 即可。
 BASE = os.environ.get("WB2API_GATEWAY_DIR", "/opt/workbuddy2api")
 AUTH_DIR = os.environ.get("WB2API_ADMIN_DIR", HERE)
-AUTHS_DIR = os.path.join(BASE, "auths")
+AUTHS_DIR = os.environ.get("WB2API_AUTHS_DIR", os.path.join(BASE, "auths"))
 TRASH_DIR = os.path.join(BASE, "auths-trash")
-CONFIG_PATH = os.path.join(BASE, "config.json")
+CONFIG_PATH = os.environ.get("WB2API_CONFIG_PATH", os.path.join(BASE, "config.json"))
 INDEX_PATH = os.path.join(HERE, "index.html")
 LOGIN_PATH = os.path.join(HERE, "login.html")
 CRED_PATH = os.path.join(AUTH_DIR, "credentials.json")
@@ -116,7 +122,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.1.29"
+PANEL_VERSION = "2.2.0"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -125,7 +131,7 @@ REQUEST_ROW = re.compile(
     r"^\|\s*#(?P<seq>\d+)\s*\|\s*(?P<time>[^|]*?)\s*\|\s*(?P<model>[^|]*?)\s*\|\s*(?P<mode>[^|]*?)\s*\|\s*"
     r"(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*TTFB=(?P<ttfb>[^|]*?)\s*\|\s*"
     r"(?:in=(?P<in>[^|]*?)\s*\|\s*hit=(?P<hit>[^|]*?)\s*\|\s*)?"
-    r"tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*$"
+    r"tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*(?:rid=(?P<request_id>[A-Za-z0-9_]+)\s*\|\s*)?$"
 )
 
 
@@ -173,7 +179,7 @@ CREDIT_TTL = 60.0
 CREDIT_RETRY_INTERVAL = 30.0
 _credit_cache = {"ts": 0.0, "data": None, "error": None, "retry_at": 0.0}
 _credit_refreshing = None
-_lock = threading.Lock()
+_lock = document_lock(lambda: CONFIG_PATH)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -181,7 +187,7 @@ _lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════
 
 ITOA64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_cred_lock = threading.RLock()
+_cred_lock = document_lock(lambda: CRED_PATH)
 _fails = {}          # ip -> [timestamp, ...]
 _revoked = set()     # 已签出但被主动作废的 nonce
 
@@ -518,6 +524,9 @@ def api_key():
 
 
 def docker(args, timeout=60, check=False):
+    if os.environ.get("WB2API_RUNTIME") == "native":
+        import native_runtime
+        return native_runtime.run(args, timeout=timeout, check=check)
     try:
         p = subprocess.run(["docker"] + list(args), capture_output=True,
                            text=True, timeout=timeout)
@@ -770,6 +779,8 @@ def restart_container():
     rc, out, err = docker(["restart", CONTAINER], timeout=210)
     if rc != 0:
         return False, "重启失败: %s" % (err or out), 0.0
+    if os.environ.get("WB2API_RUNTIME") == "native":
+        return True, "配置与账号已重新加载", round(time.monotonic() - t0, 1)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         time.sleep(1)
@@ -950,6 +961,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
         pending = list(getattr(self, "_pending", []) or [])
         self._pending = []
         for name, value in list(extra or []) + pending:
@@ -1067,6 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/__health" and os.environ.get("WB2API_RUNTIME") == "native":
+            return self._json(200, {"ok": True, "version": PANEL_VERSION})
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
         session = self._session()
 
@@ -1230,7 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/login": {"username", "password"},
             "/api/auth/logout": set(),
             "/api/auth/password": {"current", "username", "password", "confirm"},
-            "/api/login/start": {"realm"}, "/api/login/poll": {"realm"},
+            "/api/login/start": {"realm"}, "/api/login/poll": {"realm", "login_id"},
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
             "/api/service/restart": set(), "/api/credit": set(),
@@ -1242,6 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
         for field, value in body.items():
             if field in {"username", "password", "current", "confirm", "realm", "uid", "key"} and not isinstance(value, str):
                 raise RequestBodyError(400, "字段格式不正确：" + field)
+        if "login_id" in body and (not isinstance(body["login_id"], str) or not re.fullmatch(r"[a-f0-9]{32}", body["login_id"])):
+            raise RequestBodyError(400, "登录流程标识无效，请重新生成链接")
         for route, field in (("/api/account/toggle", "disabled"), ("/api/task/toggle", "enabled")):
             if path == route and type(body.get(field)) is not bool:
                 raise RequestBodyError(400, "开关值必须明确指定为 true 或 false")
@@ -1519,20 +1536,24 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "message": "realm 只能是 cn 或 global"}
         if not container_running():
             return {"ok": False, "message": "容器未运行，先启动服务"}
-        rc, out, err = docker(["exec", CONTAINER, "./login", "--realm=%s" % realm, "url"],
+        login_id = secrets.token_hex(16)
+        rc, out, err = docker(["exec", CONTAINER, "./login", "--realm=%s" % realm, "--session=" + login_id, "url"],
                               timeout=60)
         if rc != 0:
             return {"ok": False, "message": err or out or "获取授权链接失败"}
         url = out.strip().splitlines()[-1].strip() if out.strip() else ""
         if not url.startswith("http"):
             return {"ok": False, "message": "没拿到授权链接: %s" % (out or err)[:200]}
-        return {"ok": True, "url": url, "realm": realm}
+        return {"ok": True, "url": url, "realm": realm, "login_id": login_id}
 
     def login_poll(self, body):
         realm = (body.get("realm") or "cn").strip().lower()
         if realm not in REALMS:
             return {"ok": False, "message": "realm 只能是 cn 或 global"}
-        rc, out, err = docker(["exec", CONTAINER, "./login", "--realm=%s" % realm, "poll"],
+        login_id = body.get("login_id")
+        if not isinstance(login_id, str) or not re.fullmatch(r"[a-f0-9]{32}", login_id):
+            return {"ok": False, "message": "登录流程已失效，请重新生成链接"}
+        rc, out, err = docker(["exec", CONTAINER, "./login", "--realm=%s" % realm, "--session=" + login_id, "poll"],
                               timeout=90)
         if rc != 0:
             return {"ok": False, "pending": True, "message": err or out or "poll 失败"}
@@ -1641,8 +1662,27 @@ class RequestBodyError(ValueError):
 
 def main():
     os.makedirs(AUTHS_DIR, exist_ok=True)
-    srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    sys.stderr.write("wb2api-admin listening on %s:%d" % (LISTEN_HOST, LISTEN_PORT) + chr(10))
+    socket_path = os.environ.get("WB2API_PANEL_SOCKET")
+    if socket_path:
+        load_credentials()
+        if os.name == "posix" and os.getpgrp() == os.getpid():
+            def stop_native_group(_signum, _frame):
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.killpg(os.getpgrp(), signal.SIGTERM)
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM, stop_native_group)
+        class LocalServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+            def get_request(self):
+                connection, _ = super().get_request()
+                connection.settimeout(30)
+                return connection, ('127.0.0.1', 0)
+        srv = LocalServer(socket_path, Handler)
+        os.chmod(socket_path, 0o600)
+        sys.stderr.write("embedded administration ready\n")
+    else:
+        srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+        sys.stderr.write("wb2api-admin listening on %s:%d" % (LISTEN_HOST, LISTEN_PORT) + chr(10))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

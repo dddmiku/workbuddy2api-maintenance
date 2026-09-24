@@ -43,5 +43,10 @@ big_payload.json
 trial_bin
 activity_bin
 
-# Panel sources build their own image; keep them out of the gateway build context.
-panel/
+# Only embedded panel source is needed; runtime credentials never enter layers.
+panel-data/
+panel/credentials.json
+panel/initial-password.txt
+panel/__pycache__/
+panel/*.lock
+config/

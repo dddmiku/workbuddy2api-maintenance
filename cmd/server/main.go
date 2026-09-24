@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：单容器内托管同版管理台及完整更新包，信号退出同样等待长流和最终状态落盘。
 // 2026-09-20：向密钥管理接口提供重复推理保护默认值，支持每把密钥单独覆盖。
 // 2026-09-19：将重复推理保护的明确开关传入共享HTTP处理器。
 // 2026-09-19：不再向 HTTP handler 传入旧输入倍率，用量始终使用上游原值。
@@ -24,6 +25,7 @@ import (
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/hotupdate"
+	"workbuddy2api/internal/panelruntime"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -49,6 +51,10 @@ func main() {
 		}
 	}
 
+	layout, err := prepareUnified(cfg, *cfgPath)
+	if err != nil {
+		log.Fatalf("prepare unified runtime: %v", err)
+	}
 	var keyStore *apikeys.Store
 	if cfg.APIKeysFile != "" {
 		keyStore, err = apikeys.Open(cfg.APIKeysFile, cfg.APIKey)
@@ -253,7 +259,7 @@ func main() {
 	// 有继承 FD 就用它，否则照常监听（启动时会清掉上次遗留的死 socket 文件）。
 	var adminLn net.Listener
 	adminPending := false
-	if keyStore != nil {
+	if keyStore != nil || layout.enabled {
 		if fd, ok := hotupdate.InheritedAdminFD(); ok {
 			adminLn, err = hotupdate.ListenerFromFD(fd, "inherited-admin-socket")
 			if err != nil {
@@ -283,6 +289,7 @@ func main() {
 	// 新实例已经在同一套接字上 accept，本进程只负责把在途请求跑完。
 	handoverDone := make(chan string, 1)
 	updateManager := hotupdate.NewManager(hotupdate.Options{
+		Bundle:        layout.enabled,
 		Enabled:       cfg.Update.Enabled,
 		Repo:          cfg.Update.Repo,
 		Token:         cfg.Update.Token,
@@ -328,8 +335,11 @@ func main() {
 	connectionState := trackConnections(&connections)
 	serveAdmin := func(listener net.Listener) {
 		mux := http.NewServeMux()
-		mux.Handle("/keys", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
-		mux.Handle("/keys/", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
+		if keyStore != nil {
+			mux.Handle("/keys", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
+			mux.Handle("/keys/", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
+		}
+		mux.HandleFunc("POST /runtime/reload", reloadHandler(updateManager))
 		mux.Handle("/", h.InternalHandler())
 		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, ConnState: connectionState}
 		adminMu.Lock()
@@ -347,6 +357,9 @@ func main() {
 		}()
 		// 库里 0 把密钥是全新部署的正常起点：库文件已建好，用户在管理台创建第一把
 		// 即可。日志里点明这一点，免得运维看到 0 以为功能没开。
+		if keyStore == nil {
+			return
+		}
 		if count := len(keyStore.List()); count == 0 {
 			log.Printf("API key management enabled (0 keys); create the first key in the admin console")
 		} else {
@@ -381,9 +394,18 @@ func main() {
 		sch.Run(backgroundCtx)
 	}()
 
+	var panel *panelruntime.Runtime
+	var publicHandler http.Handler = h
+	if layout.enabled {
+		panel, err = panelruntime.Start(layout.panel)
+		if err != nil {
+			log.Fatalf("start embedded panel: %v", err)
+		}
+		publicHandler = withPanel(h, panel)
+	}
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           publicHandler,
 		ConnState:         connectionState,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
@@ -409,10 +431,7 @@ func main() {
 			// 正在进行的对话。
 			log.Printf("[update] draining in-flight requests before exit (%s)", reason)
 		}
-		wait := 5 * time.Second
-		if reason != "signal" {
-			wait = hotupdate.ShutdownTimeout()
-		}
+		wait := hotupdate.ShutdownTimeout()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
 		if err := drainRuntime(shutdownCtx, runtimeShutdown{
@@ -436,6 +455,9 @@ func main() {
 			},
 		}); err != nil {
 			log.Printf("WARN: [server] shutdown: %v", err)
+		}
+		if panel != nil {
+			panel.Close()
 		}
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），

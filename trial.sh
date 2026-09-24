@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# ═══ 更新日志 ═══
+# 2026-09-25：完整运行包中的辅助脚本沿用持久化账号目录。
 # trial.sh — global trial 加油包领取辅助工具（薄包装）
 #
 # 不调 HTTP：cmd/trial 已自带逐账号表格输出（uid/nick/status/detail
@@ -18,7 +20,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-AUTHS_DIR="auths"
+AUTHS_DIR="${WB2A_AUTH_DIR:-${WB2A_AUTHS:-${WB2API_GATEWAY_DIR:-.}/auths}}"
 if [[ $# -gt 0 ]]; then
     AUTHS_DIR="$1"
 fi

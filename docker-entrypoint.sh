@@ -1,5 +1,6 @@
 #!/bin/sh
 # ═══ 更新日志 ═══
+# 2026-09-25：统一容器首次创建目录配置，旧版单程序指针不覆盖完整运行版，停止信号先交给网关收尾。
 # 2026-09-17：新增 PID 1 监督脚本，支撑容器内热更新：网关以子进程运行，热更新时
 #             子进程把监听套接字交给新实例后以 75 退出，本脚本不重启、保持容器存活，
 #             由新实例继续服务；收到 SIGTERM 时转发信号并随子进程退出。
@@ -8,6 +9,11 @@
 # 2026-09-18：解析同一配置文件和状态目录，向 Go 传递统一的更新目录，保证自定义位置重启后仍生效。
 # 2026-09-18：用 shell 内建读取子进程状态，降低监督循环的额外进程开销。
 set -u
+
+if [ "${WB2API_PANEL_ENABLED:-0}" = "1" ] && [ ! -f /app/config/config.json ]; then
+  umask 077
+  cp /app/config.example.json /app/config/config.json || exit 1
+fi
 
 # 默认二进制（镜像内）；存在热更新落地的 current 指针时优先用它，重启后仍是新版本。
 IMAGE_BIN="/app/wb2api"
@@ -82,6 +88,11 @@ pick_binary() {
   if [ -f "$CURRENT_POINTER" ]; then
     candidate="$(cat "$CURRENT_POINTER" 2>/dev/null || true)"
     if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      if [ "${WB2API_PANEL_ENABLED:-0}" = "1" ] && [ ! -f "$(dirname "$candidate")/manifest.json" ]; then
+        echo "[entrypoint] ignoring legacy standalone update in unified runtime" >&2
+        printf '%s\n' "$IMAGE_BIN"
+        return 0
+      fi
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -96,12 +107,23 @@ terminating=0
 # 不依赖已退出的首个 child_pid，也不向容器外或其他进程组广播信号。
 signal_tree() {
   signal_children=""
-  { read -r signal_children < "/proc/$1/task/$1/children"; } 2>/dev/null || true
+  for signal_thread in /proc/"$1"/task/*/children; do
+    signal_thread_children=""
+    { read -r signal_thread_children < "$signal_thread"; } 2>/dev/null || true
+    signal_children="$signal_children $signal_thread_children"
+  done
   for signal_pid in $signal_children; do
     signal_tree "$signal_pid"
   done
   if [ "$1" -ne "$$" ]; then
-    kill -TERM "$1" 2>/dev/null || true
+    if [ "${WB2API_PANEL_ENABLED:-0}" = "1" ]; then
+      signal_exe="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
+      case "$signal_exe" in
+        */wb2api) kill -TERM "$1" 2>/dev/null || true ;;
+      esac
+    else
+      kill -TERM "$1" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -110,6 +132,13 @@ has_live_children() {
   { read -r checked_children < "/proc/$$/task/$$/children"; } 2>/dev/null || true
   for checked_pid in $checked_children; do
     [ -r "/proc/$checked_pid/status" ] || continue
+    if [ "${WB2API_PANEL_ENABLED:-0}" = "1" ]; then
+      checked_exe="$(readlink "/proc/$checked_pid/exe" 2>/dev/null || true)"
+      case "$checked_exe" in
+        */wb2api) ;;
+        *) continue ;;
+      esac
+    fi
     while read -r status_key status_value status_rest; do
       if [ "$status_key" = "State:" ]; then
         case "$status_value" in

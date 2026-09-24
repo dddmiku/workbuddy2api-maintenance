@@ -1158,7 +1158,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', timer:null, tries:0 };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false };
 var modalCb = null;
 var logKey = null, logName = '';
 
@@ -1971,6 +1971,7 @@ async function startLogin(){
   var go = $('#drGo'); go.disabled = true; go.textContent = '正在获取…';
   try{
     var r = await api('api/login/start', { realm:DT.realm });
+    DT.loginId = r.login_id || '';
     if (!r.ok){ toast(r.message, 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
     DT.url = r.url;
     renderWait();
@@ -2021,12 +2022,15 @@ function stopPoll(){ if (DT.timer){ clearInterval(DT.timer); DT.timer = null; } 
 function startPoll(){
   stopPoll(); DT.tries = 0;
   DT.timer = setInterval(async function(){
+    if (DT.polling) return;
     if (DT.tries++ > 100){ stopPoll(); setWait('等待超时，请重新生成链接。'); return; }
     try{
-      var r = await api('api/login/poll', { realm:DT.realm });
+      DT.polling = true;
+      var r = await api('api/login/poll', { realm:DT.realm, login_id:DT.loginId });
       if (r.ok){ stopPoll(); renderDone(r); return; }
       if (r.pending && DT.tries % 3 === 0) setWait('等待扫码…');
     }catch(err){ /* 单次失败继续等 */ }
+    finally { DT.polling = false; }
   }, 3000);
 }
 function renderDone(r){

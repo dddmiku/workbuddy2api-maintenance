@@ -1,34 +1,41 @@
 # ═══ 更新日志 ═══
-# 2026-09-24：发布前增加 Go、管理台和静态产物检查；每日构建使用 dev，稳定版本标签才更新 latest。
-# build.yml 多架构打包发布 ghcr.io（网关 + 管理台）与 amd64 离线 tar.gz artifact。
-# 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
-# 推 v* tag 时额外产出同名版本镜像，部署方可以固定版本而不是跟着 latest 漂。
-# 手动 dispatch 仍可指定 tag ref，沿用对应版本的发布入口：
-#   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches  {"ref":"v1.2.0"}
-name: Build & Publish
+# 2026-09-25：仅在已核验私有维护仓库手动或版本tag校验并生成完整运行包，移除定时公开镜像及自动Release发布。
+name: Private runtime build
 
 on:
-  schedule:
-    # 每天北京时间 12:00 = UTC 04:00
-    - cron: '0 4 * * *'
   workflow_dispatch:
   push:
-    tags: ['v*'] # 打 tag 也触发发布
+    tags: ['v*']
 
 permissions:
   contents: read
-  packages: write
 
+concurrency:
+  group: private-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
 
 jobs:
   verify:
-    name: Verify source and panel
+    name: Verify private source and embedded panel
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.event.repository.private == true
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     steps:
+      - name: Verify current repository visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
@@ -42,199 +49,98 @@ jobs:
         with:
           node-version: '22'
 
-      # Linux 覆盖监听器继承、监督脚本和文件锁；Python/Node 测试均只依赖标准库。
-      - name: Test Go packages
-        run: go test ./...
+      - name: Verify committed dependencies
+        run: go mod verify
 
-      - name: Vet Go packages
-        run: go vet ./...
+      - name: Test and vet Go packages
+        run: |
+          go test ./... -count=1
+          go vet ./...
+          go test -race ./... -count=1
 
-      - name: Verify generated panel matches source
+      - name: Verify embedded panel matches its source
         run: |
           python3 panel/build.py
           git diff --exit-code -- panel/index.html
 
-      - name: Test admin panel and frontend behavior
+      - name: Test panel and runtime scripts
         run: |
-          node --version
           python3 -m unittest discover -s panel -p 'test_*.py' -v
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
-  gateway:
-    name: Gateway image
+  runtime:
+    name: Build both private runtime bundles
     needs: verify
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.event.repository.private == true
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      - name: Verify current repository visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+
       - uses: actions/checkout@v4
-
-      - name: Create config.json for build
-        run: cp config.example.json config.json
-
-      # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # ghcr 镜像名必须全小写：github.repository 含大写（Sliverkiss/...），需转小写
-      - name: Compute image tags
-        id: image
-        run: |
-          name="ghcr.io/${GITHUB_REPOSITORY,,}"
-          {
-            echo 'tags<<TAGS'
-            if [[ "${GITHUB_REF_TYPE}" = "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "${name}:latest"
-            else
-              echo "${name}:dev"
-            fi
-            echo "${name}:${GITHUB_SHA}"
-            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "${name}:${GITHUB_REF_NAME}"; fi
-            echo 'TAGS'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build & push multi-arch
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.image.outputs.tags }}
-          build-args: |
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
-            COMMIT=${{ github.sha }}
-            BUILT_AT=${{ github.run_started_at }}
-          cache-from: type=gha,scope=gateway
-          cache-to: type=gha,mode=max,scope=gateway
-
-      # 额外导出 amd64 离线 tar.gz：NAS 拉不到 ghcr 时用 artifact 部署。
-      - name: Export offline tarball (amd64)
-        run: |
-          docker buildx build --platform linux/amd64 --file Dockerfile \
-            --build-arg VERSION="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}" \
-            --build-arg COMMIT="${GITHUB_SHA}" \
-            --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
-          gzip -f wb2api-amd64.tar
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wb2api-amd64
-          path: wb2api-amd64.tar.gz
-          if-no-files-found: error
-
-  panel:
-    name: Admin panel image
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 管理台镜像固定加 -panel 后缀，与网关镜像同属一个发布节奏。
-      - name: Compute image tags
-        id: image
-        run: |
-          name="ghcr.io/${GITHUB_REPOSITORY,,}-panel"
-          {
-            echo 'tags<<TAGS'
-            if [[ "${GITHUB_REF_TYPE}" = "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "${name}:latest"
-            else
-              echo "${name}:dev"
-            fi
-            echo "${name}:${GITHUB_SHA}"
-            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "${name}:${GITHUB_REF_NAME}"; fi
-            echo 'TAGS'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build & push multi-arch
-        uses: docker/build-push-action@v6
-        with:
-          context: panel
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.image.outputs.tags }}
-          cache-from: type=gha,scope=panel
-          cache-to: type=gha,mode=max,scope=panel
-
-      - name: Export offline tarball (amd64)
-        run: |
-          docker buildx build --platform linux/amd64 --file panel/Dockerfile \
-            --tag wb2api-admin:offline --output type=docker,dest=wb2api-admin-amd64.tar panel
-          gzip -f wb2api-admin-amd64.tar
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wb2api-admin-amd64
-          path: wb2api-admin-amd64.tar.gz
-          if-no-files-found: error
-
-  # 热更新用的原始二进制：容器内直接下载替换进程（不重建镜像、不重启容器）。
-  # 只在打 tag 时挂到 Release，日常 workflow_dispatch 仅产出 artifact。
-  binaries:
-    name: Update binaries
-    needs: verify
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.8'
 
-      - name: Build linux binaries
-        run: |
-          set -eu
-          version="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
-          commit="${{ github.sha }}"
-          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          ldflags="-s -w -X workbuddy2api/internal/version.Version=${version} -X workbuddy2api/internal/version.Commit=${commit} -X workbuddy2api/internal/version.BuiltAt=${built_at}"
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags "${ldflags}" \
-              -o "wb2api-linux-${arch}" ./cmd/server
-          done
-          sha256sum wb2api-linux-* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Upload artifact
+      - name: Build fixed runtime contents
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == 'tag' ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]
+            version="$GITHUB_REF_NAME"
+          else
+            version="dev-${GITHUB_SHA:0:12}"
+          fi
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X workbuddy2api/internal/version.Version=$version -X workbuddy2api/internal/version.Commit=$GITHUB_SHA -X workbuddy2api/internal/version.BuiltAt=$built_at"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            stage="$RUNNER_TEMP/runtime-$arch"
+            mkdir -p "$stage/scripts"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$stage/wb2api" ./cmd/server
+            for helper in login credit signin trial activity; do
+              output="$helper"
+              case "$helper" in
+                signin|trial|activity) output="${helper}_bin" ;;
+              esac
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags '-s -w' -o "$stage/$output" "./cmd/$helper"
+            done
+            cp login.sh credit.sh signin.sh trial.sh "$stage/"
+            cp scripts/global_region.py scripts/task_common.py scripts/task_runner.py scripts/school_open_day_2026.py scripts/growth_center.py "$stage/scripts/"
+            sed -i 's/\r$//' "$stage/"*.sh "$stage/scripts/"*.py
+            python3 scripts/runtime_bundle.py --stage "$stage" --version "$version" --arch "$arch" --archive "dist/wb2api-runtime-linux-$arch.tar.gz"
+          done
+          cd dist
+          sha256sum wb2api-runtime-linux-*.tar.gz > SHA256SUMS.txt
+
+      - name: Confirm artifacts will remain private
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+
+      - name: Save private build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wb2api-binaries
+          name: wb2api-runtime-${{ github.sha }}
           path: |
-            wb2api-linux-amd64
-            wb2api-linux-arm64
-            SHA256SUMS.txt
+            dist/wb2api-runtime-linux-amd64.tar.gz
+            dist/wb2api-runtime-linux-arm64.tar.gz
+            dist/SHA256SUMS.txt
           if-no-files-found: error
-
-      - name: Attach to release (tags only)
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
-            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "见提交记录"
-          gh release upload "${GITHUB_REF_NAME}" wb2api-linux-amd64 wb2api-linux-arm64 SHA256SUMS.txt --clobber
+          compression-level: 0
+          retention-days: 14

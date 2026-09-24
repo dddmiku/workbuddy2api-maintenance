@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：前置计量读取与协议解析共用有界 SSE 行读取，事件累计含换行限制为 64MiB，防止先分配后检查。
 // 2026-09-16：统计读取器保留底层错误，避免带末尾数据的断流被误报为正常 EOF。
 // 2026-09-17：请求行加 key= 列（调用方密钥身份），并带上 prompt/completion 明细供用量账本记账。
 // 2026-09-18：请求行加 in=（输入 tokens）与 hit=（其中缓存命中）两列，账本同步记录缓存维度：
@@ -20,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/runlog"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -32,13 +34,14 @@ var chatLogEnabled = true
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	requestID string
+	start     time.Time
+	model     string
+	mode      string // "stream" | "sync"
+	uid       string // 完整 uid，展示时只取前 8 位
+	ttfb      time.Duration
+	toks      int // <0 表示 usage 缺失 → 显示 "-"
+	status    int
 
 	// 调用方密钥身份（鉴权命中时填，单密钥模式留空 → 显示 "-"）。
 	keyID           string
@@ -125,26 +128,29 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status,
-		s.prompt, s.cached, s.toks, s.keyLabel())
+		s.prompt, s.cached, s.toks, s.keyLabel(), s.requestID)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
-	br        *bufio.Reader
-	start     time.Time
-	ttfb      time.Duration
-	seen      bool // 已见过首个 data 帧（TTFB 只记一次）
-	hasUsage  bool // 末帧是否带 usage
-	hasCredit bool // 是否出现过带 credit 的 usage（缺失≠0，见 Credit() 注释）
-	tokens    int
-	credit    float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
-	prompt    int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
-	cached    int     // usage.prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
-	pend      []byte  // 已读未返回的行缓存
-	readErr   error
-	dataParts []string
+	br             *bufio.Reader
+	start          time.Time
+	ttfb           time.Duration
+	seen           bool // 已见过首个 data 帧（TTFB 只记一次）
+	hasUsage       bool // 末帧是否带 usage
+	hasCredit      bool // 是否出现过带 credit 的 usage（缺失≠0，见 Credit() 注释）
+	tokens         int
+	credit         float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
+	prompt         int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
+	cached         int     // usage.prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
+	pend           string  // 已读未返回的行缓存；复用有界行，避免额外复制整行
+	readErr        error
+	data           strings.Builder
+	hasData        bool
+	eventNameBytes int
+	maxEventBytes  int // zero selects the shared upstream SSE limit; small values support boundary tests
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -186,29 +192,70 @@ func (s *chatStatsReader) TotalTokens() int { return max(0, s.prompt) + max(0, s
 
 func (s *chatStatsReader) CompleteUsage() bool { return s.prompt >= 0 && s.tokens >= 0 }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
-func (s *chatStatsReader) parseSSELine(line string) {
-	line = strings.TrimRight(line, "\r\n")
+func (s *chatStatsReader) eventLimit() int {
+	if s.maxEventBytes > 0 {
+		return s.maxEventBytes
+	}
+	return upstream.MaxSSEEventBytes
+}
+
+func oversizedStatsEvent() error {
+	return &upstream.StreamError{Code: "upstream_event_too_large", Message: "upstream stream line or event exceeded the size limit"}
+}
+
+// parseSSELine shares SSE data/newline and event-name accounting with the
+// downstream protocol parser. Empty data fields consume a separator byte too;
+// storing a slice of strings would otherwise allocate unbounded headers.
+func (s *chatStatsReader) parseSSELine(line string) error {
+	line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 	if line == "" {
 		s.observePendingEvent()
-		return
+		return nil
 	}
-	if !strings.HasPrefix(line, "data:") {
-		return
+	field, payload, found := strings.Cut(line, ":")
+	if found {
+		payload = strings.TrimPrefix(payload, " ")
 	}
-	payload := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
+	if field == "event" {
+		if len(payload) > s.eventLimit()-s.data.Len() {
+			return oversizedStatsEvent()
+		}
+		s.eventNameBytes = len(payload)
+		return nil
+	}
+	if field != "data" {
+		return nil
+	}
+	extra := len(payload)
+	if s.hasData {
+		extra++
+	}
+	if extra > s.eventLimit()-s.data.Len()-s.eventNameBytes {
+		return oversizedStatsEvent()
+	}
 	if !s.seen && payload != "[DONE]" {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
-	s.dataParts = append(s.dataParts, payload)
+	if s.hasData {
+		s.data.WriteByte('\n')
+	}
+	s.data.WriteString(payload)
+	s.hasData = true
+	return nil
+}
+
+func (s *chatStatsReader) resetPendingEvent() {
+	s.data.Reset()
+	s.hasData = false
+	s.eventNameBytes = 0
 }
 
 func (s *chatStatsReader) observePendingEvent() {
-	if len(s.dataParts) > 0 {
-		s.observeJSON(strings.Join(s.dataParts, "\n"))
+	if s.hasData {
+		s.observeJSON(s.data.String())
 	}
-	s.dataParts = nil
+	s.resetPendingEvent()
 }
 
 func (s *chatStatsReader) observeJSON(payload string) {
@@ -250,25 +297,31 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	if s.readErr != nil {
-		err := s.readErr
-		s.readErr = nil
-		return 0, err
+		s.resetPendingEvent()
+		return 0, s.readErr
 	}
-	line, err := s.br.ReadString('\n')
+	line, err := upstream.ReadSSELine(s.br, s.eventLimit())
 	if line != "" {
-		s.readErr = err
-		s.parseSSELine(line)
+		if parseErr := s.parseSSELine(line); parseErr != nil {
+			s.resetPendingEvent()
+			s.readErr = parseErr
+			return 0, parseErr
+		}
 		if err == io.EOF {
 			s.observePendingEvent()
 		}
-		s.pend = []byte(line)
+		s.readErr = err
+		s.pend = line
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
 	}
 	if err == io.EOF {
 		s.observePendingEvent()
+	} else if err != nil {
+		s.resetPendingEvent()
 	}
+	s.readErr = err
 	return 0, err
 }
 
@@ -327,7 +380,7 @@ func uidPrefix(uid string) string {
 //
 // 三个 token 列都是「上游 usage 原值」：in= 输入、hit= 输入里命中缓存的、
 // tok= 输出（含思考 token）。负值表示上游没给 usage，显示 "-"（缺失≠0）。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key string) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key string, requestIDs ...string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -355,7 +408,16 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 	if cached >= 0 {
 		cachedField = fmt.Sprintf("%d", cached)
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	suffix := ""
+	if len(requestIDs) > 0 && requestIDs[0] != "" {
+		suffix = " rid=" + strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+				return r
+			}
+			return -1
+		}, requestIDs[0]) + " |"
+	}
+	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -369,5 +431,6 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		tokField,
 		tokpsField,
 		total.Seconds(),
+		suffix,
 	)
 }

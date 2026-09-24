@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# ═══ 更新日志 ═══
+# 2026-09-25：CLI扫码使用独立流程ID，运行包中的脚本仍把账号写入持久目录。
 # login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
@@ -17,7 +19,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-AUTH_DIR="./auths"
+AUTH_DIR="${WB2A_AUTH_DIR:-${WB2A_AUTHS:-${WB2API_GATEWAY_DIR:-.}/auths}}"
 CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
@@ -50,7 +52,8 @@ echo "  WorkBuddy OAuth 登录"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" "--realm=$REALM" url)
+LOGIN_FLOW=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+AUTH_URL=$("$LOGIN_BIN" "--realm=$REALM" "--session=$LOGIN_FLOW" url)
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -73,7 +76,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" "--realm=$REALM" poll) || {
+RESULT=$("$LOGIN_BIN" "--realm=$REALM" "--session=$LOGIN_FLOW" poll) || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"

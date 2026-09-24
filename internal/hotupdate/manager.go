@@ -60,6 +60,7 @@ type Status struct {
 
 // Options 构造参数。
 type Options struct {
+	Bundle   bool
 	Enabled  bool
 	Repo     string
 	Token    string
@@ -91,11 +92,13 @@ func NewManager(opts Options) *Manager {
 	if strings.TrimSpace(opts.Dir) == "" {
 		opts.Dir = filepath.Join(os.TempDir(), "wb2api-updates")
 	}
-	return &Manager{
+	manager := &Manager{
 		opts:   opts,
 		client: NewClient(opts.Repo, opts.Token),
 		state:  StateIdle,
 	}
+	manager.client.Bundle = opts.Bundle
+	return manager
 }
 
 // Status 返回当前状态快照。
@@ -204,7 +207,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.fail(err)
 		return m.Status(), err
 	}
-	if release.AssetURL == "" {
+	if release.AssetURL == "" && release.AssetAPIURL == "" {
 		err := fmt.Errorf("发布 %s 没有本机架构的二进制资产（%s）", release.Tag, release.AssetName)
 		m.fail(err)
 		return m.Status(), err
@@ -226,6 +229,21 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 	log.Printf("[update] downloaded %s (%s, sha256=%s)", release.Tag, path, sum[:12])
+	stage := ""
+	committed := false
+	defer func() {
+		if stage != "" && !committed {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	if m.opts.Bundle {
+		path, err = extractRuntimeBundle(path, release, m.opts.Dir)
+		if err != nil {
+			m.fail(err)
+			return m.Status(), err
+		}
+		stage = filepath.Dir(path)
+	}
 
 	m.mu.Lock()
 	m.state = StateHandover
@@ -245,6 +263,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 	log.Printf("[update] handover to %s done; draining in-flight requests", release.Tag)
+	committed = true
 	m.mu.Lock()
 	m.state = StateIdle
 	m.checkedAt = time.Now().UTC()
@@ -253,6 +272,39 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.opts.OnSwitched()
 	}
 	return m.Status(), nil
+}
+
+// Reload uses the same ready/rollback/drain contract as updates, but keeps the
+// current complete runtime. It is only exposed through the local admin socket.
+func (m *Manager) Reload(ctx context.Context) error {
+	if m == nil {
+		return errors.New("runtime reload unavailable")
+	}
+	m.mu.Lock()
+	if m.busy {
+		m.mu.Unlock()
+		return errors.New("another runtime change is in progress")
+	}
+	m.busy = true
+	m.state = StateHandover
+	m.mu.Unlock()
+	defer func() { m.mu.Lock(); m.busy = false; m.mu.Unlock() }()
+	binary, err := os.Executable()
+	if err == nil {
+		err = handover(binary, m.opts.Args, m.opts.Listener, m.opts.AdminListener, readyTimeout, func() error { return ctx.Err() })
+	}
+	if err != nil {
+		m.fail(err)
+		return err
+	}
+	m.mu.Lock()
+	m.state = StateIdle
+	m.lastError = ""
+	m.mu.Unlock()
+	if m.opts.OnSwitched != nil {
+		m.opts.OnSwitched()
+	}
+	return nil
 }
 
 // writeCurrentPointer 记录当前生效的二进制路径（原子替换）。

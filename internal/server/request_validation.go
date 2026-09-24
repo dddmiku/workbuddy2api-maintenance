@@ -167,8 +167,8 @@ func requestValidationTools(value any, path string, responses bool) error {
 // 就会带上 web_search，整条请求拒绝会让客户端完全不可用。
 //
 // 两类区别对待：
-//   - 客户端自己执行、默认就会带上的（web_search / tool_search）：接受并丢弃，
-//     拒绝等于整个会话不可用（Codex 0.156 起默认带 tool_search）。
+//   - 客户端默认可能携带的声明（web_search / tool_search）：兼容接受，但网关不执行，
+//     通过能力发现及响应提示明确告知；拒绝默认声明会使整个会话不可用。
 //   - 需要服务端能力、用户显式声明的（file_search / mcp / image_generation 等）：
 //     继续明确报错。静默丢弃会让用户以为文件检索/图片生成在生效，比报错更难排查。
 var unimplementedBuiltinTools = map[string]bool{
@@ -563,6 +563,11 @@ func requestValidationResponsesInput(value any) error {
 					return err
 				}
 			}
+			if output, ok := item["output"].(map[string]any); ok && responsesContentObject(output) {
+				if err := requestValidationContent([]any{output}, path+".output", true); err != nil {
+					return err
+				}
+			}
 			// Other JSON outputs remain compatible: responsesToolOutput
 			// serializes maps/numbers/booleans without dropping their value.
 		case "reasoning":
@@ -578,6 +583,17 @@ func requestValidationResponsesInput(value any) error {
 		}
 	}
 	return nil
+}
+
+// Recognize protocol content objects without claiming arbitrary business JSON.
+func responsesContentObject(object map[string]any) bool {
+	kind, _ := object["type"].(string)
+	switch kind {
+	case "input_text", "output_text", "text", "summary_text", "refusal", "input_image", "image_url",
+		"input_file", "input_audio", "file", "audio", "image", "document":
+		return true
+	}
+	return false
 }
 
 func requestValidationStateOption(value any, path string) error {

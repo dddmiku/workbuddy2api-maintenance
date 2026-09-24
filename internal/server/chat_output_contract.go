@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：保留实际网络 flush 失败，让终态检查与失败用量一致。
 // 2026-09-18：直接 Chat 复用工具/结构化输出契约；正文增量保留，成功 finish 与 DONE 在完整校验后发出。
 // 2026-09-18：重复终态检查仍返回客户端写失败，避免清理路径把断开误报为成功。
 // 2026-09-18：过滤无法执行的内置 Chat 工具声明，无可用工具时去掉仅用于工具的空控制字段。
@@ -361,10 +362,13 @@ func (w *chatContractWriter) PrepareCompletion(chat map[string]any) {
 	}
 }
 
-func (w *chatContractWriter) Flush() {
-	if flush, ok := w.inner.(http.Flusher); ok {
-		flush.Flush()
+func (w *chatContractWriter) Flush() { _ = w.FlushError() }
+
+func (w *chatContractWriter) FlushError() error {
+	if w.writeErr == nil {
+		w.writeErr = flushHTTPResponse(w.inner)
 	}
+	return w.writeErr
 }
 
 func (w *chatContractWriter) ValidateCompletion(chat map[string]any) error {

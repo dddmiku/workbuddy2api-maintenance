@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：补齐模型详情与双协议发现鉴权，未知上下文不填假值；统一限制慢客户端写出并告知兼容过滤。
 // 2026-09-25：超限保持历史及会话绑定，成本统计统一读取上游实际用量，不再给客户端补写未处理的token。
 // 2026-09-25：流内超限与循环重试后的超限保持真实错误信号，不解绑会话、不覆盖已观测用量。
 // 2026-09-24：多密钥模式隔离账号与排程管理端点，调用密钥不再具备全局管理权限。
@@ -173,10 +174,14 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	// 把启动配置播种进运行期开关；之后管理台可以热切换，不必重启。
 	h.SetReasoningLoopStopOnly(cfg.ReasoningLoopStopOnly)
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.withDecodedRequest(h.chatCompletions)))
 	// Responses API 兼容层（NarraFork / Codex 等客户端走这条）：内部委托 chatCompletions。
-	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.withDecodedRequest(h.responses)))
+	h.mux.HandleFunc("POST /v1/messages", h.messagesEntry)
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.messagesEntry)
+	h.mux.HandleFunc("GET /v1/models", h.withDiscoveryAuth(h.models))
+	h.mux.HandleFunc("GET /v1/models/{model}", h.withDiscoveryAuth(h.model))
+	h.mux.HandleFunc("GET /v1/capabilities", h.withDiscoveryAuth(h.capabilities))
 	h.mux.HandleFunc("GET /status", h.withAccountAdmin(h.status))
 	// 排程任务自省与手动触发（账户管理面板的「定时任务」页）。
 	h.mux.HandleFunc("GET /tasks", h.withAccountAdmin(h.tasks))
@@ -198,7 +203,10 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	r = identifyRequest(w, r)
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	h.mux.ServeHTTP(newBoundedResponseWriter(w, cancel, downstreamWriteTimeout), r.WithContext(ctx))
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -549,20 +557,9 @@ const (
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 // 绑定模型的密钥只会看到自己可用的模型，客户端据此选择也不会撞 403。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
-	list := h.modelList()
-	if info, ok := requestKeyInfo(r); ok && len(info.Models) > 0 {
-		filtered := make([]map[string]any, 0, len(list))
-		for _, entry := range list {
-			id, _ := entry["id"].(string)
-			if id != "" && modelAllowedByKey(info, id) {
-				filtered = append(filtered, entry)
-			}
-		}
-		list = filtered
-	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   list,
+		"data":   h.visibleModels(r),
 	})
 }
 
@@ -646,15 +643,16 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
-			"owned_by":          "workbuddy",
-			"context_length":    mi.ContextWindow,
-			"max_output_tokens": mi.MaxTokens,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
+			"owned_by": "workbuddy",
 		}
-		if mi.ContextWindow == 0 {
-			entry["context_length"] = 131072 // 兜底
+		if mi.ContextWindow > 0 {
+			entry["context_length"] = mi.ContextWindow
+		}
+		if mi.MaxTokens > 0 {
+			entry["max_output_tokens"] = mi.MaxTokens
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
@@ -685,16 +683,15 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":             "global:" + id,
-				"object":         "model",
-				"created":        1753600000,
-				"owned_by":       "workbuddy",
-				"context_length": 131072,
+				"id":       "global:" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
 			}
 			if mi, ok := globalInfos[id]; ok {
 				entry = applyModelInfoFields(entry, mi)
-				// 富条目命中：context_length/max_output_tokens 用探测真实值替换
-				// 131072 兜底（与 CN 动态分支同口径；上游零值保留兜底）。
+				// 两域均只公布已知的真实限制；上游没给时保持未知，避免客户端
+				// 把兼容兜底值当成模型窗口并触发错误的压缩策略。
 				if mi.ContextWindow > 0 {
 					entry["context_length"] = mi.ContextWindow
 				}
@@ -801,7 +798,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	limit := h.cfg.MaxBodyBytes
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		writeBodyReadError(w, err)
 		return
 	}
 	if int64(len(body)) > limit {
@@ -834,12 +831,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if r.URL.Path == "/v1/chat/completions" && peek.Stream && hideChatStreamUsage(requestObject) {
+		w = &chatUsageVisibilityWriter{inner: w}
+	}
 	if _, responses := w.(*responsesWriter); !responses {
 		contract, err := newChatOutputContract(requestObject)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
+		warnIgnoredBuiltinToolsJSON(w, r, requestObject["tools"])
 		changed, err := normalizeChatToolDeclarations(requestObject, contract)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -883,6 +884,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.requestID = requestID(r)
 	defer st.done()
 	defer func() {
 		// Responses emits its final client-facing frame after Chat returns. Finish
@@ -1055,6 +1057,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	}
 	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
+	chatMeta.GatewayRequestID = st.requestID
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -1659,6 +1662,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, err = w.Write(raw)
+	if err == nil {
+		err = flushHTTPResponse(w)
+	}
 	return err
 }
 

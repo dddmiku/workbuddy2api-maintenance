@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：旧进程迟到冷却不能覆盖盘上的禁用或有效余额不足限制，保留显式管理恢复意图。
 // 2026-09-18：按本实例基线合并持久化字段增量，记录显式赋值意图，防止旧进程最后落盘覆盖新状态。
 // 2026-09-18：导入快照计数单独作为下限，创建意图带删除代次，避免重复计数与删除后复活。
 package pool
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"time"
 )
 
 type stateIntent struct {
@@ -183,6 +185,17 @@ func mergeStateAccount(base, current, latest stateAccount, intent *stateIntent) 
 	var result stateAccount
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return stateAccount{}, err
+	}
+	// During a hot update the draining process may not have observed a newer
+	// disable or exhausted-balance result. A late cooldown is not an explicit
+	// recovery action, even though it changes the shared reason/until fields.
+	if latest.Disabled && !intent.fields["disabled"] {
+		result.Disabled, result.Reason = true, latest.Reason
+		result.Until, result.CoolKind, result.SoftStreak = time.Time{}, 0, 0
+		result.ModelCooldowns = nil
+	} else if !result.Disabled && latest.CoolKind == CoolHard && time.Now().Before(latest.Until) && current.CoolKind == CoolSoft {
+		result.CoolKind, result.Until, result.Reason = latest.CoolKind, latest.Until, latest.Reason
+		result.SoftStreak = latest.SoftStreak
 	}
 	latestSuccess, latestErrors := latest.SuccessCount, max(latest.ErrTotal, int64(latest.ErrCount))
 	if intent.importedCounters {

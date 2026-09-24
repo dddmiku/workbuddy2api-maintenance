@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：告知默认内置工具的兼容过滤，保留网络 flush 错误，防止客户端没收到终态却记成功。
 // 2026-09-25：拒绝无法解读的原生压缩历史与服务端压缩配置，防止丢上下文后仍返回成功。
 // 2026-09-25：流式上下文超限返回标准失败事件，供客户端标记窗口已满并在下一轮压缩；不伪造用量。
 // 2026-09-25：流内厂商超限码统一为标准失败码，保留已发正文与真实用量，未观测用量保持为空。
@@ -691,6 +692,9 @@ func chatImagePart(em map[string]any) map[string]any {
 //
 // 纯文本输出仍退化成字符串：上游对纯文本 tool 结果最稳，也是历史零回归路径。
 func responsesToolOutput(v any) any {
+	if object, ok := v.(map[string]any); ok && responsesContentObject(object) {
+		v = []any{object}
+	}
 	switch o := v.(type) {
 	case nil:
 		return ""
@@ -1085,7 +1089,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	limit := h.cfg.MaxBodyBytes
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		writeBodyReadError(w, err)
 		return
 	}
 	if int64(len(body)) > limit {
@@ -1099,6 +1103,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	warnIgnoredBuiltinTools(w, r, req.Tools)
 	// 运行约定：只在带工具的请求上追加，抑制「一句话一个命令」的叙述式输出。
 	chatBody = applyActNote(chatBody, h.cfg.PromptActNote, len(req.Tools) > 0)
 
@@ -1248,12 +1253,13 @@ func (rw *responsesWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (rw *responsesWriter) Flush() {
-	if rw.mode == 1 {
-		if fl, ok := rw.inner.(http.Flusher); ok {
-			fl.Flush()
-		}
+func (rw *responsesWriter) Flush() { _ = rw.FlushError() }
+
+func (rw *responsesWriter) FlushError() error {
+	if rw.mode == 1 && rw.writeErr == nil {
+		rw.writeErr = flushHTTPResponse(rw.inner)
 	}
+	return rw.writeErr
 }
 
 // finish 在 chatCompletions 返回后收尾。
@@ -1274,6 +1280,9 @@ func (rw *responsesWriter) finish() {
 		rw.inner.Header().Set("Content-Type", ct)
 		rw.inner.WriteHeader(rw.status)
 		_, rw.writeErr = rw.inner.Write(rw.buf)
+		if rw.writeErr == nil {
+			rw.writeErr = flushHTTPResponse(rw.inner)
+		}
 	case 2:
 		rw.finishJSON()
 	default:
@@ -1324,10 +1333,7 @@ func (rw *responsesWriter) finishJSON() {
 			return
 		}
 	}
-	raw, _ := json.Marshal(result)
-	rw.inner.Header().Set("Content-Type", "application/json")
-	rw.inner.WriteHeader(http.StatusOK)
-	_, rw.writeErr = rw.inner.Write(raw)
+	rw.writeErr = writeJSON(rw.inner, http.StatusOK, result)
 }
 
 func (rw *responsesWriter) resolvedModel() string {
@@ -1370,9 +1376,7 @@ func (rw *responsesWriter) emit(evType string, payload map[string]any) {
 		return
 	}
 	_, rw.writeErr = fmt.Fprintf(rw.inner, "event: %s\ndata: %s\n\n", evType, raw)
-	if fl, ok := rw.inner.(http.Flusher); ok {
-		fl.Flush()
-	}
+	rw.Flush()
 }
 
 // feed 累积字节并按空行切帧。

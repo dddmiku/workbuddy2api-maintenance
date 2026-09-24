@@ -207,6 +207,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
+	GatewayRequestID      string // Gateway-generated request id; shared by all attempts.
 	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
@@ -218,6 +219,9 @@ type ChatMeta struct {
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
+	if meta.GatewayRequestID != "" {
+		req.Header.Set("X-Gateway-Request-ID", meta.GatewayRequestID)
+	}
 	a = a.Snapshot()
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。

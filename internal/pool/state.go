@@ -1,6 +1,7 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
 // 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 // ═══ 更新日志 ═══
+// 2026-09-25：每次成败同时衰减相反观测，避免近期成功率被历史记录永久钉在约 50%。
 // 2026-09-24：余额恢复仅解除余额冷却，探活始终服从账号级冷却与熔断。
 // 2026-09-18：跨实例落盘保留显式复活/清零意图，并以实际扣费增量合并余额，避免旧快照回滚状态。
 // 2026-09-18：持久化扣费保留实际消费量，只有本地余额展示钳零，避免旧余额少记后来可见的消费。
@@ -101,6 +102,7 @@ func (p *Pool) NoteError(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
 		e.errorEMA += (1 - e.errorEMA) * successAlpha
+		e.successEMA *= 1 - successAlpha
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
@@ -214,6 +216,7 @@ func (p *Pool) NoteSuccess(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
 		e.successEMA += (1 - e.successEMA) * successAlpha
+		e.errorEMA *= 1 - successAlpha
 		e.lastSuccess = time.Now()
 		e.fails = 0
 		e.retryCount = 0

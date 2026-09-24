@@ -25,6 +25,9 @@ import (
 // 若进程以别的工作目录拉起（如 systemd/裸 binary），上溯穷尽后仍以
 // os.Getwd() 兜底，把缺失暴露成 WARN 而非静默。
 func repoRoot() string {
+	if dir := strings.TrimSpace(os.Getenv("WB2API_RUNTIME_DIR")); dir != "" {
+		return dir
+	}
 	start, err := os.Getwd()
 	if err != nil {
 		return "."

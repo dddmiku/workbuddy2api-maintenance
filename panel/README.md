@@ -1,56 +1,39 @@
-# workbuddy2api-panel
+# workbuddy2api 管理台
 
-`workbuddy2api` 的 Web 管理台源码，随网关同一个仓库发布。管理账号、API key、排程任务与容器日志。
+管理台与网关组成一个运行版本。Go 主程序通过 `assets.go` 内嵌 Python 后端和页面，启动私有 Unix socket 子进程并提供 `/admin/` 路由。默认只有 `workbuddy2api` 一个容器、宿主回环 `7863` 一个端口，不需要 `docker.sock` 或独立面板镜像。
 
-后端只用 Python 标准库，前端由 `src/` 与 `app.js` / `keys.js` 拼成单文件 `index.html`，不需要 Node 构建链。
+后端只使用 Python 标准库；前端由 `src/`、`app.js` 和 `keys.js` 生成 `index.html`。`native_runtime.py` 提供受限的本地登录、积分、日志和重载适配，调用当前运行包中的辅助程序。
 
-## 与网关一起部署（推荐）
+## 使用
 
-仓库根目录的 `docker-compose.yml` 已经包含 `wb2api-admin` 服务：
+按根目录 [新部署说明](../README.md#新部署) 准备五个持久化目录后启动：
 
 ```bash
-cd /opt/workbuddy2api
-sudo docker compose up -d --build
+docker compose up -d --build
 ```
 
-面板容器通过宿主 `docker.sock` 控制网关容器，并把仓库目录挂到 `/gateway`，共享 `config.json`、`auths/`、`data/`。面板自身凭证写入 `panel-data/`（不进版本库）。
+访问 `http://127.0.0.1:7863/admin/`。存量 `panel-data/credentials.json`、会话撤销记录和密码信息保留；新部署的随机初始密码写入 `panel-data/initial-password.txt`。页面中的“重启服务”使用同版本重载，不再调用宿主 Docker。
 
-首次启动后按需初始化管理员：
+账号、密钥复制、统计口径、HTTPS 代理和历史两容器迁移见 [管理台部署](../docs/panel.md)。
 
-```bash
-sudo docker compose exec wb2api-admin python3 -c 'import sys; sys.path.insert(0,"/app"); import app; app.load_credentials()'
-```
-
-没有可继承的旧口令时，随机初始密码写入 `panel-data/initial-password.txt`。
-
-## 独立运行（可选）
-
-面板也可以直接在宿主机跑（systemd 或前台进程），此时用环境变量指向网关目录：
+## 开发与测试
 
 ```bash
-WB2API_GATEWAY_DIR=/opt/workbuddy2api \
-WB2API_ADMIN_DIR=/opt/wb2api-admin \
-WB2API_GATEWAY_URL=http://127.0.0.1:7863 \
-python3 panel/app.py
-```
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `WB2API_GATEWAY_DIR` | `/opt/workbuddy2api` | 网关目录，读取 `config.json` 并管理 `auths/`、`data/` |
-| `WB2API_ADMIN_DIR` | 脚本所在目录 | 面板凭证与初始密码文件目录 |
-| `WB2API_ADMIN_HOST` | `127.0.0.1` | 监听地址；容器内为 `0.0.0.0` |
-| `WB2API_ADMIN_PORT` | `7864` | 监听端口 |
-| `WB2API_GATEWAY_URL` | `http://127.0.0.1:7863` | 网关 HTTP 地址 |
-| `WB2API_CONTAINER` | `workbuddy2api` | 网关容器名（docker CLI 操作对象） |
-| `WB2API_HTPASSWD_PATH` | `/etc/nginx/.htpasswd_wb2admin` | 可选的旧口令继承文件 |
-
-## 开发
-
-```bash
-python3 panel/build.py          # 重新生成 index.html
+python3 panel/build.py
+git diff --exit-code -- panel/index.html
 python3 -m unittest discover -s panel -p 'test_*.py' -v
+go test ./internal/panelruntime ./internal/server ./internal/hotupdate
 ```
 
-改版式动 `panel/src/*.css`、`panel/src/body.html`；改行为动 `panel/app.js`、`panel/keys.js`。
+修改页面源文件后生成并提交 `index.html`，再编译网关；内嵌前后端随主程序一起更新。Node.js 仅用于前端行为回归，不是面板运行依赖。CI 使用 Python 3.12。
 
-完整部署、反向代理与排障说明见仓库 [README](../README.md) 与 [docs/panel.md](../docs/panel.md)。
+| 文件 | 作用 |
+|---|---|
+| `assets.go` | 固定内嵌清单，排除运行凭据和测试数据 |
+| `app.py`、`file_lock.py` | 页面、会话认证、跨进程状态保护 |
+| `native_runtime.py` | 统一运行版受限本地操作 |
+| `key_management.py` | 经私有管理 socket 访问密钥、用量和更新 |
+| `src/`、`app.js`、`keys.js` | 页面源文件 |
+| `build.py`、`index.html` | 页面生成器及产物 |
+
+旧 Docker 适配仅用于历史部署和回滚验证，不是新的部署主线。

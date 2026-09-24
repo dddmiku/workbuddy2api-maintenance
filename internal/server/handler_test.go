@@ -1408,9 +1408,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 }
 
-// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 兜底 131072，
-// 其余真实值不得被覆盖（issue 提醒：不能全表统一 131072 抹平真实 ContextLength）。
-func TestModelsDynamicZeroContextFallback(t *testing.T) {
+// TestModelsDynamicUnknownContextOmitted 动态模型缺 maxInputTokens 时不编造窗口，
+// 其余真实值仍需保留，客户端可以区分未知与真实模型限制。
+func TestModelsDynamicUnknownContextOmitted(t *testing.T) {
 	resetModelsCache()
 
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1442,9 +1442,8 @@ func TestModelsDynamicZeroContextFallback(t *testing.T) {
 			real = m
 		}
 	}
-	// 缺 maxInputTokens → 兜底 131072（其余字段保持真实）。
-	if zc, _ := zero["context_length"].(float64); zc != 131072 {
-		t.Errorf("zero-ctx context_length=%v want 131072 fallback", zc)
+	if zc, exists := zero["context_length"]; exists {
+		t.Errorf("zero-ctx context_length=%v want omitted unknown value", zc)
 	}
 	if zo, _ := zero["max_output_tokens"].(float64); zo != 4096 {
 		t.Errorf("zero-ctx max_output_tokens=%v want 4096 (real value preserved)", zo)

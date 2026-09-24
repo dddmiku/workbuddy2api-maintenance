@@ -144,6 +144,7 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 
 	// #nosec G204 -- binary 是本进程自己下载并校验过 sha256 的更新产物路径，args 来自本进程启动参数
 	cmd := exec.Command(binary, args...)
+	configureCandidate(cmd)
 	env := append(stripHandoverEnv(os.Environ()),
 		fmt.Sprintf("%s=%d", EnvListenFD, inheritedFDBase),
 		fmt.Sprintf("%s=%d", EnvReadyFD, inheritedFDBase+1),
@@ -163,6 +164,8 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 		_ = writePipe.Close()
 		return fmt.Errorf("start new instance: %w", err)
 	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
 	// 父进程只保留读端：写端若仍打开，读端永远等不到 EOF。
 	_ = writePipe.Close()
 
@@ -178,8 +181,18 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 		ready <- readErr
 	}()
 	stopCandidate := func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		children := candidateChildren(cmd.Process.Pid)
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-exited
+		}
+		children = append(children, candidateChildren(cmd.Process.Pid)...)
+		// A failed child may have died before its own cleanup. Only signal
+		// descendants whose original process identity still matches.
+		stopCandidateChildren(children)
 	}
 
 	select {
@@ -204,7 +217,6 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 	}
 
 	// 新实例已在服务：后台回收它，父进程继续把手上的在途请求跑完。
-	go func() { _ = cmd.Wait() }()
 	return nil
 }
 

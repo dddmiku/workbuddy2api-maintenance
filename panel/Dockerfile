@@ -8,7 +8,7 @@ RUN apk add --no-cache docker-cli tzdata \
  && adduser -D -u 10002 -H panel
 
 WORKDIR /app
-COPY app.py key_management.py index.html login.html ./
+COPY app.py key_management.py file_lock.py native_runtime.py index.html login.html ./
 COPY vendor/ ./vendor/
 
 # 运行期数据（credentials.json、initial-password.txt）放挂载卷，镜像内不落凭证。

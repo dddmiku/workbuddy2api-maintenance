@@ -1,54 +1,33 @@
 # ═══ 更新日志 ═══
-# 2026-09-18：网关停机宽限设为 3 分钟，覆盖默认在途 RPC 与最终状态落盘，避免 Docker 提前强杀。
+# 2026-09-25：网关与管理台合为一个非root容器，仅发布一个回环端口，目录配置支持原子替换。
 services:
   wb2api:
-    build: .
-    image: workbuddy2api-wb2api:local
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILT_AT: ${BUILT_AT:-unknown}
+    image: workbuddy2api-unified:${VERSION:-local}
     container_name: workbuddy2api
     restart: unless-stopped
-    stop_grace_period: 3m
+    stop_grace_period: 16m
+    network_mode: bridge
     environment:
-      - TZ=Asia/Shanghai
+      TZ: Asia/Shanghai
+      WB2API_PANEL_ENABLED: "1"
+      # Trust the actual host proxy address; override for a custom Docker bridge.
+      WB2API_TRUSTED_PROXIES: ${WB2API_TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.17.0.1/32}
     ports:
       - "127.0.0.1:7863:7863"
     volumes:
-      # auths 凭证卷：login.sh 在宿主机落盘 workbuddy-<uid>.json（0600），容器网关以
-      # app(uid 10001) 读 + 回写（refresh / realm backfill 走 tmp+rename，需目录写权限）。
-      # 跨 uid 部署（非 root 宿主落盘 / rootful 下宿主 uid≠10001）读不到 → 账号数为 0
-      # （issue #108）。登录后把目录属主交给 10001（与 ./data 卷同口径）：
-      #   chown -R 10001:10001 ./auths
-      # 之后新增账号建议进容器登录（app 自身落盘，属主即 10001，免反复 chown；容器内无
-      # docker CLI，完成后回宿主机重启）：
-      #   docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
+      # These persistent directories must be writable by uid/gid 10001.
       - ./auths:/app/auths
-      # data 保持 bind mount（本地映射，与旧版本一致）。
-      # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
-      #   chown -R 10001:10001 ./data
+      - ./auths-trash:/app/auths-trash
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
-
-  # 管理面板：账号、API key、排程与日志。与网关同项目启动，共享 auths/ 与 data/。
-  # 需要访问宿主 docker.sock（重启网关容器、读取日志、执行登录工具）。
-  wb2api-admin:
-    build: ./panel
-    image: workbuddy2api-panel:local
-    container_name: wb2api-admin
-    restart: unless-stopped
-    environment:
-      - TZ=Asia/Shanghai
-      - WB2API_GATEWAY_DIR=/gateway
-      - WB2API_ADMIN_DIR=/data
-      - WB2API_ADMIN_HOST=0.0.0.0
-      - WB2API_GATEWAY_URL=http://wb2api:7863
-      - WB2API_CONTAINER=workbuddy2api
-    ports:
-      - "127.0.0.1:7864:7864"
-    volumes:
-      # 面板不直接调用公网接口，所有管理动作都经容器管理或本机管理通道完成。
-      - /var/run/docker.sock:/var/run/docker.sock
-      # 网关目录整体挂载：面板需要读写 config.json、auths/、data/（含密钥管理 socket）。
-      - ./:/gateway
-      # 面板自身凭证独立存放，不进镜像也不进仓库。
-      - ./panel-data:/data
-    depends_on:
-      - wb2api
+      - ./config:/app/config
+      - ./panel-data:/app/panel-data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

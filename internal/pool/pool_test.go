@@ -847,6 +847,9 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
 	}
+	// A rate-limit error cannot itself recover an exhausted balance. Observe
+	// actual credit recovery before testing the next independent soft streak.
+	p.ReenableIfCredits("u1", 500)
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 600, 3)
 }

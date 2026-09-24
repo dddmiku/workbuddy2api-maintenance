@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：出站始终请求实际用量，保留其他流选项；客户端展示偏好不再关闭内部计量。
 // 2026-09-16：移除业务正文清洗，旧 sanitize 参数仅兼容配置；保留既有协议适配。
 // 2026-09-16：请求及 console 系统消息适配保留 JSON 数字字面量，避免 schema 和业务值损失精度。
 // 2026-09-17：合并 fork 测试入口约定，保留参数兼容、协议整理与数字/正文保真。
@@ -48,11 +49,15 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, effort
 		return src
 	}
 	obj["stream"] = true
-	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
-	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
-	if _, has := obj["stream_options"]; !has {
-		obj["stream_options"] = map[string]any{"include_usage": true}
+	// The gateway needs upstream usage even when a caller opts out of seeing
+	// it. Client-facing filtering belongs to the protocol writer, after the
+	// raw usage observer; otherwise include_usage=false silently disables billing.
+	streamOptions, ok := obj["stream_options"].(map[string]any)
+	if !ok || streamOptions == nil {
+		streamOptions = map[string]any{}
+		obj["stream_options"] = streamOptions
 	}
+	streamOptions["include_usage"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行。

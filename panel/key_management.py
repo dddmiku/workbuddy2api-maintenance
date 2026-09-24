@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：内置面板优先使用网关传入的已解析管理socket，避免自定义配置路径或环境覆盖造成分叉。
 # 2026-09-22：密钥管理默认启用——api_keys_file 留空（含历史示例里的空串）时按默认
 #             路径解析，只有显式 api_keys_enabled=false 才关闭；修掉新装用户照抄
 #             config.example.json 时密钥页报「密钥管理尚未启用」、建不了密钥。
@@ -19,6 +20,8 @@ DEFAULT_API_KEYS_FILE = "./data/api_keys.json"
 
 
 def socket_path(config_path, base):
+    if os.environ.get("WB2API_RUNTIME") == "native" and os.environ.get("WB2API_ADMIN_SOCKET"):
+        return os.environ["WB2API_ADMIN_SOCKET"]
     with open(config_path, "r", encoding="utf-8") as file:
         config = json.load(file)
     registry = _api_keys_file(config)

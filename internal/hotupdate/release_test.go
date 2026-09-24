@@ -40,7 +40,7 @@ func TestLatestPicksAssetForThisArchitecture(t *testing.T) {
 	}
 	body, _ := json.Marshal(payload)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/dddmiku/workbuddy2api/releases/latest" {
+		if r.URL.Path != "/repos/"+DefaultRepo+"/releases/latest" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		if got := r.Header.Get("Accept"); !strings.Contains(got, "github") {

@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-25：逐段读取并限制 SSE 单行/单事件为 64MiB，防止异常上游持续分配内存；超限返回明确失败。
 // 2026-09-25：厂商错误事件包装成标准 error 时保留同帧顶层 usage，避免下游漏掉真实用量更新。
 // 2026-09-25：移除裁剪记录对用量的覆盖，流式和聚合仅合并上游实际报告的累计值。
 // 2026-09-19：工具参数允许在早到的结束标记后补齐；传输收尾统一校验，成功终态延迟到校验通过后发送。
@@ -56,25 +57,45 @@ type sseEvent struct {
 	data string
 }
 
+// MaxSSEEventBytes is the shared upper bound for a single SSE line/event in
+// protocol parsing and the raw usage observer that runs before it.
+const MaxSSEEventBytes = 64 << 20
+
 // readSSE 按空行分隔事件，data: 可无空格、多行 data 按 SSE 规范用换行连接。
 // 保留最后一个没有空行但数据完整的 EOF 事件，兼容只发 finish_reason 的上游。
 // 非 EOF 读错误始终保留；done 由 consume 显式返回，之后不再消费任何数据。
 func readSSE(r io.Reader, consume func(sseEvent) (bool, error), comment func(string) error) error {
-	br := bufio.NewReaderSize(r, 64*1024)
-	var data []string
+	return readSSEWithLimit(r, consume, comment, MaxSSEEventBytes)
+}
+
+// readSSEWithLimit shares the production parser with small-limit regression
+// tests. The limit bounds an individual line and accumulated event, not the
+// stream duration or total amount of generated output.
+func readSSEWithLimit(r io.Reader, consume func(sseEvent) (bool, error), comment func(string) error, limit int) error {
+	if limit <= 0 {
+		limit = MaxSSEEventBytes
+	}
+	br := bufio.NewReaderSize(r, min(64*1024, limit))
+	var data strings.Builder
+	hasData := false
 	eventName := ""
 	dispatch := func() (bool, error) {
-		if len(data) == 0 {
+		if !hasData {
 			eventName = ""
 			return false, nil
 		}
-		ev := sseEvent{name: eventName, data: strings.Join(data, "\n")}
-		data = nil
+		ev := sseEvent{name: eventName, data: data.String()}
+		data.Reset()
+		hasData = false
 		eventName = ""
 		return consume(ev)
 	}
 	for {
-		line, err := br.ReadString('\n')
+		line, err := ReadSSELine(br, limit)
+		var parseErr *StreamError
+		if errors.As(err, &parseErr) {
+			return err
+		}
 		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		if line == "" && err == nil {
 			if stop, consumeErr := dispatch(); consumeErr != nil || stop {
@@ -93,8 +114,22 @@ func readSSE(r io.Reader, consume func(sseEvent) (bool, error), comment func(str
 			}
 			switch field {
 			case "data":
-				data = append(data, value)
+				extra := len(value)
+				if hasData {
+					extra++ // The SSE newline between data fields also occupies memory.
+				}
+				if extra > limit-data.Len()-len(eventName) {
+					return oversizedSSEEvent()
+				}
+				if hasData {
+					data.WriteByte('\n')
+				}
+				data.WriteString(value)
+				hasData = true
 			case "event":
+				if len(value) > limit-data.Len() {
+					return oversizedSSEEvent()
+				}
 				eventName = value
 			}
 		}
@@ -104,6 +139,31 @@ func readSSE(r io.Reader, consume func(sseEvent) (bool, error), comment func(str
 		}
 		if err != nil {
 			return &StreamError{Code: "upstream_read_error", Message: "upstream stream read failed", Cause: err}
+		}
+	}
+}
+
+func oversizedSSEEvent() *StreamError {
+	return &StreamError{Code: "upstream_event_too_large", Message: "upstream stream line or event exceeded the size limit"}
+}
+
+// ReadSSELine bounds each allocation with ReadSlice before assembling a line.
+// A non-positive limit selects MaxSSEEventBytes. Checking the
+// length only after ReadString returns would still allow unbounded allocation
+// when an upstream never sends a newline.
+func ReadSSELine(br *bufio.Reader, limit int) (string, error) {
+	if limit <= 0 {
+		limit = MaxSSEEventBytes
+	}
+	var line strings.Builder
+	for {
+		part, err := br.ReadSlice('\n')
+		if len(part) > limit-line.Len() {
+			return "", oversizedSSEEvent()
+		}
+		line.Write(part)
+		if err != bufio.ErrBufferFull {
+			return line.String(), err
 		}
 	}
 }
