@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：仅密文推理必须显式拒绝；保留空标记、明文回放与形态诊断的独立测试。
 // 2026-09-18：锁定历史推理内容的回灌：DeepSeek 思考模式要求把上一轮 reasoning_content
 // 原样带回（上游 11155 reasoning_content_missing），Conversions 不能把 reasoning 项丢掉。
 package server
@@ -132,29 +133,16 @@ func TestReasoningPassthroughSurvivesUpstreamBackfill(t *testing.T) {
 	}
 }
 
-// TestReasoningTextlessItemStillMarksTrace 客户端只剩加密推理（summary/content 都没有明文）
-// 时也必须把「本对话走过思考」这件事带出去：上游按字段存在性校验，整条链缺字段就是 11155。
-func TestReasoningTextlessItemStillMarksTrace(t *testing.T) {
+// Opaque reasoning cannot be replaced with an empty string and reported as replayed.
+func TestReasoningTextlessEncryptedItemRejected(t *testing.T) {
 	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
 	  {"role":"user","content":"读文件"},
 	  {"type":"reasoning","id":"rs_1","summary":[],"content":null,"encrypted_content":"opaque-blob"},
 	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
 	  {"type":"function_call_output","call_id":"call_1","output":"结果"}],
 	  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
-	body, _, err := responsesToChat([]byte(request))
-	if err != nil {
-		t.Fatalf("转换失败: %v", err)
-	}
-	messages := assistantMessages(t, body)
-	if len(messages) != 1 {
-		t.Fatalf("assistant 消息数 = %d want 1: %s", len(messages), body)
-	}
-	value, present := messages[0]["reasoning_content"]
-	if !present {
-		t.Fatalf("无明文推理时仍必须带 reasoning_content 字段: %s", body)
-	}
-	if text, _ := value.(string); text != "" {
-		t.Errorf("无明文推理应补空串，得到 %q", text)
+	if _, _, err := responsesToChat([]byte(request)); err == nil || !strings.Contains(err.Error(), "encrypted_content") {
+		t.Fatalf("仅密文推理必须显式拒绝: %v", err)
 	}
 }
 
@@ -183,7 +171,7 @@ func TestReasoningTrailingItemAttachesToLastAssistant(t *testing.T) {
 func TestReasoningFillSkippedForNonDeepSeek(t *testing.T) {
 	request := `{"model":"global:glm-5.2","stream":false,"input":[
 	  {"role":"user","content":"读文件"},
-	  {"type":"reasoning","id":"rs_1","summary":[],"content":null,"encrypted_content":"opaque-blob"},
+	  {"type":"reasoning","id":"rs_1","summary":[],"content":null},
 	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
 	  {"type":"function_call_output","call_id":"call_1","output":"结果"}],
 	  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
@@ -202,7 +190,7 @@ func TestReasoningStatsFeedsDiagnostics(t *testing.T) {
 	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
 	  {"role":"user","content":"hi"},
 	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"有明文"}]},
-	  {"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"opaque"},
+	  {"type":"reasoning","id":"rs_2","summary":[]},
 	  {"role":"assistant","content":"答案"}]}`
 	_, req, err := responsesToChat([]byte(request))
 	if err != nil {

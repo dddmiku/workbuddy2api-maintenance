@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：失败/截断保留真实推理与正文，但不交付未验证工具，适配 eager 客户端。
 // 2026-09-19：锁定推理与正文/工具交错时的单一条目生命周期，防止重用ID、重放旧摘要或丢失输出。
 package server
 
@@ -144,7 +145,7 @@ func TestResponsesReasoningItemRemainsStableAcrossInterleavedOutput(t *testing.T
 					}
 				}
 			}
-			if reasonItems != 1 || tools != tc.tools || textContent.String() != tc.text {
+			if reasonItems != 1 || tools != wantToolDone || textContent.String() != tc.text {
 				t.Fatal("final response lost or duplicated reasoning, text, or tools")
 			}
 		})

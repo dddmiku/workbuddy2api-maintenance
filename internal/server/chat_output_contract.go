@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：所有 Chat 请求共享工具声明边界；整组校验前隐藏身份和参数，缓冲有界并在生成期间保活。
 // 2026-09-25：保留实际网络 flush 失败，让终态检查与失败用量一致。
 // 2026-09-18：直接 Chat 复用工具/结构化输出契约；正文增量保留，成功 finish 与 DONE 在完整校验后发出。
 // 2026-09-18：重复终态检查仍返回客户端写失败，避免清理路径把断开误报为成功。
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/upstream"
@@ -226,9 +228,8 @@ func normalizeChatToolDeclarations(fields map[string]json.RawMessage, req *respo
 	return changed, nil
 }
 
-// Chat's successful finish marker is an execution boundary for clients. Retain
-// it until every call/choice is validated, including metadata arriving late.
-// Text and argument deltas can still stream; usage follows the final finish.
+// Eager clients execute as soon as argument JSON parses, before a finish marker.
+// Stream text/reasoning immediately; release tools only after validating every choice.
 type chatContractWriter struct {
 	inner       http.ResponseWriter
 	req         *responsesRequest
@@ -240,14 +241,18 @@ type chatContractWriter struct {
 	checked     bool
 	err         error
 	writeErr    error
+	lastWrite   time.Time
 }
 
-func (w *chatContractWriter) Header() http.Header    { return w.inner.Header() }
-func (w *chatContractWriter) WriteHeader(status int) { w.inner.WriteHeader(status) }
+func (w *chatContractWriter) Header() http.Header         { return w.inner.Header() }
+func (w *chatContractWriter) WriteHeader(status int)      { w.inner.WriteHeader(status) }
+func (w *chatContractWriter) Unwrap() http.ResponseWriter { return w.inner }
+func (w *chatContractWriter) FinishResponse() error       { return w.CompletionError() }
 
 func (w *chatContractWriter) writeRaw(raw []byte) {
 	if w.writeErr == nil {
 		_, w.writeErr = w.inner.Write(raw)
+		w.lastWrite = time.Now()
 	}
 }
 
@@ -259,6 +264,10 @@ func (w *chatContractWriter) Write(raw []byte) (int, error) {
 		return w.inner.Write(raw)
 	}
 	w.streaming = true
+	if len(raw) > protocolBufferLimit-w.raw.Len() {
+		w.err = fmt.Errorf("upstream response exceeds the adapter buffer limit")
+		return 0, w.err
+	}
 	w.raw.Write(raw)
 	w.buffer = append(w.buffer, raw...)
 	for {
@@ -316,13 +325,20 @@ func (w *chatContractWriter) frame(raw []byte) {
 			changed = true
 		}
 		if delta, _ := choice["delta"].(map[string]any); len(delta) > 0 {
-			hasDelta = true
-			if w.restoreToolNames(delta) {
-				changed = true
+			for _, key := range []string{"tool_calls", "function_call"} {
+				if _, exists := delta[key]; exists {
+					delete(delta, key)
+					changed = true
+				}
 			}
+			hasDelta = hasDelta || len(delta) > 0
 		}
 	}
 	if !hasDelta {
+		if time.Since(w.lastWrite) >= protocolProgressInterval {
+			w.writeRaw([]byte(": keepalive\n\n"))
+			w.Flush()
+		}
 		return
 	}
 	if changed {
@@ -358,6 +374,10 @@ func (w *chatContractWriter) PrepareCompletion(chat map[string]any) {
 	for _, raw := range responseArray(chat["choices"]) {
 		choice, _ := raw.(map[string]any)
 		message, _ := choice["message"].(map[string]any)
+		if choice["finish_reason"] == "length" || choice["finish_reason"] == "content_filter" {
+			delete(message, "tool_calls")
+			delete(message, "function_call")
+		}
 		w.restoreToolNames(message)
 	}
 }
@@ -408,6 +428,7 @@ func (w *chatContractWriter) CompletionError() error {
 			w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
 		}
 	} else {
+		w.emitValidatedTools(chat)
 		choices := []any{}
 		for _, raw := range responseArray(chat["choices"]) {
 			choice, _ := raw.(map[string]any)
@@ -429,3 +450,42 @@ func (w *chatContractWriter) CompletionError() error {
 }
 
 func (w *chatContractWriter) finish() { _ = w.CompletionError() }
+
+func (w *chatContractWriter) emitValidatedTools(chat map[string]any) {
+	choices := []any{}
+	for _, raw := range responseArray(chat["choices"]) {
+		choice, _ := raw.(map[string]any)
+		if choice["finish_reason"] == "length" || choice["finish_reason"] == "content_filter" {
+			return
+		}
+		message, _ := choice["message"].(map[string]any)
+		delta := map[string]any{}
+		if calls := responseArray(message["tool_calls"]); len(calls) > 0 {
+			for index, value := range calls {
+				call, _ := value.(map[string]any)
+				call["index"] = index
+				if id, _ := call["id"].(string); id == "" {
+					call["id"] = newRespID("call_")
+				}
+			}
+			delta["tool_calls"] = calls
+		} else if fn := legacyResponseFunction(message); fn != nil {
+			delta["function_call"] = fn
+		}
+		if len(delta) == 0 {
+			continue
+		}
+		w.restoreToolNames(delta)
+		choices = append(choices, map[string]any{"index": choice["index"], "delta": delta, "finish_reason": nil})
+	}
+	if len(choices) == 0 {
+		return
+	}
+	frame := map[string]any{"id": chat["id"], "object": "chat.completion.chunk", "created": chat["created"], "model": chat["model"], "choices": choices, "usage": nil}
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		w.err = err
+		return
+	}
+	w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
+}

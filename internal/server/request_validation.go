@@ -1,12 +1,12 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：兼容 NF 默认图片工具声明并保留能力警告，拒绝未执行的截断/推理策略及仅含密文的历史。
 // 2026-09-25：单对象工具结果仅识别明确协议标签，泛型业务type保留完整JSON，防止误拒及丢失额外字段。
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
 // 2026-09-17：接受 Responses 的命名空间工具分组，并把命名空间名字写回函数调用历史。
 // 2026-09-18：内置工具按前缀接受并丢弃（补齐 tool_search 等新类型），避免客户端升级即不可用。
 // 2026-09-18：只对"能力/状态"类字段报错（background/store/previous_response_id/
 //
-//	服务端工具），风格与提示类字段（text.verbosity、truncation、allowed_tools、
-//	未知历史项）一律接受并忽略，避免客户端升级反复炸在 400 上。
+//	服务端工具）；2026-09-25 起自动截断/不支持推理语义明确拒绝，工具约束实际执行。
 //
 // 2026-09-18：工具白名单是执行约束，校验 mode 和引用结构，不能静默放宽为任意工具。
 // 2026-09-18：拒绝无法区分的重复工具身份，避免名称映射和参数 schema 被覆盖。
@@ -168,14 +168,15 @@ func requestValidationTools(value any, path string, responses bool) error {
 // 就会带上 web_search，整条请求拒绝会让客户端完全不可用。
 //
 // 两类区别对待：
-//   - 客户端默认可能携带的声明（web_search / tool_search）：兼容接受，但网关不执行，
+//   - 客户端默认可能携带的声明（web_search / tool_search / image_generation）：兼容接受，但网关不执行，
 //     通过能力发现及响应提示明确告知；拒绝默认声明会使整个会话不可用。
-//   - 需要服务端能力、用户显式声明的（file_search / mcp / image_generation 等）：
-//     继续明确报错。静默丢弃会让用户以为文件检索/图片生成在生效，比报错更难排查。
+//   - 其它服务端能力（file_search / mcp 等），以及强制执行上述内置工具：
+//     继续明确报错。声明的过滤始终通过响应提示和能力发现告知。
 var unimplementedBuiltinTools = map[string]bool{
 	"web_search":         true,
 	"web_search_preview": true,
 	"tool_search":        true,
+	"image_generation":   true,
 }
 
 // builtinToolPrefixes 已知内置工具族：官方会发布带日期后缀的版本变体
@@ -572,8 +573,9 @@ func requestValidationResponsesInput(value any) error {
 			// Other JSON outputs remain compatible: responsesToolOutput
 			// serializes maps/numbers/booleans without dropping their value.
 		case "reasoning":
-			// Optional reasoning/encrypted history is not required to answer
-			// the full message history supplied by current Codex clients.
+			if err := validateReasoningReplay(item, path); err != nil {
+				return err
+			}
 		case "item_reference":
 			// 指向服务端保存的内容项：网关无状态，取不到内容，必须让客户端改传完整历史。
 			return fmt.Errorf("%s.type %q is not supported; include full message and function/custom tool history", path, kind)
@@ -658,7 +660,10 @@ func validateResponsesOptions(object map[string]json.RawMessage, req *responsesR
 		}
 	}
 	// truncation 是"上下文超限时怎么办"的策略提示。网关本身不保存会话，auto 与 disabled
-	// 在行为上只差上游报错时机，因此按声明接受、不转发，避免客户端带上默认值时整条 400。
+	// 语义不同：auto 会删除历史；未实现时必须明确拒绝，不能当成 disabled。
+	if truncation, _ := fields["truncation"].(string); truncation != "" && truncation != "disabled" {
+		return fmt.Errorf("truncation=%q is not supported; use disabled and send complete history or a client-generated summary", truncation)
+	}
 	for _, key := range []string{"metadata", "client_metadata", "reasoning", "text"} {
 		if value := fields[key]; value != nil {
 			if _, err := requestValidationObject(value, key); err != nil {
@@ -667,6 +672,11 @@ func validateResponsesOptions(object map[string]json.RawMessage, req *responsesR
 		}
 	}
 	if reasoning, ok := fields["reasoning"].(map[string]any); ok {
+		for key, value := range reasoning {
+			if key != "effort" && key != "summary" && value != nil {
+				return fmt.Errorf("reasoning.%s is not supported; only effort and summary can be applied by this gateway", key)
+			}
+		}
 		for _, key := range []string{"effort", "summary"} {
 			if value, present := reasoning[key]; present {
 				if err := requestValidationString(value, "reasoning."+key, true); err != nil {
@@ -720,4 +730,16 @@ func validateResponsesOptions(object map[string]json.RawMessage, req *responsesR
 		return err
 	}
 	return requestValidationResponsesInput(fields["input"])
+}
+
+func validateReasoningReplay(item map[string]any, path string) error {
+	if value := item["encrypted_content"]; value != nil {
+		if err := requestValidationString(value, path+".encrypted_content", false); err != nil {
+			return err
+		}
+		if encrypted, _ := value.(string); encrypted != "" && responsesReasoningText(item) == "" {
+			return fmt.Errorf("%s.encrypted_content cannot be replayed without readable reasoning; include readable history or a client-generated summary", path)
+		}
+	}
+	return nil
 }

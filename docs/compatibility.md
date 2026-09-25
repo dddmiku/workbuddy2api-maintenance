@@ -2,6 +2,8 @@
 
 网关适配 `/v1/responses` 与 `/v1/chat/completions`，把请求转换为上游格式，并把结果还原给客户端。请求结构可以接受，不代表选定的上游模型、账号或渠道一定支持该能力。
 
+v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另外两种协议见 [Anthropic messages](anthropic-messages.md) 与 [Gemini](gemini.md)，nf 地址填写见 [六模式指南](narrafork.md)。
+
 ## Responses
 
 | 能力 | 当前行为 |
@@ -17,7 +19,9 @@
 | `text.verbosity` | 接受有效字符串声明但不转发；上游没有对应的风格开关 |
 | `reasoning.effort` / `summary` | 转发，具体可用档位由模型决定 |
 | `prompt_cache_key` | 保留；它不是服务端历史存储 |
-| `truncation` | 接受有效声明但不实现本地自动截断；是否接受上下文由上游决定 |
+| `truncation` | 省略/disabled 保留完整历史；auto 与其它未支持策略返回 400 |
+| `reasoning.context` / `mode` | 不支持，明确拒绝非空语义设置，不原样回显为已执行 |
+| 仅含原生 `encrypted_content` 的 reasoning | 无法恢复可读内容时返回 400；有可读推理的历史继续保留 |
 | 未知历史 item 类型 | 忽略其不支持的元数据，不把它提升为用户消息或聊天正文 |
 | 未知内容块类型 | Responses 内容适配器返回 400，避免接受后静默丢失正文 |
 | `previous_response_id`、`store=true`、`background=true` | 不支持，返回 400 |
@@ -31,9 +35,9 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 
 | 选择方式 | 成功完成时的约束 |
 |---|---|
-| `auto` | 模型可返回正文或工具调用 |
+| `auto` | 模型可返回正文或已声明工具调用；没有声明时不允许幻觉工具 |
 | `none` | 不得返回工具调用 |
-| `required` | 至少声明一个可执行工具，且成功结果必须包含调用 |
+| `required` | 至少声明一个可执行工具，且成功结果必须包含声明集合内的调用 |
 | 指定 function/custom | 必须恰好调用一次所指定的工具 |
 | `allowed_tools` | 只向上游提供选中的工具，并检查返回调用没有超出该子集；mode 支持 auto 或 required |
 
@@ -53,18 +57,18 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 
 `strict:true` 函数参数按声明的 JSON Schema 校验，非法 schema 或外部 schema 引用在请求阶段拒绝。`strict:false` 或未声明 strict 的函数保持尽力模式，不额外套用严格参数 schema；工具名称、参数形状和完整性仍按相应协议路径检查。
 
-工具参数完整性在本次上游流的 `[DONE]` 或合法 EOF 收尾时校验。早到的 `finish_reason` 后仍可接收参数增量或完整消息快照；正文、参数和已观测用量继续流式发送，成功结束标记在校验通过后发送一次。这样既能接住迟到的完整参数，也不会先宣告成功再报告残参或上游错误。真正缺失、残缺或不是合法 JSON 的参数仍返回错误，不自动补写或猜测工具操作；`length`、`content_filter` 保留原有不完整语义。
+工具参数完整性在本次上游流的 `[DONE]` 或合法 EOF 收尾时校验。早到的 `finish_reason` 后仍可接收参数增量或完整消息快照；正文和思考继续流式发送，工具身份和参数在整组校验通过后才交付，成功结束标记只发送一次。缺失、残缺、非 JSON 对象参数、重复调用身份和未声明工具都会失败，不自动猜测工具操作。`length`、`content_filter` 保留不完整状态和已有正文，但不交付未完成工具。
 
 `text.format=json_schema` 检查最终文本是否匹配 schema；`json_object` 要求完整 JSON 对象，不能带 Markdown 围栏或尾随文字。可以先返回工具调用，随后再给最终结构化文本。纯拒答以及明确的 length/content_filter 不完整结果有独立语义，不会被 required 或指定工具约束强改成工具违约。
 
 ## 内置工具的边界
 
-`web_search`、`tool_search` 及其版本后缀声明可以出现在两种接口中，但会从出站工具列表过滤。接受声明只用于兼容客户端默认元数据，不代表网关已实现联网搜索、工具发现或客户端内置工具执行。
+`web_search`、`tool_search` 及其版本后缀声明，以及 nf 默认的 `image_generation` 声明可以出现在两种接口中，但会从出站工具列表过滤。接受声明只用于兼容客户端默认元数据，不代表网关已实现联网搜索、工具发现或图片生成。过滤通过 `X-WB2API-Ignored-Tools`、Warning 和能力接口明确说明。
 
 - 过滤后没有可执行工具，且选择为省略、auto 或 none 时，可移除无意义的工具控制字段。
 - 只剩不可执行内置工具却要求 required，或强制选择被过滤的工具时，前置返回 400，不发送上游请求，也不静默降级为 auto。
 - 混合声明中的 function/custom 仍按工具选择规则处理。
-- 需要服务端能力的 file_search、mcp、image_generation、computer_use、code_interpreter、local_shell 等内置类型不受支持，返回明确错误。
+- 需要服务端能力的 file_search、mcp、computer_use、code_interpreter、local_shell 等内置类型不受支持，返回明确错误。默认 image_generation 声明可过滤，强制选择它仍拒绝。
 
 这里区分的是工具的 type；用户声明的普通 function 不会仅因名称类似内置工具就被当成内置类型。
 
@@ -90,9 +94,9 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 
 ## Chat Completions
 
-直接 Chat 支持普通消息、function 工具和兼容的 legacy `functions/function_call` 形态。`response_format` 支持 text、json_object、json_schema；存在工具选择、严格参数或结构化输出要求时，复用上述成功完成校验，并逐个检查返回的 choice。
+直接 Chat 支持普通消息、function 工具和兼容的 legacy `functions/function_call` 形态。`response_format` 支持 text、json_object、json_schema。所有请求都复用上述工具完成校验，并逐个检查返回的 choice；无工具声明也不会跳过校验。
 
-流式请求中的正文、refusal 和工具参数增量保持实时输出。需要契约校验或别名还原时，仅推迟成功的 finish、末尾 usage 和 `[DONE]`；完整结果校验后再发终态。迟到的上游错误保留错误信封，不先发成功结束再补报错。非流式输出违约返回 502。
+流式请求中的正文、思考和 refusal 保持实时输出；工具身份、参数、成功 finish、末尾 usage 和 `[DONE]` 在完整校验后交付。按片段进展发送保活，避免缓冲工具时长时间没有下行数据。迟到的上游错误保留错误信封，不先发可执行参数再补报错。非流式输出违约返回 502，截断结果同样不附带工具负载。
 
 已经发出的增量无法撤回，因此调用方必须检查最终状态或流内错误。收到 HTTP 200 或若干正文片段不能视为完整成功。Chat 的其他结构合法的内容形态可继续交给选定上游处理，不等同于网关保证该模态可用。
 
@@ -102,7 +106,7 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 - 输出上限或内容过滤截断：`response.incomplete`，携带 `incomplete_details`。
 - 上游流错误、意外结束或输出契约不满足：`response.failed` 或相应 HTTP 错误。
 - refusal 按拒答字段和 `response.refusal.delta/done` 保留，不伪装成普通正文，也不把纯拒答当作缺少必需工具。
-- 不完整或无效的工具调用不会作为可执行的成功 `output_item.done` 交付。
+- 不完整或无效工具的身份/参数不会通过 delta、done 或最终 output 交付，不仅是省略成功 done。
 - `tool_calls/function_call` 结束原因没有实际调用时，返回 missing_tool_call 失败。
 - 非数组 tool_calls 是格式错误；null 或空数组配合正常正文结束仍可接受。
 
@@ -120,7 +124,7 @@ Responses 的同一 output item 只发送一次 `response.output_item.added`，�
 
 ## 思考模式的推理回灌（上游 11155）
 
-Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 时，网关不能解密并恢复推理原文。
+Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 而没有可读内容时，网关返回明确错误，不把密文默默换成空串。nf 自己先把推理转成普通正文的情况见 [客户端边界](narrafork.md#nf-077-的已知边界)。
 
 转换层会合并连续 assistant 片段，保留正文、多模态内容、工具调用及可用推理内容，兼容对消息形状敏感的上游。11155 不能单独证明是某一个字段缺失，也可能涉及历史消息结构；应检查客户端实际发送的历史形状，而不是把所有情况归结为模型能力或账号故障。
 

@@ -6,18 +6,22 @@
 
 | 模块 | 职责 |
 |---|---|
-| `cmd/server`、`internal/server` | `/v1/` 协议入口、鉴权、转换、完整性校验、流式写出 |
+| `cmd/server`、`internal/server` | `/v1/`、`/v1beta/` 协议入口、鉴权、转换、完整性校验、流式写出 |
 | `internal/pool`、`internal/session`、`internal/upstream` | 统一调度、会话隔离、上游连接、错误与限流策略 |
 | `internal/usage`、`internal/runlog` | 原始消费账本、失败/缺失状态、有界滚动日志 |
 | `panel/assets.go`、`internal/panelruntime` | 内嵌资源、私有 Python 子进程、`/admin/` 代理及生命周期 |
 | `panel/native_runtime.py` | 仅允许已列出的登录、积分、日志、同版本重载操作 |
 | `internal/hotupdate` | 私有下载、整包校验、候选就绪、监听器交接与旧进程收尾 |
 
-三个协议都进入公共 chat 执行模块，不各自复制换号或记账循环。原始用量在响应翻译前观察；原生 Chat 的展示过滤发生在工具契约校验之后。协议边界详见 [agent 接入](agent-compatibility.md)。
+四个协议都进入公共 chat 执行模块，不各自复制换号或记账循环。原始用量在响应翻译前观察；原生 Chat 的展示过滤发生在工具契约校验之后。协议边界详见 [agent 接入](agent-compatibility.md)。
+
+工具身份和参数在整组校验后才交付，正文/思考保持流式。`finishResponseWriters` 先收尾外层校验，再收尾 messages/Gemini 等输出适配器，最后检查网络 writer；这一步发生在公共记账前。适配器收尾幂等，不重复发成功终态，不因最后一帧写失败丢掉实际消费。
 
 管理台资源只从 `panel/assets.go` 的固定清单嵌入，运行时释放到私有临时目录，通过权限为 `0600` 的 Unix socket 通信。管理凭据继续使用原格式。入口校验可信代理后重建转发头，子进程没有宿主 Docker 控制权限。
 
 配置使用 `./config:/app/config`，实际文件为 `/app/config/config.json`；`auths`、`auths-trash`、`data`、`panel-data` 分别挂载。运行身份为 `10001:10001`。运行包和临时面板资源不包含这些持久化目录。
+
+v2.3.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历史双容器部署文件，不是当前启动入口；现有统一运行版无需再次做迁移。
 
 ## 完整运行包
 
@@ -37,6 +41,8 @@
 验证后的候选进程启动同版面板并继承公共及管理监听器；完整就绪后才提交 `current`。失败回收候选、保留旧版本。旧请求、任务和状态提交按统一 15 分钟预算收尾，Compose 留出 16 分钟停止宽限。配置重载复用这一流程；首次两容器迁移仍使用完整镜像与维护窗口。
 
 ## 私有构建与校验
+
+根 `VERSION` 记录本轮发行目标 `v2.3.0`，面板元数据为 `2.3.0`。Go 的实际版本、提交和时间由构建参数注入；未注入时仍为 `dev`。本地正式构建从 `VERSION` 读取，tag 构建使用对应 tag；手动非 tag 的 CI 构建保持开发标识。目标版本文件不替代实际二进制和运行清单核验。
 
 `.github/workflows/build.yml` 仅允许 `dddmiku/workbuddy2api-maintenance`，同时检查事件中的私有标识和 GitHub API 的当前可见性。入口只有手动运行和版本 tag。每次上传产物前再次检查仓库仍为私有；权限仅为仓库内容读取，不拥有包或 Release 发布权限。
 
@@ -58,8 +64,8 @@ ai 治理是另一个默认关闭的手动流程。只有同时允许外发和�
 
 | 主要参考 | 本项目借鉴的设计 |
 |---|---|
-| new-api `d04c118c8803f49e0c9bab74dcf5b5efeab9464a` | 流式生命周期、单次写出限时、协议适配边界、原始用量与展示分离 |
-| sub2api `a3eb7ef302961cba716dc78b39b93b60c467db0e` | 模型可见性、能力声明、工具块往返、错误恢复与上下文超限语义 |
+| new-api `d04c118c8803f49e0c9bab74dcf5b5efeab9464a` | 流式生命周期、Gemini 格式与历史配对、协议适配边界、原始用量与展示分离 |
+| sub2api `a3eb7ef302961cba716dc78b39b93b60c467db0e` | 统一鉴权与模型可见性、SSE 心跳兼容、能力声明、工具块往返、错误恢复与上下文超限语义 |
 | workbuddy2api-panel `dbd7c6800ed8071d7dd617d456b6041294781fee` | 辅助对照同源面板功能和单服务部署取舍 |
 
 参考快照时间为 2026-09-25。分别保留其 AGPL-3.0、LGPL-3.0、MIT 许可边界；本轮按本项目模块独立实现，没有直接并入前两个项目的源码。尤其没有照搬默认模型窗口、原生 compact 或完整 Anthropic 平台能力。

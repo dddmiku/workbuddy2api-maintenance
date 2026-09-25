@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：接入Gemini共享鉴权/调度，并在记账前收尾全部输出适配器，防止最终写失败被记为成功。
 // 2026-09-25：补齐模型详情与双协议发现鉴权，未知上下文不填假值；统一限制慢客户端写出并告知兼容过滤。
 // 2026-09-25：超限保持历史及会话绑定，成本统计统一读取上游实际用量，不再给客户端补写未处理的token。
 // 2026-09-25：流内超限与循环重试后的超限保持真实错误信号，不解绑会话、不覆盖已观测用量。
@@ -179,8 +180,14 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.withDecodedRequest(h.responses)))
 	h.mux.HandleFunc("POST /v1/messages", h.messagesEntry)
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.messagesEntry)
-	h.mux.HandleFunc("GET /v1/models", h.withDiscoveryAuth(h.models))
-	h.mux.HandleFunc("GET /v1/models/{model}", h.withDiscoveryAuth(h.model))
+	h.mux.HandleFunc("POST /v1beta/models/{modelAction}", h.withGeminiProtocol(h.geminiContent, true))
+	h.mux.HandleFunc("POST /v1/models/{modelAction}", h.withGeminiProtocol(h.geminiContent, true))
+	h.mux.HandleFunc("GET /v1beta/models", h.withGeminiProtocol(h.geminiModels, false))
+	h.mux.HandleFunc("GET /v1beta/models/{model}", h.withGeminiProtocol(h.geminiModels, false))
+	h.mux.HandleFunc("POST /v1beta/interactions", h.withGeminiProtocol(h.unsupportedGeminiTransport, false))
+	h.mux.HandleFunc("POST /v1/interactions", h.withGeminiProtocol(h.unsupportedGeminiTransport, false))
+	h.mux.HandleFunc("GET /v1/models", h.modelProtocolDiscovery(h.models))
+	h.mux.HandleFunc("GET /v1/models/{model}", h.modelProtocolDiscovery(h.model))
 	h.mux.HandleFunc("GET /v1/capabilities", h.withDiscoveryAuth(h.capabilities))
 	h.mux.HandleFunc("GET /status", h.withAccountAdmin(h.status))
 	// 排程任务自省与手动触发（账户管理面板的「定时任务」页）。
@@ -887,15 +894,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.requestID = requestID(r)
 	defer st.done()
 	defer func() {
-		// Responses emits its final client-facing frame after Chat returns. Finish
-		// it before accounting so a disconnect on that last write remains visible.
-		if response, ok := w.(*responsesWriter); ok {
-			response.finish()
-			if response.writeErr != nil || response.streamErr != nil || response.status >= 400 {
-				st.failed = true
-				if st.status < 400 {
-					st.status = http.StatusBadGateway
-				}
+		// Protocol adapters may buffer their final JSON/SSE frame. Walk the
+		// complete chain before accounting, including adapters below a tool
+		// contract or visibility wrapper.
+		if err := finishResponseWriters(w); err != nil {
+			st.failed = true
+			if st.status < 400 {
+				st.status = http.StatusBadGateway
 			}
 		}
 		if r.Context().Err() != nil {

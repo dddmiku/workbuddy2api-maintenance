@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：所有选择模式以声明工具为边界，避免 auto/required 放行幻觉工具；只回显实际支持的推理选项。
 // 2026-09-16：映射并校验 Responses 的输出格式，禁用外部 schema 加载，防止格式约束静默丢失。
 // 2026-09-18：text.verbosity 改为接受并忽略：新版 Codex 默认携带，上游没有对应开关，
 //
@@ -76,6 +77,7 @@ func (req *responsesRequest) prepareToolPolicy(tools []any) ([]any, any, error) 
 			policy.schemas[name] = schema
 		}
 	}
+	policy.allowed = available
 	resolve := func(reference map[string]any) (string, error) {
 		name, _ := reference["name"].(string)
 		name = upstreamToolName(req.toolAliasIndex(), namespaceOf(reference), name)
@@ -287,7 +289,13 @@ func (req *responsesRequest) applyEcho(obj map[string]any) {
 		obj["parallel_tool_calls"] = *req.ParallelToolCalls
 	}
 	if req.Reasoning != nil {
-		obj["reasoning"] = req.Reasoning
+		reasoning := map[string]any{}
+		for _, key := range []string{"effort", "summary"} {
+			if value, ok := req.Reasoning[key]; ok {
+				reasoning[key] = value
+			}
+		}
+		obj["reasoning"] = reasoning
 	}
 	if req.output != nil {
 		obj["text"] = map[string]any{"format": req.output.format}

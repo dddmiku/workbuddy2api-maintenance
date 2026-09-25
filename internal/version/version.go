@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：发行目标统一记录在根 VERSION；保留未注入构建的 dev 身份，避免误报正式版本。
 // 2026-09-17：新增版本元数据：构建时经 ldflags 注入，供 /healthz、/update/status
 //
 //	与自更新比对使用。
@@ -6,9 +7,10 @@ package version
 
 import "strings"
 
-// 构建期注入（Dockerfile / Makefile 的 -ldflags "-X ...=..."）。未注入时是开发态默认值。
+// 构建期注入（Dockerfile / 私有工作流的 -ldflags "-X ...=..."）。根 VERSION
+// 记录源码的发行目标；未注入时仍使用开发态默认值，不据目标版本冒充已发布二进制。
 var (
-	// Version 语义化版本号，例如 v1.2.0。
+	// Version 是实际构建版本；本轮发行目标例如 v2.3.0。
 	Version = "dev"
 	// Commit 构建来源提交（短 SHA 或完整 SHA）。
 	Commit = "unknown"

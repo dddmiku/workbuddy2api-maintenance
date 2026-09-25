@@ -1,12 +1,14 @@
 # workbuddy2api
 
-将已授权的 WorkBuddy / CodeBuddy 账号接入常用 ai 工具的自托管中转。网关与管理台合在一个镜像、一个容器内：同一端口提供 `/v1/` 接口和 `/admin/` 页面。
+将已授权的 WorkBuddy / CodeBuddy 账号接入常用 ai 工具的自托管中转。网关与管理台合在一个镜像、一个容器内：同一端口提供 `/v1/`、`/v1beta/` 接口和 `/admin/` 页面。
+
+本轮源码版本为 **v2.3.0**，新增 Gemini 生成接口并完善四协议工具校验。见 [版本变更](CHANGELOG.md) 与 [NarraFork 六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
 
 维护仓库为私有的 [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
 
 ## 能力
 
-- OpenAI chat、Responses 与 Anthropic messages 共用鉴权、账号池、会话隔离、错误处理和原始用量账本。
+- OpenAI chat、Responses、Anthropic messages 与 Gemini generate content 共用鉴权、账号池、会话隔离、错误处理和原始用量账本。
 - 支持流式与非流式响应、函数工具、Responses 自定义工具和命名空间桥接、JSON schema 校验。
 - 管理台提供账号、密钥复制、模型白名单、到期时间、重复推理保护、任务、日志和用量管理。
 - Go 主程序内嵌面板资源并托管 Python 子进程；以 `10001:10001` 运行，不挂载宿主 Docker socket。
@@ -25,6 +27,9 @@ git clone https://github.com/dddmiku/workbuddy2api-maintenance.git workbuddy2api
 cd workbuddy2api
 sudo install -d -o 10001 -g 10001 -m 700 config auths auths-trash data panel-data
 sudo install -o 10001 -g 10001 -m 600 config.example.json config/config.json
+export VERSION="$(cat VERSION)"
+export COMMIT="$(git rev-parse HEAD)"
+export BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker compose build
 docker compose up -d
 ```
@@ -68,6 +73,7 @@ docker compose run --rm --entrypoint /bin/bash wb2api /app/login.sh --realm=cn
 | 模型 | `/v1/models` 中的完整 id，保留 `cn:` 或 `global:` 前缀 |
 | Codex 接口类型 | `responses` |
 | Anthropic 兼容路径 | `/v1/messages`，接受 `x-api-key` 或显式 Bearer |
+| Gemini Base URL | `http://127.0.0.1:7863/v1beta`；选择 generate content 运输，使用 `x-goog-api-key` |
 
 以下示例读取已设置的 `WORKBUDDY_API_KEY`：
 
@@ -78,7 +84,7 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
   -H "Authorization: Bearer $WORKBUDDY_API_KEY"
 ```
 
-模型详情 `/v1/models/{model}` 与列表使用相同白名单。`X-Request-ID` 可与日志 `rid=` 关联。工具终态、计量与压缩语义见 [agent 接入](docs/agent-compatibility.md)。
+模型详情与列表使用相同白名单。Gemini 使用 `/v1beta/models`；六种 nf 模式的完整地址和鉴权见 [配置指南](docs/narrafork.md)。`X-Request-ID` 可与日志 `rid=` 关联。工具终态、计量与压缩语义见 [agent 接入](docs/agent-compatibility.md)。
 
 ## 密钥、用量与升级
 

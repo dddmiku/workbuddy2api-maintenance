@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：未实现的自动截断由 NF 专项回归明确拒绝，不再作为兼容成功样例。
 // 2026-09-16：覆盖入口坏类型与不支持能力，并保留空消息、历史配对兼容、custom 工具及三份真实 Codex 捕获。
 // 2026-09-17：公开的 Codex 转换测试改用最小合成夹具，真实捕获不随源码发布。
 package server
@@ -148,7 +149,6 @@ func TestValidateResponsesOptionsAcceptsCompatibleBodies(t *testing.T) {
 		// 风格/提示类字段：接受声明，网关不转发也不报错。新版 Codex 默认携带这些字段。
 		{"text_verbosity", `{"model":"m","input":"hi","text":{"verbosity":"low"}}`},
 		{"text_verbosity_with_format", `{"model":"m","input":"hi","text":{"verbosity":"high","format":{"type":"text"}}}`},
-		{"automatic_truncation", `{"model":"m","input":"hi","truncation":"auto"}`},
 		{"empty_truncation", `{"model":"m","input":"hi","truncation":""}`},
 		{"allowed_tools_choice", `{"model":"m","input":"hi","tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"lookup"}]}}`},
 		{"unknown_history_items", `{"model":"m","input":[{"type":"tool_search_call","call_id":"c1","query":"x"},{"type":"tool_search_output","call_id":"c1","output":"y"},{"type":"web_search_call","id":"ws1","status":"completed"},{"role":"user","content":"hi"}]}`},

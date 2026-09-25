@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：整组工具校验后才交付身份/参数，封堵 NF 提前执行；限制缓冲并在工具生成期间保活，拒绝密文静默丢失。
 // 2026-09-25：告知默认内置工具的兼容过滤，保留网络 flush 错误，防止客户端没收到终态却记成功。
 // 2026-09-25：拒绝无法解读的原生压缩历史与服务端压缩配置，防止丢上下文后仍返回成功。
 // 2026-09-25：流式上下文超限返回标准失败事件，供客户端标记窗口已满并在下一轮压缩；不伪造用量。
@@ -403,6 +404,9 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			})
 			continue
 		case "reasoning":
+			if err := validateReasoningReplay(m, fmt.Sprintf("input[%d]", index)); err != nil {
+				return nil, stats, err
+			}
 			stats.Items++
 			if text := responsesReasoningText(m); text != "" {
 				stats.WithText++
@@ -1122,6 +1126,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────── 写出口翻译 ───────────────────────────
 
 const (
+	protocolBufferLimit      = 16 << 20
+	protocolToolLimit        = 4096
+	protocolProgressInterval = 5 * time.Second
+
 	evCreated      = "response.created"
 	evInProgress   = "response.in_progress"
 	evItemAdded    = "response.output_item.added"
@@ -1179,15 +1187,18 @@ type responsesWriter struct {
 	rsOutIdx  int
 	msgOutIdx int
 
-	text         strings.Builder
-	refusal      strings.Builder
-	messageParts []string
-	legacyCallID string
-	reason       strings.Builder
-	calls        map[int]*respToolCall
-	order        []int
-	usage        map[string]any
-	finishReason string
+	text           strings.Builder
+	refusal        strings.Builder
+	messageParts   []string
+	legacyCallID   string
+	reason         strings.Builder
+	calls          map[int]*respToolCall
+	order          []int
+	toolBytes      int
+	toolsValidated bool
+	lastWrite      time.Time
+	usage          map[string]any
+	finishReason   string
 
 	msgOpen        bool
 	rsOpen         bool
@@ -1209,7 +1220,21 @@ func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responses
 	}
 }
 
-func (rw *responsesWriter) Header() http.Header { return rw.hdr }
+func (rw *responsesWriter) Header() http.Header         { return rw.hdr }
+func (rw *responsesWriter) Unwrap() http.ResponseWriter { return rw.inner }
+func (rw *responsesWriter) FinishResponse() error {
+	rw.finish()
+	if rw.writeErr != nil {
+		return rw.writeErr
+	}
+	if rw.mode == 1 {
+		return rw.CompletionError()
+	}
+	if rw.streamErr != nil {
+		return fmt.Errorf("%v: %v", rw.streamErr["code"], rw.streamErr["message"])
+	}
+	return nil
+}
 
 func (rw *responsesWriter) WriteHeader(code int) {
 	rw.status = code
@@ -1249,6 +1274,9 @@ func (rw *responsesWriter) Write(p []byte) (int, error) {
 	}
 	if rw.writeErr != nil {
 		return 0, rw.writeErr
+	}
+	if rw.streamErr != nil && rw.streamErr["code"] == "upstream_response_too_large" {
+		return 0, fmt.Errorf("upstream_response_too_large: %v", rw.streamErr["message"])
 	}
 	return len(p), nil
 }
@@ -1320,6 +1348,7 @@ func (rw *responsesWriter) finishJSON() {
 	var chat map[string]any
 	if json.Unmarshal(rw.buf, &chat) != nil {
 		rw.status = http.StatusBadGateway
+		rw.failOutput("upstream_parse", "upstream response is not valid JSON")
 		// 解析不了就原样透传，别把本来能用的响应弄坏。
 		writeOpenAIError(rw.inner, http.StatusBadGateway, "upstream_parse", "upstream response is not valid JSON")
 		return
@@ -1329,6 +1358,7 @@ func (rw *responsesWriter) finishJSON() {
 		rw.req.applyEcho(result)
 		if err := rw.validateJSONCompletion(chat, result); err != nil {
 			rw.status = http.StatusBadGateway
+			rw.failOutput("response_contract_violation", err.Error())
 			writeOpenAIError(rw.inner, http.StatusBadGateway, "response_contract_violation", err.Error())
 			return
 		}
@@ -1376,11 +1406,26 @@ func (rw *responsesWriter) emit(evType string, payload map[string]any) {
 		return
 	}
 	_, rw.writeErr = fmt.Fprintf(rw.inner, "event: %s\ndata: %s\n\n", evType, raw)
+	rw.lastWrite = time.Now()
+	rw.Flush()
+}
+
+// Called only on upstream progress; there is no concurrent writer or timer.
+func (rw *responsesWriter) toolProgress(force bool) {
+	if rw.writeErr != nil || (!force && time.Since(rw.lastWrite) < protocolProgressInterval) {
+		return
+	}
+	_, rw.writeErr = fmt.Fprint(rw.inner, ": keepalive\n\n")
+	rw.lastWrite = time.Now()
 	rw.Flush()
 }
 
 // feed 累积字节并按空行切帧。
 func (rw *responsesWriter) feed(p []byte) {
+	if len(p) > protocolBufferLimit-len(rw.buf) {
+		rw.failOutput("upstream_response_too_large", "upstream event exceeds the adapter buffer limit")
+		return
+	}
 	rw.buf = append(rw.buf, p...)
 	for {
 		i := bytes.Index(rw.buf, []byte("\n\n"))
@@ -1399,6 +1444,10 @@ func (rw *responsesWriter) handleFrame(frame string) {
 	}
 	for _, line := range strings.Split(frame, "\n") {
 		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, ":") {
+			rw.toolProgress(true)
+			continue
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -1615,6 +1664,8 @@ func (rw *responsesWriter) openCall(call *respToolCall) {
 		return
 	}
 	call.opened = true
+	call.outIdx = rw.nextIdx
+	rw.nextIdx++
 	prefix := "fc_"
 	if call.custom {
 		prefix = "ctc_"
@@ -1631,7 +1682,7 @@ func (rw *responsesWriter) failOutput(code, message string) {
 
 // flushReadyCalls 按首次出现顺序开出工具；早到的参数仅发送一次，custom 参数留到 input 收尾。
 func (rw *responsesWriter) flushReadyCalls() {
-	if rw.streamErr != nil {
+	if rw.streamErr != nil || !rw.toolsValidated {
 		return
 	}
 	for _, index := range rw.order {
@@ -1669,8 +1720,11 @@ func (rw *responsesWriter) toolCallDelta(tcs []any) {
 		}
 		call := rw.calls[index]
 		if call == nil {
-			call = &respToolCall{outIdx: rw.nextIdx}
-			rw.nextIdx++
+			if len(rw.calls) >= protocolToolLimit {
+				rw.failOutput("upstream_response_too_large", "upstream exceeded the adapter tool count limit")
+				return
+			}
+			call = &respToolCall{outIdx: -1}
 			rw.calls[index] = call
 			rw.order = append(rw.order, index)
 		}
@@ -1679,6 +1733,13 @@ func (rw *responsesWriter) toolCallDelta(tcs []any) {
 				rw.failOutput("upstream_parse", "upstream changed a streamed tool call identity")
 				return
 			}
+			if call.callID == "" {
+				if len(value) > protocolBufferLimit-rw.toolBytes {
+					rw.failOutput("upstream_response_too_large", "tool metadata exceeds the adapter buffer limit")
+					return
+				}
+				rw.toolBytes += len(value)
+			}
 			call.callID = value
 		}
 		if fn, ok := tm["function"].(map[string]any); ok {
@@ -1686,6 +1747,13 @@ func (rw *responsesWriter) toolCallDelta(tcs []any) {
 				if call.name != "" && call.name != value {
 					rw.failOutput("upstream_parse", "upstream changed a streamed tool name")
 					return
+				}
+				if call.name == "" {
+					if len(value) > protocolBufferLimit-rw.toolBytes {
+						rw.failOutput("upstream_response_too_large", "tool metadata exceeds the adapter buffer limit")
+						return
+					}
+					rw.toolBytes += len(value)
 				}
 				call.name = value
 				call.custom = rw.req != nil && rw.req.customTools[value]
@@ -1697,11 +1765,20 @@ func (rw *responsesWriter) toolCallDelta(tcs []any) {
 					return
 				}
 				call.argumentsSeen = true
+				if len(args) > protocolBufferLimit-rw.toolBytes {
+					rw.failOutput("upstream_response_too_large", "tool arguments exceed the adapter buffer limit")
+					return
+				}
+				rw.toolBytes += len(args)
 				call.args.WriteString(args)
 			}
 		}
+		if rw.toolBytes > protocolBufferLimit {
+			rw.failOutput("upstream_response_too_large", "tool metadata exceeds the adapter buffer limit")
+			return
+		}
 	}
-	rw.flushReadyCalls()
+	rw.toolProgress(false)
 }
 
 func (rw *responsesWriter) legacyFunctionDelta(fn map[string]any) {
@@ -1730,7 +1807,7 @@ func (rw *responsesWriter) closeCalls() {
 		if !call.opened {
 			continue
 		}
-		// Codex 可把 output_item.done 当作工具执行信号；失败/截断只在最终响应保留 incomplete 项。
+		// 失败/截断不交付工具；只有已通过整组校验的调用才有可执行终态。
 		if rw.itemStatus() != "completed" {
 			call.opened = false
 			continue
@@ -1779,6 +1856,9 @@ func (rw *responsesWriter) CompletionError() error {
 	if rw.writeErr != nil {
 		return rw.writeErr
 	}
+	if rw.toolsValidated {
+		return nil
+	}
 	if rw.streamErr == nil && !rw.sawDone && rw.finishReason == "" {
 		rw.failOutput("upstream_truncated", "upstream stream ended without a completion marker")
 	}
@@ -1789,8 +1869,14 @@ func (rw *responsesWriter) CompletionError() error {
 		if rw.req != nil && rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(rw.order) > 1 {
 			rw.failOutput("parallel_tool_calls_violation", "model returned parallel tool calls despite parallel_tool_calls=false")
 		}
+		identities := map[string]bool{}
 		for _, index := range rw.order {
 			call := rw.calls[index]
+			if call.callID != "" && identities[call.callID] {
+				rw.failOutput("invalid_tool_call", "upstream reused a tool call identity")
+				break
+			}
+			identities[call.callID] = true
 			if err := validateResponseToolCall(call.name, call.args.String(), call.argumentsSeen); err != nil {
 				rw.failOutput("invalid_tool_call", err.Error())
 				break
@@ -1817,6 +1903,7 @@ func (rw *responsesWriter) CompletionError() error {
 					call.callID = newRespID("call_")
 				}
 			}
+			rw.toolsValidated = true
 			rw.flushReadyCalls()
 		}
 	}
@@ -1833,7 +1920,8 @@ func validateResponseToolCall(name, args string, argumentsSeen bool) error {
 	if !argumentsSeen {
 		return fmt.Errorf("upstream tool arguments must be a JSON string")
 	}
-	if strings.TrimSpace(args) != "" && !json.Valid([]byte(args)) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(args), &object) != nil || object == nil {
 		return fmt.Errorf("upstream ended with incomplete or invalid tool arguments")
 	}
 	return nil
@@ -1878,8 +1966,15 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 	if rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(calls) > 1 {
 		return fmt.Errorf("model returned parallel tool calls despite parallel_tool_calls=false")
 	}
+	identities := map[string]bool{}
 	for _, value := range calls {
 		call, _ := value.(map[string]any)
+		if id, _ := call["id"].(string); id != "" {
+			if identities[id] {
+				return fmt.Errorf("upstream reused a tool call identity")
+			}
+			identities[id] = true
+		}
 		fn, _ := call["function"].(map[string]any)
 		name, _ := fn["name"].(string)
 		args, ok := fn["arguments"].(string)
@@ -2133,7 +2228,7 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 			"id": newRespID("msg_"), "type": "message", "status": status,
 			"role": "assistant", "content": content,
 		})
-		if tcs := responseToolCalls(msg); len(tcs) > 0 {
+		if tcs := responseToolCalls(msg); status == "completed" && len(tcs) > 0 {
 			for _, t := range tcs {
 				tm, ok := t.(map[string]any)
 				if !ok {

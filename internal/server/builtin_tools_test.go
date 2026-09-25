@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：NF 默认图片生成仅声明也兼容过滤，强制执行在 NF 专项回归中保持拒绝。
 // 2026-09-18：锁定内置工具的"接受但丢弃"契约：客户端（Codex 0.156）默认带 tool_search，
 // 拒绝会让整个会话不可用；未知类型仍必须明确拒绝而不是静默放过。
 package server
@@ -35,7 +36,7 @@ func TestBuiltinToolsAreAcceptedAndDropped(t *testing.T) {
 
 func TestBuiltinToolFamiliesAcceptDatedVariants(t *testing.T) {
 	for _, kind := range []string{
-		"tool_search", "tool_search_2026_01_01", "web_search_2025_08_26",
+		"tool_search", "tool_search_2026_01_01", "web_search_2025_08_26", "image_generation",
 		"web_search_preview", "web_search_preview_2025_03_11",
 	} {
 		if !isUnimplementedBuiltinTool(kind) {
@@ -43,7 +44,7 @@ func TestBuiltinToolFamiliesAcceptDatedVariants(t *testing.T) {
 		}
 	}
 	for _, kind := range []string{"", "future_builtin", "function", "custom", "namespace", "toolsearch",
-		"file_search", "mcp", "image_generation", "computer_use", "local_shell"} {
+		"file_search", "mcp", "computer_use", "local_shell"} {
 		if isUnimplementedBuiltinTool(kind) {
 			t.Errorf("%q 不应被当成内置工具", kind)
 		}
@@ -54,11 +55,10 @@ func TestBuiltinToolFamiliesAcceptDatedVariants(t *testing.T) {
 // 仍然明确报错：静默丢弃会让用户以为这些能力在生效。
 func TestServerSideBuiltinToolsStayRejected(t *testing.T) {
 	cases := map[string]string{
-		"file_search":      `{"type":"file_search","vector_store_ids":["vs_1"]}`,
-		"mcp":              `{"type":"mcp","server_url":"https://example.invalid"}`,
-		"image_generation": `{"type":"image_generation"}`,
-		"computer_use":     `{"type":"computer_use"}`,
-		"local_shell":      `{"type":"local_shell"}`,
+		"file_search":  `{"type":"file_search","vector_store_ids":["vs_1"]}`,
+		"mcp":          `{"type":"mcp","server_url":"https://example.invalid"}`,
+		"computer_use": `{"type":"computer_use"}`,
+		"local_shell":  `{"type":"local_shell"}`,
 	}
 	for name, tool := range cases {
 		request := `{"model":"m","input":"hi","tools":[` + tool + `]}`

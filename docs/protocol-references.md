@@ -4,6 +4,16 @@
 
 ## 固定版本与许可证
 
+2026-09-25 本轮重点参考以下两个成熟项目；同源 panel 仅作辅助对照。固定快照用于复核，不表示后续默认分支始终相同。
+
+| 项目 | 固定提交 | 本轮用途与许可证 |
+|---|---|---|
+| [new-api](https://github.com/QuantumNous/new-api) | [d04c118c8803f49e0c9bab74dcf5b5efeab9464a](https://github.com/QuantumNous/new-api/commit/d04c118c8803f49e0c9bab74dcf5b5efeab9464a) | 主要参考：Gemini 请求/输出转换、工具历史配对、原子参数交付；AGPL-3.0 |
+| [sub2api](https://github.com/Wei-Shaw/sub2api) | [a3eb7ef302961cba716dc78b39b93b60c467db0e](https://github.com/Wei-Shaw/sub2api/commit/a3eb7ef302961cba716dc78b39b93b60c467db0e) | 主要参考：统一鉴权、模型权限、错误/用量、SSE 心跳兼容；LGPL-3.0 |
+| [workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | [dbd7c6800ed8071d7dd617d456b6041294781fee](https://github.com/linguo2625469/workbuddy2api-panel/commit/dbd7c6800ed8071d7dd617d456b6041294781fee) | 次要参考：同源面板与部署取舍；MIT |
+
+先前协议修复还使用了以下辅助参考，保留原固定提交：
+
 | 项目 | 固定提交 | 许可证范围 |
 |---|---|---|
 | [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) | [b773607e3e7756dc6020a291825e4eb08899595a](https://github.com/router-for-me/CLIProxyAPI/commit/b773607e3e7756dc6020a291825e4eb08899595a) | [MIT](https://github.com/router-for-me/CLIProxyAPI/blob/b773607e3e7756dc6020a291825e4eb08899595a/LICENSE) |
@@ -16,7 +26,9 @@
 
 | 主题 | 已读源码 | 本项目采用方式 |
 |---|---|---|
-| 流式工具状态与增量 | CLIProxyAPI [状态、待发送参数和已发长度][cli-delta]；LiteLLM [工具事件队列与增量补齐][lite-tools] | 名称与 call_id 就绪后建立 item；保留尚未发送的参数，避免早到内容丢失或重复发送 |
+| Gemini 入口与工具历史 | new-api [请求转换][na-gemini-request]、[输出转换][na-gemini-response] | 复用公共 chat 执行模块，保留业务 JSON；无 ID 历史按待配对顺序解析，孤立结果明确拒绝 |
+| Google 鉴权与心跳 | sub2api [密钥来源与优先级][sa-google-auth]、[SSE 兼容处理][sa-gemini-heartbeat] | 保留共享权限和模型过滤；Gemini 将缓冲期保活转换为不含假内容/用量的 JSON data 帧 |
+| 流式工具状态与增量 | CLIProxyAPI [状态、待发送参数和已发长度][cli-delta]；LiteLLM [工具事件队列与增量补齐][lite-tools] | 收集迟到名称/id/参数，整组校验后再建立对外 item；避免 nf 根据可解析的参数前缀提前执行 |
 | 终态与末尾 usage | CLIProxyAPI [将响应终态延后至 DONE][cli-terminal] | 直接 Chat 的约束包装保持正文实时输出，完整消费和校验后再发送成功 finish、末尾 usage 与 DONE |
 | 事件身份稳定 | LiteLLM [最终快照复用流式 item ID][lite-ids] | 增量、item.done 和最终 output 保持一致身份，不在收尾时另造一套调用标识 |
 | 长工具名与双向别名 | CLIProxyAPI [64 字节边界][cli-names]、[命名碰撞消歧][cli-collisions]、[tool_choice 共用名称解析][cli-choice] | 独立实现稳定摘要别名并保留 UTF-8 边界；覆盖顶层和命名空间工具、历史、指定工具选择及回程恢复 |
@@ -31,7 +43,8 @@
 - LiteLLM 的 [Chat 桥接状态映射][lite-status] 对缺失或未知 finish_reason 默认 completed，并由该桥接 [构造 ResponseCompletedEvent][lite-ids]；其 [原生 Responses 路径][lite-native-terminal] 则区分 completed、incomplete、failed。cc-switch 的 [不完整收尾][cc-tool-completion] 也存在事件名与内层状态分开的兼容表示。本项目保留独立的 response.incomplete / response.failed 语义。
 - LiteLLM 的 [流式文本选择][lite-choices] 明确只取第一 choice；本项目直接 Chat 的完成契约逐 choice 检查，不沿用“第一条代表全部”的假设。
 - LiteLLM 的 [schema 调整][lite-schema] 带 provider/model 条件，本项目不把这种特定后端兼容策略扩散成对所有 schema 的全局改写。
-- 参考项目可能实现 tool_search 或其他客户端桥接；本项目对 web_search/tool_search 只接受声明后过滤，没有据此新增搜索、工具发现、原生 CFG 或服务端工具执行能力。
+- new-api 所读路径对非法或非对象函数参数有包装兼容行为，本项目不把错误参数塞进另一个对象伪装合法调用；采用完整对象及声明 schema 校验。
+- 参考项目可能实现 tool_search 或其他客户端桥接；本项目对 web_search/tool_search/image_generation 只接受默认声明后过滤并提示，没有据此新增搜索、工具发现、图片生成、原生 CFG 或服务端工具执行能力。
 
 以上是指定源码路径的比较，不是对参考项目整体运行时行为的判定。
 
@@ -41,7 +54,16 @@
 
 实现变更由公开合成回归覆盖，例如 [协议约束与别名回归](../internal/server/protocol_diagnosis_test.go)、[Responses 输出完整性](../internal/server/responses_output_integrity_test.go) 和 [请求结构校验](../internal/server/request_validation_test.go)。测试不会用真实账号、个人会话或生产日志作为公开夹具。
 
+v2.3.0 增加 [nf 工具边界](../internal/server/nf_protocol_boundary_test.go)、[四协议入口与收尾](../internal/server/protocol_entry_test.go)、[Gemini 配置](../internal/server/gemini_request_test.go) 与 [保活](../internal/server/gemini_progress_test.go) 回归。原 nf 0.7.7 的请求构建/解析函数另在隔离环境回放：它不是 GUI 验证，也不会把回环假上游说成真实模型。
+
+OpenAI 的 [函数工具规范](https://developers.openai.com/api/docs/guides/function-calling)、[Responses 事件](https://developers.openai.com/api/reference/resources/responses/streaming-events) 与 [reasoning 说明](https://developers.openai.com/api/docs/guides/reasoning) 用于区分原生契约和兼容桥接。`truncation=auto`、原生 reasoning 密文、平台服务端工具不能因为参考项目有代码就宣称本站支持。
+
 这些协议处理不能替客户端判断整个任务是否完成，也不能保证模型在纯文字预告后一定继续调用工具。
+
+[na-gemini-request]: https://github.com/QuantumNous/new-api/blob/d04c118c8803f49e0c9bab74dcf5b5efeab9464a/relaykit/relayconvert/internal/gemini_chat/to_oai_chat_req.go#L16
+[na-gemini-response]: https://github.com/QuantumNous/new-api/blob/d04c118c8803f49e0c9bab74dcf5b5efeab9464a/relaykit/relayconvert/internal/oai_chat/to_gemini_chat_resp.go#L229
+[sa-google-auth]: https://github.com/Wei-Shaw/sub2api/blob/a3eb7ef302961cba716dc78b39b93b60c467db0e/backend/internal/server/middleware/api_key_auth_google.go#L224
+[sa-gemini-heartbeat]: https://github.com/Wei-Shaw/sub2api/blob/a3eb7ef302961cba716dc78b39b93b60c467db0e/backend/internal/service/gemini_sse_comment_compat.go#L9
 
 [cli-delta]: https://github.com/router-for-me/CLIProxyAPI/blob/b773607e3e7756dc6020a291825e4eb08899595a/internal/translator/openai/openai/responses/openai_openai-responses_response.go#L337-L399
 [cli-terminal]: https://github.com/router-for-me/CLIProxyAPI/blob/b773607e3e7756dc6020a291825e4eb08899595a/internal/translator/openai/openai/responses/openai_openai-responses_response.go#L763-L775

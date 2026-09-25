@@ -2,6 +2,12 @@
 
 `POST /v1/messages` 复用网关的账号调度、权限、原始计量和上游错误处理。官方 JavaScript SDK 的 `baseURL` 应指向站点根地址，由 SDK 添加 `/v1/messages`。`x-api-key` 可用于鉴权；显式 `Authorization` 始终优先，包括其值无效时。
 
+nf 的 Anthropic 兼容与 ClaudeCode 中转共用该入口，但 nf 自行追加的是 `/messages`，因此两者在 nf 中都填到 `/v1`。前者通常用 `x-api-key`，后者用 Bearer 并带 `?beta=true`。`beta=true` 不代表所有官方平台 beta 能力都可用，详见 [六模式配置](narrafork.md)。
+
+## nf 思考与上下文设置
+
+支持 nf 的精确保留请求 `context_management={"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`：它表示保留全部思考，不执行裁剪。其它主动清理/压缩/服务端上下文动作仍拒绝。`output_config.effort` 接受 low、medium、high、xhigh、max，后续按实际模型的既有规则处理，不伪造精确思考预算。
+
 ## 流式内容与工具
 
 正文和明文思考正常流式输出。工具调用先缓冲，直到上游整轮结束、全部工具身份及参数 JSON 都校验通过，再按工具顺序输出各自完整的 `content_block_start`、`content_block_delta`、`content_block_stop`，最后输出消息终态。
@@ -14,7 +20,7 @@
 
 ## 用量
 
-`message_start` 的计数是初始快照，尚无上游计量时为零；`message_delta.usage` 携带实际累计用量。客户端应按字段覆盖累计值，不把各帧相加。
+`message_start` 的计数是初始快照，尚无上游计量或缓存拆分尚未明确时不抢报普通输入；`message_delta.usage` 携带实际累计用量。客户端应按字段覆盖累计值，不把各帧相加。nf 0.7.7 会忽略部分合法零修正，因此不能把未知缓存拆分的总输入先当作普通输入发送；最终真实值不为补偿客户端而改写。
 
 Anthropic 的 `input_tokens` 表示普通输入，缓存读取和缓存创建分别报告。例如上游 OpenAI 口径总输入为 100、其中缓存读取 60 时，messages 输出 `input_tokens: 40` 与 `cache_read_input_tokens: 60`。思考已包含在输出总量时不再重复相加。
 
@@ -34,3 +40,5 @@ Anthropic 的 `input_tokens` 表示普通输入，缓存读取和缓存创建分
 对应 Go 测试为 `TestMessagesOfficialSDKContract`；设置 `WB2API_ANTHROPIC_SDK_CONTRACT` 指向已安装固定 SDK 的 `handler-contract.mjs` 后执行。未配置该外部验证依赖时，此项明确跳过；普通 Go 回归仍检查顺序内容块、全量参数校验与心跳。
 
 该验证覆盖标准 messages SDK 接口，不表示原生 Anthropic 服务端工具、存储、MCP、容器或所有 beta 功能均受支持。
+
+本轮还使用 nf 原始请求构建与解析函数做回环假上游验证。nf 的模型测试不发送完整 Agent 参数，短测试通过不能替代正式工具轮；nf 对部分 EOF/错误字段的处理也有自身限制。没有把这些回放写成完整 GUI 或本轮真实模型验证。

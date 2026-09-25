@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：合法工具回合必须先声明工具，再验证最终正文 schema 不误用于工具回合。
 // 2026-09-16：用真实 Codex 请求字段的最小形式锁定参数保真、结构化输出和异常终态。
 package server
 
@@ -136,7 +137,11 @@ func TestContractJSONLengthIsIncomplete(t *testing.T) {
 }
 
 func TestContractValidToolRoundDoesNotRequireFinalSchema(t *testing.T) {
-	names, _ := contractWriter(t, contractRequest, `{"choices":[{"index":0,"delta":{"content":"checking","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"invoice_id\":11128}"}}]},"finish_reason":"tool_calls"}]}`)
+	var request map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(contractRequest), &request)
+	request["tools"] = json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`)
+	body, _ := json.Marshal(request)
+	names, _ := contractWriter(t, string(body), `{"choices":[{"index":0,"delta":{"content":"checking","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"invoice_id\":11128}"}}]},"finish_reason":"tool_calls"}]}`)
 	if !strings.Contains(strings.Join(names, ","), "response.completed") {
 		t.Fatal("valid tool round blocked by final-output schema")
 	}

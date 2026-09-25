@@ -1,6 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-25：Anthropic messages 输入复用现有请求执行模块，保留工具配对、图片、思考与模型权限。
 // 2026-09-25：按 messages 契约校验正数预算、采样范围、签名与工具结果顺序，避免无效参数调用上游。
+// 2026-09-25：精确接受 NF 保留全部思考的无裁剪请求，并将 xhigh 交给既有上游 effort 归一化。
 package server
 
 import (
@@ -92,7 +93,10 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 			return nil, "", false, err
 		}
 	}
-	for _, key := range []string{"context_management", "container", "mcp_servers"} {
+	if value := source["context_management"]; value != nil && !messagesKeepsAllContext(value) {
+		return nil, "", false, fmt.Errorf("context_management only supports clear_thinking_20251015 with keep all; active context edits are unavailable")
+	}
+	for _, key := range []string{"container", "mcp_servers"} {
 		if value := source[key]; value != nil {
 			return nil, "", false, fmt.Errorf("%s is not supported by this stateless gateway", key)
 		}
@@ -147,9 +151,9 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 				return nil, "", false, err
 			}
 			switch effort {
-			case "low", "medium", "high", "max":
+			case "low", "medium", "high", "xhigh", "max":
 			default:
-				return nil, "", false, fmt.Errorf("output_config.effort must be low, medium, high or max")
+				return nil, "", false, fmt.Errorf("output_config.effort must be low, medium, high, xhigh or max")
 			}
 			chat["reasoning_effort"] = effort
 		}
@@ -349,6 +353,22 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 	}
 	encoded, err := json.Marshal(chat)
 	return encoded, model, stream, err
+}
+
+// NarraFork's official profile asks to keep every thinking block. This exact
+// shape needs no server-side state and is already honored by retaining history.
+// Extra fields or edits may request real mutations and must not be discarded.
+func messagesKeepsAllContext(value any) bool {
+	control, ok := value.(map[string]any)
+	if !ok || len(control) != 1 {
+		return false
+	}
+	edits, ok := control["edits"].([]any)
+	if !ok || len(edits) != 1 {
+		return false
+	}
+	edit, ok := edits[0].(map[string]any)
+	return ok && len(edit) == 2 && edit["type"] == "clear_thinking_20251015" && edit["keep"] == "all"
 }
 
 func anthropicBlocks(value any, path string) ([]map[string]any, error) {

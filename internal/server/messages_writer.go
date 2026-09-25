@@ -3,6 +3,7 @@
 // 2026-09-25：流式工具保留参数增量并延迟完成，透传心跳与写失败，保留上下文错误类别和缓存创建用量。
 // 2026-09-25：按官方 SDK 合同在全量校验后顺序交付工具块，避免并行完成回调错位；首帧不写会残留的临时用量扩展标记。
 // 2026-09-25：缓冲长工具期间按实际片段进展补标准心跳，防止下游空闲超时，不提前交付未验证工具。
+// 2026-09-25：首帧缓存拆分未知时不抢报普通输入，真实终态保持原值；提供幂等收尾供公共计费路径确认。
 package server
 
 import (
@@ -63,7 +64,12 @@ func (m *messagesWriter) FlushError() error {
 	}
 	return m.err
 }
-func (m *messagesWriter) CompletionError() error { return m.err }
+func (m *messagesWriter) CompletionError() error      { return m.err }
+func (m *messagesWriter) Unwrap() http.ResponseWriter { return m.inner }
+func (m *messagesWriter) FinishResponse() error {
+	m.finish()
+	return m.CompletionError()
+}
 
 func (m *messagesWriter) Write(data []byte) (int, error) {
 	if m.err != nil {
@@ -305,6 +311,13 @@ func (m *messagesWriter) begin() {
 	m.inner.WriteHeader(200)
 	m.started = true
 	usage := anthropicUsage(m.usage)
+	// A gross prompt count without any reported cache split is not a measured
+	// noncached count. Keep this initial field provisional until the terminal
+	// snapshot instead of later correcting a fabricated split down to zero.
+	// An explicitly reported split remains visible; final counters are untouched.
+	if _, known := upstream.CachedInputTokens(m.usage); !known {
+		usage["input_tokens"] = 0
+	}
 	// Initial counters are provisional. Official SDKs update standard counters
 	// from message_delta but do not merge extension fields, so an early true
 	// flag would incorrectly survive even after complete usage was reported.

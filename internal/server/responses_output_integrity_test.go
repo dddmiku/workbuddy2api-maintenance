@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：失败/截断不能携带工具身份与参数，覆盖提前执行客户端的终态安全边界。
 // 2026-09-16：通过真实 SSE 转换链锁定迟到工具元数据、legacy 调用、refusal 及错误后的工具终态。
 package server
 
@@ -287,8 +288,11 @@ func TestResponsesOutputErrorNeverCompletesTools(t *testing.T) {
 					}
 				}
 			}
-			if call := outputIntegrityCall(t, final); call["status"] == "completed" {
-				t.Fatalf("failed tool completed: %#v", call)
+			for _, raw := range responseArray(final["output"]) {
+				item, _ := raw.(map[string]any)
+				if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
+					t.Fatalf("failed tool payload escaped: %#v", item)
+				}
 			}
 		}
 	}
@@ -365,8 +369,11 @@ func TestResponsesOutputIncompleteNeverCompletesTools(t *testing.T) {
 			t.Fatal(err)
 		}
 		final := outputIntegrityFinal(t, names, values, "response.incomplete")
-		if call := outputIntegrityCall(t, final); call["status"] != "incomplete" {
-			t.Fatalf("partial tool lost incomplete status: %#v", call)
+		for _, raw := range responseArray(final["output"]) {
+			item, _ := raw.(map[string]any)
+			if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
+				t.Fatalf("partial tool payload escaped: %#v", item)
+			}
 		}
 		for i, event := range names {
 			if event == "response.function_call_arguments.done" {

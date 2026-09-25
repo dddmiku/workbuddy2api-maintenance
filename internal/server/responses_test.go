@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：函数参数在全组验证后交付；失败和截断响应不再携带可执行工具负载。
 // 2026-09-19：推理与正文可交错到达，done改为终态时发出，ID/index与最终输出顺序仍需一致。
 // 2026-09-15: 新增。/v1/responses 兼容层单测：请求翻译、工具翻译、非流式对象翻译、
 //   流式事件序列（含推理条目与工具调用）。
@@ -281,8 +282,8 @@ func TestResponsesWriterStreamToolCall(t *testing.T) {
 	for i, n := range names {
 		if n == evArgsDelta && !sawDelta {
 			sawDelta = true
-			if datas[i]["delta"] != `{"city":` {
-				t.Fatalf("首个参数分片不对: %v", datas[i]["delta"])
+			if datas[i]["delta"] != `{"city":"北京"}` {
+				t.Fatalf("验证后的完整参数不对: %v", datas[i]["delta"])
 			}
 		}
 	}
@@ -755,20 +756,16 @@ func TestResponsesWriterIncompleteDoesNotCompleteTools(t *testing.T) {
 					t.Fatalf("partial tool item completed: %v", datas[i])
 				}
 			}
-			if !sawArgs {
-				t.Fatal("partial tool arguments disappeared")
+			if sawArgs {
+				t.Fatal("unvalidated partial tool arguments escaped")
 			}
 			final := datas[len(datas)-1]["response"].(map[string]any)
 			if final["status"] != "incomplete" || final["incomplete_details"].(map[string]any)["reason"] != tc.detail {
 				t.Fatalf("incomplete details wrong: %v", final)
 			}
 			out := final["output"].([]any)
-			if len(out) != 1 {
-				t.Fatalf("tool item lost/duplicated: %v", out)
-			}
-			call := out[0].(map[string]any)
-			if call["status"] != "incomplete" || call["arguments"] != `{"id":` {
-				t.Fatalf("partial arguments/status changed: %v", call)
+			if len(out) != 0 {
+				t.Fatalf("unvalidated tool item escaped: %v", out)
 			}
 		})
 	}

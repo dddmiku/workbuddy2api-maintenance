@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：面板版本同步为2.3.0，对应新增Gemini与四协议统一校验的整包版本。
 # 2026-09-25：最终统一运行版本为2.2.1，包含真实SDK审查发现的工具事件与业务JSON保真修复。
 # 2026-09-25：每次扫码使用独立登录流程ID，原生重载按进程就绪确认，不把账号冷却误报成重启失败。
 # 2026-09-25：管理台支持网关托管的私有Unix监听与原生运行接口，配置和账号路径由网关统一传入。
@@ -123,7 +124,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.2.1"
+PANEL_VERSION = "2.3.0"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

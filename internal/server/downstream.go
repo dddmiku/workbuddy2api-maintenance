@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：从外到内幂等收尾协议链，统一记录缓冲终态和最终网络写出错误。
 // 2026-09-25：按每次实际写出限制慢客户端等待时间，写出后清除期限以保留长推理，并将失败取消传回上游。
 package server
 
@@ -94,4 +95,26 @@ func flushHTTPResponse(w http.ResponseWriter) error {
 		return nil
 	}
 	return err
+}
+
+// Finish outer adapters first: their final write can feed buffered state into
+// the next adapter. Every participating FinishResponse method is idempotent.
+func finishResponseWriters(w http.ResponseWriter) error {
+	var result error
+	for depth := 0; w != nil; depth++ {
+		if depth == 32 {
+			return errors.Join(result, errors.New("response writer chain exceeds the supported depth"))
+		}
+		if finalizer, ok := w.(interface{ FinishResponse() error }); ok {
+			result = errors.Join(result, finalizer.FinishResponse())
+		} else if checker, ok := w.(interface{ CompletionError() error }); ok {
+			result = errors.Join(result, checker.CompletionError())
+		}
+		wrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		w = wrapper.Unwrap()
+	}
+	return result
 }
