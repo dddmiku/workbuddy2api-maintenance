@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-26：明确的参数错误（invalid_request_error/11101/11133）先于限流关键词分类，"too many images" 等不再冷却健康账号。
 // 2026-09-26：出站补齐目录输出预算；超限或窗口边界 11133 时只收缩网关自选预算同号重发（最多两次），不改历史。
 // 2026-09-25：上下文超限直接返回上游原文，移除自动删历史重发，交由客户端完成真正的压缩。
 // 2026-09-25：首次拒绝与重试共用精确超限码识别，避免格式差异漏判与普通错误文案误判。
@@ -527,6 +528,18 @@ func Classify(status int, body string) ErrKind {
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
+	// 明确的请求参数错误先于限流关键词判定：限流词表按子串匹配（含 "too many"），会把
+	// "too many images/tools" 这类确定性参数错误误判为限流，冷却一批健康账号并打开来源级
+	// 闸门，客户端还拿到误导性的 429。429 状态与正文明说限流的仍按限流处理。
+	if status >= 400 && status != http.StatusTooManyRequests && isExplicitInvalidRequest(body, lower) {
+		if contentBlockedRule.hit(body, lower) {
+			return ErrContentBlocked
+		}
+		if badParamsRule.hit(body, lower) {
+			return ErrBadParams
+		}
+		return ErrClient
+	}
 	if softRateRule.hit(body, lower) {
 		return ErrSoftRate
 	}
@@ -557,6 +570,48 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardRule 捕获。
 	return ErrNone
+}
+
+// explicitRateMarkers 正文明说限流的措辞；带这些措辞的参数类错误仍交给限流规则。
+var explicitRateMarkers = []string{"rate limit", "rate-limit", "too many requests", "usage limit", "限流", "请求过于频繁"}
+
+// isExplicitInvalidRequest 识别上游明确标注的请求参数错误：code 11101/11133，
+// 或 type=invalid_request_error（顶层、error、extError 任一层）。
+func isExplicitInvalidRequest(body, lower string) bool {
+	var envelope map[string]any
+	if json.Unmarshal([]byte(body), &envelope) != nil {
+		return false
+	}
+	for _, marker := range explicitRateMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	objects := []map[string]any{envelope}
+	for _, key := range []string{"error", "extError"} {
+		if nested, ok := envelope[key].(map[string]any); ok {
+			objects = append(objects, nested)
+			if deeper, ok := nested["extError"].(map[string]any); ok {
+				objects = append(objects, deeper)
+			}
+		}
+	}
+	for _, object := range objects {
+		switch code := object["code"].(type) {
+		case float64:
+			if code == 11101 || code == 11133 {
+				return true
+			}
+		case string:
+			if code == "11101" || code == "11133" {
+				return true
+			}
+		}
+		if kind, _ := object["type"].(string); kind == "invalid_request_error" {
+			return true
+		}
+	}
+	return false
 }
 
 // apiEnvelope 上游统一信封。
@@ -1061,17 +1116,26 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				// 本质仍是「输入 + 预算」超窗。仅在估算已贴近窗口时处理：网关自选预算先缩小
 				// 重发；无法再缩（或预算来自客户端）则按上下文超限返回，客户端据此压缩。
 				if kind == ErrClient {
-					if requestID, boundary := modelParamRejected(raw); boundary && (boundaryShrunk || nearContextWindow(prepared, budget)) {
-						if budgetRetries < maxBudgetRetries {
-							if next, ok := shrunkOutputBudget(budget); ok && retryWithBudget(next, "shrunk at window boundary", raw) {
-								boundaryShrunk = true
-								lastSent = prepared
-								continue retry
+					if requestID, boundary := modelParamRejected(raw); boundary {
+						sessionPrompt := c.sessionPrompt(budgetSession(ctx), a.Realm(), budget.model)
+						beyond := false
+						if !boundaryShrunk && nearContextWindow(prepared, budget, sessionPrompt) {
+							if budgetRetries < maxBudgetRetries {
+								if next, ok := shrunkOutputBudget(budget); ok && retryWithBudget(next, "shrunk at window boundary", raw) {
+									boundaryShrunk = true
+									lastSent = prepared
+									continue retry
+								}
 							}
+							beyond = true
+						} else if boundaryShrunk {
+							beyond = stillBeyondWindow(prepared, budget, sessionPrompt)
 						}
-						log.Printf("WARN: [upstream] chat_stream uid=%s: 11133 at context window boundary (max_tokens=%d) -> context_length_exceeded",
-							logfmt.UID8(a.UID), budget.tokens)
-						return nil, resp.StatusCode, boundaryContextFailure(raw, budget, requestID), nil
+						if beyond {
+							log.Printf("WARN: [upstream] chat_stream uid=%s: 11133 at context window boundary (input~%d max_tokens=%d window=%d) -> context_length_exceeded",
+								logfmt.UID8(a.UID), estimateInputTokens(prepared, sessionPrompt), budget.tokens, budget.context)
+							return nil, resp.StatusCode, boundaryContextFailure(raw, budget, requestID), nil
+						}
 					}
 				}
 				// 国际版 WAF 按正文特征拦截（脚本、命令注入、路径穿越等），返回的是前置

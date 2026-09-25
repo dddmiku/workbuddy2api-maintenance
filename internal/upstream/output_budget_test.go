@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：下限随输出上限缩放、边界复核与客户端超大预算不改判的回归。
 // 2026-09-26：锁定输出预算补齐、按上游精确计数收缩、窗口边界 11133 处理与会话主动收缩；历史始终不变。
 package upstream
 
@@ -249,7 +250,7 @@ func TestOutputBudgetHandlesBoundaryModelParamRejection(t *testing.T) {
 		}}
 		client := budgetClient(t, upstream, true)
 		outcome := runBudget(t, client, upstream, context.Background(), budgetBody(t, nil, large))
-		if !outcome.ok || !reflect.DeepEqual(outcome.budgets, []int64{128000, minFittedOutputTokens}) {
+		if !outcome.ok || !reflect.DeepEqual(outcome.budgets, []int64{128000, outputFloor(128000)}) {
 			t.Fatalf("ok=%v budgets=%v body=%s", outcome.ok, outcome.budgets, outcome.raw)
 		}
 		assertHistoryUnchanged(t, outcome)
@@ -352,14 +353,14 @@ func TestEstimatePromptTokensSkipsImageData(t *testing.T) {
 }
 
 func TestFittedOutputBudgetBounds(t *testing.T) {
-	chosen := outputBudget{tokens: 128000, gatewayChosen: true}
+	chosen := outputBudget{tokens: 128000, gatewayChosen: true, floor: outputFloor(128000)}
 	detail := func(total int64) string {
 		return "prompt is too long: " + strconv.FormatInt(total, 10) + " tokens > 1048576 maximum"
 	}
 	if got, ok := fittedOutputBudget(chosen, detail(960000+128000)); !ok || got != budgetWindow-960000-fitMarginTokens {
 		t.Fatalf("fit = %d %v", got, ok)
 	}
-	if _, ok := fittedOutputBudget(outputBudget{tokens: 128000}, detail(1088000)); ok {
+	if _, ok := fittedOutputBudget(outputBudget{tokens: 128000, floor: outputFloor(128000)}, detail(1088000)); ok {
 		t.Fatal("client budget was shrunk")
 	}
 	if _, ok := fittedOutputBudget(chosen, "prompt is too long"); ok {
@@ -367,5 +368,94 @@ func TestFittedOutputBudgetBounds(t *testing.T) {
 	}
 	if _, ok := fittedOutputBudget(chosen, detail(1030000+128000)); ok {
 		t.Fatal("fit below the output floor")
+	}
+}
+
+// 线上 2026-09-26 验收：104 万重复短词（约 2 字符/token）超窗时上游回 11133，
+// 官方口径估算只有约 52 万，旧判定漏判为参数错误。
+func TestOutputBudgetBoundaryDetectsLowDensityText(t *testing.T) {
+	upstream := &budgetUpstream{t: t, reject: func(int64) string { return boundary11133 }}
+	client := budgetClient(t, upstream, true)
+	outcome := runBudget(t, client, upstream, context.Background(), budgetBody(t, nil, 1040000))
+	if Classify(outcome.status, string(outcome.raw)) != ErrContextTooLong {
+		t.Fatalf("over-window low-density request kept a parameter error: %s", outcome.raw)
+	}
+}
+
+func TestOutputBudgetSessionPromptMarksBoundary(t *testing.T) {
+	upstream := &budgetUpstream{t: t, reject: func(maxTokens int64) string {
+		if maxTokens > minFittedOutputTokens {
+			return boundary11133
+		}
+		return ""
+	}}
+	client := budgetClient(t, upstream, true)
+	body := budgetBody(t, nil, 10) // 正文很短（例如大部分上下文在图片或缓存外），只有会话样本能说明已贴近窗口
+	client.RecordPromptSample("s", "cn", budgetModel, 950000, bytes.Repeat([]byte("a"), 4000))
+	outcome := runBudget(t, client, upstream, WithBudgetSession(context.Background(), "s"), body)
+	if !outcome.ok || len(outcome.budgets) != 2 || outcome.budgets[1] != outputFloor(128000) {
+		t.Fatalf("session evidence ignored: ok=%v budgets=%v body=%s", outcome.ok, outcome.budgets, outcome.raw)
+	}
+}
+
+func TestRecordPromptSampleRaisesWindowFromAcceptedPrompt(t *testing.T) {
+	client := &Client{}
+	client.storeModelLimits("cn", []ModelInfo{{ID: budgetModel, MaxTokens: 128000, ContextWindow: 1000000}})
+	client.RecordPromptSample("s", "cn", budgetModel, 1000041, []byte(strings.Repeat("a ", 100)))
+	if got, want := client.windowFor("cn", budgetModel), int64(1000041)+minFittedOutputTokens; got != want {
+		t.Fatalf("window = %d, want %d", got, want)
+	}
+	if client.sessionPrompt("s", "cn", budgetModel) != 1000041 {
+		t.Fatal("accepted prompt above the catalog window was not kept as a sample")
+	}
+	// 已学到更大的窗口时不回退。
+	client.learnWindow("cn", budgetModel, "prompt is too long: 1100000 tokens > 1048576 maximum")
+	client.RecordPromptSample("s", "cn", budgetModel, 1000041, []byte(strings.Repeat("a ", 100)))
+	if got := client.windowFor("cn", budgetModel); got != 1048576 {
+		t.Fatalf("window regressed to %d", got)
+	}
+}
+
+// 审查反例：客户端给出超过模型上限的预算、输入很小，无字段 11133 是预算参数本身的问题。
+func TestOutputBudgetOversizedClientBudgetKeepsParameterError(t *testing.T) {
+	upstream := &budgetUpstream{t: t, reject: func(int64) string { return boundary11133 }}
+	client := budgetClient(t, upstream, true)
+	outcome := runBudget(t, client, upstream, context.Background(), budgetBody(t, map[string]any{"max_tokens": 1000000}, 500))
+	if len(outcome.budgets) != 1 || string(outcome.raw) != boundary11133 {
+		t.Fatalf("oversized client budget was reported as context overflow: budgets=%v body=%s", outcome.budgets, outcome.raw)
+	}
+}
+
+// 审查反例：目录预算 384000、输入约 45 万时缩预算无效，说明拒绝与窗口无关；只缩一次，原样返回。
+func TestOutputBudgetShrinkOnceAndKeepUnrelatedRejection(t *testing.T) {
+	upstream := &budgetUpstream{t: t, reject: func(int64) string { return boundary11133 }}
+	srv := httptest.NewServer(http.HandlerFunc(upstream.handler))
+	t.Cleanup(srv.Close)
+	client := &Client{ChatBaseCN: srv.URL, HTTP: srv.Client(), ChatHTTP: srv.Client()}
+	client.storeModelLimits("cn", []ModelInfo{{ID: budgetModel, MaxTokens: 384000, ContextWindow: 1000000}})
+	// 约 52 万估算输入：已过「输入占窗口一半」门槛，缩到下限后仍远离窗口。
+	outcome := runBudget(t, client, upstream, context.Background(), budgetBody(t, nil, 650000))
+	if !reflect.DeepEqual(outcome.budgets, []int64{384000, outputFloor(384000)}) {
+		t.Fatalf("budgets = %v, want one shrink straight to the floor", outcome.budgets)
+	}
+	if string(outcome.raw) != boundary11133 {
+		t.Fatalf("rejection unrelated to the window was relabeled: %s", outcome.raw)
+	}
+}
+
+func TestOutputFloorScalesWithModelOutput(t *testing.T) {
+	for maxOutput, want := range map[int64]int64{0: 32768, 8192: 4096, 32000: 8000, 64000: 16000, 128000: 32000, 384000: 32768} {
+		if got := outputFloor(maxOutput); got != want {
+			t.Fatalf("outputFloor(%d) = %d, want %d", maxOutput, got, want)
+		}
+	}
+}
+
+func TestOutputBudgetMidSizeRejectionNotRetried(t *testing.T) {
+	upstream := &budgetUpstream{t: t, reject: func(int64) string { return boundary11133 }}
+	client := budgetClient(t, upstream, true)
+	outcome := runBudget(t, client, upstream, context.Background(), budgetBody(t, nil, 450000))
+	if len(outcome.budgets) != 1 || string(outcome.raw) != boundary11133 {
+		t.Fatalf("mid-size parameter error was retried or relabeled: budgets=%v body=%s", outcome.budgets, outcome.raw)
 	}
 }

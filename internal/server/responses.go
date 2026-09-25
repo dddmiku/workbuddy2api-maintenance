@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：禁止并行时上游多返回的工具调用只交付第一个（此前整轮失败）；纯工具调用的非流式结果不再多出空消息。
 // 2026-09-25：整组工具校验后才交付身份/参数，封堵 NF 提前执行；限制缓冲并在工具生成期间保活，拒绝密文静默丢失。
 // 2026-09-25：告知默认内置工具的兼容过滤，保留网络 flush 错误，防止客户端没收到终态却记成功。
 // 2026-09-25：拒绝无法解读的原生压缩历史与服务端压缩配置，防止丢上下文后仍返回成功。
@@ -45,6 +46,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -1353,6 +1355,7 @@ func (rw *responsesWriter) finishJSON() {
 		writeOpenAIError(rw.inner, http.StatusBadGateway, "upstream_parse", "upstream response is not valid JSON")
 		return
 	}
+	rw.req.limitParallelToolCalls(chat)
 	result := chatToResponses(chat, rw.resolvedModel(), rw.req)
 	if rw.req != nil {
 		rw.req.applyEcho(result)
@@ -1866,8 +1869,9 @@ func (rw *responsesWriter) CompletionError() error {
 		rw.failOutput("missing_tool_call", "upstream ended with a tool finish reason but no tool call")
 	}
 	if rw.streamErr == nil && rw.finishReason != "length" && rw.finishReason != "content_filter" {
-		if rw.req != nil && rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(rw.order) > 1 {
-			rw.failOutput("parallel_tool_calls_violation", "model returned parallel tool calls despite parallel_tool_calls=false")
+		if rw.req.parallelDisabled() && len(rw.order) > 1 {
+			logDroppedParallelCalls(len(rw.order))
+			rw.order = rw.order[:1]
 		}
 		identities := map[string]bool{}
 		for _, index := range rw.order {
@@ -1944,6 +1948,7 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 	}
 	choice, _ := choices[0].(map[string]any)
 	message, _ := choice["message"].(map[string]any)
+	rw.req.keepFirstToolCall(message)
 	if value := message["tool_calls"]; value != nil {
 		switch value.(type) {
 		case []any, []map[string]any:
@@ -1962,9 +1967,6 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 	calls := responseToolCalls(message)
 	if (choice["finish_reason"] == "tool_calls" || choice["finish_reason"] == "function_call") && len(calls) == 0 {
 		return fmt.Errorf("upstream ended with a tool finish reason but no tool call")
-	}
-	if rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(calls) > 1 {
-		return fmt.Errorf("model returned parallel tool calls despite parallel_tool_calls=false")
 	}
 	identities := map[string]bool{}
 	for _, value := range calls {
@@ -2002,6 +2004,39 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 	}
 	text, _ := message["content"].(string)
 	return rw.req.output.validate(text)
+}
+
+// parallelDisabled 报告客户端是否禁止并行工具调用。
+func (req *responsesRequest) parallelDisabled() bool {
+	return req != nil && req.ParallelToolCalls != nil && !*req.ParallelToolCalls
+}
+
+// keepFirstToolCall 客户端禁止并行调用、上游仍返回多个调用时只交付第一个。其余调用
+// 从未执行，丢弃不会让客户端状态不一致；此前整轮失败，客户端只能重试并重复计费。
+func (req *responsesRequest) keepFirstToolCall(message map[string]any) {
+	if !req.parallelDisabled() || message == nil {
+		return
+	}
+	if calls := responseArray(message["tool_calls"]); len(calls) > 1 {
+		logDroppedParallelCalls(len(calls))
+		message["tool_calls"] = calls[:1]
+	}
+}
+
+// limitParallelToolCalls 对整个 chat completion 的各 choice 应用 keepFirstToolCall。
+func (req *responsesRequest) limitParallelToolCalls(chat map[string]any) {
+	if !req.parallelDisabled() {
+		return
+	}
+	for _, raw := range responseArray(chat["choices"]) {
+		choice, _ := raw.(map[string]any)
+		message, _ := choice["message"].(map[string]any)
+		req.keepFirstToolCall(message)
+	}
+}
+
+func logDroppedParallelCalls(count int) {
+	log.Printf("WARN: [server] upstream returned %d tool calls despite parallel_tool_calls=false; delivering the first only", count)
 }
 
 func legacyResponseFunction(message map[string]any) map[string]any {
@@ -2217,17 +2252,22 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 		}
 		txt, _ := msg["content"].(string)
 		refusal, _ := msg["refusal"].(string)
+		// 纯工具调用的回复不带空 assistant 消息（与流式输出一致）；没有任何可交付内容时
+		// 仍保留一条空消息，避免 output 为空。
+		deliversCalls := status == "completed" && len(responseToolCalls(msg)) > 0
 		content := []any{}
-		if txt != "" || refusal == "" {
+		if txt != "" || (refusal == "" && !deliversCalls) {
 			content = append(content, map[string]any{"type": "output_text", "text": txt, "annotations": []any{}})
 		}
 		if refusal != "" {
 			content = append(content, map[string]any{"type": "refusal", "refusal": refusal})
 		}
-		items = append(items, map[string]any{
-			"id": newRespID("msg_"), "type": "message", "status": status,
-			"role": "assistant", "content": content,
-		})
+		if len(content) > 0 {
+			items = append(items, map[string]any{
+				"id": newRespID("msg_"), "type": "message", "status": status,
+				"role": "assistant", "content": content,
+			})
+		}
 		if tcs := responseToolCalls(msg); status == "completed" && len(tcs) > 0 {
 			for _, t := range tcs {
 				tm, ok := t.(map[string]any)

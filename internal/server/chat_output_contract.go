@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：结束校验只缓存工具调用等精简帧，长回答不再因整条流进 16MB 缓冲而在约 7.4 万分片处被截断。
 // 2026-09-25：所有 Chat 请求共享工具声明边界；整组校验前隐藏身份和参数，缓冲有界并在生成期间保活。
 // 2026-09-25：保留实际网络 flush 失败，让终态检查与失败用量一致。
 // 2026-09-18：直接 Chat 复用工具/结构化输出契约；正文增量保留，成功 finish 与 DONE 在完整校验后发出。
@@ -233,7 +234,8 @@ func normalizeChatToolDeclarations(fields map[string]json.RawMessage, req *respo
 type chatContractWriter struct {
 	inner       http.ResponseWriter
 	req         *responsesRequest
-	raw         bytes.Buffer
+	raw         bytes.Buffer // 只保存校验所需的精简帧（工具调用、结束原因、拒答等），不含整段正文/思考
+	marked      map[any]bool // 已为该 choice 记录过「有输出」标记
 	buffer      []byte
 	usageFrames [][]byte
 	errorFrame  []byte
@@ -264,12 +266,14 @@ func (w *chatContractWriter) Write(raw []byte) (int, error) {
 		return w.inner.Write(raw)
 	}
 	w.streaming = true
-	if len(raw) > protocolBufferLimit-w.raw.Len() {
-		w.err = fmt.Errorf("upstream response exceeds the adapter buffer limit")
+	if w.err != nil {
 		return 0, w.err
 	}
-	w.raw.Write(raw)
 	w.buffer = append(w.buffer, raw...)
+	if len(w.buffer) > protocolBufferLimit {
+		w.err = fmt.Errorf("upstream event exceeds the adapter buffer limit")
+		return 0, w.err
+	}
 	for {
 		index := bytes.Index(w.buffer, []byte("\n\n"))
 		if index < 0 {
@@ -293,6 +297,7 @@ func (w *chatContractWriter) frame(raw []byte) {
 	}
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
+		w.keep([]byte("data: [DONE]\n\n"))
 		return
 	}
 	var frame map[string]any
@@ -302,8 +307,10 @@ func (w *chatContractWriter) frame(raw []byte) {
 	}
 	if frame["error"] != nil {
 		w.errorFrame = raw
+		w.keep(raw)
 		return
 	}
+	w.keepSlim(frame)
 	changed := false
 	if frame["usage"] != nil {
 		usage := make(map[string]any, len(frame))
@@ -346,6 +353,79 @@ func (w *chatContractWriter) frame(raw []byte) {
 		raw = append(append([]byte("data: "), encoded...), '\n', '\n')
 	}
 	w.writeRaw(raw)
+}
+
+// keep 追加一段校验用帧；超过缓冲上限时记录错误（此时只可能是工具参数本身过大）。
+func (w *chatContractWriter) keep(frame []byte) {
+	if w.err != nil {
+		return
+	}
+	if len(frame) > protocolBufferLimit-w.raw.Len() {
+		w.err = fmt.Errorf("upstream tool output exceeds the adapter buffer limit")
+		return
+	}
+	w.raw.Write(frame)
+}
+
+// keepSlim 只保留结束校验需要的字段：工具调用、结束原因、拒答、角色和用量。
+// 正文与思考不再整段缓存（此前整条流都进缓冲，长回答约 7.4 万分片即被截断）；
+// 结构化输出需要校验正文时才保留正文。每个 choice 首次出现输出时留一个占位字符，
+// 让聚合仍能区分「有输出但被截断」与「空响应」。
+func (w *chatContractWriter) keepSlim(frame map[string]any) {
+	keepText := w.req != nil && w.req.output != nil
+	slim := map[string]any{}
+	for _, key := range []string{"id", "object", "created", "model", "usage"} {
+		if value, ok := frame[key]; ok {
+			slim[key] = value
+		}
+	}
+	informative := frame["usage"] != nil || w.raw.Len() == 0
+	choices := []any{}
+	for _, raw := range responseArray(frame["choices"]) {
+		choice, _ := raw.(map[string]any)
+		out := map[string]any{"index": choice["index"]}
+		if finish, ok := choice["finish_reason"]; ok && finish != nil {
+			out["finish_reason"] = finish
+			informative = true
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		slimDelta := map[string]any{}
+		for _, key := range []string{"role", "tool_calls", "function_call", "refusal"} {
+			if value, ok := delta[key]; ok && value != nil {
+				slimDelta[key] = value
+				informative = informative || key != "role"
+			}
+		}
+		for _, key := range []string{"content", "reasoning_content"} {
+			text, _ := delta[key].(string)
+			if text == "" {
+				continue
+			}
+			if keepText {
+				slimDelta[key] = text
+				informative = true
+			} else if !w.marked[choice["index"]] {
+				if w.marked == nil {
+					w.marked = map[any]bool{}
+				}
+				w.marked[choice["index"]] = true
+				slimDelta[key] = " "
+				informative = true
+			}
+		}
+		out["delta"] = slimDelta
+		choices = append(choices, out)
+	}
+	if !informative {
+		return
+	}
+	slim["choices"] = choices
+	encoded, err := json.Marshal(slim)
+	if err != nil {
+		w.err = err
+		return
+	}
+	w.keep(append(append([]byte("data: "), encoded...), '\n', '\n'))
 }
 
 func (w *chatContractWriter) restoreToolNames(message map[string]any) bool {

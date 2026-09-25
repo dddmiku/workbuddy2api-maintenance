@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：请求模型名限长 256 字节，防止超长名字撑爆用量账本写盘上限。
+// 2026-09-26：参数错误、WAF、渠道与内容拦截等请求决定的终态不再解绑会话，保留同号提示缓存。
 // 2026-09-26：会话键交给出站层并记录每轮上游实报输入，用于长会话主动收缩输出预算。
 // 2026-09-25：四协议统一密钥限流与消费明细，管理接口只对内部通道开放。
 // 2026-09-25：每次实际尝试独立记账和归因，循环重发失败返回当前错误，工具契约拒绝不误报上游成功。
@@ -815,6 +817,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	return infos
 }
 
+// maxModelNameBytes 请求模型名长度上限（含 realm 前缀）。
+const maxModelNameBytes = 256
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
 	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
@@ -854,6 +859,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateChatRequest(body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	// 模型名进入账本键、请求明细和日志行：不设上限时，持有密钥的调用方可用超长名字
+	// 撑爆用量文件的写盘上限，让所有用量停止落盘。真实模型名远短于此。
+	if len(peek.Model) > maxModelNameBytes {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("model name exceeds %d bytes", maxModelNameBytes))
 		return
 	}
 	if r.URL.Path == "/v1/chat/completions" && peek.Stream && hideChatStreamUsage(requestObject) {
@@ -1242,8 +1254,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.absorbJSONUsage(respBody)
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
+			// 以下几类终态由请求本身决定、与账号无关：只释放在途名额，保留会话绑定，
+			// 下一轮仍落在同一账号，上游提示缓存不失效（换号会让整段前缀重新计费）。
 			if kind == upstream.ErrChannelRejected {
-				fail(acct.UID)
+				releaseHeld()
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected",
 					"upstream rejected the client channel: Illegal API invocation from an unapproved channel")
 				st.status = http.StatusBadRequest
@@ -1253,7 +1267,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 判定看正文、不看账号：同域内换任何号都会撞同一条规则，因此请求终态——
 			// 不轮转、不罚账号，也不把 HTML 页当作「请求参数被拒」回显给调用方。
 			if kind == upstream.ErrUpstreamWAF {
-				fail(acct.UID)
+				releaseHeld()
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_waf_blocked",
 					"upstream WAF rejected this request even after the gateway broke the matching "+
 						"patterns; start a new conversation, or remove the HTML/script/SQL-looking part")
@@ -1286,7 +1300,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样，
 				// 任务书授权上游错误码/账号语义对客户端可见），不再改写成网关固定文案。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
-				fail(acct.UID)
+				releaseHeld()
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
@@ -1308,7 +1322,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			if kind == upstream.ErrBadParams || kind == upstream.ErrClient {
-				fail(acct.UID)
+				releaseHeld()
 				detail := string(respBody)
 				acct.Lock()
 				secretValues := []string{acct.AccessToken, acct.RefreshToken, acct.DeviceToken}

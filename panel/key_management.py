@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-26：管理接口响应上限由 1 MiB 放宽到 8 MiB，密钥多时用量页不再整体失效。
 # 2026-09-25：内置面板优先使用网关传入的已解析管理socket，避免自定义配置路径或环境覆盖造成分叉。
 # 2026-09-22：密钥管理默认启用——api_keys_file 留空（含历史示例里的空串）时按默认
 #             路径解析，只有显式 api_keys_enabled=false 才关闭；修掉新装用户照抄
@@ -53,6 +54,9 @@ def _api_keys_file(config):
     return DEFAULT_API_KEYS_FILE
 
 
+MANAGEMENT_RESPONSE_LIMIT = 8 << 20
+
+
 def request(path, method, endpoint, body=None, timeout=15):
     if not path:
         return 503, {"ok": False, "message": "密钥管理尚未启用"}
@@ -61,8 +65,9 @@ def request(path, method, endpoint, body=None, timeout=15):
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         connection.request(method, endpoint, body=data, headers={"Content-Type": "application/json"})
         response = connection.getresponse()
-        raw = response.read((1 << 20) + 1)
-        if len(raw) > 1 << 20:
+        # 用量快照含每把密钥 120 天日数据，密钥多时会超过 1 MiB；上限放宽到 8 MiB。
+        raw = response.read(MANAGEMENT_RESPONSE_LIMIT + 1)
+        if len(raw) > MANAGEMENT_RESPONSE_LIMIT:
             raise ValueError("management response exceeds limit")
         result = json.loads(raw.decode("utf-8"))
         if not isinstance(result, dict):

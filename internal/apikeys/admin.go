@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：GET /keys 在密钥库不可读时返回 503 与明确原因。
 // 2026-09-25：管理通道支持每密钥限流策略，未提供保持原值、null恢复无限制。
 // 2026-09-20：密钥管理接口接受可选 expires_at；字段缺省表示保持现状，显式 null 表示无限制。
 // 2026-09-20：增加仅限管理通道的按需复制接口，以及逐密钥重复推理保护设置。
@@ -52,7 +53,13 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /keys", func(w http.ResponseWriter, r *http.Request) {
-		reply(w, 200, map[string]any{"ok": true, "keys": s.List(), "max_keys": MaxKeys, "default_reasoning_loop_guard": guardDefault})
+		keys, err := s.ListChecked()
+		if err != nil {
+			log.Printf("ERROR: [api-keys] key store unreadable: %v", err)
+			reply(w, 503, map[string]any{"ok": false, "message": "密钥库文件不可读，请检查 data/api_keys.json 及其加密密钥（密钥没有被删除）"})
+			return
+		}
+		reply(w, 200, map[string]any{"ok": true, "keys": keys, "max_keys": MaxKeys, "default_reasoning_loop_guard": guardDefault})
 	})
 	mux.HandleFunc("POST /keys", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

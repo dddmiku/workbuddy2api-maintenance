@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：预热模型目录；内嵌面板首次启动失败时网关继续服务，面板后台重试。
 // 2026-09-25：启用共享密钥限流与有界请求明细，热交接/信号退出均在在途结束后关闭。
 // 2026-09-25：单容器内托管同版管理台及完整更新包，信号退出同样等待长流和最终状态落盘。
 // 2026-09-20：向密钥管理接口提供重复推理保护默认值，支持每把密钥单独覆盖。
@@ -432,9 +433,15 @@ func main() {
 	var panel *panelruntime.Runtime
 	var publicHandler http.Handler = h
 	if layout.enabled {
+		// 面板启动失败（凭据文件损坏、目录不可写、Python 启动过慢等）不再拖垂整个网关：
+		// /v1 继续服务，面板在后台重试。
+		layout.panel.RetryInitialFailure = true
 		panel, err = panelruntime.Start(layout.panel)
 		if err != nil {
-			log.Fatalf("start embedded panel: %v", err)
+			if panel == nil {
+				log.Fatalf("start embedded panel: %v", err)
+			}
+			log.Printf("ERROR: embedded panel failed to start (%v); API keeps serving and the panel retries in the background", err)
 		}
 		publicHandler = withPanel(h, panel)
 	}

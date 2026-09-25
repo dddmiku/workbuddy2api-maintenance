@@ -14,7 +14,7 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
 | namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
-| `parallel_tool_calls` | 保留；显式 false 时检查成功结果是否返回多个调用 |
+| `parallel_tool_calls` | 保留；显式 false 而上游仍返回多个调用时，2.4.2 起只交付第一个并记日志（此前整轮失败） |
 | `text.format` | 支持 text、json_object、json_schema；结构化格式检查最终文本输出 |
 | `text.verbosity` | 接受有效字符串声明但不转发；上游没有对应的风格开关 |
 | `reasoning.effort` / `summary` | 转发，具体可用档位由模型决定 |

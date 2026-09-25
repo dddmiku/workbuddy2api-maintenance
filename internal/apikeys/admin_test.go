@@ -137,3 +137,25 @@ func TestWaitUnixTakesOverAfterRelease(t *testing.T) {
 		t.Fatalf("status = %d want 200", response.StatusCode)
 	}
 }
+
+func TestAdminListReportsUnreadableStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.AdminHandler()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/keys", strings.NewReader(`{"name":"client"}`)))
+	if rec.Code != 201 {
+		t.Fatalf("create=%d %s", rec.Code, rec.Body)
+	}
+	if err := os.WriteFile(path, []byte("{corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/keys", nil))
+	if rec.Code != 503 || strings.Contains(rec.Body.String(), `"keys"`) {
+		t.Fatalf("unreadable key store shown as a key list: %d %s", rec.Code, rec.Body)
+	}
+}

@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：禁止并行时多余调用只交付第一个，不再整轮失败。
 // 2026-09-25: 重放 NF 提前执行工具的真实模式，锁定整组校验、声明能力和无损推理历史边界。
 package server
 
@@ -51,7 +52,8 @@ func TestNFResponsesToolsWaitForWholeValidatedGroup(t *testing.T) {
 		{"strict", "auto", "Read", `{"path":3}`, "", true, true, false},
 		{"null arguments", "auto", "Read", `null`, "", true, false, false},
 		{"array arguments", "auto", "Read", `[]`, "", true, false, false},
-		{"parallel", "auto", "Read", `{"path":"file.txt"}`, "", false, false, false},
+		// 禁止并行而上游仍返回两个调用：只交付第一个，不再整轮失败（见 keepFirstToolCall）。
+		{"parallel", "auto", "Read", `{"path":"file.txt"}`, "", false, false, true},
 		{"duplicate identity", "auto", "Read", `{"path":"file.txt"}`, "", true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -81,6 +83,9 @@ func TestNFResponsesToolsWaitForWholeValidatedGroup(t *testing.T) {
 			if tc.valid {
 				if err != nil || !strings.Contains(recorder.Body.String(), `"type":"function_call"`) {
 					t.Fatalf("valid call lost: %v %s", err, recorder.Body)
+				}
+				if tc.name == "parallel" && strings.Contains(recorder.Body.String(), "another") {
+					t.Fatalf("second parallel call delivered despite parallel_tool_calls=false: %s", recorder.Body)
 				}
 			} else {
 				if err == nil {

@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：首次启动失败可选后台重试，关闭时及时退出。
 // 2026-09-25：使用隔离凭据目录验证内嵌面板、进程恢复和反向代理信任边界。
 package panelruntime
 
@@ -102,5 +103,24 @@ func TestPanelProxyForwardingTrust(t *testing.T) {
 		if out.Host != in.Host || out.URL.Path != "/api/state" || out.Header.Get("X-Real-IP") != wantIP || out.Header.Get("X-Forwarded-Proto") != wantProto || out.Header.Get("Forwarded") != "" || strings.Contains(out.Header.Get("CF-Connecting-IP"), "forged") {
 			t.Fatalf("proxy lost origin or trusted a forged header: %+v", out)
 		}
+	}
+}
+
+func TestPanelInitialFailureCanKeepRetrying(t *testing.T) {
+	base := t.TempDir()
+	missing := filepath.Join(base, "no-such-python")
+	if r, err := Start(Options{Python: missing, BaseDir: base}); err == nil || r != nil {
+		t.Fatalf("default start must fail fast: runtime=%v err=%v", r, err)
+	}
+	r, err := Start(Options{Python: missing, BaseDir: base, RetryInitialFailure: true})
+	if err == nil || r == nil {
+		t.Fatalf("tolerant start must report the error and keep a retrying runtime: runtime=%v err=%v", r, err)
+	}
+	closed := make(chan struct{})
+	go func() { r.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retrying runtime did not stop on Close")
 	}
 }

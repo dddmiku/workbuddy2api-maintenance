@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：thinking.type=adaptive 映射为上游可识别的 enabled（不带预算），不再原样转发。
 // 2026-09-25：Anthropic messages 输入复用现有请求执行模块，保留工具配对、图片、思考与模型权限。
 // 2026-09-25：按 messages 契约校验正数预算、采样范围、签名与工具结果顺序，避免无效参数调用上游。
 // 2026-09-25：精确接受 NF 保留全部思考的无裁剪请求，并将 xhigh 交给既有上游 effort 归一化。
@@ -137,6 +138,16 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 		}
 		// Retain the actual budget hint instead of replacing it with a made-up
 		// multiplier. Its enforcement remains a capability of the chosen model.
+		if kind == "adaptive" {
+			// Anthropic adaptive = 由模型决定是否思考；上游只认 enabled/disabled，原样转发
+			// 会被忽略或拒绝。映射为不带预算的 enabled，保留其余字段。
+			adapted := make(map[string]any, len(object))
+			for key, value := range object {
+				adapted[key] = value
+			}
+			adapted["type"] = "enabled"
+			object = adapted
+		}
 		chat["thinking"] = object
 		if kind == "enabled" || kind == "adaptive" {
 			chat["reasoning_effort"] = "high"

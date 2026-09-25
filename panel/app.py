@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-26：面板版本同步为 2.4.2（输出预算与全项目审查修复）。
 # 2026-09-25：无筛选条件直接使用空参数列表，兼容Python3.8严格解析空查询串的差异。
 # 2026-09-25：面板版本同步为2.4.0，限流、调度消费明细与兼容性回归作为同一运行版本交付。
 # 2026-09-25：接入请求明细和限流私有通道，验证密钥限流字段；账本不可读时不再显示零消费。
@@ -127,7 +128,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.4.0"
+PANEL_VERSION = "2.4.2"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |

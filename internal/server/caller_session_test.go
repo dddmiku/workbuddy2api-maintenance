@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：请求决定的 400 终态保留失败方自己的会话绑定，仍验证不影响其他调用方。
 // 2026-09-19：通过真实鉴权及 Chat/Responses Handler 锁定跨调用密钥会话隔离、失败解绑和关联头隔离。
 package server
 
@@ -150,7 +151,9 @@ func TestCallerFailureDoesNotUnbindAnotherCaller(t *testing.T) {
 			second := httptest.NewRecorder()
 			h.ServeHTTP(second, callerSessionRequest(t, path, "conversation", 1, keys[1]))
 			after := bindings.LoadBinds()
-			if first.Code != 200 || second.Code != 400 || len(before) != 1 || len(after) != 1 {
+			// B 的失败由请求本身决定（上游 400 参数错误）：B 保留自己的会话绑定以维持同号缓存，
+			// 但绝不能改动 A 的绑定。
+			if first.Code != 200 || second.Code != 400 || len(before) != 1 || len(after) != 2 {
 				t.Fatalf("statuses=%d/%d bindings=%d/%d; caller B must not unbind A", first.Code, second.Code, len(before), len(after))
 			}
 			for key, uid := range before {

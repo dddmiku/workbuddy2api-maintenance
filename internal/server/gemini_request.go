@@ -1,10 +1,12 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：schema 中字符串形式的计数约束（minItems 等，proto3 int64 映射）转为数字，官方 JS SDK 不再被整请求拒绝。
 // 2026-09-25：完整保留 Gemini 工具业务 JSON，按调用顺序配对无 ID 历史并规范函数 schema。
 package server
 
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -364,6 +366,16 @@ func geminiSchemaDepth(value any, path string, depth int) (map[string]any, error
 				}
 			default:
 				return nil, fmt.Errorf("%s.type must be a schema type", path)
+			}
+		case "minItems", "maxItems", "minLength", "maxLength", "minProperties", "maxProperties":
+			// Gemini 的 int64 字段按 proto3 JSON 映射可以是字符串（@google/genai 会发
+			// "minItems":"1"）；按 JSON Schema 需要数字，否则本地 schema 编译整请求 400。
+			if text, ok := value.(string); ok {
+				count, err := strconv.ParseUint(strings.TrimSpace(text), 10, 63)
+				if err != nil {
+					return nil, fmt.Errorf("%s.%s must be a non-negative integer", path, key)
+				}
+				out[key] = json.Number(strconv.FormatUint(count, 10))
 			}
 		case "properties", "$defs", "definitions", "patternProperties":
 			members, err := requestValidationObject(value, path+"."+key)

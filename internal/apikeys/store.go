@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：新增 ListChecked，密钥库读取失败不再伪装成空列表。
 // 2026-09-25：逐密钥保存频率/并发/排队策略，缺省字段不改旧记录，读取和写入均校验边界。
 // 2026-09-22：模型绑定写入侧要求完整模型名（cn:/global: 前缀），裸名返回 ErrBindingRealm；
 //
@@ -405,16 +406,23 @@ func expired(info Info) bool {
 }
 
 func (s *Store) List() []Info {
+	result, _ := s.ListChecked()
+	return result
+}
+
+// ListChecked 同 List，但把密钥库读取失败作为错误返回：管理面板据此显示「密钥库不可读」，
+// 而不是一个让运维误以为密钥全部丢失的空列表。
+func (s *Store) ListChecked() ([]Info, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.refreshLocked(); err != nil {
-		return nil
+		return nil, err
 	}
 	result := make([]Info, 0, len(s.keys))
 	for _, entry := range s.keys {
 		result = append(result, s.recordInfo(entry))
 	}
-	return result
+	return result, nil
 }
 
 func (s *Store) Create(name, note string, models []string, options ...Options) (Info, string, error) {

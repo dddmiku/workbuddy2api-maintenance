@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：可选首次启动失败后继续后台重试，面板故障不再拖垂网关 API。
 // 2026-09-25：网关托管同版管理台的私有Unix进程，启动就绪后才服务并在优雅退出后回收。
 package panelruntime
 
@@ -27,6 +28,9 @@ import (
 type Options struct {
 	ConfigPath, BaseDir, AuthDir, AdminDir, AdminSocket, RuntimeDir, LogPath, Python string
 	TrustedProxies                                                                   string
+	// RetryInitialFailure 首次启动失败时不放弃：返回错误供调用方记录，同时继续在后台
+	// 按退避重试；面板就绪前 /admin 由代理返回错误页，网关 API 不受影响。
+	RetryInitialFailure bool
 }
 
 type Runtime struct {
@@ -78,6 +82,9 @@ func Start(opts Options) (*Runtime, error) {
 	ready := make(chan error, 1)
 	go r.supervise(ctx, ready)
 	if err := <-ready; err != nil {
+		if opts.RetryInitialFailure {
+			return r, err
+		}
 		r.Close()
 		return nil, err
 	}
@@ -126,7 +133,14 @@ func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
 		if err := cmd.Start(); err != nil {
 			if initial {
 				first <- err
-				return
+				if !r.opts.RetryInitialFailure {
+					return
+				}
+				initial = false
+				if !wait(ctx, initialRetryDelay) {
+					return
+				}
+				continue
 			}
 			log.Printf("[panel] restart failed: %v", err)
 			if !wait(ctx, time.Second) {
@@ -150,7 +164,14 @@ func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
 			}
 			if initial {
 				first <- err
-				return
+				if !r.opts.RetryInitialFailure {
+					return
+				}
+				initial = false
+				if !wait(ctx, initialRetryDelay) {
+					return
+				}
+				continue
 			}
 			if !wait(ctx, time.Second) {
 				return
@@ -182,6 +203,9 @@ func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
 		}
 	}
 }
+
+// initialRetryDelay 首次启动失败后的重试间隔（凭据文件损坏等需要人工处理的故障不宜高频重启）。
+const initialRetryDelay = 10 * time.Second
 
 func wait(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)

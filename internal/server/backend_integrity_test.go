@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：禁止并行时上游多返回的调用只交付第一个。
 // 2026-09-16：从 HTTP 入口贯穿上游 SSE、Responses 终态与账号统计，防止失败/截断在适配层变成成功。
 package server
 
@@ -172,11 +173,25 @@ func TestGatewayIntegrityAggregateToolsHonorParallelLimit(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","input":"lookup","stream":false,"parallel_tool_calls":false,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]}`)))
-	if rec.Code != 502 {
-		t.Fatalf("parallel-tool contract violation was accepted: status=%d body=%s", rec.Code, rec.Body)
+	// 上游无视 parallel_tool_calls=false 返回两个调用时只交付第一个（其余从未执行）。
+	if rec.Code != 200 {
+		t.Fatalf("parallel-limited turn failed: status=%d body=%s", rec.Code, rec.Body)
 	}
-	state, _ := p.Status("integrity")
-	if state.SuccessCount != 0 {
-		t.Fatalf("contract violation counted as success: %+v", state)
+	var final map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	for _, rawItem := range final["output"].([]any) {
+		item := rawItem.(map[string]any)
+		if item["type"] == "function_call" {
+			calls++
+			if item["call_id"] != "call_1" {
+				t.Fatalf("delivered call is not the first one: %v", item)
+			}
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("delivered %d calls, want exactly the first: %s", calls, rec.Body)
 	}
 }

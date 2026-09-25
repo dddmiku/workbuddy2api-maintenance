@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：边界 11133 只在输入本身已占窗口一半以上时改判，缩预算一次到下限，仍远离窗口则原样返回；下限随模型输出上限缩放。
+// 2026-09-26：边界判定改用较保守的输入估算并参考会话样本；成功的大请求反推窗口下限（上游超窗也可能只回 11133）。
 // 2026-09-26：客户端未声明输出预算时按模型目录 maxOutputTokens 补齐（与官方客户端一致）；
 //
 //	上游按「输入+输出预算」判超限时，只收缩网关自选的预算后同号重发，不改历史；
@@ -32,15 +34,21 @@ import (
 )
 
 const (
-	// minFittedOutputTokens 收缩后的输出预算下限。推理模型的思考也计入 max_tokens，
-	// 预算再小就可能只够思考、没有正文；低于下限不再重发，原样返回超限让客户端压缩。
+	// minFittedOutputTokens 收缩后的输出预算下限（小输出上限的模型按 maxOutput/4 缩放，
+	// 不低于 minFittedOutputFloor）。推理模型的思考也计入 max_tokens，预算再小就可能只够
+	// 思考、没有正文；低于下限不再重发，原样返回超限让客户端压缩。
 	minFittedOutputTokens int64 = 32768
+	minFittedOutputFloor  int64 = 4096
 	// fitMarginTokens 按上游报告的精确计数重算预算时额外留出的余量。
 	fitMarginTokens int64 = 256
 	// maxBudgetRetries 单个请求内因输出预算重发的上限（缩预算一次 + 精确重算一次）。
 	maxBudgetRetries = 2
-	// nearWindowRatio 估算输入+输出预算达到窗口的这个比例，才把无字段 11133 归因到窗口边界。
+	// nearWindowRatio 估算输入+输出预算达到窗口的这个比例，才把无字段 11133 归因到窗口边界；
+	// 同时要求输入本身至少占窗口 minInputShare，避免把「预算参数本身过大」说成上下文超限。
 	nearWindowRatio = 0.75
+	minInputShare   = 0.5
+	// stillBeyondRatio 缩到下限预算后仍被拒时，输入+新预算至少达到窗口这个比例才维持超限判定。
+	stillBeyondRatio = 0.85
 )
 
 // modelLimits 模型目录里与请求预算相关的两项上限（0 = 未知）。
@@ -55,6 +63,16 @@ type outputBudget struct {
 	tokens        int64 // 出站 max_tokens（0 = 未携带）
 	gatewayChosen bool  // 客户端未声明、由网关按目录补齐；只有这种预算允许网关收缩
 	context       int64 // 目录窗口（0 = 未知），用于判断 11133 是否发生在窗口边界
+	maxOutput     int64 // 目录输出上限（0 = 未知）
+	floor         int64 // 收缩下限
+}
+
+// outputFloor 按模型输出上限缩放的收缩下限。
+func outputFloor(maxOutput int64) int64 {
+	if maxOutput <= 0 {
+		return minFittedOutputTokens
+	}
+	return min(minFittedOutputTokens, max(minFittedOutputFloor, maxOutput/4))
 }
 
 // storeModelLimits 按 realm 写入模型目录上限。空目录不写，避免一次异常探测清掉已知上限。
@@ -97,7 +115,7 @@ func (c *Client) limitsSnapshot(realm string) map[string]modelLimits {
 func applyOutputBudget(obj map[string]any, limits map[string]modelLimits) outputBudget {
 	model, _ := obj["model"].(string)
 	lim := limits[model]
-	budget := outputBudget{model: model, context: lim.context}
+	budget := outputBudget{model: model, context: lim.context, maxOutput: lim.maxOutput, floor: outputFloor(lim.maxOutput)}
 	if value, present := obj["max_tokens"]; present && value != nil {
 		if number, ok := value.(json.Number); ok {
 			if count, err := number.Int64(); err == nil && count > 0 {
@@ -152,25 +170,19 @@ func fittedOutputBudget(budget outputBudget, detail string) (int64, bool) {
 		return 0, false
 	}
 	fitted := window - prompt - fitMarginTokens
-	if fitted < minFittedOutputTokens || fitted >= budget.tokens {
+	if fitted < budget.floor || fitted >= budget.tokens {
 		return 0, false
 	}
 	return fitted, true
 }
 
-// shrunkOutputBudget 为窗口边界处的 11133 选一个更小的网关预算（无精确计数时按 1/4 收缩）。
+// shrunkOutputBudget 为窗口边界处的 11133 选更小的网关预算：没有精确计数，一次直接缩到
+// 下限（分多档会让客户端多等几轮 3.5–5 秒的上游拒绝）。
 func shrunkOutputBudget(budget outputBudget) (int64, bool) {
-	if !budget.gatewayChosen {
+	if !budget.gatewayChosen || budget.floor <= 0 || budget.floor >= budget.tokens {
 		return 0, false
 	}
-	next := budget.tokens / 4
-	if next < minFittedOutputTokens {
-		next = minFittedOutputTokens
-	}
-	if next >= budget.tokens {
-		return 0, false
-	}
-	return next, true
+	return budget.floor, true
 }
 
 // modelParamRejected 识别模型提供方拒绝参数且未指明字段的 11133（model_param_invalid）。
@@ -194,14 +206,55 @@ func modelParamRejected(raw []byte) (requestID string, ok bool) {
 	return requestID, true
 }
 
-// nearContextWindow 判断请求是否已贴近窗口：估算输入 + 输出预算 ≥ 窗口的 nearWindowRatio。
+// nearContextWindow 判断请求是否已贴近窗口：输入 + 输出预算 ≥ 窗口的 nearWindowRatio。
+// 输入取「官方口径估算」与「非图片字节/2.5」的较大者（低字节/token 的文本按官方口径会严重
+// 低估，线上 104 万重复短词请求就曾被误判为远离窗口），以及同会话上一轮的实报输入。
 // 窗口或预算未知时返回 false（保守：不把参数错误改判成超限）。
-func nearContextWindow(body []byte, budget outputBudget) bool {
+func nearContextWindow(body []byte, budget outputBudget, sessionPrompt int64) bool {
 	if budget.context <= 0 || budget.tokens <= 0 {
 		return false
 	}
-	estimate := estimatePromptTokens(body)
-	return float64(estimate+budget.tokens) >= nearWindowRatio*float64(budget.context)
+	// 客户端显式给出超过模型输出上限的预算：那是预算参数本身不合法，不是上下文问题。
+	if !budget.gatewayChosen && budget.maxOutput > 0 && budget.tokens > budget.maxOutput {
+		return false
+	}
+	input := estimateInputTokens(body, sessionPrompt)
+	window := float64(budget.context)
+	return float64(input) >= minInputShare*window && float64(input+budget.tokens) >= nearWindowRatio*window
+}
+
+// stillBeyondWindow 缩到下限后仍被拒时复核：输入 + 当前预算仍贴近窗口才维持超限判定，
+// 否则缩预算无效恰恰说明拒绝与窗口无关，应原样返回参数错误。
+func stillBeyondWindow(body []byte, budget outputBudget, sessionPrompt int64) bool {
+	if budget.context <= 0 {
+		return false
+	}
+	input := estimateInputTokens(body, sessionPrompt)
+	return float64(input+budget.tokens) >= stillBeyondRatio*float64(budget.context)
+}
+
+// estimateInputTokens 取官方口径估算、非图片字节/2.5 与会话实报输入三者的较大值。
+// 字节口径：中文约 4–5 字节/token、代码约 3 字节/token 时偏高（只影响边界判定的保守侧）；
+// 重复短词约 2 字节/token 时仍能认出已超窗（线上 104 万请求验收）。
+func estimateInputTokens(body []byte, sessionPrompt int64) int64 {
+	return max(estimatePromptTokens(body), (textBytes(body)*2+4)/5, sessionPrompt)
+}
+
+// textBytes 请求体中除 base64 图片数据以外的字节数。
+func textBytes(body []byte) int64 {
+	var total int64
+	dataURI := []byte("data:")
+	for i := 0; i < len(body); {
+		if body[i] == 'd' && bytes.HasPrefix(body[i:], dataURI) {
+			if end := bytes.IndexByte(body[i:], '"'); end > 0 && bytes.Contains(body[i:i+end], []byte(";base64,")) {
+				i += end
+				continue
+			}
+		}
+		total++
+		i++
+	}
+	return total
 }
 
 // estimatePromptTokens 粗估请求体的文本 token 数，口径与官方客户端 estimateTokensRough 一致：
@@ -314,6 +367,33 @@ func (c *Client) learnWindow(realm, model string, detail string) {
 	c.windows[realmKey(realm)+"\x00"+model] = window
 }
 
+// raiseWindow 把已学到的窗口提高到至少 window（只升不降）。
+func (c *Client) raiseWindow(realm, model string, window int64) {
+	c.limitsMu.Lock()
+	defer c.limitsMu.Unlock()
+	if c.windows == nil {
+		c.windows = make(map[string]int64)
+	}
+	key := realmKey(realm) + "\x00" + model
+	if window > c.windows[key] {
+		c.windows[key] = window
+	}
+}
+
+// sessionPrompt 返回会话最近一次实报输入（无样本或已过期返回 0）。
+func (c *Client) sessionPrompt(session, realm, model string) int64 {
+	if session == "" {
+		return 0
+	}
+	c.samplesMu.Lock()
+	defer c.samplesMu.Unlock()
+	sample, ok := c.samples[sampleKey(session, realm, model)]
+	if !ok || time.Since(sample.at) > promptSampleTTL {
+		return 0
+	}
+	return sample.prompt
+}
+
 // windowFor 返回模型窗口：上游实报优先，其次目录值；都未知返回 0。
 func (c *Client) windowFor(realm, model string) int64 {
 	c.limitsMu.RLock()
@@ -331,8 +411,14 @@ func (c *Client) RecordPromptSample(session, realm, model string, promptTokens i
 		return
 	}
 	window := c.windowFor(realm, model)
+	if window > 0 && promptTokens+minFittedOutputTokens > window {
+		// 上游接受了这么大的输入（加上至少下限的输出预算），真实窗口必然更大：
+		// 目录标称 1000000 而实际 1048576 时，靠它把窗口下限抬到已证实的值。
+		window = promptTokens + minFittedOutputTokens
+		c.raiseWindow(realm, model, window)
+	}
 	key := sampleKey(session, realm, model)
-	if window <= 0 || float64(promptTokens) < proactiveMinShare*float64(window) || promptTokens > window {
+	if window <= 0 || float64(promptTokens) < proactiveMinShare*float64(window) {
 		c.samplesMu.Lock()
 		delete(c.samples, key)
 		c.samplesMu.Unlock()
@@ -369,7 +455,7 @@ func (c *Client) RecordPromptSample(session, realm, model string, promptTokens i
 // proactiveOutputBudget 按会话样本推算本轮输入，返回放得进窗口的网关预算。
 // 只收缩、不放大；推算结果不低于 minFittedOutputTokens；样本缺失或过期时返回 false。
 func (c *Client) proactiveOutputBudget(session, realm string, budget outputBudget, body []byte) (int64, bool) {
-	if session == "" || !budget.gatewayChosen || budget.tokens <= minFittedOutputTokens {
+	if session == "" || !budget.gatewayChosen || budget.tokens <= budget.floor {
 		return 0, false
 	}
 	key := sampleKey(session, realm, budget.model)
@@ -396,8 +482,8 @@ func (c *Client) proactiveOutputBudget(session, realm string, budget outputBudge
 	if fitted >= budget.tokens {
 		return 0, false
 	}
-	if fitted < minFittedOutputTokens {
-		fitted = minFittedOutputTokens
+	if fitted < budget.floor {
+		fitted = budget.floor
 	}
 	return fitted, true
 }
