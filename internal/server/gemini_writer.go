@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：保留逐密钥频率与并发响应头，客户端可读取共享额度与重试提示。
 // 2026-09-25：统一错误文本的小写开头，通过最终静态检查而不改变错误代码或协议行为。
 // 2026-09-25：Gemini 输出保留真实聚合用量和错误终态，SSE 只输出客户端可解析的数据帧。
 // 2026-09-25：整组验证函数参数再交付，固定客户端请求的流式运输，并传播最终写出失败。
@@ -454,7 +455,7 @@ func (g *geminiWriter) finish() {
 }
 
 func (g *geminiWriter) copyHeaders() {
-	for _, key := range []string{"Retry-After", "X-Request-ID", "X-Gateway-Capabilities", "Cache-Control"} {
+	for _, key := range []string{"Retry-After", "X-Request-ID", "X-Gateway-Capabilities", "Cache-Control", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-Concurrency-Limit"} {
 		if value := g.hdr.Get(key); value != "" {
 			g.inner.Header().Set(key, value)
 		}

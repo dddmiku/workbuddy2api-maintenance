@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：管理通道支持每密钥限流策略，未提供保持原值、null恢复无限制。
 // 2026-09-20：密钥管理接口接受可选 expires_at；字段缺省表示保持现状，显式 null 表示无限制。
 // 2026-09-20：增加仅限管理通道的按需复制接口，以及逐密钥重复推理保护设置。
 // 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
@@ -55,12 +56,13 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 	})
 	mux.HandleFunc("POST /keys", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name               string   `json:"name"`
-			Note               string   `json:"note"`
-			Models             []string `json:"models"`
-			ReasoningLoopGuard *bool    `json:"reasoning_loop_guard"`
-			GlobalFallbackToCN *bool    `json:"global_fallback_to_cn"`
-			ExpiresAt          *string  `json:"expires_at"`
+			Name               string          `json:"name"`
+			Note               string          `json:"note"`
+			Models             []string        `json:"models"`
+			ReasoningLoopGuard *bool           `json:"reasoning_loop_guard"`
+			GlobalFallbackToCN *bool           `json:"global_fallback_to_cn"`
+			ExpiresAt          *string         `json:"expires_at"`
+			Limits             json.RawMessage `json:"limits"`
 		}
 		if !readBody(w, r, &body) {
 			return
@@ -70,10 +72,16 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			replyError(w, err)
 			return
 		}
+		limits, err := parseLimits(body.Limits)
+		if err != nil {
+			replyError(w, err)
+			return
+		}
 		entry, key, err := s.Create(body.Name, body.Note, body.Models,
 			Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
 				GlobalFallbackToCN: body.GlobalFallbackToCN,
-				ExpiresAt:          expiresAt, ExpiresAtSet: true})
+				ExpiresAt:          expiresAt, ExpiresAtSet: true,
+				Limits: limits, LimitsSet: len(body.Limits) > 0})
 		if err != nil {
 			replyError(w, err)
 			return
@@ -91,17 +99,26 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 			// ExpiresAt 用 RawMessage 区分「没提这个字段」与「显式传 null」：
 			// 前者保持现状，后者表示改成无限制。
 			ExpiresAt json.RawMessage `json:"expires_at"`
+			Limits    json.RawMessage `json:"limits"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
 		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil &&
-			body.ReasoningLoopGuard == nil && body.GlobalFallbackToCN == nil && len(body.ExpiresAt) == 0 {
+			body.ReasoningLoopGuard == nil && body.GlobalFallbackToCN == nil && len(body.ExpiresAt) == 0 && len(body.Limits) == 0 {
 			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
 			return
 		}
 		options := Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
 			GlobalFallbackToCN: body.GlobalFallbackToCN}
+		if len(body.Limits) > 0 {
+			limits, err := parseLimits(body.Limits)
+			if err != nil {
+				replyError(w, err)
+				return
+			}
+			options.Limits, options.LimitsSet = limits, true
+		}
 		if len(body.ExpiresAt) > 0 {
 			if string(bytes.TrimSpace(body.ExpiresAt)) != "null" {
 				var raw string
@@ -187,6 +204,9 @@ func replyError(w http.ResponseWriter, err error) {
 		message = err.Error()
 	case errors.Is(err, ErrLimit):
 		code = 409
+		message = err.Error()
+	case errors.Is(err, ErrInvalidLimits):
+		code = 400
 		message = err.Error()
 	case errors.Is(err, ErrSecretNotStored), errors.Is(err, ErrSecretUnavailable):
 		code = 409

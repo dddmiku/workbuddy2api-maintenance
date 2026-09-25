@@ -48,6 +48,10 @@
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>
         用量统计
       </button>
+      <button data-view="requests">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4zM8 8h8M8 12h8M8 16h4"/></svg>
+        请求明细
+      </button>
     </div>
     <div class="nav-lb">运维</div>
     <div id="tabs2">
@@ -160,6 +164,7 @@
           <p class="sub">停用或删除会立即阻止后续请求，已开始的请求不受影响。</p>
         </div>
         <div id="keyError" class="note err hide" role="alert"></div>
+        <div id="keyLimitsError" class="note warn hide" role="status"></div>
         <div class="panel">
           <div class="ph">
             <div class="search"><input id="keySearch" placeholder="搜索名称或备注" autocomplete="off" spellcheck="false" aria-label="搜索密钥"></div>
@@ -168,14 +173,17 @@
             <button class="btn sm pri" id="btnCreateKey">＋ 创建密钥</button>
           </div>
           <div class="tblwrap">
-            <table class="tbl key-table">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>状态</th><th>重复推理保护</th><th>CN 回落</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="10"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+            <table class="tbl key-table" data-sticky-head="keys">
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>限流与占用</th><th>状态</th><th>重复推理保护</th><th>CN 回落</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="11"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
         <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复输出（推理或正文）的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
+        <p class="sub key-footnote">限流由此密钥的各协议共同计数；频率统计网关接纳的请求，内部重试不重复占用额度。限流修改对后续请求及正在排队的请求生效，已经开始的请求继续完成。占用为最近一次刷新的快照。</p>
       </section>
+
+      <!--__REQUESTS_VIEW__-->
 
       <section class="view hide" data-view="usage">
         <div class="usage-filter" id="usageFilter"></div>
@@ -429,6 +437,16 @@
           </select>
         </label>
         <label class="fld hide" id="keyExpiryCustomField"><span class="k">到期时间</span><input type="datetime-local" id="keyExpiryCustom" aria-label="自定义到期时间"></label>
+        <fieldset class="key-limit-fields">
+          <legend>此密钥的请求限流</legend>
+          <p class="sub">三个设置对全部协议共用。默认不限制，填 0 可关闭对应限制。</p>
+          <div class="key-limit-grid">
+            <label class="fld"><span class="k">每分钟请求数</span><input type="number" id="keyRPM" min="0" max="60000" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">同时进行的请求数</span><input type="number" id="keyConcurrency" min="0" max="256" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">并发满时最多等待（秒）</span><input type="number" id="keyQueueSeconds" min="0" max="30" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+          </div>
+          <p class="sub" id="keyLimitHint">请求频率按滚动 60 秒计数，边界最多延迟 1 秒释放。并发满时可等待 1–30 秒；0 表示直接返回限流提示。只有设置并发上限后才能排队，每把密钥最多排队 32 个请求。</p>
+        </fieldset>
       </div>
       <div id="keyCreated" class="hide">
         <div class="note ok" id="keySecretStatus" role="status">密钥已创建，可以用于连接网关。</div>

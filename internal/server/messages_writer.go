@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：保留逐密钥频率与并发响应头，客户端可读取共享额度与重试提示。
 // 2026-09-25：将已校验的Chat结果转为Anthropic消息与流事件，错误不产生成功终态，缓存用量避免重复相加。
 // 2026-09-25：流式工具保留参数增量并延迟完成，透传心跳与写失败，保留上下文错误类别和缓存创建用量。
 // 2026-09-25：按官方 SDK 合同在全量校验后顺序交付工具块，避免并行完成回调错位；首帧不写会残留的临时用量扩展标记。
@@ -274,7 +275,7 @@ func stringField(object map[string]any, key string) string {
 }
 
 func (m *messagesWriter) copyHeaders() {
-	for _, key := range []string{"Retry-After", "X-Request-ID"} {
+	for _, key := range []string{"Retry-After", "X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-Concurrency-Limit"} {
 		if value := m.hdr.Get(key); value != "" {
 			m.inner.Header().Set(key, value)
 		}

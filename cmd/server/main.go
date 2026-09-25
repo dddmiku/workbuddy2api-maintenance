@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：启用共享密钥限流与有界请求明细，热交接/信号退出均在在途结束后关闭。
 // 2026-09-25：单容器内托管同版管理台及完整更新包，信号退出同样等待长流和最终状态落盘。
 // 2026-09-20：向密钥管理接口提供重复推理保护默认值，支持每把密钥单独覆盖。
 // 2026-09-19：将重复推理保护的明确开关传入共享HTTP处理器。
@@ -25,9 +26,11 @@ import (
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/hotupdate"
+	"workbuddy2api/internal/keylimit"
 	"workbuddy2api/internal/panelruntime"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/requestlog"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
@@ -79,6 +82,34 @@ func main() {
 		defer usageStore.Close()
 		log.Printf("usage ledger enabled: %s", cfg.UsageFile)
 	}
+	var keyLimits *keylimit.Manager
+	var requestStore *requestlog.Store
+	if keyStore != nil {
+		keyLimits, err = keylimit.Open(filepath.Join(filepath.Dir(cfg.APIKeysFile), "key-limits"))
+		if err != nil {
+			log.Fatalf("load key limits: %v", err)
+		}
+	}
+	if cfg.UsageFile != "" {
+		requestStore, err = requestlog.Open(filepath.Join(filepath.Dir(cfg.UsageFile), "requests.jsonl"), requestlog.Options{})
+		if err != nil {
+			log.Printf("WARN: [requests] detail storage unavailable; cumulative usage remains enabled: %v", err)
+		}
+	}
+	var closeOpsOnce sync.Once
+	var closeOpsErr error
+	closeOps := func() error {
+		closeOpsOnce.Do(func() {
+			if requestStore != nil {
+				closeOpsErr = errors.Join(closeOpsErr, requestStore.Close())
+			}
+			if keyLimits != nil {
+				closeOpsErr = errors.Join(closeOpsErr, keyLimits.Close())
+			}
+		})
+		return closeOpsErr
+	}
+	defer closeOps()
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
@@ -325,6 +356,8 @@ func main() {
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Usage:         usageStore,
+		KeyLimits:     keyLimits,
+		Requests:      requestStore,
 	})
 
 	// 管理通道 HTTP 服务：正常运行时就绪；兼容路径下等旧实例释放路径后再起。
@@ -448,10 +481,11 @@ func main() {
 				return shutdownHTTPServer(ctx, srv)
 			},
 			closeUsage: func() error {
+				var err error
 				if usageStore != nil {
-					return usageStore.Close()
+					err = usageStore.Close()
 				}
-				return nil
+				return errors.Join(err, closeOps())
 			},
 		}); err != nil {
 			log.Printf("WARN: [server] shutdown: %v", err)

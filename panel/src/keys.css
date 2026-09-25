@@ -2,6 +2,15 @@
  * 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
 /* 2026-09-20：列表复制入口和逐密钥重复推理保护开关，兼容移动端卡片。 */
 /* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
+/* 2026-09-25：增加限流表单、占用摘要与固定表头，窄屏保持独立字段对应。 */
+.key-limits{line-height:1.7}.key-limit-state{margin-top:3px;white-space:normal}.key-limit-content{min-width:0}
+@media(min-width:901px){.key-table{min-width:1660px}.key-table td:first-child{min-width:160px}.key-table td:nth-child(3){min-width:210px}.key-limits{min-width:210px}.key-actions{min-width:160px}.key-model-tag{overflow-wrap:normal}}
+.key-limit-fields{border:1px solid var(--line);border-radius:var(--r2);padding:14px;margin:6px 0 0;min-width:0}
+.key-limit-fields legend{padding:0 6px;font-weight:500}.key-limit-fields p{margin:0 0 12px;line-height:1.7}
+.key-limit-fields p:last-child{margin-bottom:0}.key-limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.key-limit-grid .fld:last-child{grid-column:1/-1}.key-limit-grid .fld{min-width:0}
+.key-dialog-head,.key-dialog-foot{position:sticky;background:var(--surface);z-index:1}.key-dialog-head{top:0}.key-dialog-foot{bottom:0}
+@media(max-width:420px){.key-limit-grid{grid-template-columns:1fr}}
 .key-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 16px}
 .key-summary p{margin:0}.key-count{font:600 26px/1 var(--mono);letter-spacing:-.02em;color:var(--ink)}
 .key-name{font-weight:500;display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}

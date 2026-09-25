@@ -1,0 +1,45 @@
+<!-- 2026-09-25：新增完成请求明细与只读详情，明确已知消耗、重试缺失和留存范围。 -->
+<section id="pg-requests" class="page view hide" data-view="requests" aria-label="请求明细">
+  <div class="vacts">
+    <span class="sub">按请求核对消耗、重试和账号调度</span>
+    <span class="sp"></span>
+    <button type="button" class="btn" id="btnRequestsReload">刷新明细</button>
+  </div>
+  <form id="requestFilters" class="requests-filters" autocomplete="off" aria-label="筛选请求明细">
+    <label><span>调用密钥</span><input id="requestKeyFilter" list="requestKeyOptions" maxlength="128" placeholder="选择调用方或填写管理 ID" spellcheck="false"><datalist id="requestKeyOptions"></datalist></label>
+    <label><span>完整模型名</span><input id="requestModelFilter" list="requestModelOptions" maxlength="256" placeholder="例如 global:hy3" spellcheck="false"><datalist id="requestModelOptions"></datalist></label>
+    <label><span>请求状态</span><select id="requestStatusFilter"><option value="">全部状态</option><option value="success">成功</option><option value="error">失败</option><option value="canceled">已取消</option><option value="rejected">已拒绝</option></select></label>
+    <label><span>请求 ID</span><input id="requestIDFilter" maxlength="128" placeholder="填写完整请求 ID" spellcheck="false"></label>
+    <div class="requests-filter-actions"><button type="submit" class="btn pri">筛选</button><button type="reset" class="btn">清空</button></div>
+  </form>
+  <div id="requestsError" class="note err hide" role="alert"></div>
+  <div id="requestsRecovery" class="note warn hide" role="status"></div>
+  <div class="panel requests-panel" id="requestsPanel" aria-busy="false">
+    <div class="ph"><b>已完成请求</b><span class="sp"></span><span id="requestsStatus" class="sub" role="status" aria-live="polite">尚未加载</span></div>
+    <div class="requests-table-wrap" tabindex="0" role="region" aria-label="请求明细表，可横向滚动">
+      <table class="tbl requests-table">
+        <thead><tr><th scope="col">时间 / 请求 ID</th><th scope="col">模型 / 协议</th><th scope="col">调用密钥</th><th scope="col">状态</th><th scope="col" class="r">已知输入</th><th scope="col" class="r">已知输出</th><th scope="col" class="r">缓存</th><th scope="col" class="r">推理</th><th scope="col" class="r">积分</th><th scope="col" class="r">总耗时</th><th scope="col" class="r">首字节</th><th scope="col" class="r">排队</th><th scope="col">本次调度</th></tr></thead>
+        <tbody id="requestRows"><tr><td colspan="13"><div class="empty">正在准备请求明细…</div></td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <nav class="requests-pagination" aria-label="请求明细分页">
+    <span id="requestsRange" class="sub" aria-live="polite">—</span><span class="sp"></span>
+    <label>每页 <select id="requestPageSize" aria-label="每页请求数"><option value="20">20 条</option><option value="50">50 条</option></select></label>
+    <button type="button" class="btn sm" id="requestsPrevious" disabled>上一页</button>
+    <span id="requestsPageNumber" class="requests-page-number">1</span>
+    <button type="button" class="btn sm" id="requestsNext" disabled>下一页</button>
+  </nav>
+  <p class="requests-footnote">仅显示已知消耗；“未知”表示未上报。翻页后保持当前页，点击刷新回到最新记录。</p>
+  <details class="requests-explainer">
+    <summary>统计范围与留存</summary>
+    <p>这里只保存已完成的请求；鉴权前或入口拒绝的请求不可见。明细保留 7 天，最多 10000 条 / 64 MiB，与“用量统计”的累计账本范围不同。</p>
+    <p>失败、取消和重试会保留已上报的用量。缺失部分无法按零计算，缓存和推理也不再重复计入输入、输出。调用密钥筛选填写管理 ID，不填写密钥内容。</p>
+  </details>
+
+  <dialog id="requestDetailDialog" class="requests-dialog" aria-labelledby="requestDetailTitle">
+    <div class="requests-dialog-head"><div><h3 id="requestDetailTitle">请求详情</h3><code id="requestDetailID"></code></div><button type="button" class="vbtn" id="requestDetailClose" aria-label="关闭请求详情">×</button></div>
+    <div class="requests-dialog-body" id="requestDetailBody"></div>
+    <div class="requests-dialog-foot"><button type="button" class="btn hide" id="requestDetailRetry">重试加载</button><span class="sp"></span><button type="button" class="btn" id="requestDetailDone">关闭</button></div>
+  </dialog>
+</section>

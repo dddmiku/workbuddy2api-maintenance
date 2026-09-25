@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-25：接入请求消费明细导航与刷新，保持筛选和历史分页状态。
 // 2026-09-24：忽略过时刷新响应，日志按完整行检测更新并补取改变后的条数；修正空成功时间、凭证到期判断和当前页刷新。
 // 2026-09-24：冷却截止时间随数据快照固定，搜索或切页不再重新开始倒计时；同一到期快照仅补取一次。
 // 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
@@ -215,6 +216,7 @@ var PAGE = {
   accounts:{ t:'账号', d:'凭证、积分与启停' },
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
   usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
+  requests:{ t:'请求明细', d:'核对每次调用、重试消费与账号调度' },
   tasks:   { t:'排程', d:'定时任务开关与手动触发' },
   logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
@@ -241,6 +243,7 @@ function go(v){
   renderView(v);
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (v === 'requests' && typeof loadRequests === 'function') loadRequests();
   // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
   if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
   // 重复推理保护开关同样不依赖 /api/state，进入系统页就拉当前运行期值。
@@ -1056,6 +1059,7 @@ $('#btnRefresh').addEventListener('click', function(){
   loadAll(true);
   if (CURRENT_VIEW === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (CURRENT_VIEW === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (CURRENT_VIEW === 'requests' && typeof loadRequests === 'function') loadRequests(true);
   if (CURRENT_VIEW === 'logs') loadLogs();
 });
 $('#btnRestart').addEventListener('click', actRestart);

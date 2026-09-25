@@ -1,5 +1,7 @@
 // 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
 // ═══ 更新日志 ═══
+// 2026-09-25：删除已无调用的旧私有包装，选择与抽签继续复用同一实现，避免静态检查遗留。
+// 2026-09-25：在实际选号锁内记录阶段、排除、权重与成本事实；旧 API 复用同一算法且不增加抽签。
 // 2026-09-19：免费优先保留，每四次普通分配给未知可用账号一次轮询机会；粘性和跨模型流量不干扰探索。
 // 2026-09-18：全冷却兜底仍遵守请求模型的独立冷却，避免重复选择已明确限额或不可用的模型。
 package pool
@@ -39,35 +41,45 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
 // 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickWithDecision(tried, reqModel, realm, nil)
+}
+
+func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d *Decision) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	d.begin("pool", len(p.byUID), now)
 	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
 	}
-	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
-	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
-	}
 	var cands []*entry
 	for uid, e := range p.byUID {
+		d.increment("evaluated")
 		if tried != nil && tried[uid] {
+			d.exclude("already_tried")
 			continue
 		}
-		if !healthyOf(e) {
+		if realm != "" && e.a.Realm() != realm {
+			d.exclude("realm_mismatch")
 			continue
 		}
+		if reason := e.unavailableReason(now, reqModel); reason != "" {
+			d.exclude(reason)
+			continue
+		}
+		d.increment("healthy")
 		if p.inFlightFull(e) {
+			d.exclude("in_flight_full")
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
 		cands = append(cands, e)
 	}
+	d.stage("available", len(cands))
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, reqModel, realm)
+		return p.pickEarliestExpiryWithDecisionLocked(tried, now, reqModel, realm, d)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -94,22 +106,37 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
 	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
 	// 已知收费号不参与免费层探索，避免仅为打散流量而产生额外已知费用。
-	costTier := func(e *entry) (int, float64) {
+	costTier := func(e *entry) (int, float64, decisionCost) {
 		mc, ok := e.modelCostOf(reqModel, now)
+		var fact decisionCost
+		if d != nil {
+			fact = decisionCostOf(e, reqModel, now, mc, ok)
+		}
 		if !ok {
-			return 1, 0
+			return 1, 0, fact
 		}
 		if mc.CostPer1k <= 0 {
-			return 0, 0
+			return 0, 0, fact
 		}
-		return 2, mc.CostPer1k
+		return 2, mc.CostPer1k, fact
 	}
 	bestTier := 2
 	all := make([]weighted, 0, len(cands))
 	var unknown []*entry
+	d.stage("cost_free", 0)
+	d.stage("cost_unknown", 0)
+	d.stage("cost_paid", 0)
 	for _, e := range cands {
-		ti, ci := costTier(e)
-		all = append(all, weighted{e: e, tier: ti, cost1k: ci})
+		ti, ci, fact := costTier(e)
+		all = append(all, weighted{e: e, tier: ti, cost1k: ci, cost: fact})
+		switch ti {
+		case 0:
+			d.increment("cost_free")
+		case 1:
+			d.increment("cost_unknown")
+		case 2:
+			d.increment("cost_paid")
+		}
 		if ti == 1 {
 			unknown = append(unknown, e)
 		}
@@ -119,6 +146,16 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	if bestTier == 0 && len(unknown) > 0 {
 		if e := p.exploreUnknownLocked(unknown, reqModel, realm); e != nil {
+			if d != nil {
+				d.ReasonCode, d.SelectionMethod = "unknown_exploration", "exploration"
+				d.stage("preferred", len(unknown))
+				for _, candidate := range all {
+					if candidate.e == e {
+						d.selected(e, candidate.cost, true)
+						break
+					}
+				}
+			}
 			e.lastUsed = now
 			p.pickSeq++
 			e.usedSeq = p.pickSeq
@@ -132,6 +169,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			ws = append(ws, candidate)
 		}
 	}
+	d.stage("preferred", len(ws))
 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
 	// 候选数超过 top5 时，才对 ws 做 Fisher-Yates 洗牌（且**不消耗 p.randInt64N
 	// 注入源**，避免改变 pickWeighted 的确定性语义，见 TestPickDeterministicViaSet
@@ -174,6 +212,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) > 5 {
 		cands = cands[:5]
 	}
+	d.stage("shortlist", len(cands))
 	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
 	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
 	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
@@ -186,8 +225,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			eligible = append(eligible, we)
 		}
 	}
+	d.stage("eligible", len(eligible))
+	d.stage("recent", len(cands)-len(eligible))
 	var e *entry
 	if len(eligible) == 0 {
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "recent_lru", "lru"
+		}
 		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
 		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
 		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
@@ -199,7 +243,24 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			}
 		}
 	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集，权重直接用预计算值
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "weighted_selection", "weighted"
+			if bestTier == 0 {
+				d.ReasonCode = "free_preferred"
+			} else if bestTier == 1 && d.StageCounts["cost_paid"] > 0 {
+				d.ReasonCode = "unknown_preferred"
+			}
+		}
+		e = p.pickWeightedWithDecision(eligible, d) // 复用已有权重与相同一次抽签
+	}
+	if d != nil {
+		for _, candidate := range ws {
+			if candidate.e == e {
+				d.selected(e, candidate.cost, true)
+				d.weight(candidate.w)
+				break
+			}
+		}
 	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
@@ -207,41 +268,65 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return e.a
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
+// pickEarliestExpiryWithDecisionLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryWithDecisionLocked(tried map[string]bool, now time.Time, reqModel, realm string, d *Decision) *auth.Auth {
 	var best *entry
+	var bestExpiry time.Time
+	d.stage("fallback_evaluated", 0)
+	d.stage("fallback_eligible", 0)
 	for uid, e := range p.byUID {
+		d.increment("fallback_evaluated")
 		if tried != nil && tried[uid] {
+			d.exclude("fallback_already_tried")
 			continue
 		}
 		if realm != "" && e.a.Realm() != realm {
+			d.exclude("fallback_realm_mismatch")
 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
 		}
 		if e.disabled {
+			d.exclude("fallback_disabled")
 			continue // 禁用的账号永不参与兜底
 		}
 		if e.modelCooled(now, reqModel) {
+			d.exclude("fallback_model_cooldown")
 			continue
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+			d.exclude("fallback_account_limit")
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 		}
 		if p.inFlightFull(e) {
+			d.exclude("fallback_in_flight_full")
 			continue
 		}
 		exp := e.expiry(now)
 		if exp.IsZero() {
+			d.exclude("fallback_no_cooldown")
 			continue
 		}
+		d.increment("fallback_eligible")
 		if best == nil || exp.Before(best.expiry(now)) {
 			best = e
+			bestExpiry = exp
 		}
 	}
 	if best == nil {
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "no_available_account", "none"
+		}
 		return nil
+	}
+	if d != nil {
+		d.ReasonCode, d.SelectionMethod = "cooldown_fallback", "fallback"
+		d.FallbackKind = best.fallbackKind(now)
+		expires := bestExpiry.UTC()
+		d.FallbackUntil = &expires
+		mc, known := best.modelCostOf(reqModel, now)
+		d.selected(best, decisionCostOf(best, reqModel, now, mc, known), false)
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
@@ -270,6 +355,7 @@ type weighted struct {
 	w      float64
 	tier   int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
 	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
+	cost   decisionCost
 }
 
 // expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
@@ -277,7 +363,7 @@ type weighted struct {
 // 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
 const expiringWeight = 8.0
 
-// pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
+// pickWeightedWithDecision 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
 //		weight = credits 比例 × 10 + idleWeight + successRate × 3
 //
@@ -294,7 +380,7 @@ const expiringWeight = 8.0
 // 本函数**不再调用 weightOf**——单次 pick 内每个候选的权重只算一次，预计算与抽签
 // 共用同一数值（旧实现在 eligible 子集上用子集 maxCredits 重算第二遍，两次口径
 // 分裂：全集最大 credits 号被 minPickGap 挤出后，子集内 credits 比例整体膨胀）。
-func (p *Pool) pickWeighted(cands []weighted) *entry {
+func (p *Pool) pickWeightedWithDecision(cands []weighted, d *Decision) *entry {
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
@@ -314,12 +400,23 @@ func (p *Pool) pickWeighted(cands []weighted) *entry {
 		rnd = p.randInt64N
 	}
 	r := rnd(total)
+	if d != nil {
+		d.WeightTotal = &total
+	}
 	var acc int64
 	for i := range cands {
 		acc += weights[i]
 		if r < acc {
+			if d != nil {
+				units := weights[i]
+				d.WeightUnits = &units
+			}
 			return cands[i].e
 		}
+	}
+	if d != nil {
+		units := weights[len(weights)-1]
+		d.WeightUnits = &units
 	}
 	return cands[len(cands)-1].e
 }

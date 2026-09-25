@@ -1,5 +1,6 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 // ═══ 更新日志 ═══
+// 2026-09-25：健康判断与调度解释共用同一首个阻断条件，保留账号优先于模型限制的既有顺序。
 // 2026-09-24：移除绕过账号冷却的旧模型豁免判据，保持模型与账号限制正交。
 // 2026-09-24：11102 到期后有界保留命中计数，使半开重试失败能继续退避。
 // 2026-09-18：状态文件保存账号删除代次，阻止尚未落盘的旧创建意图越过已完成的删除。
@@ -161,16 +162,7 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
-		return false
-	}
-	if !e.until.IsZero() && now.Before(e.until) {
-		return false
-	}
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		return false
-	}
-	return true
+	return e.unavailableReason(now, "") == ""
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -200,13 +192,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 未记录模型 → 等价 healthy。6004 从不写账号级 until（见 CooldownSoftForModel），
 // 因此不存在「账号级冷却因病 6004 而起、应豁免其他模型」的形态。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if !e.healthy(now) { // 全账号级（disabled/until/breakerUntil）先判
-		return false
-	}
-	if e.modelCooled(now, reqModel) { // 全账号健康时再查该模型的 6004 独立冷却
-		return false
-	}
-	return true
+	return e.unavailableReason(now, reqModel) == ""
 }
 
 // pruneExpiredModelCooldowns 清理过期模型限制。11102 到期后仍保留最多一天的
@@ -243,7 +229,7 @@ func (e *entry) expiry(now time.Time) time.Time {
 }
 
 // fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
+// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryWithDecisionLocked 排除）。判定口径：
 // 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
 func (e *entry) fallbackKind(now time.Time) string {
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {

@@ -415,6 +415,15 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
  * 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
 /* 2026-09-20：列表复制入口和逐密钥重复推理保护开关，兼容移动端卡片。 */
 /* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
+/* 2026-09-25：增加限流表单、占用摘要与固定表头，窄屏保持独立字段对应。 */
+.key-limits{line-height:1.7}.key-limit-state{margin-top:3px;white-space:normal}.key-limit-content{min-width:0}
+@media(min-width:901px){.key-table{min-width:1660px}.key-table td:first-child{min-width:160px}.key-table td:nth-child(3){min-width:210px}.key-limits{min-width:210px}.key-actions{min-width:160px}.key-model-tag{overflow-wrap:normal}}
+.key-limit-fields{border:1px solid var(--line);border-radius:var(--r2);padding:14px;margin:6px 0 0;min-width:0}
+.key-limit-fields legend{padding:0 6px;font-weight:500}.key-limit-fields p{margin:0 0 12px;line-height:1.7}
+.key-limit-fields p:last-child{margin-bottom:0}.key-limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.key-limit-grid .fld:last-child{grid-column:1/-1}.key-limit-grid .fld{min-width:0}
+.key-dialog-head,.key-dialog-foot{position:sticky;background:var(--surface);z-index:1}.key-dialog-head{top:0}.key-dialog-foot{bottom:0}
+@media(max-width:420px){.key-limit-grid{grid-template-columns:1fr}}
 .key-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 16px}
 .key-summary p{margin:0}.key-count{font:600 26px/1 var(--mono);letter-spacing:-.02em;color:var(--ink)}
 .key-name{font-weight:500;display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}
@@ -549,6 +558,53 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   .table-scroll .tbl tbody tr:last-child td{border-bottom:0}
   .table-scroll .tbl td::before{display:none}
 }
+/* ═══ 更新日志 ═══
+ * 2026-09-25：请求明细复用现有主题，固定表头、保留完整模型名，窄屏横向滚动和有界详情弹窗。 */
+.requests-filters{display:grid;grid-template-columns:minmax(160px,1fr) minmax(190px,1.3fr) 120px minmax(160px,1fr) auto;gap:10px;align-items:end;margin-bottom:14px}
+.requests-filters label{display:flex;flex-direction:column;gap:5px;min-width:0;font-size:12px;color:var(--ink-2)}
+.requests-filters input,.requests-filters select,.requests-pagination select{width:100%;min-width:0;height:34px;padding:0 10px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface);color:var(--ink);font:inherit}
+.requests-filter-actions{display:flex;gap:7px}.requests-filter-actions .btn{height:34px}
+.requests-panel{margin-top:8px}.requests-panel[aria-busy=true] .requests-table-wrap{opacity:.65}
+.requests-table-wrap{overflow:auto;max-height:68vh;overscroll-behavior:contain}
+.requests-table{width:100%;min-width:1430px;border-collapse:separate;border-spacing:0}
+.requests-table th{position:sticky;top:0;z-index:2;background:var(--surface-2);box-shadow:0 1px 0 var(--line);white-space:nowrap}
+.requests-table td{vertical-align:top}.requests-table td.num,.requests-table th.r{text-align:right;white-space:nowrap}
+.requests-table tbody tr[data-request-id]{cursor:pointer}.requests-table tbody tr[data-request-id]:hover{background:var(--surface-2)}
+.requests-table td:first-child{min-width:145px}.requests-table td:nth-child(2){min-width:220px;max-width:310px}.requests-table td:nth-child(3){min-width:120px;max-width:200px}.requests-table td:nth-child(4){min-width:114px}.requests-table td:last-child{min-width:170px;max-width:230px}
+.requests-model,.requests-key{white-space:normal;overflow-wrap:anywhere;word-break:break-word;font-weight:500}
+.requests-model{font:12px/1.55 var(--mono)}.requests-sub{display:block;margin-top:4px;font-size:11px;line-height:1.45;color:var(--ink-3);white-space:normal;overflow-wrap:anywhere}
+.requests-id{padding:0;margin:4px 0 0;font:11px/1.5 var(--mono);color:var(--accent-2);text-align:left;text-decoration:none}
+.requests-id:hover{text-decoration:underline}.requests-time{white-space:nowrap;font:11.5px/1.6 var(--mono)}
+.requests-badge{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:11.5px;line-height:1.55;white-space:nowrap}
+.requests-badge.success{color:var(--ok);background:var(--ok-soft)}.requests-badge.error{color:var(--err);background:var(--err-soft)}
+.requests-badge.canceled,.requests-badge.rejected{color:var(--warn);background:var(--warn-soft)}.requests-badge.unknown{color:var(--ink-2);background:var(--sunken)}
+.requests-coverage{display:block;margin-top:5px;font-size:11px;color:var(--ink-3);line-height:1.4}.requests-coverage.partial,.requests-coverage.missing{color:var(--warn)}
+.requests-finish{display:block;margin-top:5px;font-size:11px;color:var(--ink-2);line-height:1.4}.requests-finish.limited{color:var(--warn);font-weight:500}
+.requests-metric{font:12px/1.6 var(--mono);font-variant-numeric:tabular-nums}.requests-null{font:11px/1.6 var(--font);color:var(--ink-3)}
+.requests-partial{display:block;font:10px/1.3 var(--font);color:var(--warn);margin-top:3px}
+.requests-decision{font-size:12px;white-space:normal;overflow-wrap:anywhere}.requests-decision-code{font:10px/1.5 var(--mono);color:var(--ink-3)}
+.requests-pagination{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:14px}.requests-pagination label{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-2)}
+.requests-pagination select{width:auto;height:30px}.requests-page-number{min-width:22px;text-align:center;font:12px/1 var(--mono);color:var(--ink-2)}
+.requests-footnote,.requests-explainer{font-size:12px;color:var(--ink-3);line-height:1.7;margin:12px 0 0}.requests-explainer summary{cursor:pointer;color:var(--ink-2);width:max-content}.requests-explainer p{margin:6px 0;max-width:1000px}
+.requests-dialog{margin:auto;padding:0;width:min(1040px,calc(100vw - 28px));max-height:88vh;max-height:88dvh;border:1px solid var(--line);border-radius:var(--r);background:var(--surface);color:var(--ink);box-shadow:var(--shadow-2);overflow:hidden}
+.requests-dialog[open]{display:flex;flex-direction:column}.requests-dialog:not([open]){display:none}.requests-dialog::backdrop{background:rgba(10,10,10,.46)}
+.requests-dialog-head,.requests-dialog-foot{display:flex;align-items:center;gap:12px;padding:14px 18px;flex:none;background:var(--surface)}
+.requests-dialog-head{justify-content:space-between;border-bottom:1px solid var(--line)}.requests-dialog-head>div{min-width:0}.requests-dialog-head h3{font-size:16px}
+.requests-dialog-head code{display:block;margin-top:3px;font-size:11px;color:var(--ink-3);overflow-wrap:anywhere}.requests-dialog-head .vbtn{font-size:24px}
+.requests-dialog-foot{border-top:1px solid var(--line)}.requests-dialog-body{overflow:auto;min-height:100px;padding:18px;overscroll-behavior:contain}
+.requests-detail-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 20px;margin:0 0 16px}.requests-detail-meta div{min-width:0}.requests-detail-meta dt{font-size:11px;color:var(--ink-3);margin-bottom:3px}.requests-detail-meta dd{margin:0;font-size:12.5px;overflow-wrap:anywhere}.requests-detail-meta .wide{grid-column:1/-1}
+.requests-detail-note{padding:10px 12px;margin:0 0 16px;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunken);font-size:12px;line-height:1.65;color:var(--ink-2)}.requests-detail-note.warn{border-color:var(--warn-soft);background:var(--warn-soft);color:var(--warn)}
+.requests-detail-title{font-size:14px;margin:18px 0 12px}.requests-timeline{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:14px}
+.requests-attempt{border:1px solid var(--line);border-radius:var(--r2);padding:14px;min-width:0}.requests-attempt-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.requests-attempt-head b{font-size:13px}.requests-attempt-head .requests-sub{margin:0}
+.requests-attempt .requests-detail-meta{gap:10px 16px;margin-bottom:12px}.requests-attempt-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}
+.requests-attempt-metrics>div{padding:9px 10px;border-radius:var(--r3);background:var(--sunken)}.requests-attempt-metrics span{display:block;font-size:11px;color:var(--ink-3)}.requests-attempt-metrics b{display:block;margin-top:3px;font:500 14px/1.5 var(--mono);overflow-wrap:anywhere}
+.requests-attempt-explanation{font-size:12px;color:var(--ink-2);line-height:1.65;margin:8px 0 0}.requests-code{font:11px/1.6 var(--mono);color:var(--ink-3);overflow-wrap:anywhere}
+.requests-decision-detail{border-top:1px dashed var(--line-2);padding-top:12px;margin-top:12px;font-size:12px}.requests-decision-detail h5{font-size:12px;margin:0 0 5px;font-weight:600}.requests-decision-detail p{margin:5px 0;color:var(--ink-2);line-height:1.6;overflow-wrap:anywhere}
+.requests-counts{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0}.requests-counts span{font-size:11px;padding:3px 7px;background:var(--sunken);border-radius:var(--r3);color:var(--ink-2)}
+@media(max-width:1150px){.requests-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.requests-filter-actions{grid-column:1/-1;justify-content:flex-end}}
+@media(max-width:900px){.requests-table-wrap .requests-table thead{display:table-header-group}.requests-table-wrap .requests-table tbody tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.requests-table-wrap .requests-table td{display:table-cell;padding:11px 14px;border-bottom:1px solid var(--line)}.requests-table-wrap .requests-table td::before{display:none}.requests-table-wrap .requests-table tbody tr:hover{background:var(--surface-2)}}
+@media(max-width:650px){.requests-detail-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.requests-attempt-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.requests-dialog-body{padding:13px}.requests-dialog-head,.requests-dialog-foot{padding:12px 14px}.requests-attempt{padding:12px}.requests-pagination .sp{display:none}.requests-pagination>span:first-child{width:100%;margin-bottom:2px}.requests-filters{gap:9px}}
+@media(max-width:420px){.requests-filters{grid-template-columns:minmax(0,1fr)}.requests-attempt-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 </head>
 <body>
@@ -601,6 +657,10 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
       <button data-view="usage">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>
         用量统计
+      </button>
+      <button data-view="requests">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4zM8 8h8M8 12h8M8 16h4"/></svg>
+        请求明细
       </button>
     </div>
     <div class="nav-lb">运维</div>
@@ -714,6 +774,7 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           <p class="sub">停用或删除会立即阻止后续请求，已开始的请求不受影响。</p>
         </div>
         <div id="keyError" class="note err hide" role="alert"></div>
+        <div id="keyLimitsError" class="note warn hide" role="status"></div>
         <div class="panel">
           <div class="ph">
             <div class="search"><input id="keySearch" placeholder="搜索名称或备注" autocomplete="off" spellcheck="false" aria-label="搜索密钥"></div>
@@ -722,14 +783,62 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
             <button class="btn sm pri" id="btnCreateKey">＋ 创建密钥</button>
           </div>
           <div class="tblwrap">
-            <table class="tbl key-table">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>状态</th><th>重复推理保护</th><th>CN 回落</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="10"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+            <table class="tbl key-table" data-sticky-head="keys">
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>限流与占用</th><th>状态</th><th>重复推理保护</th><th>CN 回落</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="11"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
         <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复输出（推理或正文）的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
+        <p class="sub key-footnote">限流由此密钥的各协议共同计数；频率统计网关接纳的请求，内部重试不重复占用额度。限流修改对后续请求及正在排队的请求生效，已经开始的请求继续完成。占用为最近一次刷新的快照。</p>
       </section>
+
+      <!-- 2026-09-25：新增完成请求明细与只读详情，明确已知消耗、重试缺失和留存范围。 -->
+<section id="pg-requests" class="page view hide" data-view="requests" aria-label="请求明细">
+  <div class="vacts">
+    <span class="sub">按请求核对消耗、重试和账号调度</span>
+    <span class="sp"></span>
+    <button type="button" class="btn" id="btnRequestsReload">刷新明细</button>
+  </div>
+  <form id="requestFilters" class="requests-filters" autocomplete="off" aria-label="筛选请求明细">
+    <label><span>调用密钥</span><input id="requestKeyFilter" list="requestKeyOptions" maxlength="128" placeholder="选择调用方或填写管理 ID" spellcheck="false"><datalist id="requestKeyOptions"></datalist></label>
+    <label><span>完整模型名</span><input id="requestModelFilter" list="requestModelOptions" maxlength="256" placeholder="例如 global:hy3" spellcheck="false"><datalist id="requestModelOptions"></datalist></label>
+    <label><span>请求状态</span><select id="requestStatusFilter"><option value="">全部状态</option><option value="success">成功</option><option value="error">失败</option><option value="canceled">已取消</option><option value="rejected">已拒绝</option></select></label>
+    <label><span>请求 ID</span><input id="requestIDFilter" maxlength="128" placeholder="填写完整请求 ID" spellcheck="false"></label>
+    <div class="requests-filter-actions"><button type="submit" class="btn pri">筛选</button><button type="reset" class="btn">清空</button></div>
+  </form>
+  <div id="requestsError" class="note err hide" role="alert"></div>
+  <div id="requestsRecovery" class="note warn hide" role="status"></div>
+  <div class="panel requests-panel" id="requestsPanel" aria-busy="false">
+    <div class="ph"><b>已完成请求</b><span class="sp"></span><span id="requestsStatus" class="sub" role="status" aria-live="polite">尚未加载</span></div>
+    <div class="requests-table-wrap" tabindex="0" role="region" aria-label="请求明细表，可横向滚动">
+      <table class="tbl requests-table">
+        <thead><tr><th scope="col">时间 / 请求 ID</th><th scope="col">模型 / 协议</th><th scope="col">调用密钥</th><th scope="col">状态</th><th scope="col" class="r">已知输入</th><th scope="col" class="r">已知输出</th><th scope="col" class="r">缓存</th><th scope="col" class="r">推理</th><th scope="col" class="r">积分</th><th scope="col" class="r">总耗时</th><th scope="col" class="r">首字节</th><th scope="col" class="r">排队</th><th scope="col">本次调度</th></tr></thead>
+        <tbody id="requestRows"><tr><td colspan="13"><div class="empty">正在准备请求明细…</div></td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <nav class="requests-pagination" aria-label="请求明细分页">
+    <span id="requestsRange" class="sub" aria-live="polite">—</span><span class="sp"></span>
+    <label>每页 <select id="requestPageSize" aria-label="每页请求数"><option value="20">20 条</option><option value="50">50 条</option></select></label>
+    <button type="button" class="btn sm" id="requestsPrevious" disabled>上一页</button>
+    <span id="requestsPageNumber" class="requests-page-number">1</span>
+    <button type="button" class="btn sm" id="requestsNext" disabled>下一页</button>
+  </nav>
+  <p class="requests-footnote">仅显示已知消耗；“未知”表示未上报。翻页后保持当前页，点击刷新回到最新记录。</p>
+  <details class="requests-explainer">
+    <summary>统计范围与留存</summary>
+    <p>这里只保存已完成的请求；鉴权前或入口拒绝的请求不可见。明细保留 7 天，最多 10000 条 / 64 MiB，与“用量统计”的累计账本范围不同。</p>
+    <p>失败、取消和重试会保留已上报的用量。缺失部分无法按零计算，缓存和推理也不再重复计入输入、输出。调用密钥筛选填写管理 ID，不填写密钥内容。</p>
+  </details>
+
+  <dialog id="requestDetailDialog" class="requests-dialog" aria-labelledby="requestDetailTitle">
+    <div class="requests-dialog-head"><div><h3 id="requestDetailTitle">请求详情</h3><code id="requestDetailID"></code></div><button type="button" class="vbtn" id="requestDetailClose" aria-label="关闭请求详情">×</button></div>
+    <div class="requests-dialog-body" id="requestDetailBody"></div>
+    <div class="requests-dialog-foot"><button type="button" class="btn hide" id="requestDetailRetry">重试加载</button><span class="sp"></span><button type="button" class="btn" id="requestDetailDone">关闭</button></div>
+  </dialog>
+</section>
+
 
       <section class="view hide" data-view="usage">
         <div class="usage-filter" id="usageFilter"></div>
@@ -983,6 +1092,16 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           </select>
         </label>
         <label class="fld hide" id="keyExpiryCustomField"><span class="k">到期时间</span><input type="datetime-local" id="keyExpiryCustom" aria-label="自定义到期时间"></label>
+        <fieldset class="key-limit-fields">
+          <legend>此密钥的请求限流</legend>
+          <p class="sub">三个设置对全部协议共用。默认不限制，填 0 可关闭对应限制。</p>
+          <div class="key-limit-grid">
+            <label class="fld"><span class="k">每分钟请求数</span><input type="number" id="keyRPM" min="0" max="60000" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">同时进行的请求数</span><input type="number" id="keyConcurrency" min="0" max="256" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">并发满时最多等待（秒）</span><input type="number" id="keyQueueSeconds" min="0" max="30" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+          </div>
+          <p class="sub" id="keyLimitHint">请求频率按滚动 60 秒计数，边界最多延迟 1 秒释放。并发满时可等待 1–30 秒；0 表示直接返回限流提示。只有设置并发上限后才能排队，每把密钥最多排队 32 个请求。</p>
+        </fieldset>
       </div>
       <div id="keyCreated" class="hide">
         <div class="note ok" id="keySecretStatus" role="status">密钥已创建，可以用于连接网关。</div>
@@ -1000,6 +1119,7 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 "use strict";
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-25：接入请求消费明细导航与刷新，保持筛选和历史分页状态。
 // 2026-09-24：忽略过时刷新响应，日志按完整行检测更新并补取改变后的条数；修正空成功时间、凭证到期判断和当前页刷新。
 // 2026-09-24：冷却截止时间随数据快照固定，搜索或切页不再重新开始倒计时；同一到期快照仅补取一次。
 // 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
@@ -1215,6 +1335,7 @@ var PAGE = {
   accounts:{ t:'账号', d:'凭证、积分与启停' },
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
   usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
+  requests:{ t:'请求明细', d:'核对每次调用、重试消费与账号调度' },
   tasks:   { t:'排程', d:'定时任务开关与手动触发' },
   logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
@@ -1241,6 +1362,7 @@ function go(v){
   renderView(v);
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (v === 'requests' && typeof loadRequests === 'function') loadRequests();
   // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
   if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
   // 重复推理保护开关同样不依赖 /api/state，进入系统页就拉当前运行期值。
@@ -2056,6 +2178,7 @@ $('#btnRefresh').addEventListener('click', function(){
   loadAll(true);
   if (CURRENT_VIEW === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (CURRENT_VIEW === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (CURRENT_VIEW === 'requests' && typeof loadRequests === 'function') loadRequests(true);
   if (CURRENT_VIEW === 'logs') loadLogs();
 });
 $('#btnRestart').addEventListener('click', actRestart);
@@ -2129,6 +2252,7 @@ if (document.readyState === 'loading'){
 
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-25：逐密钥编辑请求频率、并发与排队，显示实时快照和请求明细入口；未知消费不补零。
 // 2026-09-23：密钥新增「global 全部限流时回落同名 CN 模型」开关：表单、列表与提交
 //             三处同步，未设置按关闭处理（既有密钥零回归）。
 // 2026-09-20：密钥列表增加累计 token 用量列与有效期列；创建/编辑可选有效期，留空表示无限制。
@@ -2137,7 +2261,7 @@ if (document.readyState === 'loading'){
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
 // 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
 
-var KS = {keys:null, loading:false, error:'', query:'', models:null, guardDefault:true, revision:0};
+var KS = {keys:null, loading:false, error:'', query:'', models:null, guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
 var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, active:false, recoverable:false, mode:'edit'};
 
 function keyGuardEnabled(key){
@@ -2223,10 +2347,17 @@ async function loadKeys(){
   KS.loading = true;
   $('#btnKeysReload').disabled = true;
   try{
-    var result = await api('api/keys');
+    var results = await Promise.all([
+      api('api/keys'),
+      api('api/key-limits').then(function(value){return {value:value};}).catch(function(error){return {error:error};})
+    ]);
     if (revision !== KS.revision){ reload = true; return; }
+    var result = results[0], status = results[1];
     if (!result || !Array.isArray(result.keys)) throw new Error('服务返回的密钥列表不完整');
     KS.keys = result.keys; KS.error = '';
+    KS.usageAvailable = result.usage_available !== false;
+    KS.limits = status.value && status.value.ok === true && status.value.keys && typeof status.value.keys === 'object' ? status.value.keys : null;
+    KS.limitsError = KS.limits ? '' : '暂时无法读取限流占用，已保存的限流设置仍然生效。';
     if (typeof result.default_reasoning_loop_guard === 'boolean') KS.guardDefault = result.default_reasoning_loop_guard;
   }catch(error){ if (revision === KS.revision) KS.error = error.message || '加载失败，请稍后重试'; else reload = true; }
   finally{
@@ -2236,10 +2367,40 @@ async function loadKeys(){
   }
 }
 
+function keyLimitsSummary(key){
+  var policy = key.limits || {}, rpm = policy.requests_per_minute || 0, concurrent = policy.max_concurrent || 0, queue = policy.queue_timeout_seconds || 0;
+  var text = (rpm ? rpm + ' 次/分' : '不限频率') + ' · ' + (concurrent ? '并发 ' + concurrent : '不限并发');
+  var rows = '<div>' + esc(text) + '</div>';
+  if (concurrent) rows += '<div class="sub">' + (queue ? '最多等待 ' + queue + ' 秒' : '并发满时不排队') + '</div>';
+  if (rpm || concurrent){
+    var status = KS.limits && KS.limits[key.id], observed = [];
+    if (status && status.policy && status.policy.requests_per_minute === rpm && status.policy.max_concurrent === concurrent && status.policy.queue_timeout_seconds === queue){
+      if (rpm && Number.isSafeInteger(status.requests)) observed.push('窗口内 ' + status.requests + ' 次');
+      if (concurrent && Number.isSafeInteger(status.active) && Number.isSafeInteger(status.queued)) observed.push('在途 ' + status.active + ' · 排队 ' + status.queued);
+    }
+    rows += '<div class="sub key-limit-state">' + esc(observed.join(' · ') || '占用待刷新') + '</div>';
+  }
+  return rows;
+}
+
+function selectedKeyLimits(){
+  var fields = [['keyRPM','requests_per_minute',60000],['keyConcurrency','max_concurrent',256],['keyQueueSeconds','queue_timeout_seconds',30]], policy = {};
+  for (var i=0;i<fields.length;i++){
+    var field=fields[i], raw=$('#'+field[0]).value.trim(), value=raw==='' ? 0 : Number(raw);
+    if (!/^\d*$/.test(raw) || !Number.isSafeInteger(value) || value<0 || value>field[2]) return {error:'限流设置需要填写 0–' + field[2] + ' 的整数', field:field[0]};
+    policy[field[1]]=value;
+  }
+  if (policy.queue_timeout_seconds>0 && !policy.max_concurrent) return {error:'请先设置并发上限，再设置等待时间',field:'keyConcurrency'};
+  return {value:policy.requests_per_minute || policy.max_concurrent ? policy : null};
+}
+
 function renderKeys(){
   var keys = KS.keys || [];
   $('#keyError').textContent = KS.error;
   $('#keyError').classList.toggle('hide', !KS.error);
+  var messages = [KS.limitsError, KS.usageAvailable ? '' : '累计用量暂不可读，当前显示为“—”，恢复后刷新即可。'].filter(Boolean).join(' ');
+  $('#keyLimitsError').textContent = messages;
+  $('#keyLimitsError').classList.toggle('hide', !messages);
   $('#tabKeys').textContent = KS.keys ? keys.length : '—';
   $('#btnCreateKey').disabled = KS.keys === null;
   $('#keyEnabledCount').textContent = KS.keys ? keys.filter(function(k){return k.enabled;}).length : '—';
@@ -2247,7 +2408,7 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="10">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="11">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
@@ -2261,7 +2422,8 @@ function renderKeys(){
       '<td data-l="模型绑定">' + (models.length
         ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
         : '<span class="sub">不限制</span>') + '</td>' +
-      '<td data-l="总用量" class="mono key-tokens">' + (Number(key.total_tokens) > 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub">0</span>') + '</td>' +
+      '<td data-l="总用量" class="mono key-tokens">' + (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') + '</td>' +
+      '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
       '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
       '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
@@ -2271,7 +2433,7 @@ function renderKeys(){
       '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">' + (keyGlobalFallbackEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
       '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
-      '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
+      '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="requests" data-id="' + esc(key.id) + '">请求明细</button><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
       '<button class="btn sm" data-key-action="toggle" data-id="' + esc(key.id) + '">' + (key.enabled ? '停用' : '启用') + '</button>' +
       '<button class="btn sm danger" data-key-action="delete" data-id="' + esc(key.id) + '">删除</button></div></td></tr>';
   }).join('');
@@ -2290,6 +2452,10 @@ function openKeyEditor(key){
   fillModelInput(key ? keyModels((key.models || []).join(',')) : []);
   $('#keyGuard').checked = keyGuardEnabled(key);
   $('#keyGlobalFallback').checked = keyGlobalFallbackEnabled(key);
+  var limits = key && key.limits || {};
+  $('#keyRPM').value = limits.requests_per_minute || 0;
+  $('#keyConcurrency').value = limits.max_concurrent || 0;
+  $('#keyQueueSeconds').value = limits.queue_timeout_seconds || 0;
   // 有效期默认「无限制」：既有密钥和新密钥都保持这个默认，只有显式选择才设置。
   // 编辑一把已经设过有效期的密钥时回填原值，避免保存时把有效期无声清掉。
   var preset = key && key.expires_at ? expiryToInput(key.expires_at) : '';
@@ -2357,6 +2523,9 @@ $('#keyForm').addEventListener('submit', async function(event){
   var expiry = selectedExpiry();
   if (expiry.error){keyFormError(expiry.error);return;}
   body.expires_at = expiry.value;
+  var limits = selectedKeyLimits();
+  if (limits.error){keyFormError(limits.error);$('#'+limits.field).focus();return;}
+  body.limits = limits.value;
   if (KD.id) body.id = KD.id;
   KD.busy = true; $('#keyDialogSave').disabled = true; keyFormError('');
   try{
@@ -2431,6 +2600,8 @@ $('#keyRows').addEventListener('click', function(event){
   var key = (KS.keys || []).find(function(k){return k.id === button.getAttribute('data-id');}); if (!key) return;
   var action = button.getAttribute('data-key-action');
   if (action === 'edit'){openKeyEditor(key);return;}
+  if (action === 'limits'){openKeyEditor(key);$('#keyRPM').focus();return;}
+  if (action === 'requests'){if (typeof openRequestsForKey === 'function') openRequestsForKey(key.id,key.name);return;}
   if (action === 'copy'){copySavedKey(key);return;}
   if (action === 'guard'){
     var desired = !keyGuardEnabled(key); button.disabled = true;
@@ -2857,6 +3028,310 @@ function usageInit(){
   bindRange($('#usageTo'), 'to');
 }
 usageInit();
+
+"use strict";
+// ═══ 更新日志 ═══
+// 2026-09-25：密钥列表可直接打开对应调用明细，切换调用方时作废旧分页响应。
+// 2026-09-25：新增只读请求明细页，保留未知用量、真实调度与重试；隔离乱序响应并避免翻页后自动刷新。
+// 2026-09-25：显示服务报告的明细写入失败次数，避免把可见记录误当成完整历史。
+// 2026-09-25：显示真实调度总数与截断提示，保留记录不再冒充完整调度历史。
+(function(){
+  var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null)};
+  var detail = {revision:0, active:false, requestID:'', opener:null};
+  var statusNames = {success:'成功', error:'失败', canceled:'已取消', rejected:'已拒绝'};
+  var protocolNames = {chat_completions:'Chat Completions', responses:'Responses', anthropic_messages:'Messages', gemini_generate_content:'Gemini'};
+  var finishNames = {stop:'正常结束',end_turn:'正常结束',stop_sequence:'命中停止条件',length:'达到输出上限',max_tokens:'达到输出上限',max_completion_tokens:'达到输出上限',content_filter:'内容受到过滤',tool_calls:'转为工具调用',function_call:'转为工具调用',pause_turn:'等待继续'};
+  var reasonNames = {
+    sticky_hit:'继续使用会话绑定账号', sticky_unavailable:'会话绑定账号暂不可用',
+    weighted_selection:'按权重选择账号', free_preferred:'优先选择已观测免费账号',
+    unknown_preferred:'选择成本待确认的账号', unknown_exploration:'探测成本待确认的账号',
+    recent_lru:'选择较久未使用的账号', no_available_account:'没有可用账号',
+    cooldown_fallback:'使用冷却兜底账号', weighted:'按权重选择账号', retry:'为重试重新选择账号',
+    already_tried:'本次请求已尝试', realm_mismatch:'区域不匹配', disabled:'账号已停用',
+    account_limit:'账号额度受限', account_cooldown:'账号冷却中', circuit_breaker:'账号熔断中',
+    model_cooldown:'该模型冷却中', in_flight_full:'账号并发已满', missing_account:'绑定账号不存在',
+    fallback_no_cooldown:'不符合冷却兜底条件',
+    channel_rejected:'上游通道拒绝请求', upstream_not_reported:'上游没有上报用量',
+    upstream_error:'上游请求失败', upstream_canceled:'上游调用已取消', client_canceled:'客户端已取消',
+    incomplete_usage:'用量未完整上报', incomplete_stream:'上游响应未完整结束',
+    invalid_tool_arguments:'工具参数不完整或无效', context_length_exceeded:'上下文超出限制',
+    reasoning_loop_guard:'触发重复推理保护', timeout:'请求超时', rate_limited:'请求受到限流',
+    unobserved:'尚无成本观测', expired:'成本观测已过期', invalid_observation:'成本观测无效', model_unspecified:'未指定模型'
+  };
+  var stageNames = {pool_total:'账号总数', evaluated:'已检查', healthy:'状态可用', available:'可承接请求',
+    free:'已观测免费', paid:'已观测付费', unknown:'成本未知', candidates:'候选', cost_tier:'成本分组',
+    selected_tier:'选中分组', recent:'近期使用', outside_recent:'近期未使用', weighted:'进入权重选择',
+    cost_free:'已观测免费',cost_unknown:'成本未知',cost_paid:'已观测付费',preferred:'优先分组',shortlist:'筛后候选',eligible:'参与选择'};
+
+  function node(id){ return document.getElementById(id); }
+  function lookup(map,key,fallback){return Object.prototype.hasOwnProperty.call(map,key) ? map[key] : fallback;}
+  function escapeHTML(value){ return String(value == null ? '' : value).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function text(id, value){ var n=node(id); if(n) n.textContent=String(value == null ? '' : value); }
+  function show(id, visible){ var n=node(id); if(n) n.classList.toggle('hide', !visible); }
+  function finite(value){ return typeof value === 'number' && Number.isFinite(value) && value >= 0; }
+  function count(value){ return finite(value) && Number.isSafeInteger(value) ? value : 0; }
+  function metric(value, credit){ return finite(value) ? value.toLocaleString('zh-CN', {maximumFractionDigits:credit ? 6 : 0}) : '未知'; }
+  function duration(value){ if(!finite(value)) return '未知'; if(value < 1000) return metric(value)+' ms'; return (value/1000).toLocaleString('zh-CN', {maximumFractionDigits:2})+' s'; }
+  function when(value, full){
+    if(typeof value !== 'string' || value.indexOf('0001-') === 0) return '—';
+    var d=new Date(value); if(!Number.isFinite(d.getTime())) return '—';
+    function pad(x){return x < 10 ? '0'+x : String(x);}
+    return (full ? d.getFullYear()+'-' : '')+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+  }
+  function shortID(value){ value=String(value || ''); return value.length > 28 ? value.slice(0,14)+'…'+value.slice(-8) : (value || '—'); }
+  function reason(code){
+    code=String(code || '');
+    if(lookup(reasonNames,code,'')) return reasonNames[code];
+    if(code.indexOf('fallback_')===0 && lookup(reasonNames,code.slice(9),'')) return '兜底检查：'+reasonNames[code.slice(9)];
+    return code || '未记录调度原因';
+  }
+  function statusBadge(value, httpStatus){
+    var known=Object.prototype.hasOwnProperty.call(statusNames,value), label=known ? statusNames[value] : '未知状态';
+    return '<span class="requests-badge '+(known ? value : 'unknown')+'">'+escapeHTML(label)+'</span>'+(count(httpStatus) ? '<span class="requests-sub">'+escapeHTML(httpStatus)+'</span>' : '');
+  }
+  function usageLabel(item){
+    if(item.upstream_started === false || item.usage_state === 'not_started') return '未调用上游';
+    if(item.usage_state === 'complete') return '输入/输出齐全';
+    return item.usage_state === 'partial' ? '部分用量' : '用量未上报';
+  }
+  function finishLabel(value){return lookup(finishNames,value,String(value || '未上报'));}
+  function finishBadge(value){
+    if(!value) return '';
+    var limited=value==='length' || value==='max_tokens' || value==='max_completion_tokens' || value==='content_filter';
+    return '<span class="requests-finish'+(limited ? ' limited' : '')+'" title="'+escapeHTML(value)+'">'+escapeHTML(finishLabel(value))+'</span>';
+  }
+  function metricCell(value, missing, started, credit){
+    if(started === false) return '<span class="requests-null" title="未调用上游">—</span>';
+    if(!finite(value)) return '<span class="requests-null" title="上游没有上报此项，不能按零计算">未知</span>';
+    var note=count(missing) > 0 ? '<span class="requests-partial" title="'+escapeHTML(missing)+' 次尝试未上报此项，仅显示已知消耗">部分</span>' : '';
+    return '<span class="requests-metric">'+escapeHTML(metric(value,credit))+'</span>'+note;
+  }
+  function decisionCell(d,item){
+    var total=count(item && item.decision_count), truncated=!!(item && item.decisions_truncated);
+    var history=total>0 || truncated ? '<span class="requests-sub">'+(total>0 ? total+' 次调度' : '调度次数未知')+(truncated ? ' · 明细已截断' : '')+'</span>' : '';
+    if(!d || typeof d !== 'object') return '<span class="requests-null">未记录</span>'+history;
+    var identity=String(d.account_id || '');
+    if(d.account_id_truncated) identity+='…';
+    return '<div class="requests-decision">'+escapeHTML(reason(d.reason_code))+'</div>'+
+      (d.blocked_by ? '<span class="requests-sub">'+escapeHTML(reason(d.blocked_by))+'</span>' : '')+
+      (identity ? '<span class="requests-sub mono" title="'+escapeHTML(identity)+'">'+escapeHTML(shortID(identity))+'</span>' : '')+history;
+  }
+  function renderRows(){
+    var rows=node('requestRows'); if(!rows) return;
+    if(state.loading){ rows.innerHTML='<tr><td colspan="13"><div class="empty">正在加载请求明细…</div></td></tr>'; return; }
+    if(state.error){rows.innerHTML='<tr><td colspan="13"><div class="empty">暂时无法读取明细，请重试。</div></td></tr>';return;}
+    if(!state.items.length){
+      rows.innerHTML='<tr><td colspan="13"><div class="empty">'+(state.offset > 0 ? '这一页已没有记录，点击刷新返回最新记录。' : '没有匹配的已完成请求，可以调整筛选条件。')+'</div></td></tr>'; return;
+    }
+    rows.innerHTML=state.items.map(function(item){
+      var usageClass=item.usage_state==='partial' ? 'partial' : (item.usage_state==='missing' ? 'missing' : '');
+      var title=count(item.unknown_attempts) ? count(item.unknown_attempts)+' 次尝试未完整上报用量' : '输入与输出的上报情况；可选计量仍可能缺失';
+      return '<tr data-request-id="'+escapeHTML(item.request_id)+'"><td><span class="requests-time">'+escapeHTML(when(item.started_at))+'</span><br><button type="button" class="requests-id" title="'+escapeHTML(item.request_id)+'" aria-label="查看请求 '+escapeHTML(item.request_id)+'">'+escapeHTML(shortID(item.request_id))+'</button></td>'+
+        '<td><div class="requests-model">'+escapeHTML(item.model || '未确认模型')+'</div><span class="requests-sub">'+escapeHTML(lookup(protocolNames,item.protocol,'未知协议'))+' · '+(item.stream ? '流式' : '非流式')+'</span></td>'+
+        '<td><div class="requests-key">'+escapeHTML(item.key_name || item.key_id || '未确认调用方')+'</div>'+(item.key_name && item.key_id ? '<span class="requests-sub mono" title="'+escapeHTML(item.key_id)+'">'+escapeHTML(shortID(item.key_id))+'</span>' : '')+'</td>'+
+        '<td>'+statusBadge(item.status,item.http_status)+finishBadge(item.finish_reason)+'<span class="requests-coverage '+usageClass+'" title="'+escapeHTML(title)+'">'+escapeHTML(usageLabel(item))+'</span></td>'+
+        '<td class="num">'+metricCell(item.input_tokens,item.missing_input_attempts,item.upstream_started)+'</td>'+
+        '<td class="num">'+metricCell(item.output_tokens,item.missing_output_attempts,item.upstream_started)+'</td>'+
+        '<td class="num">'+metricCell(item.cached_tokens,item.missing_cached_attempts,item.upstream_started)+'</td>'+
+        '<td class="num">'+metricCell(item.reasoning_tokens,item.missing_reasoning_attempts,item.upstream_started)+'</td>'+
+        '<td class="num">'+metricCell(item.credit,item.missing_credit_attempts,item.upstream_started,true)+'</td>'+
+        '<td class="num requests-metric">'+escapeHTML(duration(item.duration_ms))+'</td><td class="num requests-metric">'+escapeHTML(duration(item.ttfb_ms))+'</td><td class="num requests-metric">'+escapeHTML(duration(item.queue_ms))+'</td><td>'+decisionCell(item.last_decision,item)+'</td></tr>';
+    }).join('');
+  }
+  function renderPagination(){
+    text('requestsRange',state.loading ? '正在加载…' : (state.error ? '暂时无法读取条数' : (state.total ? (state.items.length ? (state.offset+1)+'–'+(state.offset+state.items.length)+' / '+state.total+' 条' : '本页为空 / 共 '+state.total+' 条') : '0 条记录')));
+    text('requestsPageNumber',Math.floor(state.offset/state.limit)+1);
+    node('requestsPrevious').disabled=state.loading || state.offset===0;
+    node('requestsNext').disabled=state.loading || !state.items.length || state.offset+state.items.length>=state.total;
+    node('requestPageSize').disabled=state.loading;
+    node('btnRequestsReload').disabled=state.loading;
+    node('requestsPanel').setAttribute('aria-busy',state.loading ? 'true' : 'false');
+  }
+  function updateOptions(){
+    state.items.forEach(function(item){
+      if(item.key_id && Object.keys(state.keyOptions).length < 300) state.keyOptions[item.key_id]=String(item.key_name || item.key_id);
+      if(item.model && Object.keys(state.modelOptions).length < 300) state.modelOptions[item.model]=true;
+    });
+    node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){return '<option value="'+escapeHTML(id)+'" label="'+escapeHTML(state.keyOptions[id])+'"></option>';}).join('');
+    node('requestModelOptions').innerHTML=Object.keys(state.modelOptions).map(function(model){return '<option value="'+escapeHTML(model)+'"></option>';}).join('');
+  }
+  function errorMessage(error){ return error && error.message ? String(error.message).slice(0,240) : '加载失败，请重试'; }
+  function readFilters(){
+    return {key_id:node('requestKeyFilter').value.trim(),model:node('requestModelFilter').value.trim(),status:node('requestStatusFilter').value,request_id:node('requestIDFilter').value.trim()};
+  }
+  async function fetchPage(){
+    var revision=++state.revision, offset=state.offset, limit=state.limit, filters=Object.assign({},state.filters);
+    var query=new URLSearchParams();
+    Object.keys(filters).forEach(function(key){if(filters[key]) query.set(key,filters[key]);});
+    query.set('offset',String(offset));query.set('limit',String(limit));
+    state.loading=true;state.error='';state.items=[];show('requestsError',false);show('requestsRecovery',false);
+    text('requestsStatus','正在加载…');renderRows();renderPagination();
+    try{
+      // Relative paths preserve both the original panel root and /admin/ in the
+      // unified container. An absolute /api path would escape the panel mount.
+      var result=await api('api/requests?'+query.toString());
+      if(revision!==state.revision) return;
+      if(!result || result.ok!==true) throw new Error((result && result.message) || '请求明细暂不可用');
+      if(!Array.isArray(result.items) || result.items.length>100 || !Number.isSafeInteger(result.total) || result.total<0 || !Number.isSafeInteger(result.offset) || result.offset<0 || !Number.isSafeInteger(result.limit) || result.limit<1 || result.limit>100 || result.items.some(function(item){return !item || typeof item.request_id!=='string';})) throw new Error('服务返回的请求明细不完整');
+      state.items=result.items;state.total=result.total;state.offset=result.offset;state.limit=result.limit;state.loaded=true;
+      updateOptions();
+      text('requestsStatus','已更新 · '+when(new Date().toISOString()).split(' ')[1]);
+      var warnings=[];
+      if(count(result.recording_errors)>0) warnings.push('服务报告 '+count(result.recording_errors)+' 次明细写入失败，当前列表可能不完整。');
+      if(result.recovery && count(result.recovery.count)>0){
+        warnings.push('日志曾恢复 '+count(result.recovery.count)+' 次损坏尾记录，已保留此前完整记录。最近恢复：'+when(result.recovery.last_recovered_at,true));
+      }
+      if(warnings.length){text('requestsRecovery',warnings.join(' '));show('requestsRecovery',true);}
+    }catch(error){
+      if(revision!==state.revision) return;
+      state.loaded=false;state.items=[];state.total=0;state.error=errorMessage(error);text('requestsError',state.error);show('requestsError',true);text('requestsStatus','加载失败');
+    }finally{
+      if(revision===state.revision){state.loading=false;renderRows();renderPagination();}
+    }
+  }
+  function meta(label,value,wide){return '<div'+(wide ? ' class="wide"' : '')+'><dt>'+escapeHTML(label)+'</dt><dd>'+escapeHTML(value == null || value==='' ? '—' : value)+'</dd></div>';}
+  function renderCounts(counts,fallback){
+    if(!counts || typeof counts!=='object') return '';
+    return Object.keys(counts).slice(0,32).filter(function(key){return (key.indexOf('fallback_')===0)===fallback;}).map(function(key){
+      var label=lookup(stageNames,key,'') || lookup(stageNames,key.replace(/^fallback_/,''),'') || reason(key);
+      return '<span title="'+escapeHTML(key)+'">'+escapeHTML(label)+' '+escapeHTML(metric(counts[key]))+'</span>';
+    }).join('');
+  }
+  function renderDecision(d){
+    var normal=renderCounts(d.excluded_counts,false), fallback=renderCounts(d.excluded_counts,true);
+    var selected=d.account_id ? '选中账号 '+d.account_id+(d.account_id_truncated ? '（标识已截短）' : '') : '';
+    var output='<div class="requests-decision-detail"><h5>'+escapeHTML(reason(d.reason_code))+'</h5><div class="requests-code">'+escapeHTML(d.reason_code || '未记录代码')+'</div>';
+    if(d.observed_at) output+='<p>调度时间：'+escapeHTML(when(d.observed_at,true))+'</p>';
+    if(selected) output+='<p>'+escapeHTML(selected)+(d.account_realm ? ' · '+escapeHTML(d.account_realm) : '')+'</p>';
+    if(d.bound_account_id) output+='<p>会话绑定账号：'+escapeHTML(d.bound_account_id)+'</p>';
+    if(d.blocked_by) output+='<p>'+escapeHTML(reason(d.blocked_by))+' <span class="requests-code">'+escapeHTML(d.blocked_by)+'</span></p>';
+    var stages=renderCounts(d.stage_counts,false), fallbackStages=renderCounts(d.stage_counts,true);
+    if(stages) output+='<div class="requests-counts">'+stages+'</div>';
+    if(normal) output+='<p>常规筛选排除</p><div class="requests-counts">'+normal+'</div>';
+    if(fallback || fallbackStages) output+='<p>兜底检查（单独统计）</p><div class="requests-counts">'+fallbackStages+fallback+'</div>';
+    if(d.selection_method==='weighted' && finite(d.weight_units) && finite(d.weight_total) && d.weight_total>0){
+      output+='<p>本次抽签权重：'+escapeHTML(metric(d.weight_units))+' / '+escapeHTML(metric(d.weight_total))+'</p>';
+    }
+    if(d.cost_state==='free' || d.cost_state==='paid'){
+      output+='<p>历史成本观测：'+escapeHTML(metric(d.cost_per_1k,true))+' 积分 / 千 tokens'+(d.cost_used_for_selection ? '，本次用于选择。' : '，本次未用于选择。')+'这不是本次消费。</p>';
+      if(d.cost_observed_at) output+='<p>观测时间：'+escapeHTML(when(d.cost_observed_at,true))+' · '+escapeHTML(metric(d.cost_samples))+' 次样本</p>';
+    }else if(d.cost_state==='unknown') output+='<p>历史成本未知'+(d.cost_unknown_reason ? '：'+escapeHTML(reason(d.cost_unknown_reason)) : '')+'</p>';
+    if(d.fallback_kind || d.fallback_until) output+='<p>兜底类型：'+escapeHTML(d.fallback_kind || '未记录')+'；原冷却截止：'+escapeHTML(when(d.fallback_until,true))+'</p>';
+    return output+'</div>';
+  }
+  function renderAttempt(a,decisions){
+    var result='<li class="requests-attempt"><div class="requests-attempt-head"><b>第 '+escapeHTML(a.number)+' 次尝试</b>'+statusBadge(a.status,a.http_status)+'<span class="sp"></span><span class="requests-sub">'+escapeHTML(duration(a.duration_ms))+'</span></div>';
+    var account=a.account_name && a.account_id ? a.account_name+' · '+a.account_id : (a.account_name || a.account_id);
+    result+='<dl class="requests-detail-meta">'+meta('账号',account)+meta('开始时间',when(a.started_at,true))+meta('结束时间',when(a.finished_at,true))+meta('排队',duration(a.queue_ms))+meta('完整模型',a.model,true)+'</dl>';
+    result+='<div class="requests-attempt-metrics">'+[['输入',a.input_tokens],['输出',a.output_tokens],['缓存',a.cached_tokens],['推理',a.reasoning_tokens],['积分',a.credit,true]].map(function(m){return '<div><span>'+m[0]+'</span><b>'+escapeHTML(metric(m[1],m[2]))+'</b></div>';}).join('')+'</div>';
+    var usage=a.usage_state==='complete' ? '输入、输出已上报；可选计量仍可能缺失。' : (a.usage_state==='partial' ? '只收到了部分计量，未知部分没有按零补齐。' : '上游未上报用量，不能判断本次实际消耗。');
+    result+='<p class="requests-attempt-explanation">'+usage+'</p>';
+    if(a.finish_reason) result+='<p class="requests-attempt-explanation">结束原因：'+escapeHTML(finishLabel(a.finish_reason))+' <span class="requests-code">'+escapeHTML(a.finish_reason)+'</span></p>';
+    if(a.usage_reason) result+='<p class="requests-attempt-explanation">'+escapeHTML(reason(a.usage_reason))+' <span class="requests-code">'+escapeHTML(a.usage_reason)+'</span></p>';
+    if(a.error_code) result+='<p class="requests-attempt-explanation">'+escapeHTML(reason(a.error_code))+' <span class="requests-code">'+escapeHTML(a.error_code)+'</span></p>';
+    decisions.forEach(function(d){result+=renderDecision(d);});
+    return result+'</li>';
+  }
+  function renderDetail(record){
+    var attempts=Array.isArray(record.attempts) ? record.attempts : [], decisions=Array.isArray(record.decisions) ? record.decisions : [];
+    if(attempts.length>64 || decisions.length>64) throw new Error('请求详情超过显示上限');
+    var decisionTotal=count(record.decision_count) || decisions.length;
+    var decisionsTruncated=record.decisions_truncated===true || decisionTotal>decisions.length;
+    var output='<dl class="requests-detail-meta">'+meta('完整模型',record.model,true)+meta('调用密钥',record.key_name || record.key_id)+meta('密钥管理 ID',record.key_id)+meta('协议',lookup(protocolNames,record.protocol,'未知协议'))+meta('开始时间',when(record.started_at,true))+meta('完成时间',when(record.finished_at,true))+meta('状态',lookup(statusNames,record.status,'未知状态')+(count(record.http_status) ? ' · '+record.http_status : ''))+meta('总耗时',duration(record.duration_ms))+meta('首字节',duration(record.ttfb_ms))+meta('排队',duration(record.queue_ms))+'</dl>';
+    if(record.error_code) output+='<p class="requests-detail-note">'+escapeHTML(reason(record.error_code))+' <span class="requests-code">'+escapeHTML(record.error_code)+'</span></p>';
+    if(record.finish_reason) output+='<p class="requests-detail-note">结束原因：'+escapeHTML(finishLabel(record.finish_reason))+' <span class="requests-code">'+escapeHTML(record.finish_reason)+'</span></p>';
+    if(record.upstream_started===false){output+='<p class="requests-detail-note">请求未调用上游，没有上游消费观测。</p>';}
+    else{
+      output+='<p class="requests-detail-note">共 '+escapeHTML(metric(record.attempt_count))+' 次上游尝试；每次的已知消耗独立保留，未知用量无法补算。</p>';
+      if(record.attempts_truncated) output+='<p class="requests-detail-note warn">保留了 '+attempts.length+' 次尝试明细，其余 '+Math.max(0,count(record.attempt_count)-attempts.length)+' 次仍计为未知。此处不是完整消费账单。</p>';
+    }
+    if(decisionsTruncated) output+='<p class="requests-detail-note warn">共 '+decisionTotal+' 次调度，保留 '+decisions.length+' 条记录；调度历史已截断。</p>';
+    else if(decisionTotal>0) output+='<p class="requests-detail-note">共 '+decisionTotal+' 次调度。</p>';
+    output+='<h4 class="requests-detail-title">尝试时间线</h4>';
+    if(attempts.length){
+      output+='<ol class="requests-timeline">'+attempts.map(function(a){return renderAttempt(a,decisions.filter(function(d){return d && d.attempt===a.number;}));}).join('')+'</ol>';
+    }else output+='<p class="requests-detail-note">没有上游尝试明细。</p>';
+    var unmatched=decisions.filter(function(d){return d && !attempts.some(function(a){return a.number===d.attempt;});});
+    if(unmatched.length) output+='<h4 class="requests-detail-title">其他调度记录</h4>'+unmatched.map(renderDecision).join('');
+    node('requestDetailBody').innerHTML=output;
+  }
+  function closeDetail(){
+    detail.revision++;detail.active=false;detail.requestID='';
+    var dialog=node('requestDetailDialog');
+    if(dialog && dialog.open && typeof dialog.close==='function') dialog.close();
+    else if(dialog) dialog.removeAttribute('open');
+    text('requestDetailID','');node('requestDetailBody').innerHTML='';show('requestDetailRetry',false);
+    if(detail.opener && detail.opener.isConnected!==false && typeof detail.opener.focus==='function') detail.opener.focus();
+    detail.opener=null;
+  }
+  async function openDetail(requestID){
+    var revision=++detail.revision;
+    if(!detail.active) detail.opener=document.activeElement;
+    detail.active=true;detail.requestID=requestID;text('requestDetailID',requestID);show('requestDetailRetry',false);
+    node('requestDetailBody').innerHTML='<div class="empty" role="status">正在加载请求详情…</div>';
+    var dialog=node('requestDetailDialog');
+    if(!dialog.open){if(typeof dialog.showModal==='function') dialog.showModal();else dialog.setAttribute('open','');}
+    try{
+      var result=await api('api/requests/'+encodeURIComponent(requestID));
+      if(revision!==detail.revision || !detail.active) return;
+      if(!result || result.ok!==true || !result.record || result.record.request_id!==requestID) throw new Error((result && result.message) || '请求详情不可用或已经过期');
+      renderDetail(result.record);
+    }catch(error){
+      if(revision!==detail.revision || !detail.active) return;
+      node('requestDetailBody').innerHTML='<div class="note err" role="alert">'+escapeHTML(errorMessage(error))+'</div>';show('requestDetailRetry',true);
+    }
+  }
+  function init(){
+    if(state.ready) return true;
+    if(!node('pg-requests')) return false;
+    state.ready=true;
+    node('requestsRecovery').classList.add('w');node('requestsError').classList.add('e');
+    node('requestFilters').addEventListener('submit',function(event){event.preventDefault();state.filters=readFilters();state.offset=0;return fetchPage();});
+    node('requestFilters').addEventListener('reset',function(event){
+      event.preventDefault();['requestKeyFilter','requestModelFilter','requestStatusFilter','requestIDFilter'].forEach(function(id){node(id).value='';});
+      state.filters={};state.offset=0;return fetchPage();
+    });
+    node('btnRequestsReload').addEventListener('click',function(){state.offset=0;return fetchPage();});
+    node('requestPageSize').addEventListener('change',function(){state.limit=node('requestPageSize').value==='50' ? 50 : 20;state.offset=0;return fetchPage();});
+    node('requestsPrevious').addEventListener('click',function(){if(state.loading || state.offset===0) return;state.offset=Math.max(0,state.offset-state.limit);return fetchPage();});
+    node('requestsNext').addEventListener('click',function(){if(state.loading || !state.items.length || state.offset+state.items.length>=state.total) return;state.offset+=state.limit;return fetchPage();});
+    node('requestRows').addEventListener('click',function(event){
+      var row=event.target && typeof event.target.closest==='function' ? event.target.closest('tr[data-request-id]') : null;
+      if(!row || state.loading) return;
+      if(typeof window.getSelection==='function' && String(window.getSelection())) return;
+      return openDetail(row.getAttribute('data-request-id'));
+    });
+    node('requestDetailClose').addEventListener('click',closeDetail);node('requestDetailDone').addEventListener('click',closeDetail);
+    node('requestDetailDialog').addEventListener('cancel',function(event){event.preventDefault();closeDetail();});
+    node('requestDetailDialog').addEventListener('close',function(){if(detail.active) closeDetail();});
+    node('requestDetailRetry').addEventListener('click',function(){if(detail.active) return openDetail(detail.requestID);});
+    if(typeof window.addEventListener==='function') window.addEventListener('hashchange',function(){if(detail.active && location.hash!=='#requests') closeDetail();});
+    return true;
+  }
+  // The navigation/global refresh can call this without moving an older page.
+  // Explicit refresh passes true; the page's refresh button always starts at 0.
+  window.loadRequests=function(force){
+    if(!init()) return Promise.resolve();
+    if(force===true){state.offset=0;return fetchPage();}
+    if(state.loading || (state.loaded && state.offset>0)) return Promise.resolve();
+    return fetchPage();
+  };
+  window.openRequestsForKey=function(keyID,keyName){
+    if(!init() || typeof keyID!=='string' || !keyID) return Promise.resolve();
+    closeDetail();
+    state.keyOptions[keyID]=String(keyName || keyID);
+    node('requestKeyFilter').value=keyID;
+    ['requestModelFilter','requestStatusFilter','requestIDFilter'].forEach(function(id){node(id).value='';});
+    state.filters=readFilters();state.offset=0;state.loaded=false;
+    // Start the selected-key load before navigation so go() cannot launch an
+    // unfiltered request or replace it with an older response already in flight.
+    var pending=fetchPage();
+    updateOptions();
+    if(typeof go==='function') go('requests');
+    return pending;
+  };
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init);else init();
+})();
 
 /* ── 版本与热更新 ────────────────────────────────────
  * 状态来自网关的本机管理接口 GET /update；真正的升级动作走

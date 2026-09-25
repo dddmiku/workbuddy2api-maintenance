@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：逐密钥保存频率/并发/排队策略，缺省字段不改旧记录，读取和写入均校验边界。
 // 2026-09-22：模型绑定写入侧要求完整模型名（cn:/global: 前缀），裸名返回 ErrBindingRealm；
 //
 //	读取旧文件不做该校验，避免存量裸名绑定让整个密钥库打不开。
@@ -28,6 +29,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"workbuddy2api/internal/keylimit"
 )
 
 const MaxKeys = 256
@@ -43,6 +46,7 @@ var (
 	ErrBindingRealm  = errors.New("模型绑定必须填完整模型名（带 cn: 或 global: 前缀），请从模型列表中选择")
 	ErrInvalidExpiry = errors.New("有效期需为将来时间，且不超过 10 年；留空表示无限制")
 	ErrLimit         = errors.New("密钥数量已达上限，请先删除不再使用的密钥")
+	ErrInvalidLimits = errors.New("限流设置无效：每分钟0—60000次、并发0—256、排队0—30秒；0表示不限或不排队")
 )
 
 // maxKeyLifetime 限制单个密钥的有效期长度，拦住把毫秒当秒之类的输入错误。
@@ -78,6 +82,9 @@ type Info struct {
 	Models []string `json:"models"`
 	// ExpiresAt 为 nil 表示无限制（既有密钥的默认状态）。
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// Nil preserves the unlimited policy of existing keys without rewriting
+	// their persisted representation on an unrelated update.
+	Limits *keylimit.Policy `json:"limits,omitempty"`
 }
 
 type record struct {
@@ -94,6 +101,8 @@ type Options struct {
 	// 为 true 时 ExpiresAt 为 nil 表示改为无限制。
 	ExpiresAt    *time.Time
 	ExpiresAtSet bool
+	Limits       *keylimit.Policy
+	LimitsSet    bool
 }
 
 type document struct {
@@ -171,6 +180,9 @@ func readKeyRecords(path string) ([]record, os.FileInfo, error) {
 	}
 	seenIDs, seenDigests := map[string]bool{}, map[string]bool{}
 	for _, key := range doc.Keys {
+		if key.Limits != nil && key.Limits.Validate() != nil {
+			return nil, nil, ErrInvalidLimits
+		}
 		decoded, e := hex.DecodeString(key.Digest)
 		if e != nil || len(decoded) != sha256.Size || key.ID == "" || strings.ContainsAny(key.ID, "/\\") || seenIDs[key.ID] || seenDigests[key.Digest] || !validLabel(key.Name, key.Note) || !validModels(key.Models) {
 			return nil, nil, errors.New("invalid or duplicate API key record")
@@ -215,6 +227,7 @@ func copyInfo(info Info) Info {
 	info.Models = append([]string(nil), info.Models...)
 	info.ReasoningLoopGuard = copyBool(info.ReasoningLoopGuard)
 	info.GlobalFallbackToCN = copyBool(info.GlobalFallbackToCN)
+	info.Limits = copyLimits(info.Limits)
 	if info.ExpiresAt != nil {
 		expiry := *info.ExpiresAt
 		info.ExpiresAt = &expiry
@@ -427,6 +440,10 @@ func (s *Store) Create(name, note string, models []string, options ...Options) (
 	key := "wbk_" + base64.RawURLEncoding.EncodeToString(raw[:])
 	entry := record{Info: Info{ID: "key_" + hex.EncodeToString(id[:]), Name: name, Note: note, MaskedKey: mask(key), Enabled: true, CreatedAt: time.Now().UTC(), Models: models}, Digest: digest(key)}
 	if len(options) > 0 {
+		if options[0].Limits != nil && options[0].Limits.Validate() != nil {
+			return Info{}, "", ErrInvalidLimits
+		}
+		entry.Limits = copyLimits(options[0].Limits)
 		entry.ReasoningLoopGuard = copyBool(options[0].ReasoningLoopGuard)
 		entry.GlobalFallbackToCN = copyBool(options[0].GlobalFallbackToCN)
 		if options[0].ExpiresAtSet {
@@ -458,6 +475,9 @@ func (s *Store) Create(name, note string, models []string, options ...Options) (
 }
 
 func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]string, options ...Options) (Info, error) {
+	if len(options) > 0 && options[0].Limits != nil && options[0].Limits.Validate() != nil {
+		return Info{}, ErrInvalidLimits
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockAndRefresh()
@@ -469,6 +489,9 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 	for i := range next {
 		if next[i].ID != id {
 			continue
+		}
+		if len(options) > 0 && options[0].LimitsSet {
+			next[i].Limits = copyLimits(options[0].Limits)
 		}
 		if name != nil {
 			next[i].Name = strings.TrimSpace(*name)

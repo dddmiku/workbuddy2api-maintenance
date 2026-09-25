@@ -1,0 +1,18 @@
+{
+  "name": "workbuddy2api-client-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Official client SDK contracts against the real gateway and a deterministic, local-only upstream",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "test": "node ../../scripts/client_contracts.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.128.0",
+    "@google/genai": "2.24.0",
+    "openai": "7.23.0"
+  }
+}

@@ -976,12 +976,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 			reqCtx, cancel := context.WithCancel(ctx)
 			req = req.WithContext(reqCtx)
+			observeChatAttempt(ctx, "start", 0)
 			resp, err := c.chatHTTP().Do(req)
 			if err != nil {
 				cancel()
 				log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
 				return nil, 0, nil, err
 			}
+			observeChatAttempt(ctx, "headers", resp.StatusCode)
 			if resp.StatusCode >= 400 {
 				errorBody := monitorBody(resp.Body, c.IdleTimeout, cancel)
 				raw, rerr := io.ReadAll(io.LimitReader(errorBody, 1<<20))

@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：四协议统一密钥限流与消费明细，管理接口只对内部通道开放。
+// 2026-09-25：每次实际尝试独立记账和归因，循环重发失败返回当前错误，工具契约拒绝不误报上游成功。
 // 2026-09-25：接入Gemini共享鉴权/调度，并在记账前收尾全部输出适配器，防止最终写失败被记为成功。
 // 2026-09-25：补齐模型详情与双协议发现鉴权，未知上下文不填假值；统一限制慢客户端写出并告知兼容过滤。
 // 2026-09-25：超限保持历史及会话绑定，成本统计统一读取上游实际用量，不再给客户端补写未处理的token。
@@ -46,9 +48,11 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/jsonutil"
+	"workbuddy2api/internal/keylimit"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/requestlog"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
@@ -107,7 +111,9 @@ type Config struct {
 
 	// Usage 按调用密钥累计的 token 账本（可选；nil = /usage 报未启用）。
 	// 已发起上游的请求独立记账；已知用量保留，失败和未完整上报另作标记。
-	Usage *usage.Store
+	Usage     *usage.Store
+	KeyLimits *keylimit.Manager
+	Requests  *requestlog.Store
 
 	// Update 热更新管理器（可选；nil = /update/* 报未启用）。
 	Update *hotupdate.Manager
@@ -137,7 +143,8 @@ type Handler struct {
 	// stopOnly 是 ReasoningLoopStopOnly 的运行期值（0 = 关闭，1 = 打开）。
 	// 用原子量而不是改 cfg：管理台热切换要立即作用于新请求，同时又不能让已经
 	// 开始的重发循环读到半个状态。启动时由 Config 播种，之后只由管理接口写。
-	stopOnly atomic.Uint32
+	stopOnly         atomic.Uint32
+	requestLogErrors atomic.Uint64
 }
 
 // SetReasoningLoopStopOnly 运行期切换「命中循环后是否只停不重发」，立即作用于后续
@@ -172,12 +179,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
+	if cfg.KeyLimits == nil {
+		cfg.KeyLimits = keylimit.NewMemory()
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	// 把启动配置播种进运行期开关；之后管理台可以热切换，不必重启。
 	h.SetReasoningLoopStopOnly(cfg.ReasoningLoopStopOnly)
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.withDecodedRequest(h.chatCompletions)))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.withGeneration(requestlog.ProtocolChat, h.withDecodedRequest(h.chatCompletions))))
 	// Responses API 兼容层（NarraFork / Codex 等客户端走这条）：内部委托 chatCompletions。
-	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.withDecodedRequest(h.responses)))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.withGeneration(requestlog.ProtocolResponses, h.withDecodedRequest(h.responses))))
 	h.mux.HandleFunc("POST /v1/messages", h.messagesEntry)
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.messagesEntry)
 	h.mux.HandleFunc("POST /v1beta/models/{modelAction}", h.withGeminiProtocol(h.geminiContent, true))
@@ -197,6 +207,9 @@ func NewHandler(cfg Config) *Handler {
 	// 用量统计只走本机 Unix socket（管理台「用量统计」页）：普通调用密钥拿不到全量用量，
 	// 单密钥自己的用量在日志与面板里按 key 归属，不需要公开端点。
 	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
+	h.mux.HandleFunc("GET /key-limits", h.requireInternal(h.keyLimitStatus))
+	h.mux.HandleFunc("GET /requests", h.requireInternal(h.requestHistory))
+	h.mux.HandleFunc("GET /requests/{requestID}", h.requireInternal(h.requestDetail))
 	// 热更新同样只走本机管理通道：能触发版本切换的入口不能暴露给调用密钥。
 	h.mux.HandleFunc("GET /update", h.requireInternal(h.updateStatus))
 	h.mux.HandleFunc("POST /update/check", h.requireInternal(h.updateCheck))
@@ -213,7 +226,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = identifyRequest(w, r)
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	h.mux.ServeHTTP(newBoundedResponseWriter(w, cancel, downstreamWriteTimeout), r.WithContext(ctx))
+	trace := &requestTrace{record: requestlog.Record{RequestID: requestID(r), StartedAt: time.Now()}}
+	wire := &traceResponseWriter{ResponseWriter: w, trace: trace}
+	ctx = context.WithValue(ctx, requestTraceKey{}, trace)
+	defer h.finishTrace(trace, wire, ctx)
+	h.mux.ServeHTTP(newBoundedResponseWriter(wire, cancel, downstreamWriteTimeout), r.WithContext(ctx))
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -892,6 +909,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	st.requestID = requestID(r)
+	st.trace = traceFor(r)
+	if st.trace != nil {
+		st.trace.stat = st
+		st.trace.record.Model = traceText(peek.Model)
+		st.trace.record.Stream = peek.Stream
+		st.start = st.trace.record.StartedAt
+	}
 	defer st.done()
 	defer func() {
 		// Protocol adapters may buffer their final JSON/SSE frame. Walk the
@@ -902,6 +926,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if st.status < 400 {
 				st.status = http.StatusBadGateway
 			}
+			st.trace.finishResponseError(w, err, r.Context())
 		}
 		if r.Context().Err() != nil {
 			st.failed = true
@@ -1064,6 +1089,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
 	chatMeta.GatewayRequestID = st.requestID
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
+	chatContext = upstream.WithChatAttemptObserver(chatContext, st.observeAttempt)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {
@@ -1087,8 +1113,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
+			var decision pool.Decision
+			acct, decision = h.cfg.Pool.PickByUIDForModelRealmWithDecision(stickyUID, bareModel, realm)
+			st.trace.decision(decision)
+			if acct == nil {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
 				unbindSticky()
 			}
@@ -1096,13 +1124,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			var decision pool.Decision
+			acct, decision = h.cfg.Pool.PickExcludingForRealmWithDecision(tried, bareModel, realm)
+			st.trace.decision(decision)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
 			break
 		}
 		st.uid = acct.UID
+		st.trace.selected(acct, bareModel)
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -1161,7 +1192,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 与账号无关，换号解决不了问题。
 		regionRepaired := false
 		for {
-			st.upstreamStarted = true
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
 			if terr != nil || status < 400 || regionRepaired {
 				break
@@ -1187,9 +1217,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("INFO: [server] region repair uid=%s country=%s (%s) — retrying same account",
 				logfmt.UID8(acct.UID), area.IOS2, area.EnName)
+			st.absorbJSONUsage(respBody)
 			regionRepaired = true
 		}
 		if terr != nil {
+			st.attemptError = traceTransportCode(r.Context())
 			st.absorbUsage(nil)
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -1342,14 +1374,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				// 被丢弃的这一轮上游确实生成并计费了（保护是在读到循环后才截断的），
 				// 用量照实累计，不能因为重发就把它抹掉。
+				st.attemptError = traceStreamCode(streamErr, r.Context())
 				st.absorbUsage(stats)
 				// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
 				_ = rc.Close()
 				loopRetries++
 				log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
 					loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
-				// 重发前重建读取器与用量观测：上一次被截断的观测已随重发作废，
-				// 只保留客户端最终真正收到的那一轮用量。
+				// 重发前重建读取器：上一轮已知用量已经入账，不能随本轮丢失或重复累加。
 				// 重发若被上下文预检拒绝，返回这次真实错误，不能用上一轮循环错误覆盖它。
 				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
 				if detail, contextFailure := upstream.ContextTooLongHTTPDetail(status, respBody); terr == nil && contextFailure {
@@ -1361,8 +1393,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if terr != nil || status >= 400 {
 					// 重发没能建立（传输层失败或上游直接报错）：Stream 已经压制了上一次
 					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
-					if !upstream.WriteStreamError(w, streamErr) {
-						writeOpenAIError(w, http.StatusBadGateway, loopErrorCode(streamErr), streamErr.Error())
+					retryErr := st.absorbRetryFailure(r.Context(), status, respBody, terr)
+					observeResponseError(w, retryErr.Code)
+					if !upstream.WriteStreamError(w, retryErr) {
+						writeOpenAIError(w, http.StatusBadGateway, retryErr.Code, retryErr.Message)
 					}
 					st.unreported = true
 					st.status = http.StatusBadGateway
@@ -1371,11 +1405,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					}
 					return
 				}
-				st.upstreamStarted = true
 				stats = newChatStatsReaderSince(rc, st.start)
 			}
 			if checker, ok := w.(interface{ CompletionError() error }); ok && streamErr == nil {
 				streamErr = checker.CompletionError()
+			}
+			if streamErr != nil {
+				st.attemptError = st.streamAttemptCode(streamErr, stats, w, r.Context())
 			}
 			st.absorbUsage(stats)
 			if streamErr != nil {
@@ -1443,6 +1479,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			// 同流式：被丢弃的那一轮上游已经产生并计费，用量照实累计。
+			st.attemptError = traceStreamCode(err, r.Context())
 			st.absorbUsage(stats)
 			// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
 			_ = rc.Close()
@@ -1459,16 +1496,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if terr != nil || status >= 400 {
 				// 重发没能建立：把失败如实回报，不能静默结束。
+				retryErr := st.absorbRetryFailure(r.Context(), status, respBody, terr)
 				st.unreported = true
 				st.status = http.StatusBadGateway
-				writeOpenAIError(w, st.status, loopErrorCode(err), err.Error())
+				writeOpenAIError(w, st.status, retryErr.Code, retryErr.Message)
 				if r.Context().Err() != nil {
 					st.status = 499
 				}
 				return
 			}
-			st.upstreamStarted = true
 			stats = newChatStatsReaderSince(rc, st.start)
+		}
+		if err != nil {
+			st.attemptError = traceStreamCode(err, r.Context())
 		}
 		st.absorbUsage(stats)
 		// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
@@ -1491,6 +1531,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if checker, ok := w.(interface{ ValidateCompletion(map[string]any) error }); ok {
 			if err := checker.ValidateCompletion(resp); err != nil {
+				st.trace.markLastFailure("response_contract_violation", false)
 				writeOpenAIError(w, http.StatusBadGateway, "response_contract_violation", err.Error())
 				st.status = http.StatusBadGateway
 				return
@@ -1674,6 +1715,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	observeResponseError(w, code)
 	_ = writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,

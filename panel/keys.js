@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-25：逐密钥编辑请求频率、并发与排队，显示实时快照和请求明细入口；未知消费不补零。
 // 2026-09-23：密钥新增「global 全部限流时回落同名 CN 模型」开关：表单、列表与提交
 //             三处同步，未设置按关闭处理（既有密钥零回归）。
 // 2026-09-20：密钥列表增加累计 token 用量列与有效期列；创建/编辑可选有效期，留空表示无限制。
@@ -8,7 +9,7 @@
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
 // 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
 
-var KS = {keys:null, loading:false, error:'', query:'', models:null, guardDefault:true, revision:0};
+var KS = {keys:null, loading:false, error:'', query:'', models:null, guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
 var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, active:false, recoverable:false, mode:'edit'};
 
 function keyGuardEnabled(key){
@@ -94,10 +95,17 @@ async function loadKeys(){
   KS.loading = true;
   $('#btnKeysReload').disabled = true;
   try{
-    var result = await api('api/keys');
+    var results = await Promise.all([
+      api('api/keys'),
+      api('api/key-limits').then(function(value){return {value:value};}).catch(function(error){return {error:error};})
+    ]);
     if (revision !== KS.revision){ reload = true; return; }
+    var result = results[0], status = results[1];
     if (!result || !Array.isArray(result.keys)) throw new Error('服务返回的密钥列表不完整');
     KS.keys = result.keys; KS.error = '';
+    KS.usageAvailable = result.usage_available !== false;
+    KS.limits = status.value && status.value.ok === true && status.value.keys && typeof status.value.keys === 'object' ? status.value.keys : null;
+    KS.limitsError = KS.limits ? '' : '暂时无法读取限流占用，已保存的限流设置仍然生效。';
     if (typeof result.default_reasoning_loop_guard === 'boolean') KS.guardDefault = result.default_reasoning_loop_guard;
   }catch(error){ if (revision === KS.revision) KS.error = error.message || '加载失败，请稍后重试'; else reload = true; }
   finally{
@@ -107,10 +115,40 @@ async function loadKeys(){
   }
 }
 
+function keyLimitsSummary(key){
+  var policy = key.limits || {}, rpm = policy.requests_per_minute || 0, concurrent = policy.max_concurrent || 0, queue = policy.queue_timeout_seconds || 0;
+  var text = (rpm ? rpm + ' 次/分' : '不限频率') + ' · ' + (concurrent ? '并发 ' + concurrent : '不限并发');
+  var rows = '<div>' + esc(text) + '</div>';
+  if (concurrent) rows += '<div class="sub">' + (queue ? '最多等待 ' + queue + ' 秒' : '并发满时不排队') + '</div>';
+  if (rpm || concurrent){
+    var status = KS.limits && KS.limits[key.id], observed = [];
+    if (status && status.policy && status.policy.requests_per_minute === rpm && status.policy.max_concurrent === concurrent && status.policy.queue_timeout_seconds === queue){
+      if (rpm && Number.isSafeInteger(status.requests)) observed.push('窗口内 ' + status.requests + ' 次');
+      if (concurrent && Number.isSafeInteger(status.active) && Number.isSafeInteger(status.queued)) observed.push('在途 ' + status.active + ' · 排队 ' + status.queued);
+    }
+    rows += '<div class="sub key-limit-state">' + esc(observed.join(' · ') || '占用待刷新') + '</div>';
+  }
+  return rows;
+}
+
+function selectedKeyLimits(){
+  var fields = [['keyRPM','requests_per_minute',60000],['keyConcurrency','max_concurrent',256],['keyQueueSeconds','queue_timeout_seconds',30]], policy = {};
+  for (var i=0;i<fields.length;i++){
+    var field=fields[i], raw=$('#'+field[0]).value.trim(), value=raw==='' ? 0 : Number(raw);
+    if (!/^\d*$/.test(raw) || !Number.isSafeInteger(value) || value<0 || value>field[2]) return {error:'限流设置需要填写 0–' + field[2] + ' 的整数', field:field[0]};
+    policy[field[1]]=value;
+  }
+  if (policy.queue_timeout_seconds>0 && !policy.max_concurrent) return {error:'请先设置并发上限，再设置等待时间',field:'keyConcurrency'};
+  return {value:policy.requests_per_minute || policy.max_concurrent ? policy : null};
+}
+
 function renderKeys(){
   var keys = KS.keys || [];
   $('#keyError').textContent = KS.error;
   $('#keyError').classList.toggle('hide', !KS.error);
+  var messages = [KS.limitsError, KS.usageAvailable ? '' : '累计用量暂不可读，当前显示为“—”，恢复后刷新即可。'].filter(Boolean).join(' ');
+  $('#keyLimitsError').textContent = messages;
+  $('#keyLimitsError').classList.toggle('hide', !messages);
   $('#tabKeys').textContent = KS.keys ? keys.length : '—';
   $('#btnCreateKey').disabled = KS.keys === null;
   $('#keyEnabledCount').textContent = KS.keys ? keys.filter(function(k){return k.enabled;}).length : '—';
@@ -118,7 +156,7 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="10">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="11">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
@@ -132,7 +170,8 @@ function renderKeys(){
       '<td data-l="模型绑定">' + (models.length
         ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
         : '<span class="sub">不限制</span>') + '</td>' +
-      '<td data-l="总用量" class="mono key-tokens">' + (Number(key.total_tokens) > 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub">0</span>') + '</td>' +
+      '<td data-l="总用量" class="mono key-tokens">' + (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') + '</td>' +
+      '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
       '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
       '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
@@ -142,7 +181,7 @@ function renderKeys(){
       '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">' + (keyGlobalFallbackEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
       '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
-      '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
+      '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="requests" data-id="' + esc(key.id) + '">请求明细</button><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
       '<button class="btn sm" data-key-action="toggle" data-id="' + esc(key.id) + '">' + (key.enabled ? '停用' : '启用') + '</button>' +
       '<button class="btn sm danger" data-key-action="delete" data-id="' + esc(key.id) + '">删除</button></div></td></tr>';
   }).join('');
@@ -161,6 +200,10 @@ function openKeyEditor(key){
   fillModelInput(key ? keyModels((key.models || []).join(',')) : []);
   $('#keyGuard').checked = keyGuardEnabled(key);
   $('#keyGlobalFallback').checked = keyGlobalFallbackEnabled(key);
+  var limits = key && key.limits || {};
+  $('#keyRPM').value = limits.requests_per_minute || 0;
+  $('#keyConcurrency').value = limits.max_concurrent || 0;
+  $('#keyQueueSeconds').value = limits.queue_timeout_seconds || 0;
   // 有效期默认「无限制」：既有密钥和新密钥都保持这个默认，只有显式选择才设置。
   // 编辑一把已经设过有效期的密钥时回填原值，避免保存时把有效期无声清掉。
   var preset = key && key.expires_at ? expiryToInput(key.expires_at) : '';
@@ -228,6 +271,9 @@ $('#keyForm').addEventListener('submit', async function(event){
   var expiry = selectedExpiry();
   if (expiry.error){keyFormError(expiry.error);return;}
   body.expires_at = expiry.value;
+  var limits = selectedKeyLimits();
+  if (limits.error){keyFormError(limits.error);$('#'+limits.field).focus();return;}
+  body.limits = limits.value;
   if (KD.id) body.id = KD.id;
   KD.busy = true; $('#keyDialogSave').disabled = true; keyFormError('');
   try{
@@ -302,6 +348,8 @@ $('#keyRows').addEventListener('click', function(event){
   var key = (KS.keys || []).find(function(k){return k.id === button.getAttribute('data-id');}); if (!key) return;
   var action = button.getAttribute('data-key-action');
   if (action === 'edit'){openKeyEditor(key);return;}
+  if (action === 'limits'){openKeyEditor(key);$('#keyRPM').focus();return;}
+  if (action === 'requests'){if (typeof openRequestsForKey === 'function') openRequestsForKey(key.id,key.name);return;}
   if (action === 'copy'){copySavedKey(key);return;}
   if (action === 'guard'){
     var desired = !keyGuardEnabled(key); button.disabled = true;

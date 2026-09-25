@@ -2,7 +2,7 @@
 
 将已授权的 WorkBuddy / CodeBuddy 账号接入常用 ai 工具的自托管中转。网关与管理台合在一个镜像、一个容器内：同一端口提供 `/v1/`、`/v1beta/` 接口和 `/admin/` 页面。
 
-本轮源码版本为 **v2.3.0**，新增 Gemini 生成接口并完善四协议工具校验。见 [版本变更](CHANGELOG.md) 与 [NarraFork 六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
+本轮源码版本为 **v2.4.0**，增加每密钥限流、请求消费明细、实际调度原因和官方 SDK 持续兼容测试。见 [运维功能](docs/operations-observability.md)、[版本变更](CHANGELOG.md) 与 [NarraFork 六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
 
 维护仓库为私有的 [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
 
@@ -11,6 +11,7 @@
 - OpenAI chat、Responses、Anthropic messages 与 Gemini generate content 共用鉴权、账号池、会话隔离、错误处理和原始用量账本。
 - 支持流式与非流式响应、函数工具、Responses 自定义工具和命名空间桥接、JSON schema 校验。
 - 管理台提供账号、密钥复制、模型白名单、到期时间、重复推理保护、任务、日志和用量管理。
+- 每密钥的请求频率、并发和排队策略由四协议共用；请求明细保留每次重试的已知消费、缺失项和当时的选号依据。
 - Go 主程序内嵌面板资源并托管 Python 子进程；以 `10001:10001` 运行，不挂载宿主 Docker socket。
 - 完整运行包同时更新网关、内嵌管理台、辅助程序和任务脚本；候选就绪后再提交当前版本指针。
 
@@ -90,6 +91,8 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 
 密钥库默认启用，空库拒绝调用。管理员可以再次复制可恢复的密钥；完整值不放进列表或日志。备份 `data/` 时同时保留密钥库及 `.enc-key` 文件。用量采用上游实际报告值；缓存属于输入、思考属于输出，不重复相加。失败和取消保留已知消费，缺失部分标成未完整上报；客户端隐藏流式用量不会关闭内部记账。
 
+在密钥页点击“设置限流”可限制请求数、并发和等待时间，已有密钥默认保持不限。在“请求明细”按调用密钥、完整模型、状态或请求 ID 筛选并展开重试/调度记录。明细保留 7 天、最多 10000 条或 64 MiB，与累计账本独立；未上报的消费显示未知，不乘固定倍率补算。详见 [限流与明细](docs/operations-observability.md)。
+
 统一运行版从私有 Release 下载 `wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`，校验压缩包与固定文件清单后交接。`update.repo` 默认指向私有维护仓库，读取凭据只放在本机实际配置。旧 `2.1.29` 已保留为私有 Release，供历史维护与回滚。
 
 运行包包含内嵌面板和辅助程序；基础镜像、Python/Bash 或 `docker-entrypoint.sh` 改动仍需重建镜像。首次从旧两容器迁移同样使用完整镜像。候选就绪后旧进程最多等待 15 分钟收尾，超时仍可能中断。详见 [管理台部署](docs/panel.md) 和 [配置说明](docs/configuration.md#热更新)。
@@ -105,7 +108,7 @@ python3 -m unittest discover -s panel -p 'test_*.py' -v
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-`-race` 需要 cgo 与 C 编译器。编译主程序前先生成并提交 `panel/index.html`。构建流程仅在指定私有仓库手动或版本 tag 触发，生成两个架构的运行包作为私有 Actions artifacts，不自动发布 Release 或公共镜像。ai 治理默认关闭，不随 issue/PR 自动运行。校验设计见 [统一架构](docs/architecture-unified.md)。
+`-race` 需要 cgo 与 C 编译器，由维护流程在服务器隔离副本执行。编译主程序前先生成并提交 `panel/index.html`。[持续兼容测试](tests/client-contracts/README.md) 使用固定官方 SDK 与回环假上游，在相关源码变更后运行；私有 CI 还运行常规全包测试、vet 与面板回归，不使用生产凭据。构建流程另行手动启用，只生成私有产物，不自动发布 Release 或公共镜像。ai 治理默认关闭，不随 issue/PR 自动运行。校验设计见 [统一架构](docs/architecture-unified.md)。
 
 合成回归、真实客户端测试和生产迁移分别验收；源码支持某接口，不代表任意模型、百万上下文恢复或生产切换已经验证通过。
 

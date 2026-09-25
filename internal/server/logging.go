@@ -1,4 +1,8 @@
 // ═══ 更新日志 ═══
+// 2026-09-25：重试失败保留当次真实消费与错误，循环截断用量明确标记未完整上报。
+// 2026-09-25：仅从实际 HTTP 尝试起点标记上游消费，发送前本地失败不再误入账本。
+// 2026-09-25：结束原因独立解析，异常 choice 元数据不能丢掉同帧已知消费。
+// 2026-09-25：每次上游观测同时写入请求尝试明细，额外保留真实思考计量和结束原因。
 // 2026-09-25：前置计量读取与协议解析共用有界 SSE 行读取，事件累计含换行限制为 64MiB，防止先分配后检查。
 // 2026-09-16：统计读取器保留底层错误，避免带末尾数据的断流被误报为正常 EOF。
 // 2026-09-17：请求行加 key= 列（调用方密钥身份），并带上 prompt/completion 明细供用量账本记账。
@@ -56,7 +60,9 @@ type chatStat struct {
 	failed          bool
 	unreported      bool
 
-	logged bool
+	logged       bool
+	trace        *requestTrace
+	attemptError string
 }
 
 // keyLabel 请求行里的密钥标识：优先名字，其次掩码密钥，都没有则 "-"。
@@ -83,11 +89,24 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 		prompt: -1, cached: -1, failed: true}
 }
 
+func (s *chatStat) observeAttempt(event upstream.ChatAttemptEvent) {
+	if event.Stage == "start" {
+		s.upstreamStarted = true
+	}
+	s.trace.event(event)
+}
+
 // absorbUsage is called once for each upstream attempt. The request itself is
 // recorded once, while known consumption from distinct attempts is preserved.
 func (s *chatStat) absorbUsage(observation *chatStatsReader) {
 	if observation == nil {
 		s.unreported = true
+		code := s.attemptCode()
+		if code == "" {
+			code = "transport_error"
+		}
+		s.trace.observe(nil, code)
+		s.attemptError = ""
 		return
 	}
 	addKnown := func(current *int, value int) {
@@ -109,13 +128,19 @@ func (s *chatStat) absorbUsage(observation *chatStatsReader) {
 		s.hasCred = true
 	}
 	s.hasUsage = s.hasUsage || observation.hasUsage
-	s.unreported = s.unreported || !observation.CompleteUsage()
+	code := s.attemptCode()
+	s.unreported = s.unreported || !observation.CompleteUsage() || traceLoopCode(code)
+	s.trace.observe(observation, code)
+	s.attemptError = ""
 	if s.mode == "stream" && s.ttfb == 0 {
 		s.ttfb = observation.TTFB()
 	}
 }
 
 func (s *chatStat) absorbJSONUsage(body []byte) {
+	if s.trace != nil && s.trace.pending != nil && s.trace.pending.HTTPStatus >= 400 {
+		s.attemptError = traceHTTPCode(s.trace.pending.HTTPStatus, body)
+	}
 	observation := newChatStatsReaderSince(strings.NewReader(""), s.start)
 	observation.observeJSON(string(body))
 	s.absorbUsage(observation)
@@ -151,6 +176,9 @@ type chatStatsReader struct {
 	hasData        bool
 	eventNameBytes int
 	maxEventBytes  int // zero selects the shared upstream SSE limit; small values support boundary tests
+	reasoning      *int64
+	finishReason   string
+	sawDone        bool
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -191,6 +219,10 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasUsage
 func (s *chatStatsReader) TotalTokens() int { return max(0, s.prompt) + max(0, s.tokens) }
 
 func (s *chatStatsReader) CompleteUsage() bool { return s.prompt >= 0 && s.tokens >= 0 }
+
+func (s *chatStatsReader) responseEnded() bool {
+	return s.sawDone || (s.finishReason != "" && s.readErr == io.EOF)
+}
 
 func (s *chatStatsReader) eventLimit() int {
 	if s.maxEventBytes > 0 {
@@ -259,15 +291,36 @@ func (s *chatStatsReader) observePendingEvent() {
 }
 
 func (s *chatStatsReader) observeJSON(payload string) {
+	if strings.TrimSpace(payload) == "[DONE]" {
+		s.sawDone = true
+		return
+	}
 	var chunk struct {
-		Usage map[string]any `json:"usage"`
+		Usage   map[string]any  `json:"usage"`
+		Choices json.RawMessage `json:"choices"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(payload))
 	decoder.UseNumber()
-	if decoder.Decode(&chunk) != nil || chunk.Usage == nil {
+	if decoder.Decode(&chunk) != nil {
 		return
 	}
 	if decoder.Decode(new(any)) != io.EOF {
+		return
+	}
+	// Output metadata is not a prerequisite for metering. A malformed choice
+	// must still fail protocol validation, but cannot erase valid usage beside it.
+	var choices []struct {
+		FinishReason json.RawMessage `json:"finish_reason"`
+	}
+	if json.Unmarshal(chunk.Choices, &choices) == nil {
+		for _, choice := range choices {
+			var reason string
+			if json.Unmarshal(choice.FinishReason, &reason) == nil && reason != "" {
+				s.finishReason = traceCode(reason)
+			}
+		}
+	}
+	if chunk.Usage == nil {
 		return
 	}
 	s.hasUsage = true
@@ -283,6 +336,15 @@ func (s *chatStatsReader) observeJSON(payload string) {
 	if value, ok := upstream.UsageCredit(chunk.Usage["credit"]); ok {
 		s.hasCredit = true
 		s.credit = value
+	}
+	if value, ok := upstream.UsageCount(chunk.Usage["completion_thinking_tokens"]); ok {
+		n := int64(value)
+		s.reasoning = &n
+	} else if details, ok := chunk.Usage["completion_tokens_details"].(map[string]any); ok {
+		if value, valid := upstream.UsageCount(details["reasoning_tokens"]); valid {
+			n := int64(value)
+			s.reasoning = &n
+		}
 	}
 }
 

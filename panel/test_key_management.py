@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：账本不可读时密钥列表保留未知值，禁止把丢失的用量伪装成零。
 # 2026-09-23：补日志窗口回归：60/120/300/600 是「请求条数」而不是原始日志行数，
 #             取窗口时要按噪声比例放大 tail，并按请求行裁到目标条数。
 # 2026-09-22：补密钥管理默认启用的口径回归：api_keys_file 未配置时按默认路径解析
@@ -191,6 +192,7 @@ class KeyManagementTests(unittest.TestCase):
             code, result = self.request("/api/keys", body=None, method="GET")
             self.assertEqual(code, 200)
             self.assertEqual([k["total_tokens"] for k in result["keys"]], [4096, 0])
+            self.assertTrue(result["usage_available"])
             self.assertEqual(upstream.call_count, 2)
 
     def test_key_list_survives_disabled_ledger(self):
@@ -199,7 +201,8 @@ class KeyManagementTests(unittest.TestCase):
                 patch.object(app.key_management, "request", side_effect=[(200, keys_payload), (200, {"ok": False, "message": "未启用"})]):
             code, result = self.request("/api/keys", body=None, method="GET")
             self.assertEqual(code, 200)
-            self.assertEqual(result["keys"][0]["total_tokens"], 0)
+            self.assertIsNone(result["keys"][0]["total_tokens"])
+            self.assertFalse(result["usage_available"])
 
     def test_usage_proxies_management_socket(self):
         payload = {"ok": True, "totals": {"requests": 3, "total_tokens": 120},

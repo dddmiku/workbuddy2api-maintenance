@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/jsonutil"
+	"workbuddy2api/internal/requestlog"
 )
 
 func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +25,7 @@ func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
 		r = r.Clone(r.Context())
 		r.Header.Set("Authorization", "Bearer "+r.Header.Get("X-API-Key"))
 	}
-	h.withAuth(h.withDecodedRequest(func(w http.ResponseWriter, r *http.Request) {
+	h.withAuth(h.withGeneration(requestlog.ProtocolMessages, h.withDecodedRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/messages/count_tokens" {
 			writeOpenAIError(w, http.StatusNotImplemented, "not_supported", "the upstream does not provide an exact token-count endpoint; use reported response usage")
 			return
@@ -48,7 +49,7 @@ func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
 		sub.Body = io.NopCloser(bytes.NewReader(chat))
 		sub.ContentLength = int64(len(chat))
 		h.chatCompletions(w, sub)
-	}))(mw, r)
+	})))(mw, r)
 	mw.finish()
 }
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-25：无筛选条件直接使用空参数列表，兼容Python3.8严格解析空查询串的差异。
+# 2026-09-25：面板版本同步为2.4.0，限流、调度消费明细与兼容性回归作为同一运行版本交付。
+# 2026-09-25：接入请求明细和限流私有通道，验证密钥限流字段；账本不可读时不再显示零消费。
 # 2026-09-25：面板版本同步为2.3.0，对应新增Gemini与四协议统一校验的整包版本。
 # 2026-09-25：最终统一运行版本为2.2.1，包含真实SDK审查发现的工具事件与业务JSON保真修复。
 # 2026-09-25：每次扫码使用独立登录流程ID，原生重载按进程就绪确认，不把账号冷却误报成重启失败。
@@ -86,7 +89,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 部署形态：宿主机 systemd（默认值）或与网关同项目的容器（由环境变量覆盖）。
@@ -124,7 +127,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.3.0"
+PANEL_VERSION = "2.4.0"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -1137,6 +1140,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/keys":
             return self.keys_with_usage()
 
+        if path == "/api/key-limits" or path == "/api/requests" or path.startswith("/api/requests/"):
+            return self.ops_get(path, query)
+
         if path == "/api/usage":
             # 用量账本只经本机管理通道读取：面板能看到全量，普通调用密钥看不到。
             return self._gateway_admin("GET", "/usage")
@@ -1294,14 +1300,50 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(code, result)
         totals = {}
         usage_code, usage = key_management.request(socket, "GET", "/usage")
-        if usage_code == 200 and isinstance(usage, dict) and usage.get("ok"):
+        usage_available = (usage_code == 200 and isinstance(usage, dict) and usage.get("ok") is True
+                           and isinstance(usage.get("keys"), list))
+        if usage_available:
             for item in usage.get("keys") or []:
                 if isinstance(item, dict) and isinstance(item.get("key_id"), str):
                     totals[item["key_id"]] = (item.get("totals") or {}).get("total_tokens") or 0
         for entry in result["keys"]:
             if isinstance(entry, dict):
-                entry["total_tokens"] = totals.get(entry.get("id"), 0)
+                entry["total_tokens"] = totals.get(entry.get("id"), 0) if usage_available else None
+        result["usage_available"] = usage_available
         return self._json(200, result)
+
+    def ops_get(self, path, query):
+        """管理员只读通道：构造固定端点，保留 400/404/503 与筛选参数含义。"""
+        if len(query) > 2048:
+            return self._json(400, {"ok": False, "message": "筛选条件过长"})
+        if path == "/api/key-limits":
+            if query:
+                return self._json(400, {"ok": False, "message": "限流状态接口不接受筛选参数"})
+            return self.keys_request("GET", "/key-limits")
+        if path.startswith("/api/requests/"):
+            try:
+                request_id = unquote(path[len("/api/requests/"):], errors="strict")
+            except UnicodeError:
+                request_id = ""
+            if query or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+                return self._json(400, {"ok": False, "message": "请求标识不正确"})
+            return self.keys_request("GET", "/requests/" + request_id)
+        try:
+            pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=6) if query else []
+        except (ValueError, UnicodeError):
+            return self._json(400, {"ok": False, "message": "筛选参数格式错误"})
+        allowed = {"key_id", "model", "status", "request_id", "offset", "limit"}
+        values = dict(pairs)
+        if len(values) != len(pairs) or set(values) - allowed:
+            return self._json(400, {"ok": False, "message": "包含重复或不支持的筛选参数"})
+        for name, value in pairs:
+            if len(value) > (256 if name == "model" else 128) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                return self._json(400, {"ok": False, "message": "筛选值无效"})
+            if name in ("offset", "limit") and (not re.fullmatch(r"[0-9]{1,9}", value) or (name == "limit" and not 1 <= int(value) <= 100)):
+                return self._json(400, {"ok": False, "message": "分页参数无效"})
+        if values.get("status", "") not in ("", "success", "error", "canceled", "rejected"):
+            return self._json(400, {"ok": False, "message": "请求状态无效"})
+        return self.keys_request("GET", "/requests" + ("?" + urlencode(pairs) if pairs else ""))
 
     def _origin_ok(self):
         """同源校验：没带 Origin（同源表单/脚本）或与 Host 完全一致才算合法。"""
@@ -1358,9 +1400,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "message": "重复推理保护必须为开启或关闭"})
         if "global_fallback_to_cn" in body and type(body["global_fallback_to_cn"]) is not bool:
             return self._json(400, {"ok": False, "message": "CN 回落必须为开启或关闭"})
+        if "limits" in body and not self._valid_limits(body["limits"]):
+            return self._json(400, {"ok": False, "message": "限流需为整数：每分钟 0–60000 次、并发 0–256、等待 0–30 秒；排队需先设置并发上限"})
         if path == "/api/keys":
             if set(body) - {"name", "note", "models", "reasoning_loop_guard",
-                            "global_fallback_to_cn", "expires_at"}:
+                            "global_fallback_to_cn", "expires_at", "limits"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
             if "expires_at" in body and not self._valid_expiry(body["expires_at"]):
                 return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
@@ -1381,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.keys_request("DELETE", "/keys/" + key_id)
         changes = {k: v for k, v in body.items() if k != "id"}
         if not changes or set(changes) - {"name", "note", "enabled", "models", "reasoning_loop_guard",
-                                          "global_fallback_to_cn", "expires_at"}:
+                                          "global_fallback_to_cn", "expires_at", "limits"}:
             return self._json(400, {"ok": False, "message": "没有有效的修改字段"})
         if "expires_at" in changes and not self._valid_expiry(changes["expires_at"]):
             return self._json(400, {"ok": False, "message": "有效期需为 RFC3339 时间，留空表示无限制"})
@@ -1390,6 +1434,17 @@ class Handler(BaseHTTPRequestHandler):
             if problem:
                 return self._json(400, {"ok": False, "message": problem})
         return self.keys_request("PATCH", "/keys/" + key_id, changes)
+
+    @staticmethod
+    def _valid_limits(value):
+        if value is None:
+            return True
+        maximums = {"requests_per_minute": 60000, "max_concurrent": 256, "queue_timeout_seconds": 30}
+        if not isinstance(value, dict) or set(value) - set(maximums):
+            return False
+        if any(type(number) is not int or not 0 <= number <= maximums[name] for name, number in value.items()):
+            return False
+        return value.get("queue_timeout_seconds", 0) == 0 or value.get("max_concurrent", 0) > 0
 
     @staticmethod
     def _model_binding_error(models):

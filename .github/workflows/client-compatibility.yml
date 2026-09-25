@@ -1,0 +1,139 @@
+# ═══ 更新日志 ═══
+# 2026-09-25：按维护约定把race放在服务器隔离验收，私有CI保留官方SDK与常规全包回归。
+# 2026-09-25：仅已核实的私有维护仓库运行官方 SDK 契约矩阵；假账号、固定依赖、只读权限，不发布或修改 issue/PR。
+name: Private client compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      dependency_report:
+        description: "Read available dependency versions without updating files"
+        type: boolean
+        default: false
+        required: false
+  push:
+    paths:
+      - "internal/**"
+      - "cmd/**"
+      - "panel/**"
+      - "go.mod"
+      - "go.sum"
+      - "tests/client-contracts/**"
+      - "scripts/client_contracts*"
+      - ".github/workflows/client-compatibility.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "internal/**"
+      - "cmd/**"
+      - "panel/**"
+      - "go.mod"
+      - "go.sum"
+      - "tests/client-contracts/**"
+      - "scripts/client_contracts*"
+      - ".github/workflows/client-compatibility.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-compatibility-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+
+jobs:
+  contracts:
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.repository_id == '1386246860' && github.event.repository.private == true
+    name: Official SDK contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify exact private repository before checkout
+        id: privacy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
+          test "$GITHUB_REPOSITORY_ID" = '1386246860'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\ttrue'
+          echo 'verified=true' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: tests/client-contracts/package-lock.json
+
+      - name: Install exact SDK dependencies without lifecycle scripts
+        working-directory: tests/client-contracts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify fixture builds against committed Go dependencies
+        run: |
+          go mod verify
+          go vet ./tests/client-contracts/fixture
+
+      - name: Verify concurrency, storage and request contracts across the gateway
+        if: runner.os == 'Linux'
+        run: |
+          go test ./... -count=1
+          go vet ./...
+          python3 -m unittest discover -s panel -p 'test_*.py'
+
+      - name: Run real Handler and official SDK contracts
+        run: node scripts/client_contracts.mjs
+
+      - name: Prove the suite detects a lost cache counter
+        run: node scripts/client_contracts.mjs --prove-oracle
+
+      - name: Read optional dependency update report
+        if: github.event_name == 'workflow_dispatch' && inputs.dependency_report == true && runner.os == 'Linux'
+        working-directory: tests/client-contracts
+        run: |
+          set +e
+          npm outdated --json > .output/dependency-report.json
+          result=$?
+          set -e
+          test "$result" -eq 0 -o "$result" -eq 1
+
+      - name: Recheck private artifact destination
+        id: artifact_privacy
+        if: always() && steps.privacy.outputs.verified == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\ttrue'
+          echo 'verified=true' >> "$GITHUB_OUTPUT"
+
+      - name: Save synthetic contract evidence
+        if: always() && steps.artifact_privacy.outputs.verified == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: client-contracts-${{ runner.os }}-${{ github.run_attempt }}
+          path: tests/client-contracts/.output/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,6 +1,7 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
 // 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 // ═══ 更新日志 ═══
+// 2026-09-25：粘性旧入口复用锁内选择实现，保留原语义并为新接口提供真实决策事实。
 // 2026-09-25：每次成败同时衰减相反观测，避免近期成功率被历史记录永久钉在约 50%。
 // 2026-09-24：余额恢复仅解除余额冷却，探活始终服从账号级冷却与熔断。
 // 2026-09-18：跨实例落盘保留显式复活/清零意图，并以实际扣费增量合并余额，避免旧快照回滚状态。
@@ -296,26 +297,7 @@ func (p *Pool) availableUIDsLocked(realm string, health func(e *entry, now time.
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	if !e.healthyForModel(now, model) {
-		return nil
-	}
-	if p.inFlightFull(e) {
-		return nil
-	}
-	e.lastUsed = now
-	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
-	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
-	// （entry.usedSeq 注释声明「每次被选中时取 pickSeq 自增值」，粘性命中也是选中）。
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
-	return e.a
+	return p.pickByUIDForModelRealm(uid, model, "", nil)
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。

@@ -9,6 +9,7 @@
 | `cmd/server`、`internal/server` | `/v1/`、`/v1beta/` 协议入口、鉴权、转换、完整性校验、流式写出 |
 | `internal/pool`、`internal/session`、`internal/upstream` | 统一调度、会话隔离、上游连接、错误与限流策略 |
 | `internal/usage`、`internal/runlog` | 原始消费账本、失败/缺失状态、有界滚动日志 |
+| `internal/keylimit`、`internal/requestlog` | 每密钥准入/租约、完成请求的尝试/调度明细与有限留存 |
 | `panel/assets.go`、`internal/panelruntime` | 内嵌资源、私有 Python 子进程、`/admin/` 代理及生命周期 |
 | `panel/native_runtime.py` | 仅允许已列出的登录、积分、日志、同版本重载操作 |
 | `internal/hotupdate` | 私有下载、整包校验、候选就绪、监听器交接与旧进程收尾 |
@@ -21,7 +22,7 @@
 
 配置使用 `./config:/app/config`，实际文件为 `/app/config/config.json`；`auths`、`auths-trash`、`data`、`panel-data` 分别挂载。运行身份为 `10001:10001`。运行包和临时面板资源不包含这些持久化目录。
 
-v2.3.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历史双容器部署文件，不是当前启动入口；现有统一运行版无需再次做迁移。
+v2.4.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历史双容器部署文件，不是当前启动入口；现有统一运行版无需再次做迁移。
 
 ## 完整运行包
 
@@ -42,7 +43,11 @@ v2.3.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历
 
 ## 私有构建与校验
 
-根 `VERSION` 记录本轮发行目标 `v2.3.0`，面板元数据为 `2.3.0`。Go 的实际版本、提交和时间由构建参数注入；未注入时仍为 `dev`。本地正式构建从 `VERSION` 读取，tag 构建使用对应 tag；手动非 tag 的 CI 构建保持开发标识。目标版本文件不替代实际二进制和运行清单核验。
+根 `VERSION` 记录本轮发行目标 `v2.4.0`，面板元数据为 `2.4.0`。Go 的实际版本、提交和时间由构建参数注入；未注入时仍为 `dev`。本地正式构建从 `VERSION` 读取，tag 构建使用对应 tag；手动非 tag 的 CI 构建保持开发标识。目标版本文件不替代实际二进制和运行清单核验。
+
+四协议在鉴权后经过同一密钥准入模块，再进入已有协议校验与执行。配置存于密钥库，窗口和租约使用旁路锁文件跨进程共享；明细存储与累计账本分离。每次上游 HTTP 起点、消费观测和池内调度快照关联到同一请求 ID，真实结束后保存有限留存记录。见 [运维契约](operations-observability.md)。
+
+`.github/workflows/client-compatibility.yml` 是持续测试入口，相关源码变更与手动运行均限制在已核验私有仓库。官方 SDK 在 Windows/Linux 测试，另执行常规全包测试、vet 和面板回归；race 由维护流程在服务器隔离副本执行。不使用模型或生产凭据，不发送评论。构建工作流需要另行启用，ai 治理继续关闭。
 
 `.github/workflows/build.yml` 仅允许 `dddmiku/workbuddy2api-maintenance`，同时检查事件中的私有标识和 GitHub API 的当前可见性。入口只有手动运行和版本 tag。每次上传产物前再次检查仓库仍为私有；权限仅为仓库内容读取，不拥有包或 Release 发布权限。
 

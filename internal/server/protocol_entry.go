@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"workbuddy2api/internal/requestlog"
 )
 
 // Model discovery shares /v1/models with OpenAI. The Google credential form
@@ -53,7 +54,7 @@ func geminiAuthRequest(r *http.Request) (*http.Request, error) {
 
 func (h *Handler) withGeminiProtocol(next http.HandlerFunc, decodeBody bool) http.HandlerFunc {
 	if decodeBody {
-		next = h.withDecodedRequest(next)
+		next = h.withGeneration(requestlog.ProtocolGemini, h.withDecodedRequest(next))
 	}
 	authenticated := h.withAuth(next)
 	return func(w http.ResponseWriter, r *http.Request) {
