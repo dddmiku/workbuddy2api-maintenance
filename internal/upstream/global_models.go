@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：global 探测同时缓存模型目录上限，供出站补齐输出预算。
 // 2026-09-17：保留动态目录并集及完整模型字段，在并发探测前固定凭据快照以避免跨代混用。
 // global 模型目录探测：同时返回模型名与上游实际下发的完整模型字段。
 // credits 仅作为展示字段透出，不注入 costTier、不参与选号；成本仍以实际 usage 为准。
@@ -135,6 +136,8 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	if len(efforts) > 0 || len(defaults) > 0 {
 		c.storeEfforts("global", efforts, defaults)
 	}
+	// global 目录上限（输出预算补齐用）；窄表探测无 infos 时不写，保留既有上限。
+	c.storeModelLimits("global", infos)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier（§3.D2 不变）。

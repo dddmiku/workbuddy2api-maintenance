@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：单独记录最后一次尝试的上游输入 token，供输出预算按会话推算（累计值会因重试偏大）。
 // 2026-09-25：重试失败保留当次真实消费与错误，循环截断用量明确标记未完整上报。
 // 2026-09-25：仅从实际 HTTP 尝试起点标记上游消费，发送前本地失败不再误入账本。
 // 2026-09-25：结束原因独立解析，异常 choice 元数据不能丢掉同帧已知消费。
@@ -52,6 +53,7 @@ type chatStat struct {
 	keyName         string
 	keyMask         string
 	prompt          int
+	lastPrompt      int // 最后一次上报用量的尝试的输入 token（多次尝试不累加；0 = 未知）
 	cached          int // 输入里命中提示缓存的 token 数（<0 表示未知）
 	hasUsage        bool
 	credit          float64
@@ -119,6 +121,9 @@ func (s *chatStat) absorbUsage(observation *chatStatsReader) {
 		*current += value
 	}
 	addKnown(&s.prompt, observation.PromptTokens())
+	if prompt := observation.PromptTokens(); prompt > 0 {
+		s.lastPrompt = prompt
+	}
 	if tokens, ok := observation.Tokens(); ok {
 		addKnown(&s.toks, tokens)
 	}

@@ -359,6 +359,8 @@ func main() {
 		KeyLimits:     keyLimits,
 		Requests:      requestStore,
 	})
+	// 模型目录预热：出站补齐输出预算依赖 maxOutputTokens，不能等到有人调用 /v1/models。
+	go h.WarmModelCatalogs(backgroundCtx)
 
 	// 管理通道 HTTP 服务：正常运行时就绪；兼容路径下等旧实例释放路径后再起。
 	// adminServer 由后台 goroutine 赋值、由停机路径读取，用锁保护。

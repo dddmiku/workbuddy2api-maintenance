@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：会话键交给出站层并记录每轮上游实报输入，用于长会话主动收缩输出预算。
 // 2026-09-25：四协议统一密钥限流与消费明细，管理接口只对内部通道开放。
 // 2026-09-25：每次实际尝试独立记账和归因，循环重发失败返回当前错误，工具契约拒绝不误报上游成功。
 // 2026-09-25：接入Gemini共享鉴权/调度，并在记账前收尾全部输出适配器，防止最终写失败被记为成功。
@@ -1090,6 +1091,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.GatewayRequestID = st.requestID
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
 	chatContext = upstream.WithChatAttemptObserver(chatContext, st.observeAttempt)
+	// 输出预算按会话推算：会话键交给出站层；成功后记录本轮上游实报输入，供下一轮主动收缩预算。
+	chatContext = upstream.WithBudgetSession(chatContext, stickyKey)
+	defer func() {
+		if !st.failed && st.status > 0 && st.status < 400 && st.lastPrompt > 0 && r.Context().Err() == nil {
+			h.cfg.Upstream.RecordPromptSample(stickyKey, realm, bareModel, int64(st.lastPrompt), body)
+		}
+	}()
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {

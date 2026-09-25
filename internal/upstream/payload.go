@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：客户端未声明 max_tokens 时按模型目录补齐输出预算，并把实际预算交给重发逻辑（见 output_budget.go）。
+// 2026-09-25：将正整数 max_completion_tokens 映射到上游 max_tokens，保留显式预算优先级和数字精度。
 // 2026-09-25：出站始终请求实际用量，保留其他流选项；客户端展示偏好不再关闭内部计量。
 // 2026-09-16：移除业务正文清洗，旧 sanitize 参数仅兼容配置；保留既有协议适配。
 // 2026-09-16：请求及 console 系统消息适配保留 JSON 数字字面量，避免 schema 和业务值损失精度。
@@ -41,12 +43,19 @@ func PrepareBodyOptWithEfforts(src []byte, legacySanitize bool, efforts map[stri
 // PrepareBodyOptWithEffortsAndDefault 在 PrepareBodyOptWithEfforts 基础上按模型
 // reasoning.defaultEffort 补默认档（缺显式 effort 时优先用模型声明档，空串/未知回退硬编码）。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	out, _ := prepareChatBody(src, legacySanitize, efforts, defaultEfforts, nil)
+	return out
+}
+
+// prepareChatBody 是出站 chat 请求体的完整整理管线；limits 为该 realm 的模型目录上限
+// （nil = 未知，不补输出预算）。返回整理后的请求体及其实际携带的输出预算。
+func prepareChatBody(src []byte, legacySanitize bool, efforts map[string][]string, defaultEfforts map[string]string, limits map[string]modelLimits) ([]byte, outputBudget) {
 	if len(src) == 0 {
-		return src
+		return src, outputBudget{}
 	}
 	var obj map[string]any
 	if err := jsonutil.Decode(src, &obj); err != nil || obj == nil {
-		return src
+		return src, outputBudget{}
 	}
 	obj["stream"] = true
 	// The gateway needs upstream usage even when a caller opts out of seeing
@@ -58,6 +67,10 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, effort
 		obj["stream_options"] = streamOptions
 	}
 	streamOptions["include_usage"] = true
+	normalizeMaxCompletionTokens(obj)
+	// 输出预算：客户端没给时按目录 maxOutputTokens 补齐，否则上游按自身默认（实测
+	// deepseek-v4.1-flash 为 384000）预留，与输入合计超过窗口即拒绝。
+	budget := applyOutputBudget(obj, limits)
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行。
@@ -87,9 +100,35 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, effort
 	warnDeprecatedSanitization(legacySanitize)
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return src
+		return src, outputBudget{}
 	}
-	return out
+	return out, budget
+}
+
+// normalizeMaxCompletionTokens maps the output-budget alias to WorkBuddy's
+// max_tokens field. An explicit positive max_tokens wins even when the alias
+// asks for more. A null max_tokens is unset; zero or malformed values are left
+// untouched for the existing request validation/default behavior.
+func normalizeMaxCompletionTokens(obj map[string]any) {
+	alias, ok := obj["max_completion_tokens"].(json.Number)
+	if !ok {
+		return
+	}
+	if count, err := alias.Int64(); err != nil || count <= 0 {
+		return
+	}
+	if current, present := obj["max_tokens"]; present && current != nil {
+		limit, ok := current.(json.Number)
+		if !ok {
+			return
+		}
+		if count, err := limit.Int64(); err != nil || count <= 0 {
+			return
+		}
+	} else {
+		obj["max_tokens"] = alias // Preserve the original JSON integer literal.
+	}
+	delete(obj, "max_completion_tokens")
 }
 
 // effortRank 档位从低到高。

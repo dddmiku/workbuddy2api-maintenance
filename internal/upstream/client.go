@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-26：出站补齐目录输出预算；超限或窗口边界 11133 时只收缩网关自选预算同号重发（最多两次），不改历史。
 // 2026-09-25：上下文超限直接返回上游原文，移除自动删历史重发，交由客户端完成真正的压缩。
 // 2026-09-25：首次拒绝与重试共用精确超限码识别，避免格式差异漏判与普通错误文案误判。
 // 2026-09-24：上下文首档裁剪不改变两三轮历史时继续尝试后续档位，不重复发送未缩短请求。
@@ -590,6 +591,16 @@ type Client struct {
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
 
+	// limitsMu/limits 缓存各模型目录上限（maxOutputTokens / maxInputTokens），按 realm 分桶，
+	// 由 CN FetchModels 与 global 探测刷新；供出站补齐输出预算（见 output_budget.go）。
+	limitsMu sync.RWMutex
+	limits   map[string]map[string]modelLimits
+	// windows 上游超限报文实报的窗口（realm\x00model → tokens），同受 limitsMu 保护。
+	windows map[string]int64
+	// samplesMu/samples 长会话最近一次真实输入样本，供主动收缩输出预算。
+	samplesMu sync.Mutex
+	samples   map[string]promptSample
+
 	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
 	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
@@ -720,6 +731,12 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+	out, _ := c.prepareBodyWithBudget(body, realm, uid, conversationID)
+	return out
+}
+
+// prepareBodyWithBudget 同 prepareBody，并返回出站请求实际携带的输出预算。
+func (c *Client) prepareBodyWithBudget(body []byte, realm, uid, conversationID string) ([]byte, outputBudget) {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -727,14 +744,14 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	body, budget := prepareChatBody(body, c.SanitizeFingerprints, efforts, defs, c.limitsSnapshot(realm))
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
 	// 出站图片预算（最后一环）：前面所有改写都可能让体积膨胀，这里统一按字节收口。
 	// 放在 prompt_cache_key 之后：裁剪只动图片 part，缓存键不受影响。
 	body = ShrinkOutboundImages(body, c.OutboundImageBudgetBytes)
-	return body
+	return body, budget
 }
 
 // effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
@@ -946,7 +963,33 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	}
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	prepared, budget := c.prepareBodyWithBudget(body, a.Realm(), a.UID, meta.ConversationID)
+	// budgetRetries：因输出预算同号重发的次数（跨路径共享，上限 maxBudgetRetries）。
+	budgetRetries := 0
+	// boundaryShrunk：已因窗口边界 11133 缩过预算；再次同样被拒时直接按超限处理，
+	// 不再用缩小后的预算重判「是否贴近窗口」（那样会把边界错误漏回给客户端）。
+	boundaryShrunk := false
+	// 主动预算：长会话按上一轮真实输入推算本轮，发送前就收缩网关自选预算。
+	if tokens, ok := c.proactiveOutputBudget(budgetSession(ctx), a.Realm(), budget, body); ok {
+		if candidate, ok := withOutputBudget(prepared, tokens); ok {
+			log.Printf("INFO: [upstream] output budget fitted from session usage uid=%s model=%s max_tokens %d -> %d",
+				logfmt.UID8(a.UID), budget.model, budget.tokens, tokens)
+			prepared, budget.tokens = candidate, tokens
+		}
+	}
+	// retryWithBudget 把出站 max_tokens 改为 tokens 后同路径重发；历史与其余字段不变。
+	retryWithBudget := func(tokens int64, reason string, raw []byte) bool {
+		candidate, ok := withOutputBudget(prepared, tokens)
+		if !ok {
+			return false
+		}
+		log.Printf("WARN: [upstream] output budget %s uid=%s model=%s max_tokens %d -> %d (history unchanged)",
+			reason, logfmt.UID8(a.UID), budget.model, budget.tokens, tokens)
+		prepared, budget.tokens = candidate, tokens
+		budgetRetries++
+		observeChatRetry(ctx, raw)
+		return true
+	}
 
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
@@ -999,10 +1042,37 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				kind := Classify(resp.StatusCode, string(raw))
 				log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-				// 上下文超限是请求终态：保留全部历史和原始错误，让客户端压缩后再请求。
-				// 数字大小与 JSON 转义方式均不影响此行为，也不触发路径回落。
+				// 上下文超限：上游计的是「输入 + max_tokens」。预算由网关自选时，按上游报告的
+				// 精确计数收缩到刚好放得下再同号重发一次；客户端显式预算、计数缺失或剩余空间
+				// 不足下限时，保留全部历史和原始错误作为终态，让客户端压缩后再请求。
 				if kind == ErrContextTooLong {
+					if detail, ok := ContextTooLongHTTPDetail(resp.StatusCode, raw); ok {
+						c.learnWindow(a.Realm(), budget.model, detail)
+						if budgetRetries < maxBudgetRetries {
+							if fitted, ok := fittedOutputBudget(budget, detail); ok && retryWithBudget(fitted, "fitted to window", raw) {
+								lastSent = prepared
+								continue retry
+							}
+						}
+					}
 					return nil, resp.StatusCode, raw, nil
+				}
+				// 窗口边界处的无字段 11133：上游预检按自己的计数放行、模型提供方按完整计数拒绝，
+				// 本质仍是「输入 + 预算」超窗。仅在估算已贴近窗口时处理：网关自选预算先缩小
+				// 重发；无法再缩（或预算来自客户端）则按上下文超限返回，客户端据此压缩。
+				if kind == ErrClient {
+					if requestID, boundary := modelParamRejected(raw); boundary && (boundaryShrunk || nearContextWindow(prepared, budget)) {
+						if budgetRetries < maxBudgetRetries {
+							if next, ok := shrunkOutputBudget(budget); ok && retryWithBudget(next, "shrunk at window boundary", raw) {
+								boundaryShrunk = true
+								lastSent = prepared
+								continue retry
+							}
+						}
+						log.Printf("WARN: [upstream] chat_stream uid=%s: 11133 at context window boundary (max_tokens=%d) -> context_length_exceeded",
+							logfmt.UID8(a.UID), budget.tokens)
+						return nil, resp.StatusCode, boundaryContextFailure(raw, budget, requestID), nil
+					}
 				}
 				// 国际版 WAF 按正文特征拦截（脚本、命令注入、路径穿越等），返回的是前置
 				// WAF 的拦截页而非模型答复。按两级做零宽断词后同路径重发：一级按已知模式
@@ -1244,6 +1314,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
+	// 目录上限（输出预算补齐用）按探测账号的 realm 落桶，与 effort 桶同一隔离原则。
+	c.storeModelLimits(a.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
 	cache := make(map[string][]string, len(out))
