@@ -1,7 +1,8 @@
 # ═══ 更新日志 ═══
+# 2026-09-25：按最新要求公开发布，核验同一仓库ID与公开可见性，保留只读权限和合成测试边界。
 # 2026-09-25：按维护约定把race放在服务器隔离验收，私有CI保留官方SDK与常规全包回归。
 # 2026-09-25：仅已核实的私有维护仓库运行官方 SDK 契约矩阵；假账号、固定依赖、只读权限，不发布或修改 issue/PR。
-name: Private client compatibility
+name: Client compatibility
 
 on:
   workflow_dispatch:
@@ -47,7 +48,7 @@ env:
 
 jobs:
   contracts:
-    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.repository_id == '1386246860' && github.event.repository.private == true
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.repository_id == '1386246860' && github.event.repository.private == false
     name: Official SDK contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -61,7 +62,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Verify exact private repository before checkout
+      - name: Verify exact public repository before checkout
         id: privacy
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,7 +70,7 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
           test "$GITHUB_REPOSITORY_ID" = '1386246860'
-          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\ttrue'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\tfalse'
           echo 'verified=true' >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -118,14 +119,14 @@ jobs:
           set -e
           test "$result" -eq 0 -o "$result" -eq 1
 
-      - name: Recheck private artifact destination
+      - name: Recheck public synthetic artifact destination
         id: artifact_privacy
         if: always() && steps.privacy.outputs.verified == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\ttrue'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\tfalse'
           echo 'verified=true' >> "$GITHUB_OUTPUT"
 
       - name: Save synthetic contract evidence

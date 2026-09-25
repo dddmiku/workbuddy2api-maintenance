@@ -14,7 +14,7 @@ node scripts/client_contracts.mjs --prove-oracle
 
 `--prove-oracle` 故意把客户端收到的缓存命中数从 40 改成 0，而真实网关账本仍为 40。它要求指定断言失败，才返回成功；构建错误、启动错误或没有运行测试不能冒充“已检出回归”。正常矩阵和这个反例分别记录结果。
 
-在安装了 C 编译器的环境中，还可运行夹具的 Go race detector：
+在服务器的隔离源码副本中，安装 C 编译器后可运行夹具的 Go race detector：
 
 ```sh
 node scripts/client_contracts.mjs --race
@@ -66,9 +66,9 @@ node scripts/client_contracts.mjs --test-name-pattern="^anthropic messages"
 - `normal-race/`：启用 race detector 时的同类记录；Go 夹具退出异常会使整次任务失败。
 - `drop-cache/`：受控反例的失败断言以及 `expected_regression_detected`。
 
-[client-compatibility.yml](../../.github/workflows/client-compatibility.yml) 仅允许已核验的 `dddmiku/workbuddy2api-maintenance`、repository ID `1386246860` 且当前仍为 private 的仓库运行。相关 push/PR 及手动触发均受同一限制，检出前和上传测试证据前还会读取当前私有状态。
+[client-compatibility.yml](../../.github/workflows/client-compatibility.yml) 仅允许已核验的公开仓库 `dddmiku/workbuddy2api-maintenance`、repository ID `1386246860` 运行。相关 push/PR 及手动触发均受同一限制，检出前和上传测试证据前还会核对仓库身份及当前公开状态。
 
-CI 在 Linux 和 Windows 各跑一次；Linux 另跑常规全包测试、vet 与面板回归。race detector 由维护流程在服务器的隔离源码副本执行，既可覆盖完整 Go 测试，也可用上面的 `--race` 运行官方 SDK 夹具。只有 `contents: read` 权限，checkout 不持久化凭据，测试子进程移除供应商凭据环境变量。工作流不发布 Release、不调用模型、不自动升级依赖、不创建 issue 或发表评论。手动选择 `dependency_report` 只运行 `npm outdated` 并保存查询结果。
+CI 在 Linux 和 Windows 各跑一次；Linux 另跑常规全包测试、vet 与面板回归。race detector 由维护流程在服务器的隔离源码副本执行，既可覆盖完整 Go 测试，也可用上面的 `--race` 运行官方 SDK 夹具。只有 `contents: read` 权限，checkout 不持久化凭据，测试子进程移除供应商凭据环境变量；上传证据只含合成请求和测试结果。工作流不发布 Release、不调用模型、不自动升级依赖、不创建 issue 或发表评论。手动选择 `dependency_report` 只运行 `npm outdated` 并保存查询结果。
 
 ## 与外部真实客户端回放的区别
 

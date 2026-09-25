@@ -4,7 +4,7 @@
 
 本轮源码版本为 **v2.4.0**，增加每密钥限流、请求消费明细、实际调度原因和官方 SDK 持续兼容测试。见 [运维功能](docs/operations-observability.md)、[版本变更](CHANGELOG.md) 与 [NarraFork 六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
 
-维护仓库为私有的 [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
+公开发布仓库为 [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
 
 ## 能力
 
@@ -19,7 +19,7 @@
 
 ## 新部署
 
-需要 Linux、Docker Engine、Compose v2 和私有仓库读取权限。镜像包含 Python、Bash 和辅助程序，宿主机不用安装 Go。源码与 CI 使用 Go 1.26.8、Python 3.12，前端行为测试另用 Node.js。
+需要 Linux、Docker Engine 和 Compose v2。镜像包含 Python、Bash 和辅助程序，宿主机不用安装 Go。源码与 CI 使用 Go 1.26.8、Python 3.12，前端行为测试另用 Node.js。
 
 以下步骤用于新目录；已有站点按 [迁移与回滚](docs/panel.md#从旧两容器部署迁移) 保留原配置和数据。
 
@@ -93,7 +93,7 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 
 在密钥页点击“设置限流”可限制请求数、并发和等待时间，已有密钥默认保持不限。在“请求明细”按调用密钥、完整模型、状态或请求 ID 筛选并展开重试/调度记录。明细保留 7 天、最多 10000 条或 64 MiB，与累计账本独立；未上报的消费显示未知，不乘固定倍率补算。详见 [限流与明细](docs/operations-observability.md)。
 
-统一运行版从私有 Release 下载 `wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`，校验压缩包与固定文件清单后交接。`update.repo` 默认指向私有维护仓库，读取凭据只放在本机实际配置。旧 `2.1.29` 已保留为私有 Release，供历史维护与回滚。
+统一运行版从公开 Release 下载 `wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`，校验压缩包与固定文件清单后交接。`update.repo` 默认仍为 `dddmiku/workbuddy2api-maintenance`，公开下载时 `update.token` 可留空。旧 `2.1.29` Release 保留用于历史维护与回滚。
 
 运行包包含内嵌面板和辅助程序；基础镜像、Python/Bash 或 `docker-entrypoint.sh` 改动仍需重建镜像。首次从旧两容器迁移同样使用完整镜像。候选就绪后旧进程最多等待 15 分钟收尾，超时仍可能中断。详见 [管理台部署](docs/panel.md) 和 [配置说明](docs/configuration.md#热更新)。
 
@@ -108,7 +108,7 @@ python3 -m unittest discover -s panel -p 'test_*.py' -v
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-`-race` 需要 cgo 与 C 编译器，由维护流程在服务器隔离副本执行。编译主程序前先生成并提交 `panel/index.html`。[持续兼容测试](tests/client-contracts/README.md) 使用固定官方 SDK 与回环假上游，在相关源码变更后运行；私有 CI 还运行常规全包测试、vet 与面板回归，不使用生产凭据。构建流程另行手动启用，只生成私有产物，不自动发布 Release 或公共镜像。ai 治理默认关闭，不随 issue/PR 自动运行。校验设计见 [统一架构](docs/architecture-unified.md)。
+`-race` 需要 cgo 与 C 编译器，由维护流程在服务器隔离副本执行。编译主程序前先生成并提交 `panel/index.html`。[持续兼容测试](tests/client-contracts/README.md) 使用固定官方 SDK 与回环假上游，在此公开仓库的相关源码变更后运行；CI 还运行常规全包测试、vet 与面板回归，只使用合成测试内容，不读取生产凭据。构建工作流保存 Actions artifact，正式公开 Release 由维护发布流程另行创建并上传运行包，不自动发布镜像。ai 治理默认关闭，不随 issue/PR 自动运行。校验设计见 [统一架构](docs/architecture-unified.md)。
 
 合成回归、真实客户端测试和生产迁移分别验收；源码支持某接口，不代表任意模型、百万上下文恢复或生产切换已经验证通过。
 

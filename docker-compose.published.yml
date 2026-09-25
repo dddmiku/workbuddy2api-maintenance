@@ -1,14 +1,12 @@
 # ═══ 更新日志 ═══
+# 2026-09-25：明确此文件仅供历史双容器回滚，避免公开发布后被误用为当前单容器入口。
 # 2026-09-18：发布镜像同样给网关 3 分钟停机宽限，保留在途 RPC 收尾和状态落盘时间。
-# 用 ghcr.io 上已发布的镜像启动，不在本地构建。
+# 仅供历史双容器部署回滚；不用于当前 v2.4.0 单容器安装或升级。
+# 当前部署使用 docker-compose.yml，按 README 和 docs/panel.md 准备目录及验证。
 #
-#   cd /opt/workbuddy2api
-#   sudo docker compose -f docker-compose.published.yml pull
-#   sudo docker compose -f docker-compose.published.yml up -d
-#
-# 目录准备（config.json、auths/、data/、panel-data/）、加账号和启动后的验证与
-# docker-compose.yml 完全一致，见 README「快速开始」。
-# 需要固定版本时把 :latest 换成发布页上的版本号，例如 :v1.1.0。
+# 回滚前先停止新部署，并把下方 :latest 改为维护记录中已核验的旧镜像版本或摘要。
+# 此文件沿用旧配置挂载、独立面板端口和 Docker socket，必须配套对应历史配置及备份。
+# 不要让旧、新部署同时写入相同数据目录，也不要将旧 latest 标签视作已验证的回滚版本。
 services:
   wb2api:
     image: ghcr.io/dddmiku/workbuddy2api:latest

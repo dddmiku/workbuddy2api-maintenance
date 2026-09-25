@@ -22,8 +22,8 @@
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
 | `prompt.act_note` | 内置运行约定 | 追加到「带工具的请求」第一条 system 末尾，Chat Completions 与 Responses 两条路径都生效；强调待执行动作必须同次返回工具调用；`off` 关闭，也可写自定义文本 |
 | `update.enabled` | `true` | 是否允许管理台一键热更新 |
-| `update.repo` | `dddmiku/workbuddy2api-maintenance` | 私有维护仓库（`owner/name`），空值使用此默认值 |
-| `update.token` | 空 | 指定私有仓库的读取凭据；只保存在本机实际配置，不是调用 API key |
+| `update.repo` | `dddmiku/workbuddy2api-maintenance` | 公开发布仓库（`owner/name`），空值使用此默认值 |
+| `update.token` | 空 | 公开仓库可留空；自选私有仓库时使用其读取凭据，只保存在本机实际配置，不是调用 API key |
 | `update.dir` | 数据目录下 `updates/` | 下载件与 `current` 指针的存放目录 |
 | `pool.max_in_flight` | `3` | 单账号并发上限；0 表示不限制 |
 | `session_sticky.enabled` | `true` | 按客户端会话键选择账号 |
@@ -198,7 +198,7 @@
 
 ## 热更新
 
-统一运行模式从私有 GitHub Release 获取本机架构的完整运行包：`wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`。包内包含主程序、内嵌面板、5 个辅助程序、4 个 shell 脚本和 5 个 Python 脚本；固定清单与校验设计见 [统一架构](architecture-unified.md#完整运行包)。
+统一运行模式从公开 GitHub Release 获取本机架构的完整运行包：`wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`。包内包含主程序、内嵌面板、5 个辅助程序、4 个 shell 脚本和 5 个 Python 脚本；固定清单与校验设计见 [统一架构](architecture-unified.md#完整运行包)。
 
 ```json
 {
@@ -211,7 +211,7 @@
 }
 ```
 
-示例不含凭据。`update.token` 需在本机配置为可读取该私有仓库的凭据，并限制配置权限；不要提交到 Git 或放进镜像、日志、截图。旧配置的非空 `update.repo` 不会自动改写，迁移时需显式切到私有维护仓库。缺少读取权限时检查更新会明确失败，不影响已有调用密钥的鉴权。`update.enabled:false` 关闭远程版本更新。
+默认公开源无需下载凭据，`update.token` 可留空。只有自选私有源时才需要配置其读取凭据，并限制配置权限；不要提交到 Git 或放进镜像、日志、截图。仓库名称和默认值仍为 `dddmiku/workbuddy2api-maintenance`，已有同名设置无需修改；其他非空 `update.repo` 保持原值，迁移时应核对实际目标。更新检查失败不影响已有调用密钥的鉴权。`update.enabled:false` 关闭远程版本更新。
 
 升级流程：
 
@@ -223,7 +223,7 @@
 
 `update.dir` 解析顺序保持为 `WB2API_UPDATE_DIR`、显式 `update.dir`、根据 `state_file` 推导；相对路径以工作目录为基准。密钥库、加密密钥文件、用量、账号和管理员数据都位于版本包之外。共享状态在文件锁内合并各进程的真实增量。
 
-从旧两容器形态首次迁移必须使用完整新镜像和维护窗口，保留旧 Compose、镜像、配置、五个数据目录及旧 `current`。统一入口会忽略没有 manifest 的旧裸二进制指针；不要用裸主程序替换完整运行版。历史 `2.1.29` 已保留为私有 Release，可用于对应历史部署的回滚，不能直接作为统一运行包。
+从旧两容器形态首次迁移必须使用完整新镜像和维护窗口，保留旧 Compose、镜像、配置、五个数据目录及旧 `current`。统一入口会忽略没有 manifest 的旧裸二进制指针；不要用裸主程序替换完整运行版。历史 `2.1.29` Release 保留用于对应历史部署的回滚，不能直接作为统一运行包。
 
 回滚选择已核验的历史完整包或旧镜像，并核对实际进程版本与文件摘要；镜像标签不是最终运行版本。需要恢复两容器旧部署时遵循 [迁移与回滚](panel.md#从旧两容器部署迁移)，不要让旧、新部署同时写相同状态。自动更新不会主动降级，明确指定历史版本的管理员回滚仍保留。不要在回滚前删除更新目录和数据备份。
 

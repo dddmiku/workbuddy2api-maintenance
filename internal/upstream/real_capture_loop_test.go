@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
-// 2026-09-20：用线上真实抓包的循环字节做回归，替代纯合成夹具，锁定「正文循环」形态。
+// 2026-09-25：更正夹具来源说明：文件只含通用循环短句与固定测试标识，不代表完整真实抓包回放。
+// 2026-09-20：根据线上正文循环现象增加固定夹具回归，锁定正文侧的保护与重试边界。
 package upstream
 
 import (
@@ -10,12 +11,12 @@ import (
 	"testing"
 )
 
-// TestOutputLoopGuardRealCaptureFixture 用线上真实抓到的循环字节做回归。2026-09-20 的
-// 抓包里，正文是「我执行。」重复 127230 行、唯一行只有 1 个（占比 100%），而推理侧
-// 只有 3736 字符、重复覆盖 23%。旧实现只看 reasoning_content，因此既不中断也不重试。
+// TestOutputLoopGuardRealCaptureFixture 验证正文侧的循环保护。旧实现只看
+// reasoning_content，可能遗漏正文已经循环、推理侧却没有明显重复的情况。
 //
-// testdata/real_output_loop.sse 取自那次抓包的前 700 帧，保留原始 UTF-8 字节与分帧
-// 边界，不重新构造文本；目的是让「真实循环能被拦住」这件事不依赖合成样本的假设。
+// testdata/real_output_loop.sse 是清理后的通用回归夹具，只含循环短句和固定测试标识，
+// 共 1201 个 JSON 数据帧及一个结束标记。它不包含真实会话、推理或身份信息，
+// 也不能替代真实客户端和上游验收。文件名保留以兼容已有回归入口。
 func TestOutputLoopGuardRealCaptureFixture(t *testing.T) {
 	raw, err := os.ReadFile("testdata/real_output_loop.sse")
 	if err != nil {

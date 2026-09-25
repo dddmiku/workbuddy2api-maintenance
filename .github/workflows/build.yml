@@ -1,6 +1,7 @@
 # ═══ 更新日志 ═══
+# 2026-09-25：公开运行包构建限定同一仓库ID；测试保持只读，race按约定由服务器隔离验收。
 # 2026-09-25：仅在已核验私有维护仓库手动或版本tag校验并生成完整运行包，移除定时公开镜像及自动Release发布。
-name: Private runtime build
+name: Runtime build
 
 on:
   workflow_dispatch:
@@ -11,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: private-runtime-${{ github.ref }}
+  group: runtime-build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -20,8 +21,8 @@ env:
 
 jobs:
   verify:
-    name: Verify private source and embedded panel
-    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.event.repository.private == true
+    name: Verify source and embedded panel
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.repository_id == '1386246860' && github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -31,7 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
-          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+          test "$GITHUB_REPOSITORY_ID" = '1386246860'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\tfalse'
 
       - uses: actions/checkout@v4
         with:
@@ -56,7 +58,6 @@ jobs:
         run: |
           go test ./... -count=1
           go vet ./...
-          go test -race ./... -count=1
 
       - name: Verify embedded panel matches its source
         run: |
@@ -69,9 +70,9 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
   runtime:
-    name: Build both private runtime bundles
+    name: Build both runtime bundles
     needs: verify
-    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.event.repository.private == true
+    if: github.repository == 'dddmiku/workbuddy2api-maintenance' && github.repository_id == '1386246860' && github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -81,7 +82,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'dddmiku/workbuddy2api-maintenance'
-          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+          test "$GITHUB_REPOSITORY_ID" = '1386246860'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\tfalse'
 
       - uses: actions/checkout@v4
         with:
@@ -126,14 +128,14 @@ jobs:
           cd dist
           sha256sum wb2api-runtime-linux-*.tar.gz > SHA256SUMS.txt
 
-      - name: Confirm artifacts will remain private
+      - name: Confirm public artifact destination
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '.private')" = 'true'
+          test "$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY" --jq '[.id, .private] | @tsv')" = $'1386246860\tfalse'
 
-      - name: Save private build artifacts
+      - name: Save runtime build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wb2api-runtime-${{ github.sha }}
