@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：无参数工具的空参数串视为合法，不再判整轮失败。
 // 2026-09-26：拒答文本按正文交付（Codex 解析不了 refusal 条目，会整条丢弃）。
 // 2026-09-26：运行约定同样追加到 part 数组形态的首条 system，不再另起一条 system。
 // 2026-09-26：响应中的 model 一律为调用方请求的名字，不再被上游裸名覆盖（流式与非流式一致）。
@@ -1928,6 +1929,10 @@ func validateResponseToolCall(name, args string, argumentsSeen bool) error {
 	}
 	if !argumentsSeen {
 		return fmt.Errorf("upstream tool arguments must be a JSON string")
+	}
+	if strings.TrimSpace(args) == "" {
+		// 无参数工具的合法形状（空串），上游层已按合法处理。
+		return nil
 	}
 	var object map[string]json.RawMessage
 	if json.Unmarshal([]byte(args), &object) != nil || object == nil {

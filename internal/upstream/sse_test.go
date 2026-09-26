@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：choice 级新增 logprobs（缺失为 null），与 OpenAI 实际 chunk 一致。
 // 2026-09-16：成功流夹具使用合法工具参数；只有明确结束才允许补 DONE，空流验证真实错误。
 // 2026-09-17：保留 fork 错误详情透传断言，错误返回改验 typed 失败，并覆盖完整错误信封与数字字面量。
 // ═══ 更新日志 ═══
@@ -418,27 +419,27 @@ func TestNormalizeFrame(t *testing.T) {
 			map[string]any{"id": "x", "choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"content": "", "refusal": ""}, "finish_reason": ""},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"x","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{},"finish_reason":null,"index":0,"logprobs":null}],"id":"x","object":"chat.completion.chunk","usage":null}`},
 		{"non-empty tool_calls kept",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"id": "c1", "type": "function"}}}},
 			}},
-			`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function"}]},"finish_reason":null,"index":0,"logprobs":null}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
 		{"empty tool_calls list dropped",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{}, "content": "hi"}},
 			}},
-			`{"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0,"logprobs":null}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
 		{"empty placeholder function_call dropped",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"function_call": map[string]any{"name": "", "arguments": ""}}},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{},"finish_reason":null,"index":0,"logprobs":null}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
 		{"top-level unknown fields dropped, usage null when absent",
 			map[string]any{"id": "x", "object": "chat.completion.chunk", "created": 1, "junk": "noise", "choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1,"id":"x","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{},"finish_reason":"stop","index":0,"logprobs":null}],"created":1,"id":"x","object":"chat.completion.chunk","usage":null}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

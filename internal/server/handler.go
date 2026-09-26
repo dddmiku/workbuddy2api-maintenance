@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：错误信封 type 按状态码映射；n<1 拒绝。
+// 2026-09-26：拒绝 n>1（上游只返回单个选择），避免静默降级。
 // 2026-09-26：上游请求发出时通知响应适配器（供静默期先开流与 ping）。
 // 2026-09-26：请求模型名限长 256 字节，防止超长名字撑爆用量账本写盘上限。
 // 2026-09-26：参数错误、WAF、渠道与内容拦截等请求决定的终态不再解绑会话，保留同号提示缓存。
@@ -818,6 +820,28 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	return infos
 }
 
+// rejectUnsupportedChoiceCount 拒绝 n>1：上游只返回一个选择，静默降级会让客户端
+// 按 n 取第二个选择时报错（与 previous_response_id 一样按「明确拒绝」处理）。
+func rejectUnsupportedChoiceCount(body []byte) error {
+	var request struct {
+		N *json.Number `json:"n"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.N == nil {
+		return nil
+	}
+	count, err := request.N.Int64()
+	if err != nil {
+		return nil
+	}
+	if count < 1 {
+		return fmt.Errorf("n must be at least 1")
+	}
+	if count > 1 {
+		return fmt.Errorf("n=%s is not supported: this upstream returns a single choice", request.N.String())
+	}
+	return nil
+}
+
 // maxModelNameBytes 请求模型名长度上限（含 realm 前缀）。
 const maxModelNameBytes = 256
 
@@ -858,6 +882,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request fields: "+err.Error())
 		return
 	}
+	// n>1 需要上游返回多个选择，当前上游不提供：静默只回一个 choice 会让按 n 取值
+	// 的客户端越界，明确拒绝。
+	if err := rejectUnsupportedChoiceCount(body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	if err := validateChatRequest(body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -892,6 +922,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if contract != nil {
+			// lastWrite 刻意保持零值：首帧被缓冲（工具调用要整组校验）时，零值会让
+			// 契约写入器立刻发一条 ": keepalive" 注释——它同时把响应头先送出去，
+			// 客户端才不会在整组工具参数到齐前一直等不到响应。见 review 测试
+			// TestMessagesReviewClientCancellationStopsUpstream。
 			checked := &chatContractWriter{inner: w, req: contract}
 			w = checked
 			defer checked.finish()
@@ -1759,8 +1793,31 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	_ = writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
-			"type":    "api_error",
+			"type":    openAIErrorType(status),
 			"code":    code,
 		},
 	})
+}
+
+// openAIErrorType 按状态码给出 OpenAI 的错误类型。SDK 会按 error.type 分类处理
+// （重试、提示鉴权失败、判定请求错误），一律 api_error 会让它们无法区分。
+func openAIErrorType(status int) string {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusUnsupportedMediaType:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "invalid_request_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	}
+	if status >= 500 {
+		return "server_error"
+	}
+	return "api_error"
 }

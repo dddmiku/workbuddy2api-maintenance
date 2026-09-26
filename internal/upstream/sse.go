@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-26：空工具参数归一为 {}；choice 级 logprobs 透传（缺失补 null）。
 // 2026-09-25：逐段读取并限制 SSE 单行/单事件为 64MiB，防止异常上游持续分配内存；超限返回明确失败。
 // 2026-09-25：厂商错误事件包装成标准 error 时保留同帧顶层 usage，避免下游漏掉真实用量更新。
 // 2026-09-25：移除裁剪记录对用量的覆盖，流式和聚合仅合并上游实际报告的累计值。
@@ -898,6 +899,14 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				}
 			}
 			nc["delta"] = delta
+			// logprobs 也是 choice 级字段：客户端请求后拿不到字段（而不是 null）
+			// 时，SDK 读 chunk.choices[0].logprobs.content 会直接抛异常。
+			if v, ok := c["logprobs"]; ok {
+				nc["logprobs"] = v
+			} else {
+				nc["logprobs"] = nil
+			}
+
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 				nc["finish_reason"] = fr
 			} else {

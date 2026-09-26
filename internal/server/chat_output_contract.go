@@ -196,8 +196,10 @@ func normalizeChatToolDeclarations(fields map[string]json.RawMessage, req *respo
 			if function, ok := message["function_call"].(map[string]any); ok && rename(function, false) {
 				historyChanged = true
 			}
-			if message["role"] == "function" && rename(message, false) {
-				historyChanged = true
+			for _, role := range []string{"function", "tool"} {
+				if message["role"] == role && rename(message, false) {
+					historyChanged = true
+				}
 			}
 		}
 		if historyChanged {
@@ -232,18 +234,19 @@ func normalizeChatToolDeclarations(fields map[string]json.RawMessage, req *respo
 // Eager clients execute as soon as argument JSON parses, before a finish marker.
 // Stream text/reasoning immediately; release tools only after validating every choice.
 type chatContractWriter struct {
-	inner       http.ResponseWriter
-	req         *responsesRequest
-	raw         bytes.Buffer // 只保存校验所需的精简帧（工具调用、结束原因、拒答等），不含整段正文/思考
-	marked      map[any]bool // 已为该 choice 记录过「有输出」标记
-	buffer      []byte
-	usageFrames [][]byte
-	errorFrame  []byte
-	streaming   bool
-	checked     bool
-	err         error
-	writeErr    error
-	lastWrite   time.Time
+	inner         http.ResponseWriter
+	req           *responsesRequest
+	raw           bytes.Buffer // 只保存校验所需的精简帧（工具调用、结束原因、拒答等），不含整段正文/思考
+	marked        map[any]bool // 已为该 choice 记录过「有输出」标记
+	buffer        []byte
+	usageEnvelope map[string]any // 用量帧的信封字段（id/object/created/model），发送时复用
+	usage         map[string]any // 合并后的用量：上游可能分多帧上报，只发一条最终快照
+	errorFrame    []byte
+	streaming     bool
+	checked       bool
+	err           error
+	writeErr      error
+	lastWrite     time.Time
 }
 
 func (w *chatContractWriter) Header() http.Header         { return w.inner.Header() }
@@ -312,14 +315,19 @@ func (w *chatContractWriter) frame(raw []byte) {
 	}
 	w.keepSlim(frame)
 	changed := false
-	if frame["usage"] != nil {
-		usage := make(map[string]any, len(frame))
-		for key, value := range frame {
-			usage[key] = value
+	if frameUsage, ok := frame["usage"].(map[string]any); ok {
+		// 上游可能把用量拆在多个帧里（首帧只有 prompt_tokens 等）。逐帧原样转发会让
+		// 客户端重复计数、或只拿到半截快照；这里合并成一条，收尾时只发一次。
+		w.usage = upstream.MergeUsage(w.usage, frameUsage)
+		if w.usageEnvelope == nil {
+			envelope := make(map[string]any, 4)
+			for _, key := range []string{"id", "object", "created", "model"} {
+				if value, present := frame[key]; present {
+					envelope[key] = value
+				}
+			}
+			w.usageEnvelope = envelope
 		}
-		usage["choices"] = []any{}
-		encoded, _ := json.Marshal(usage)
-		w.usageFrames = append(w.usageFrames, append(append([]byte("data: "), encoded...), '\n', '\n'))
 		frame["usage"] = nil
 		changed = true
 	}
@@ -514,11 +522,30 @@ func (w *chatContractWriter) CompletionError() error {
 			choice, _ := raw.(map[string]any)
 			choices = append(choices, map[string]any{"index": choice["index"], "delta": map[string]any{}, "finish_reason": choice["finish_reason"]})
 		}
+		// 交付工具调用时，finish_reason 按 OpenAI 约定归一为 tool_calls：
+		// 上游报 stop 时，按 finish_reason 分支的客户端会丢掉工具调用。
+		if w.deliversToolCalls(chat) {
+			for _, raw := range choices {
+				choice, _ := raw.(map[string]any)
+				if finish, _ := choice["finish_reason"].(string); finish == "" || finish == "stop" {
+					choice["finish_reason"] = "tool_calls"
+				}
+			}
+		}
 		terminal := map[string]any{"id": chat["id"], "object": "chat.completion.chunk", "created": chat["created"], "model": chat["model"], "choices": choices, "usage": nil}
 		encoded, _ := json.Marshal(terminal)
 		w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
-		for _, usage := range w.usageFrames {
-			w.writeRaw(usage)
+		if len(w.usage) > 0 {
+			usageFrame := map[string]any{"id": chat["id"], "object": "chat.completion.chunk", "created": chat["created"], "model": chat["model"], "choices": []any{}, "usage": w.usage}
+			for key, value := range w.usageEnvelope {
+				if current, present := usageFrame[key]; !present || current == nil {
+					usageFrame[key] = value
+				}
+			}
+			encoded, err := json.Marshal(usageFrame)
+			if err == nil {
+				w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
+			}
 		}
 	}
 	w.writeRaw([]byte("data: [DONE]\n\n"))
@@ -530,6 +557,24 @@ func (w *chatContractWriter) CompletionError() error {
 }
 
 func (w *chatContractWriter) finish() { _ = w.CompletionError() }
+
+// deliversToolCalls 报告这次聚合结果里是否包含可交付的工具调用。
+func (w *chatContractWriter) deliversToolCalls(chat map[string]any) bool {
+	for _, raw := range responseArray(chat["choices"]) {
+		choice, _ := raw.(map[string]any)
+		if finish, _ := choice["finish_reason"].(string); finish == "length" || finish == "content_filter" {
+			continue
+		}
+		message, _ := choice["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		if len(responseArray(message["tool_calls"])) > 0 || legacyResponseFunction(message) != nil {
+			return true
+		}
+	}
+	return false
+}
 
 func (w *chatContractWriter) emitValidatedTools(chat map[string]any) {
 	choices := []any{}
@@ -554,6 +599,17 @@ func (w *chatContractWriter) emitValidatedTools(chat map[string]any) {
 		}
 		if len(delta) == 0 {
 			continue
+		}
+		for _, raw := range responseArray(delta["tool_calls"]) {
+			call, _ := raw.(map[string]any)
+			function, _ := call["function"].(map[string]any)
+			if function == nil {
+				continue
+			}
+			if args, _ := function["arguments"].(string); strings.TrimSpace(args) == "" {
+				// 无参数工具的合法空串：交给客户端时写成 {}，避免严格客户端 JSON.parse("") 抛错。
+				function["arguments"] = "{}"
+			}
 		}
 		w.restoreToolNames(delta)
 		choices = append(choices, map[string]any{"index": choice["index"], "delta": delta, "finish_reason": nil})

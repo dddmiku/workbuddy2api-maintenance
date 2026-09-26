@@ -168,4 +168,8 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 - Anthropic `tool_use.id` 沿用上游的 `call_…` 形状而非 `toolu_…`；回填配对按原样工作，客户端一般不校验前缀。
 - thinking 块不带 `signature`：上游不提供可用签名，伪造一个「Anthropic 签名」会更糟；客户端把思考块放回历史时，网关按无签名历史接收。
 - `stop_sequence` 无法报告：上游不回显命中的停止串，仍按 `end_turn` 收尾（不做猜测）。
+- 原生 Chat 的用量帧（`choices: []`）默认下发，只有显式 `stream_options.include_usage=false` 才隐藏——与 OpenAI 规范（缺省即不下发）不同。这是本网关的既有选择，严格按 `chunk.choices[0]` 取值的客户端可能在末尾这一帧报错；需要规范行为时给网关加一次切换即可，内部账本与协议校验不受影响。
+- `n>1` 现为明确拒绝（上游只返回单个选择）；`logprobs` 请求会透传 choice 级 `logprobs`（缺失补 `null`），`top_logprobs` 是否生效取决于上游。
+- 工具调用参数为空串（无参数工具）时，交付给客户端的一律写成 `{}`；带工具调用的回合 `finish_reason` 归一为 `tool_calls`。
+- 请求体 `Content-Encoding` 支持 gzip、deflate（zlib 与裸 deflate 均接受）、zstd、identity。
 - Responses 协议没有 Anthropic 那样的提前开流：循环保护压制期（最长 60 秒）客户端可能收不到任何字节，需要给写入器加锁并发写才能安全补齐，留待后续版本。

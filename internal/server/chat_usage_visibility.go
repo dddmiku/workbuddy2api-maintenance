@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+// hideChatStreamUsage 报告客户端是否显式关闭了流式用量展示。
+//
+// 注意：缺省（未给 stream_options）时**不隐藏**，这是本网关的既有选择（README 与
+// docs/agent-compatibility.md 均按此描述）：只有显式 include_usage=false 才隐藏。
+// 与 OpenAI 规范（缺省即不下发用量帧）不同，见 CHANGELOG「已知偏差」。
 func hideChatStreamUsage(fields map[string]json.RawMessage) bool {
 	var options struct {
 		IncludeUsage *bool `json:"include_usage"`
@@ -72,6 +77,7 @@ func hideUsageFrame(frame []byte) []byte {
 	_ = json.Unmarshal(object["choices"], &choices)
 	problem := bytes.TrimSpace(object["error"])
 	if len(choices) == 0 && (len(problem) == 0 || bytes.Equal(problem, []byte("null"))) {
+		// 只含用量的帧：未请求就整帧丢弃（客户端拿到空 choices 会报错）。
 		return nil
 	}
 	delete(object, "usage")
