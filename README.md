@@ -96,9 +96,12 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 **面板热更新已关闭**（`config update.enabled=false`，2026-09-26 起）：`/update/*` 一律拒绝，更新页显示「已关闭」。升级改为手工部署：
 
 1. 本地构建运行包：`python tools/private_gateway_release_20260925.py prepare --tag <tag> --runtime`（产物 `runtime-<arch>/` 与 `wb2api-runtime-linux-<arch>.tar.gz`，构建时注入发布公钥）；
-2. 上传到服务器任意临时目录，解压到 `/opt/workbuddy2api/data/updates/runtime-<时间戳>/`；
-3. 把 `/opt/workbuddy2api/data/updates/current` 指向新目录里的 `wb2api`；
-4. `docker restart workbuddy2api`（数秒中断），再核对 `/healthz` 的版本与提交。
+2. 上传到服务器任意临时目录，解压到 `/opt/workbuddy2api/data/updates/runtime-<时间戳>/`，**务必把属主与权限对齐容器用户**：`chown -R 10001:10001 <目录> && chmod 700 <目录>`——目录归 root 且 0700 时容器内的 app 用户进不去，表现为"重启后仍是旧版本"，需要回滚；
+3. 校验清单：`manifest.json` 里每个文件的 sha256 都要与解压结果一致（`wb2api` 需 `0755`）；
+4. 把 `/opt/workbuddy2api/data/updates/current` 指向新目录里的 `wb2api`（改前先记下旧值，便于回滚）；
+5. `docker restart workbuddy2api`（数秒中断），核对 `/healthz` 的版本与提交；未就绪就把 `current` 改回旧值再重启。
+
+旧运行目录不会自动清理（热更新关闭后没有清理逻辑），可定期删除 `data/updates/runtime-*` 中不再需要回滚的那些。
 
 想把热更新开回来：`update.enabled` 改回 `true` 并重载网关；私有仓库下还需配置 `update.token`（只读令牌），否则下载会 404。
 
