@@ -30,7 +30,7 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | `prompt_cache_key` | 保留；它不是服务端历史存储 |
 | `truncation` | 省略/disabled 保留完整历史；auto 与其它未支持策略返回 400 |
 | `reasoning.context` / `mode` | 不支持，明确拒绝非空语义设置，不原样回显为已执行 |
-| 仅含原生 `encrypted_content` 的 reasoning | 无法恢复可读内容时返回 400；有可读推理的历史继续保留 |
+| 仅含原生 `encrypted_content` 的 reasoning | 别的服务签发的密文（网关与上游都读不懂）跳过并计数，不转发密文、也不整条拒绝；有可读推理的历史继续保留 |
 | 未知历史 item 类型 | 忽略其不支持的元数据，不把它提升为用户消息或聊天正文 |
 | 未知内容块类型 | Responses 内容适配器返回 400，避免接受后静默丢失正文 |
 | `previous_response_id`、`store=true`、`background=true` | 不支持，返回 400 |
@@ -133,7 +133,7 @@ Responses 的同一 output item 只发送一次 `response.output_item.added`，�
 
 ## 思考模式的推理回灌（上游 11155）
 
-Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 而没有可读内容时，网关返回明确错误，不把密文默默换成空串。nf 自己先把推理转成普通正文的情况见 [客户端边界](narrafork.md#nf-077-的已知边界)。
+Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 而没有可读内容时，网关跳过该条并在诊断里计数（Codex 默认带 `reasoning.encrypted_content`，整条拒绝会让这种会话之后每个请求都 400）；既不把密文换成空串，也不把它当可读推理转发。nf 自己先把推理转成普通正文的情况见 [客户端边界](narrafork.md#nf-077-的已知边界)。
 
 转换层会合并连续 assistant 片段，保留正文、多模态内容、工具调用及可用推理内容，兼容对消息形状敏感的上游。11155 不能单独证明是某一个字段缺失，也可能涉及历史消息结构；应检查客户端实际发送的历史形状，而不是把所有情况归结为模型能力或账号故障。
 

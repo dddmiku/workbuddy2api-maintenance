@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：仅含密文的推理条目改为跳过并计数。
 // 2026-09-25：仅密文推理必须显式拒绝；保留空标记、明文回放与形态诊断的独立测试。
 // 2026-09-18：锁定历史推理内容的回灌：DeepSeek 思考模式要求把上一轮 reasoning_content
 // 原样带回（上游 11155 reasoning_content_missing），Conversions 不能把 reasoning 项丢掉。
@@ -133,16 +134,36 @@ func TestReasoningPassthroughSurvivesUpstreamBackfill(t *testing.T) {
 	}
 }
 
-// Opaque reasoning cannot be replaced with an empty string and reported as replayed.
-func TestReasoningTextlessEncryptedItemRejected(t *testing.T) {
+// 仅含密文的推理项（别的服务签发的加密推理）跳过，不当成可读推理重放，也不整条拒绝：
+// Codex 默认带 reasoning.encrypted_content，整条拒绝会让这种会话之后每个请求都 400。
+func TestReasoningTextlessEncryptedItemIsSkipped(t *testing.T) {
 	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
 	  {"role":"user","content":"读文件"},
 	  {"type":"reasoning","id":"rs_1","summary":[],"content":null,"encrypted_content":"opaque-blob"},
 	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
 	  {"type":"function_call_output","call_id":"call_1","output":"结果"}],
 	  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
-	if _, _, err := responsesToChat([]byte(request)); err == nil || !strings.Contains(err.Error(), "encrypted_content") {
-		t.Fatalf("仅密文推理必须显式拒绝: %v", err)
+	chat, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("仅密文推理不应让整条请求失败: %v", err)
+	}
+	out := string(chat)
+	if strings.Contains(out, "opaque-blob") {
+		t.Fatalf("密文被当成推理内容发给上游: %s", out)
+	}
+	if !strings.Contains(out, "call_1") {
+		t.Fatalf("跳过推理项时丢掉了工具历史: %s", out)
+	}
+	var fields struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(request), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, stats, err := responsesMessages(fields.Input, "", nil, "global:deepseek-v4.1-flash"); err != nil {
+		t.Fatalf("历史转换失败: %v", err)
+	} else if stats.EncryptedOnly != 1 || stats.Items != 0 {
+		t.Fatalf("跳过计数不正确: encrypted_only=%d items=%d", stats.EncryptedOnly, stats.Items)
 	}
 }
 

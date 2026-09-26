@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：仅含密文的推理条目改为跳过（不再算「静默忽略能力」）。
 // 2026-09-26：禁止并行时多余调用只交付第一个，不再整轮失败。
 // 2026-09-25: 重放 NF 提前执行工具的真实模式，锁定整组校验、声明能力和无损推理历史边界。
 package server
@@ -162,7 +163,8 @@ func TestNFUnsupportedResponsesSemanticsAreExplicit(t *testing.T) {
 		`{"model":"m","input":"hi","truncation":"auto"}`,
 		`{"model":"m","input":"hi","reasoning":{"effort":"high","context":"all_turns"}}`,
 		`{"model":"m","input":"hi","reasoning":{"mode":"pro"}}`,
-		`{"model":"m","input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"},{"role":"user","content":"hi"}]}`,
+		// 仅含密文的推理项不在其列：它来自别的服务、上游也读不懂，跳过比让整个会话
+		// 永久 400 更可用（见 TestReasoningTextlessEncryptedItemIsSkipped）。
 	} {
 		if _, _, err := responsesToChat([]byte(body)); err == nil {
 			t.Fatalf("semantic capability silently ignored: %s", body)

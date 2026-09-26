@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：跳过仅含密文的推理条目并计数，避免整个会话永久 400。
 // 2026-09-26：已开流时的失败在流内交付（StreamFailure）。
 // 2026-09-26：新增 HoldProgress：压制期先开流或发心跳。
 // 2026-09-26：无参数工具的空参数串视为合法，不再判整轮失败。
@@ -312,8 +313,11 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 // 思考模式就要求所有 assistant 消息都带 reasoning_content
 // （官方客户端 requiresReasoningContentOnAssistantMessages 的匹配规则）。
 type reasoningStats struct {
-	Items    int // 历史 reasoning 项数量
+	Items    int // 历史 reasoning 项数量（只统计可读的）
 	WithText int // 其中带可读推理文本（summary/content/reasoning_content）的数量
+	// EncryptedOnly 记录被跳过的「只有密文、没有可读推理」的条目数：它们来自别的
+	// 服务，网关与上游都读不懂，跳过比让整个会话 400 更可用。
+	EncryptedOnly int
 }
 
 // responsesMessages 把 Responses 的 input（字符串或 item 数组）+ instructions 折成 chat messages。
@@ -417,6 +421,10 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			})
 			continue
 		case "reasoning":
+			if unreadableEncryptedReasoning(m) {
+				stats.EncryptedOnly++
+				continue
+			}
 			if err := validateReasoningReplay(m, fmt.Sprintf("input[%d]", index)); err != nil {
 				return nil, stats, err
 			}
@@ -592,6 +600,13 @@ func lastAssistantWithoutReasoning(msgs []any) map[string]any {
 func deepSeekModel(model string) bool {
 	_, bare := resolveModel(model)
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(bare)), "deepseek")
+}
+
+// unreadableEncryptedReasoning 报告推理项是否「只有密文、没有可读推理文本」。
+// 密文由别的服务签发（OpenAI 的加密推理），网关与上游都无法解读。
+func unreadableEncryptedReasoning(item map[string]any) bool {
+	encrypted, _ := item["encrypted_content"].(string)
+	return strings.TrimSpace(encrypted) != "" && responsesReasoningText(item) == ""
 }
 
 // responsesReasoningText 取 Responses 推理项里的可读推理文本。

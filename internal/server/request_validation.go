@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：仅含密文的推理条目不再整条拒绝（转换层跳过）。
 // 2026-09-25：兼容 NF 默认图片工具声明并保留能力警告，拒绝未执行的截断/推理策略及仅含密文的历史。
 // 2026-09-25：单对象工具结果仅识别明确协议标签，泛型业务type保留完整JSON，防止误拒及丢失额外字段。
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
@@ -737,9 +738,10 @@ func validateReasoningReplay(item map[string]any, path string) error {
 		if err := requestValidationString(value, path+".encrypted_content", false); err != nil {
 			return err
 		}
-		if encrypted, _ := value.(string); encrypted != "" && responsesReasoningText(item) == "" {
-			return fmt.Errorf("%s.encrypted_content cannot be replayed without readable reasoning; include readable history or a client-generated summary", path)
-		}
+		// 只有密文、没有可读推理的条目不再在这里整条拒绝：那段密文是别的服务签发的，
+		// 网关与上游都读不懂，重放它没有意义；而整条拒绝会让带这种历史的会话之后每个
+		// 请求都 400（Codex 默认带 reasoning.encrypted_content）。转换层会跳过它。
+		_ = value
 	}
 	return nil
 }

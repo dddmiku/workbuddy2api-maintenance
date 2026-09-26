@@ -29,7 +29,7 @@ OpenAI 客户端 Base URL 填到 `/v1`，Gemini 填到 `/v1beta`。Anthropic 官
 - JSON schema、强制工具选择和禁止并行等约束经过实际校验；auto/required 也只能调用已声明工具，空工具列表不跳过检查。能否生成所需结果仍取决于所选模型。
 - `web_search`、`tool_search`、`image_generation` 等客户端默认可能携带的声明会被兼容接受并过滤，但网关不执行它们。响应通过 `X-WB2API-Ignored-Tools`、Warning 和日志明确说明；强制调用不支持工具会拒绝。
 
-服务端文件检索、MCP、图像生成、计算机工具和原生容器等平台能力没有因此获得实现。Responses 存储、`previous_response_id`、仅含不可解读密文/redacted 的思考历史、不能忠实转换的文档/音频输入也不能假装成功。上游没有原生签名时不伪造思考密文或签名。Anthropic 仅接受明确保留全部 thinking 的无裁剪 context_management；Gemini 支持 generate content，Interactions、Files 和 cachedContent 仍拒绝。
+服务端文件检索、MCP、图像生成、计算机工具和原生容器等平台能力没有因此获得实现。Responses 存储、`previous_response_id`、不能忠实转换的文档/音频输入也不能假装成功；仅含不可解读密文/redacted 的思考历史会被跳过并在诊断里计数（不伪装成已重放，也不让整个会话失败）。上游没有原生签名时不伪造思考密文或签名。Anthropic 仅接受明确保留全部 thinking 的无裁剪 context_management；Gemini 支持 generate content，Interactions、Files 和 cachedContent 仍拒绝。
 
 ## 用量与压缩
 

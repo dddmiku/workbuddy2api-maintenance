@@ -69,7 +69,8 @@ func chatShapeSummary(body []byte, stats reasoningStats, hasStats bool) string {
 		chat.Model, len(chat.Messages), assistant, withReasoning, emptyReasoning,
 		toolCallMessages, lastRole, lastHasReasoning, lastHasTools)
 	if hasStats {
-		summary += fmt.Sprintf(" history_reasoning_items=%d with_text=%d", stats.Items, stats.WithText)
+		summary += fmt.Sprintf(" history_reasoning_items=%d with_text=%d encrypted_only=%d",
+			stats.Items, stats.WithText, stats.EncryptedOnly)
 	}
 	return summary
 }
