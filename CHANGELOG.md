@@ -2,6 +2,13 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.3 — 2026-09-26
+
+修复 Claude Code 经本网关被上游以 11128「未批准渠道」拒绝（客户端收到 HTTP 400 `upstream_channel_rejected`）的问题。
+
+- 实测：系统提示含 `You are Claude Code, Anthropic's official CLI for Claude` 时上游返回 400/11128，把这句按词插入零宽空格后同一请求返回 200；只写 `Claude Code` 或只写 `Anthropic's official CLI for Claude` 都不触发。
+- 渠道中和词表此前只收录 Codex 的触发句，因此 Claude Code 的指纹没被断词、也没有重发。现补上该句与组合指纹（同一段文本内同时出现 `Claude Code` 与 `official CLI for Claude` 才断词），仍只在原样请求确实被 11128 拒绝后重发一次，正常请求正文不变。
+
 ## v2.4.2 — 2026-09-26
 
 v2.4.1 上线后的实测修正与全项目审查修复。

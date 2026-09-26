@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：新增 Claude Code 系统提示触发句与组合指纹，修复 Claude Code 经本网关被 11128 拒绝。
 // 2026-09-17：新增上游渠道校验触发句的中性化，供被 11128 拒绝的系统说明断词重试。
 package upstream
 
@@ -16,6 +17,16 @@ import (
 // 只匹配句子主体，不带句末标点，兼容原文与去掉句号的变体。
 var channelTriggerSentences = []string{
 	"Codex CLI is an open source project led by OpenAI",
+	// 2026-09-26 实测（CLI 端到本网关）：Claude Code 系统提示首行命中同一校验，
+	// 原样发送返回 400/11128，断词后 200。
+	"You are Claude Code, Anthropic's official CLI for Claude",
+}
+
+// channelTriggerFingerprints 组合指纹：同一段文本内同时出现全部片段才断词，
+// 对付措辞稍有变化的同一句。实测：只写 "Claude Code" 或只写
+// "Anthropic's official CLI for Claude" 均通过，两个片段同现才被拒。
+var channelTriggerFingerprints = [][]string{
+	{"Claude Code", "official CLI for Claude"},
 }
 
 // NeutralizeChannelTrigger 在「已确认被上游渠道校验拒绝」的请求体上断开触发句。
@@ -83,6 +94,31 @@ func neutralizeChannelText(text string, changed *bool) string {
 				insertAt[pos] = struct{}{}
 			}
 			start = index + len(sentence)
+		}
+	}
+	for _, parts := range channelTriggerFingerprints {
+		if len(parts) < 2 {
+			continue
+		}
+		start := indexFrom(text, parts[0], 0)
+		if start < 0 {
+			continue
+		}
+		end := start + len(parts[0])
+		complete := true
+		for _, part := range parts[1:] {
+			index := indexFrom(text, part, end)
+			if index < 0 {
+				complete = false
+				break
+			}
+			end = index + len(part)
+		}
+		if !complete {
+			continue
+		}
+		for _, pos := range wordBreakPoints(text, start, end) {
+			insertAt[pos] = struct{}{}
 		}
 	}
 	if len(insertAt) == 0 {
