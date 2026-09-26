@@ -34,7 +34,8 @@ func TestRawUsageAcrossProtocolsAndResponseModes(t *testing.T) {
 				})
 				body := fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,"input":"hi"}`, stream)
 				if endpoint == "/v1/chat/completions" {
-					body = fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,"messages":[{"role":"user","content":"hi"}]}`, stream)
+					// 规范：用量只在显式请求时下发；本用例校验客户端用量与上游一致。
+					body = fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`, stream)
 				}
 				req := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
 				req.Header.Set("Authorization", "Bearer raw-usage-fixture")

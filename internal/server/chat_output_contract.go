@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：已开流时的失败在流内交付（StreamFailure）。
+// 2026-09-26：新增 HoldProgress：压制期发心跳。
 // 2026-09-26：结束校验只缓存工具调用等精简帧，长回答不再因整条流进 16MB 缓冲而在约 7.4 万分片处被截断。
 // 2026-09-25：所有 Chat 请求共享工具声明边界；整组校验前隐藏身份和参数，缓冲有界并在生成期间保活。
 // 2026-09-25：保留实际网络 flush 失败，让终态检查与失败用量一致。
@@ -434,6 +436,36 @@ func (w *chatContractWriter) keepSlim(frame map[string]any) {
 		return
 	}
 	w.keep(append(append([]byte("data: "), encoded...), '\n', '\n'))
+}
+
+// StreamFailure 在流已经开始时把失败交付在流内（SSE error 帧 + [DONE]），返回 true。
+func (w *chatContractWriter) StreamFailure(code, message string) bool {
+	if !w.streaming || w.writeErr != nil {
+		return false
+	}
+	encoded, err := json.Marshal(map[string]any{"error": map[string]any{"code": code, "message": message, "type": "api_error"}})
+	if err != nil {
+		return false
+	}
+	w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
+	w.writeRaw([]byte("data: [DONE]\n\n"))
+	w.Flush()
+	return true
+}
+
+// HoldProgress 由 handler 在循环保护压制期调用：已开流时按间隔发一条 SSE 注释心跳，
+// 工具调用被整组缓冲时客户端不至于长时间收不到任何字节。
+func (w *chatContractWriter) HoldProgress() {
+	if w.err != nil || w.writeErr != nil {
+		return
+	}
+	// 仅在流已经开始后发心跳：此前没有任何帧时提前写注释，
+	// 会把随后的 JSON 错误响应体污染成不可解析。
+	if !w.streaming || time.Since(w.lastWrite) < protocolProgressInterval {
+		return
+	}
+	w.writeRaw([]byte(": keepalive\n\n"))
+	w.Flush()
 }
 
 func (w *chatContractWriter) restoreToolNames(message map[string]any) bool {

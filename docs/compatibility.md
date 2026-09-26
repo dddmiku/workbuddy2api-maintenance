@@ -14,6 +14,9 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
 | namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
+| 压制期心跳与提前开流 | 循环保护压住输出时（最长 60 秒），网关会先开流或发心跳：Responses 先发 `response.created`/`in_progress`，Messages 先发 `message_start` 并周期 `ping`，Chat 契约路径在已开流后发 SSE 注释。回调与读上游在同一 goroutine，不引入并发写 |
+| 已开始流的失败 | 流已经开始后，失败在流内交付（Responses `response.failed`、Messages `error` 事件、Chat SSE `error` 帧），不再往已开始的 SSE 流里写 JSON 体 |
+| 原生 Chat 用量帧 | 按 OpenAI 规范：仅显式 `stream_options.include_usage=true` 时下发（缺省与 `false` 都不发）；内部账本与协议校验始终读取完整上游用量 |
 | Anthropic 顶层不支持块 | `document`、`search_result`、`web_search_tool_result`、`server_tool_use`、`tool_reference` 等在上游没有对应形态，一律替换为文字占位 `[unsupported content block: …]`（2.4.7 起覆盖顶层与嵌套位置），不再整条 400 |
 | Anthropic 工具调用 id | 只要求「同一条 assistant 消息内唯一、且不与尚未配对的上一个调用重复」；跨轮复用同一个 id（很多客户端每轮重新编号）已放行（2.4.7 起） |
 | Anthropic 流起始 | 上游请求已发出但 5 秒内没有首帧时，网关先发 `message_start` 并每 10 秒 `ping`，避免循环保护压制期客户端零字节等待 |
@@ -168,7 +171,6 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 - Anthropic `tool_use.id` 沿用上游的 `call_…` 形状而非 `toolu_…`；回填配对按原样工作，客户端一般不校验前缀。
 - thinking 块不带 `signature`：上游不提供可用签名，伪造一个「Anthropic 签名」会更糟；客户端把思考块放回历史时，网关按无签名历史接收。
 - `stop_sequence` 无法报告：上游不回显命中的停止串，仍按 `end_turn` 收尾（不做猜测）。
-- 原生 Chat 的用量帧（`choices: []`）默认下发，只有显式 `stream_options.include_usage=false` 才隐藏——与 OpenAI 规范（缺省即不下发）不同。这是本网关的既有选择，严格按 `chunk.choices[0]` 取值的客户端可能在末尾这一帧报错；需要规范行为时给网关加一次切换即可，内部账本与协议校验不受影响。
 - `n>1` 现为明确拒绝（上游只返回单个选择）；`logprobs` 请求会透传 choice 级 `logprobs`（缺失补 `null`），`top_logprobs` 是否生效取决于上游。
 - 工具调用参数为空串（无参数工具）时，交付给客户端的一律写成 `{}`；带工具调用的回合 `finish_reason` 归一为 `tool_calls`。
 - 请求体 `Content-Encoding` 支持 gzip、deflate（zlib 与裸 deflate 均接受）、zstd、identity。

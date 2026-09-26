@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：压制期回调接线（HoldProgress）；已开流时的失败走流内交付。
 // 2026-09-26：错误信封 type 按状态码映射；n<1 拒绝。
 // 2026-09-26：拒绝 n>1（上游只返回单个选择），避免静默降级。
 // 2026-09-26：上游请求发出时通知响应适配器（供静默期先开流与 ping）。
@@ -1082,6 +1083,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeContextFailure := func(detail string) {
 		releaseHeld()
 		st.status = http.StatusBadRequest
+		// 流已经开始时必须在流内交付失败：往已开始的 SSE 流里写 JSON 错误体会让
+		// 客户端解析失败（Responses 走 response.failed，Messages/Chat 走 error 事件）。
+		if deliverStreamFailure(w, "context_length_exceeded", detail) {
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", detail)
 	}
 	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
@@ -1435,6 +1441,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//   - 还有机会 → 命中循环且客户端零字节时 Stream 不写任何字节，返回 Retryable；
 			//   - 机会用尽 → Stream 按原有方式把错误如实写给客户端，不会出现"既不重发也不报错"。
 			// 重发上限 maxReasoningLoopRetries，避免持续循环时无限重试。
+			// 压制期回调：循环保护压住输出时先把流开起来/发心跳（同一 goroutine）。
+			streamOptions.OnHold = func() { holdProgress(w) }
 			for {
 				// 单项停止开关打开时不给重发额度：Stream 会把错误如实写给客户端，
 				// handler 这里也就不会进入下面的重发分支。
@@ -1786,6 +1794,42 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 		err = flushHTTPResponse(w)
 	}
 	return err
+}
+
+// streamFailureWriter 由「已经开始流」的适配器实现：把失败交付在流内而不是 JSON。
+type streamFailureWriter interface {
+	StreamFailure(code, message string) bool
+}
+
+// deliverStreamFailure 沿写入器链找一个能把失败写进流的适配器；返回是否已交付。
+func deliverStreamFailure(w http.ResponseWriter, code, message string) bool {
+	for current := w; current != nil; {
+		if failure, ok := current.(streamFailureWriter); ok && failure.StreamFailure(code, message) {
+			return true
+		}
+		next, ok := current.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return false
+		}
+		current = next.Unwrap()
+	}
+	return false
+}
+
+// holdProgress 沿响应写入器链找到支持 HoldProgress 的适配器并触发一次；
+// 没有适配器（原生 Chat 无契约时）静默跳过。
+func holdProgress(w http.ResponseWriter) {
+	for current := w; current != nil; {
+		if progress, ok := current.(interface{ HoldProgress() }); ok {
+			progress.HoldProgress()
+			return
+		}
+		next, ok := current.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		current = next.Unwrap()
+	}
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {

@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-26：压制期回调 StreamOptions.OnHold（同一 goroutine）。
 // 2026-09-26：空工具参数归一为 {}；choice 级 logprobs 透传（缺失补 null）。
 // 2026-09-25：逐段读取并限制 SSE 单行/单事件为 64MiB，防止异常上游持续分配内存；超限返回明确失败。
 // 2026-09-25：厂商错误事件包装成标准 error 时保留同帧顶层 usage，避免下游漏掉真实用量更新。
@@ -943,6 +944,13 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[[2]int]bool{}
+	// onHold 从选项里取出，供压制分支回调（见 StreamOptions.OnHold）。
+	var onHold func()
+	for _, option := range options {
+		if option.OnHold != nil {
+			onHold = option.OnHold
+		}
+	}
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -1046,6 +1054,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 				if releaseErr := releasePending(); releaseErr != nil {
 					return true, releaseErr
 				}
+			} else if onHold != nil {
+				// 仍在压制：给适配器一次机会先开流/发心跳（同一 goroutine，无需加锁）。
+				onHold()
 			}
 		}
 		if value, ok := obj["usage"].(map[string]any); ok {

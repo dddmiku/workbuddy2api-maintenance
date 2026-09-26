@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：压制期先开流、已开流失败走流内交付。
 // 2026-09-25：函数参数在全组验证后交付；失败和截断响应不再携带可执行工具负载。
 // 2026-09-19：推理与正文可交错到达，done改为终态时发出，ID/index与最终输出顺序仍需一致。
 // 2026-09-15: 新增。/v1/responses 兼容层单测：请求翻译、工具翻译、非流式对象翻译、
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func decodeChat(t *testing.T, body []byte) map[string]any {
@@ -768,5 +770,50 @@ func TestResponsesWriterIncompleteDoesNotCompleteTools(t *testing.T) {
 				t.Fatalf("unvalidated tool item escaped: %v", out)
 			}
 		})
+	}
+}
+
+// 压制期回调：尚无任何上游帧时，HoldProgress 先把流开起来（客户端才收得到响应头）。
+func TestResponsesHoldProgressStartsTheStream(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	rw := newResponsesWriter(recorder, &responsesRequest{Model: "cn:fixture", Stream: true})
+	if rw.begun {
+		t.Fatal("stream began before any upstream frame")
+	}
+	rw.HoldProgress()
+	if !rw.begun {
+		t.Fatal("hold progress did not start the stream")
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "response.created") || !strings.Contains(body, "response.in_progress") {
+		t.Fatalf("early stream missing creation events: %s", body)
+	}
+	// 再次调用只发心跳（不再重复 created）。
+	rw.lastWrite = time.Now().Add(-time.Minute)
+	rw.HoldProgress()
+	if strings.Count(recorder.Body.String(), "event: response.created") != 1 {
+		t.Fatalf("duplicate creation event: %s", recorder.Body.String())
+	}
+}
+
+// 已开始的流里，失败必须在流内交付（response.failed），不能写 JSON 体。
+func TestResponsesStreamFailureStaysInsideTheStream(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	rw := newResponsesWriter(recorder, &responsesRequest{Model: "cn:fixture", Stream: true})
+	if rw.StreamFailure("context_length_exceeded", "too long") {
+		t.Fatal("failure delivered before the stream started")
+	}
+	rw.beginStream()
+	if !rw.StreamFailure("context_length_exceeded", "prompt is too long") {
+		t.Fatal("started stream did not take over the failure")
+	}
+	// 失败事件在收尾时落盘（与常规失败路径一致）。
+	rw.finish()
+	body := recorder.Body.String()
+	if !strings.Contains(body, "response.failed") || !strings.Contains(body, "context_length_exceeded") {
+		t.Fatalf("failure missing from the stream: %s", body)
+	}
+	if strings.HasPrefix(strings.TrimSpace(body), "{") {
+		t.Fatalf("JSON body written into a started stream: %s", body)
 	}
 }

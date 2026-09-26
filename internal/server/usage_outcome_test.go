@@ -39,6 +39,10 @@ func postreleaseUsageRequest(path string, stream bool, extra string) *http.Reque
 	input := `"messages":[{"role":"user","content":"audit"}]`
 	if path == "/v1/responses" {
 		input = `"input":"audit"`
+	} else if stream {
+		// 规范：用量只在显式 stream_options.include_usage=true 时下发；
+		// 这些用例校验的是用量保真，所以显式请求它。
+		extra = `,"stream_options":{"include_usage":true}` + extra
 	}
 	return httptest.NewRequest(http.MethodPost, path, strings.NewReader(fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,%s%s}`, stream, input, extra)))
 }

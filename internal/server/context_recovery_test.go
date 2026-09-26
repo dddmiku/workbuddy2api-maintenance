@@ -39,6 +39,9 @@ func contextRecoveryBody(t *testing.T, path string, stream bool) []byte {
 		body["input"] = messages
 	} else {
 		body["messages"] = messages
+		// 按规范，用量只在显式请求时下发；这些用例校验的是用量保真，
+		// 因此显式请求它，而不是依赖缺省行为。
+		body["stream_options"] = map[string]any{"include_usage": true}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

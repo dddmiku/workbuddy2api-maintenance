@@ -19,7 +19,7 @@ import (
 )
 
 func protocolDiagnosisChatRequest(choice any, strict, stream bool) map[string]any {
-	return map[string]any{
+	request := map[string]any{
 		"model": "glm-5.2", "stream": stream,
 		"messages": []any{map[string]any{"role": "user", "content": "finish the task"}},
 		"tools": []any{
@@ -28,6 +28,11 @@ func protocolDiagnosisChatRequest(choice any, strict, stream bool) map[string]an
 		},
 		"tool_choice": choice,
 	}
+	if stream {
+		// 规范：用量只在显式请求时下发；本用例校验迟到用量仍然可见。
+		request["stream_options"] = map[string]any{"include_usage": true}
+	}
+	return request
 }
 
 func protocolDiagnosisChat(t *testing.T, request map[string]any, rawSSE string) *httptest.ResponseRecorder {

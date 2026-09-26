@@ -73,7 +73,8 @@ func TestChatUsageVisibilityDoesNotChangeAccounting(t *testing.T) {
 					t.Fatalf("stream lost output: %d %s", rec.Code, rec.Body)
 				}
 				hasUsage := strings.Contains(rec.Body.String(), `"usage"`)
-				if (option == "false") == hasUsage {
+				// 规范：只有显式 include_usage=true 才下发用量。
+				if wantUsage := option == "true"; hasUsage != wantUsage {
 					t.Fatalf("client usage visibility option=%s hasUsage=%t: %s", option, hasUsage, rec.Body)
 				}
 				options, _ := actual["stream_options"].(map[string]any)
@@ -264,6 +265,36 @@ func TestChatAcceptsDeflateRequestBody(t *testing.T) {
 			h.ServeHTTP(rec, request)
 			if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"content":"ok"`) {
 				t.Fatalf("deflate body rejected: %d %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// 规范行为：只有显式请求用量才下发用量帧（缺省与 false 都不发）。
+func TestChatUsageFrameOnlyWhenRequested(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		options  string
+		wantHide bool
+	}{
+		{"absent", "", true},
+		{"include_usage_true", `"stream_options":{"include_usage":true}`, false},
+		{"include_usage_false", `"stream_options":{"include_usage":false}`, true},
+		{"empty_options", `"stream_options":{}`, true},
+		{"malformed_options", `"stream_options":"nonsense"`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"model":"cn:m","stream":true`
+			if tc.options != "" {
+				body += "," + tc.options
+			}
+			body += `}`
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(body), &fields); err != nil {
+				t.Fatal(err)
+			}
+			if got := hideChatStreamUsage(fields); got != tc.wantHide {
+				t.Fatalf("hideChatStreamUsage=%v want %v for %s", got, tc.wantHide, body)
 			}
 		})
 	}

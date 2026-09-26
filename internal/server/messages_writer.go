@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：已开流时的失败在流内交付（StreamFailure）。
+// 2026-09-26：新增 HoldProgress：压制期先开流或 ping。
 // 2026-09-26：上游已发出但首帧迟到时先开流（message_start + ping），并在静默期周期性 ping；writer 加锁。
 // 2026-09-25：保留逐密钥频率与并发响应头，客户端可读取共享额度与重试提示。
 // 2026-09-25：将已校验的Chat结果转为Anthropic消息与流事件，错误不产生成功终态，缓存用量避免重复相加。
@@ -403,6 +405,33 @@ func (m *messagesWriter) beginLocked() {
 	// flag would incorrectly survive even after complete usage was reported.
 	delete(usage, "gateway_usage_incomplete")
 	m.eventLocked("message_start", map[string]any{"message": map[string]any{"id": m.id, "type": "message", "role": "assistant", "model": m.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": usage}})
+}
+
+// StreamFailure 在流已经开始时把失败交付在流内（error 事件），返回 true 表示已交付。
+func (m *messagesWriter) StreamFailure(code, message string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.started || m.ended {
+		return false
+	}
+	m.failureLocked(http.StatusBadRequest, code, message)
+	return true
+}
+
+// HoldProgress 由 handler 在循环保护压制期调用：先发 message_start，已开流则 ping。
+func (m *messagesWriter) HoldProgress() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ended || m.err != nil || !m.stream {
+		return
+	}
+	if !m.started {
+		m.beginLocked()
+		return
+	}
+	if time.Since(m.lastEvent) >= m.idlePing {
+		m.eventLocked("ping", map[string]any{})
+	}
 }
 
 func (m *messagesWriter) closeBlock() {

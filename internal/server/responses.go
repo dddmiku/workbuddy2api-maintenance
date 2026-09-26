@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：已开流时的失败在流内交付（StreamFailure）。
+// 2026-09-26：新增 HoldProgress：压制期先开流或发心跳。
 // 2026-09-26：无参数工具的空参数串视为合法，不再判整轮失败。
 // 2026-09-26：拒答文本按正文交付（Codex 解析不了 refusal 条目，会整条丢弃）。
 // 2026-09-26：运行约定同样追加到 part 数组形态的首条 system，不再另起一条 system。
@@ -1406,6 +1408,33 @@ func (rw *responsesWriter) beginStream() {
 	rw.rsID = newRespID("rs_")
 	rw.emit(evCreated, map[string]any{"response": rw.responseObject("in_progress")})
 	rw.emit(evInProgress, map[string]any{"response": rw.responseObject("in_progress")})
+}
+
+// StreamFailure 在流已经开始时把失败交付在流内（response.failed），返回 true 表示已交付。
+// 已开始的 SSE 流里再写 JSON 错误体会让客户端解析失败，因此由适配器接管。
+func (rw *responsesWriter) StreamFailure(code, message string) bool {
+	if rw.mode != 1 || !rw.begun || rw.closed {
+		return false
+	}
+	rw.failOutput(code, message)
+	return true
+}
+
+// HoldProgress 由 handler 在循环保护压制期调用（与读上游同 goroutine，无需加锁）：
+// 先开流（response.created/in_progress），已开流则按间隔发注释心跳。压制期最长 60 秒，
+// 此前客户端连响应头都收不到。
+func (rw *responsesWriter) HoldProgress() {
+	if rw.closed || rw.writeErr != nil || rw.terminalStatus != "" {
+		return
+	}
+	if rw.mode != 1 {
+		return
+	}
+	if !rw.begun {
+		rw.beginStream()
+		return
+	}
+	rw.toolProgress(false)
 }
 
 func (rw *responsesWriter) emit(evType string, payload map[string]any) {

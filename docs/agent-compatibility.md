@@ -35,7 +35,7 @@ OpenAI 客户端 Base URL 填到 `/v1`，Gemini 填到 `/v1beta`。Anthropic 官
 
 上游实际报告的输入、输出、缓存与扣费是计量依据。缓存属于输入，思考属于输出，不重复相加；缺失字段保持未知，非法迟到明细不会抹掉已有有效值。内部重试合计各次已知消费，但同一个客户端请求只计一次。
 
-网关始终向上游请求 usage。原生 Chat 显式 `stream_options.include_usage=false` 时，只有最终客户端输出隐藏 usage；工具契约校验和账本仍读取完整原始帧。Responses/Messages 保留各自的协议用量结构；Gemini 的未知思考拆分由 `gatewayUsage` 说明，见 [Gemini 用量](gemini.md#用量)。
+网关始终向上游请求 usage。原生 Chat 按 OpenAI 规范下发：只有显式 `stream_options.include_usage=true` 时才把用量帧发给客户端（缺省与 `false` 都不发，避免严格客户端遇到空 `choices` 报错）；无论客户端怎么选，工具契约校验和账本都读取完整原始帧。Responses/Messages 保留各自的协议用量结构；Gemini 的未知思考拆分由 `gatewayUsage` 说明，见 [Gemini 用量](gemini.md#用量)。
 
 上下文超限不会通过删除旧轮次、移动图片角色、填入被拒请求体积或乘固定倍率来伪装成功。流式 Responses 用 `response.failed` 和 `context_length_exceeded` 提供真实失败信号，让支持该行为的客户端在后续续接时尝试摘要恢复。当前失败轮仍然失败；恢复时机由客户端版本和配置决定。
 
