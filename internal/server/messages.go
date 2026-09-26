@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：历史里上游无法承载的内容块（document/tool_reference 等）改为文字占位，不再让整段会话永久 400。
 // 2026-09-26：thinking.type=adaptive 映射为上游可识别的 enabled（不带预算），不再原样转发。
 // 2026-09-25：Anthropic messages 输入复用现有请求执行模块，保留工具配对、图片、思考与模型权限。
 // 2026-09-25：按 messages 契约校验正数预算、采样范围、签名与工具结果顺序，避免无效参数调用上游。
@@ -418,6 +419,19 @@ func anthropicParts(value any, path string, images bool) ([]any, error) {
 	return parts, nil
 }
 
+// unsupportedPlaceholder 把上游无法承载的内容块替换成文字占位。
+func unsupportedPlaceholder(block map[string]any) (map[string]any, error) {
+	kind, _ := block["type"].(string)
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "unknown"
+	}
+	return map[string]any{
+		"type": "text",
+		"text": fmt.Sprintf("[unsupported content block: %s — content omitted by the gateway]", kind),
+	}, nil
+}
+
 func anthropicPart(block map[string]any, path string, images bool) (map[string]any, error) {
 	if block["type"] == "text" {
 		if err := requestValidationString(block["text"], path+".text", false); err != nil {
@@ -425,7 +439,13 @@ func anthropicPart(block map[string]any, path string, images bool) (map[string]a
 		}
 		return map[string]any{"type": "text", "text": block["text"]}, nil
 	}
-	if block["type"] != "image" || !images {
+	if block["type"] != "image" {
+		// 上游没有对应形态的块（document、tool_reference、search_result 等）用文字占位代替：
+		// 客户端读到一次 PDF 或引用后，历史里会一直带着这种块，硬拒会让整段会话永久 400。
+		// 明确告诉模型「这里原本有一块内容被省略」，不假装它不存在。
+		return unsupportedPlaceholder(block)
+	}
+	if !images {
 		return nil, fmt.Errorf("%s.type is not supported in this content position", path)
 	}
 	source, err := requestValidationObject(block["source"], path+".source")

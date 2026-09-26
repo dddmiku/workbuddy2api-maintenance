@@ -16,6 +16,9 @@ var (
 	Commit = "unknown"
 	// BuiltAt 构建时间（RFC3339 或任意可读字符串）。
 	BuiltAt = "unknown"
+	// ReleaseKey 是发布签名公钥（ed25519，十六进制，32 字节），构建期由发行流程注入。
+	// 非空时自更新强制要求发布资产带有效签名；开发构建为空则跳过验签并在日志中说明。
+	ReleaseKey = ""
 )
 
 // String 返回一行可读的版本描述。
@@ -33,6 +36,9 @@ func String() string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// ReleaseVerificationEnabled 报告本二进制是否具备发布验签能力。
+func ReleaseVerificationEnabled() bool { return strings.TrimSpace(ReleaseKey) != "" }
 
 // IsDev 判断是否为未注入版本的开发构建（自更新对 dev 构建仍允许，但会提示）。
 func IsDev() bool { return Version == "" || Version == "dev" }

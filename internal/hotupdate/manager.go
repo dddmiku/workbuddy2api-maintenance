@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：下载前验签、下载后与签名摘要对账，不符即拒绝更新。
 // 2026-09-26：交接完成后清理更新目录。
 // 2026-09-24：自动更新不降级；管理员显式指定当前 latest 的旧标签时保留手动回滚能力。
 // 2026-09-18：新实例就绪后才原子提交重启指针，提交失败终止候选实例，并保留原启动参数。
@@ -219,6 +220,19 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 
+	// 发布签名校验：拿到内置公钥时，必须验签通过才继续下载二进制。
+	// 没有签名或签名不符一律拒绝——这是自更新的信任根，不能用「拿不到就放行」兜底。
+	signedDigest, verified, err := m.client.VerifySignedRelease(ctx, release)
+	if err != nil {
+		m.fail(err)
+		return m.Status(), err
+	}
+	if verified {
+		log.Printf("[update] release %s signature verified (sha256:%s)", release.Tag, signedDigest[:12])
+	} else {
+		log.Printf("WARN: [update] this build has no release signing key; skipping signature verification for %s", release.Tag)
+	}
+
 	m.mu.Lock()
 	m.latest = release
 	m.state = StateDownloading
@@ -230,6 +244,13 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 	log.Printf("[update] downloaded %s (%s, sha256=%s)", release.Tag, path, sum[:12])
+	// 已验签时，落盘摘要必须与签名清单一致（Download 校验的是 GitHub 的 digest）。
+	if verified && !strings.EqualFold(sum, signedDigest) {
+		_ = os.Remove(path)
+		err := fmt.Errorf("下载资产与签名清单不一致（实际 %s ≠ 签名 %s）", sum[:12], signedDigest[:12])
+		m.fail(err)
+		return m.Status(), err
+	}
 	stage := ""
 	committed := false
 	defer func() {

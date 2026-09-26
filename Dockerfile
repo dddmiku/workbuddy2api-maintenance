@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
 # ═══ 更新日志 ═══
+# 2026-09-26：镜像构建同样注入发布公钥，与发布包保持一致。
 # 2026-09-25：统一网关与内嵌面板为非root单容器，移除docker.sock依赖并使用完整运行包与目录配置挂载。
 # 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
 # 2026-09-17：注入版本元数据（版本号/提交/构建时间），并改用 PID 1 监督脚本启动，
@@ -13,8 +14,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath \
-      -ldflags="-s -w -X workbuddy2api/internal/version.Version=${VERSION} -X workbuddy2api/internal/version.Commit=${COMMIT} -X workbuddy2api/internal/version.BuiltAt=${BUILT_AT}" \
+# 发布签名公钥（仓库内 release-signing.pub）写进二进制：运行时据此强制验签。
+# 文件不存在时留空（开发构建），日志会说明跳过验签。
+RUN RELEASE_KEY="$(cat release-signing.pub 2>/dev/null || true)" \
+ && CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X workbuddy2api/internal/version.Version=${VERSION} -X workbuddy2api/internal/version.Commit=${COMMIT} -X workbuddy2api/internal/version.BuiltAt=${BUILT_AT} -X workbuddy2api/internal/version.ReleaseKey=${RELEASE_KEY}" \
       -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \

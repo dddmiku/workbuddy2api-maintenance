@@ -60,6 +60,16 @@ location / {
 
 Cookie 使用 `HttpOnly`、`SameSite=Lax` 和根路径，可信 HTTPS 请求设置 `Secure`。管理 POST 需要已登录会话、JSON 对象和 `X-Admin-Request: 1`，Origin 必须同源。密钥和版本管理 socket 不应另行反向代理到公网。
 
+## 更新签名
+
+自更新只接受带发布者签名的发布：
+
+- 发布流程用本机私钥对 `SHA256SUMS.txt` 做 ed25519 签名，产出 `SHA256SUMS.txt.sig` 一并上传；
+- 网关二进制内置公钥（`gateway/release-signing.pub`，构建期注入），下载前验签、下载后与签名清单对账，签名缺失或不符直接拒绝，不提供「拿不到签名就放行」的降级；
+- 私钥只留本机（默认 `~/.wb2api/release-signing.key`，0600，可用 `WB2A_RELEASE_KEY_FILE` 指定）；泄露或遗失用 `python tools/release_signing_20260926.py keygen --force` 轮换，但公钥写在二进制里，轮换后需要给所有部署重新分发一次由新密钥签名的发布（旧版会拒绝新密钥的签名）。
+
+未注入公钥的开发构建会跳过验签并在日志里写明，仅用于本地调试。
+
 ## 日志与用量
 
 日志同时写到标准输出和 `data/logs/gateway.log` 的有界轮转文件，页面不再依赖 `docker logs`。请求保留完整模型名、密钥归属、输入、缓存命中、输出、耗时和 `rid=`，可关联响应的 `X-Request-ID`。缺失用量显示未知；固定表头和横向滚动继续保留。

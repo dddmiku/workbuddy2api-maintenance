@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：最新发布查询同时定位签名清单资产，供验签使用。
 // 2026-09-25：私有资产通过GitHub API下载，令牌仅发送到同仓库API；统一运行包要求可信摘要。
 // 2026-09-24：下载前严格校验摘要格式，拒绝 sha256: 空摘要绕过校验并覆盖更新文件。
 // 2026-09-24：稳定版本按数字顺序判断更新，避免旧 Release 被重新标为 latest 后误触自动降级。
@@ -50,6 +51,11 @@ type Release struct {
 	AssetName   string    `json:"asset_name"`
 	AssetSize   int64     `json:"asset_size"`
 	Digest      string    `json:"digest"` // 形如 "sha256:xxxx"，发布端未提供时为空
+	// 签名清单（SHA256SUMS.txt 及其 ed25519 签名）的下载地址；缺失即拒绝更新。
+	SumsAPIURL    string `json:"sums_api_url,omitempty"`
+	SumsURL       string `json:"sums_url,omitempty"`
+	SumsSigAPIURL string `json:"sums_sig_api_url,omitempty"`
+	SumsSigURL    string `json:"sums_sig_url,omitempty"`
 }
 
 // UpdateAvailable 按稳定版本号判断是否可自动升级；其他自定义标签沿用名称比较。
@@ -180,15 +186,20 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 		Notes:       payload.Body,
 	}
 	for _, asset := range payload.Assets {
-		if asset.Name != name {
-			continue
+		switch asset.Name {
+		case name:
+			release.AssetName = asset.Name
+			release.AssetURL = asset.BrowserDownloadURL
+			release.AssetAPIURL = asset.URL
+			release.AssetSize = asset.Size
+			release.Digest = asset.Digest
+		case sumsAssetName:
+			release.SumsURL = asset.BrowserDownloadURL
+			release.SumsAPIURL = asset.URL
+		case sumsSigAssetName:
+			release.SumsSigURL = asset.BrowserDownloadURL
+			release.SumsSigAPIURL = asset.URL
 		}
-		release.AssetName = asset.Name
-		release.AssetURL = asset.BrowserDownloadURL
-		release.AssetAPIURL = asset.URL
-		release.AssetSize = asset.Size
-		release.Digest = asset.Digest
-		break
 	}
 	return release, nil
 }
