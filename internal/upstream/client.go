@@ -1059,9 +1059,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 2 = 风险 token 断词；3 = 逐 token 断词。原样请求先发，只有真的撞到
 		// WAF 拦截页才改写，正常请求的正文不变；每档最多再发一次，避免反复拉扯。
 		wafLevel := 0
-		// channelNeutralized：渠道校验触发句是否已断词重发过一次。与 wafLevel 同构，
-		// 每路径最多一次，避免反复拉扯。
-		channelNeutralized := false
+		// channelLevel：渠道校验的中和档位。与 wafLevel 同构，逐档升级：
+		// 0 ≠ 未处理，1 已实测指纹，2 通用归属句，3 正文全量。
+		// 阶梯化是为了不把任何客户端挡在门外：未知客户端在第三档也能通过。
+		channelNeutralized := 0
 		lastSent := prepared
 	retry:
 		for {
@@ -1173,12 +1174,19 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				// 判定客户端来自未授权渠道。零宽断词该句后同路径重发一次即可通过
 				// （与 WAF 断词同技，词义不变，模型仍读到同一句话）。原样请求先发，
 				// 只有真的被拒才改写，正常客户端（说明里没有该句）的正文不变。
-				if kind == ErrChannelRejected && !channelNeutralized {
-					if candidate, changed := NeutralizeChannelTrigger(prepared); changed {
-						prepared = candidate
-						channelNeutralized = true
+				if kind == ErrChannelRejected && channelNeutralized < maxChannelNeutralizeLevels {
+					applied := false
+					for channelNeutralized < maxChannelNeutralizeLevels && !applied {
+						candidate, changed := NeutralizeChannelTriggerAt(prepared, channelNeutralized)
+						channelNeutralized++
+						if changed {
+							prepared, applied = candidate, true
+						}
+					}
+					if applied {
 						lastSent = prepared
-						log.Printf("WARN: [upstream] channel trigger neutralized for retry uid=%s path=%s", logfmt.UID8(a.UID), path)
+						log.Printf("WARN: [upstream] channel trigger neutralized level=%d for retry uid=%s path=%s",
+							channelNeutralized-1, logfmt.UID8(a.UID), path)
 						observeChatRetry(ctx, raw)
 						continue retry
 					}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-26：/api/logs 不再回传原始文本，改验证 stderr 诊断保留在 other。
 # 2026-09-22：补登录限流分桶回归：转发头只从可信代理采信，不可信直连一律按对端
 #             地址分桶（此前轮换 X-Real-IP 就能绕过限流），并给桶表加上限。
 # 2026-09-22：补 /api/features/reasoning-loop 的边界回归：必须登录、必须同源+管理标记、
@@ -152,8 +153,12 @@ class ManagementBoundaryTests(unittest.TestCase):
                 connection.request("GET", "/api/logs", headers={"Cookie": "fixture-session"})
                 response = connection.getresponse()
                 data = json.loads(response.read())
-            self.assertIn("ordinary request output", data["logs"])
-            self.assertIn("diagnostic on stderr", data["logs"])
+            # 接口不再回传原始日志文本（前端只用解析结果），
+            # 但 stderr 的诊断行必须仍然保留在 other 里。
+            self.assertEqual(data["rows"], [])
+            other = chr(10).join(str(line) for line in data["other"])
+            self.assertIn("ordinary request output", other)
+            self.assertIn("diagnostic on stderr", other)
         finally:
             connection.close()
 

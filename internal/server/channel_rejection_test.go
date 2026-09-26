@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：渠道拒绝会断词重发一次（上限固定、不轮换账号）。
 // 2026-09-16：固定真实 Codex 渠道拒绝的诊断，防止误报违规词或换号放大请求。
 package server
 
@@ -27,7 +28,9 @@ func TestChannelRejectionIsExplicitAndDoesNotRotate(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"upstream_channel_rejected"`) {
 		t.Fatalf("channel rejection lost: %d %s", recorder.Code, recorder.Body)
 	}
-	if strings.Contains(recorder.Body.String(), "content_blocked") || strings.Contains(recorder.Body.String(), "违规词") || requests != 1 {
+	// 2.4.4 起被渠道拒绝会按档位断词重发（这里正文无客户端归属句，一档升到「正文全量」），
+	// 但上限固定、且始终不轮换账号：上游一直拒绝时仍是同号两次尝试，然后如实返回渠道拒绝。
+	if strings.Contains(recorder.Body.String(), "content_blocked") || strings.Contains(recorder.Body.String(), "违规词") || requests != 2 {
 		t.Fatalf("wrong diagnosis or rotation: requests=%d body=%s", requests, recorder.Body)
 	}
 	for _, uid := range []string{"u1", "u2"} {

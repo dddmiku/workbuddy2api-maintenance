@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：交接完成后清理更新目录。
 // 2026-09-24：自动更新不降级；管理员显式指定当前 latest 的旧标签时保留手动回滚能力。
 // 2026-09-18：新实例就绪后才原子提交重启指针，提交失败终止候选实例，并保留原启动参数。
 // 2026-09-17：新增热更新管理器：查版本、下载校验、监听套接字交接、优雅停机，
@@ -264,6 +265,8 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	}
 	log.Printf("[update] handover to %s done; draining in-flight requests", release.Tag)
 	committed = true
+	// 交接已提交：清理旧运行目录与下载包（保留当前与上一个）。
+	pruneUpdateDir(m.opts.Dir, path)
 	m.mu.Lock()
 	m.state = StateIdle
 	m.checkedAt = time.Now().UTC()

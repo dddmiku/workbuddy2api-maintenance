@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：未知客户端的渠道拒绝也要逐档升级断词重发；无正文可断时仍为终态。
 // 2026-09-17：锁定渠道校验触发句的断词重试：只动命中句、词义不变、每路径只重发一次。
 package upstream
 
@@ -113,9 +114,39 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 	}
 }
 
-// TestChatStreamChannelRejectionWithoutTriggerStaysTerminal 说明里没有触发句时
-// 不做无谓重发：原样返回上游终态，由 handler 归类。
-func TestChatStreamChannelRejectionWithoutTriggerStaysTerminal(t *testing.T) {
+// TestChatStreamChannelRejectionEscalatesForUnknownClients 未列入词表的客户端也要救回来：
+// 第一次原样被拒 → 按档位升级断词重发（通用归属句/正文全量）。
+func TestChatStreamChannelRejectionEscalatesForUnknownClients(t *testing.T) {
+	attempts := 0
+	bodies := [][]byte{}
+	c := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if bytes.Contains(raw, []byte(wafBreakMarker)) {
+				return jsonResp(200, `{"choices":[{"index":0,"delta":{"content":"ok"}}]}`), nil
+			}
+			return jsonResp(400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`), nil
+		})},
+		ChatBaseCN: "https://chat.example",
+	}
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":"You are Foobar, a coding assistant for Baz."},{"role":"user","content":"hi"}]}`)
+	rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at"}, body, "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2 (one escalated retry)", attempts)
+	}
+	if !bytes.Contains(bodies[1], []byte(wafBreakMarker)) {
+		t.Fatalf("retry carries no break marker: %s", bodies[1])
+	}
+}
+
+// TestChatStreamChannelRejectionWithoutAnyTextStaysTerminal 没有可断词的正文时不做无谓重发。
+func TestChatStreamChannelRejectionWithoutAnyTextStaysTerminal(t *testing.T) {
 	attempts := 0
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -124,12 +155,12 @@ func TestChatStreamChannelRejectionWithoutTriggerStaysTerminal(t *testing.T) {
 		})},
 		ChatBaseCN: "https://chat.example",
 	}
-	body := []byte(`{"model":"m","messages":[{"role":"system","content":"You are a helpful assistant."}]}`)
+	body := []byte(`{"model":"m"}`)
 	_, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at"}, body, "", ChatMeta{})
 	if err != nil || status != 400 {
 		t.Fatalf("status=%d err=%v", status, err)
 	}
 	if attempts != 1 {
-		t.Fatalf("attempts=%d want 1 (no trigger sentence to break)", attempts)
+		t.Fatalf("attempts=%d want 1 (nothing to neutralize)", attempts)
 	}
 }

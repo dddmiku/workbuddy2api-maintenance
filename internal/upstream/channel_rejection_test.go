@@ -3,6 +3,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -58,5 +59,47 @@ func TestNeutralizeChannelTriggerCoversClaudeCode(t *testing.T) {
 				t.Fatal("no word break was inserted")
 			}
 		})
+	}
+}
+
+// 分级升级：未知客户端的归属句也能在中和后通过，且不动结构性字符串。
+func TestNeutralizeChannelTriggerEscalationLevels(t *testing.T) {
+	unknownClient := `{"model":"m","messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz. Always answer briefly."},{"role":"user","content":"hi"}]}`
+	if _, changed := NeutralizeChannelTriggerAt([]byte(unknownClient), channelLevelFingerprint); changed {
+		t.Fatal("level 0 cannot know an unlisted client")
+	}
+	out, changed := NeutralizeChannelTriggerAt([]byte(unknownClient), channelLevelAttribution)
+	if !changed || !strings.Contains(string(out), "\u200b") {
+		t.Fatal("attribution sentence was not neutralized at level 1")
+	}
+	if strings.Contains(string(out), "Always answer briefly.\u00a0") {
+		t.Fatal("unrelated sentence should stay intact")
+	}
+	plain := `{"model":"m","messages":[{"role":"user","content":"write a function that reverses a list"}]}`
+	if _, changed := NeutralizeChannelTriggerAt([]byte(plain), channelLevelAttribution); changed {
+		t.Fatal("plain content must stay untouched at level 1")
+	}
+	structured := `{"model":"m","tool_choice":"auto","tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"mode":{"enum":["fast","safe"]}}}}}],"messages":[{"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"Read","arguments":"{\"mode\":\"fast\"}"}}]},{"role":"tool","tool_call_id":"call_abc","content":"done"}]}`
+	out, changed = NeutralizeChannelTriggerAt([]byte(structured), channelLevelAll)
+	if !changed {
+		t.Fatal("level 2 must always break some message text")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools := parsed["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if tools["name"] != "Read" {
+		t.Fatalf("tool name was rewritten: %v", tools["name"])
+	}
+	call := parsed["messages"].([]any)[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	if call["id"] != "call_abc" {
+		t.Fatalf("tool call id was rewritten: %v", call["id"])
+	}
+	if call["function"].(map[string]any)["arguments"] != `{"mode":"fast"}` {
+		t.Fatalf("tool arguments were rewritten: %v", call["function"])
+	}
+	if !strings.Contains(parsed["messages"].([]any)[1].(map[string]any)["content"].(string), "\u200b") {
+		t.Fatal("message content was not broken at level 2")
 	}
 }

@@ -14,6 +14,7 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
 | namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
+| 客户端渠道校验 | 上游会按系统提示里的「客户端归属」句判定未批准渠道（11128）。网关先原样发送，被拒后按档位断词重发：已实测指纹（Codex、Claude Code）→ 通用归属句 → 消息正文全量断词。零宽字符不改变语义，正常请求正文不变，任何客户端都不会因为自称是谁而被挡在门外 |
 | `parallel_tool_calls` | 保留；显式 false 而上游仍返回多个调用时，2.4.2 起只交付第一个并记日志（此前整轮失败） |
 | `text.format` | 支持 text、json_object、json_schema；结构化格式检查最终文本输出 |
 | `text.verbosity` | 接受有效字符串声明但不转发；上游没有对应的风格开关 |

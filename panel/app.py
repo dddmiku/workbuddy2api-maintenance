@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-26：登录限流按 IPv6 /64 分桶、新增全站失败节流与可选管理入口 CIDR 白名单。
 # 2026-09-26：面板版本同步为 2.4.2（输出预算与全项目审查修复）。
 # 2026-09-25：无筛选条件直接使用空参数列表，兼容Python3.8严格解析空查询串的差异。
 # 2026-09-25：面板版本同步为2.4.0，限流、调度消费明细与兼容性回归作为同一运行版本交付。
@@ -115,6 +116,16 @@ LOGIN_WINDOW = 300.0
 # 登录限流分桶表的容量上限。分桶键来自转发头，未鉴权的攻击者能造出任意多的键，
 # 没有上限就是一条内存增长面；超过后清掉最旧的一批，宁可短暂放宽限流也不被撑爆。
 LOGIN_BUCKET_LIMIT = 10000
+# 全局登录节流：单 IP 分桶挡不住轮换 IP 的分布式爆破（IPv6 一个 /64 就有海量地址）。
+# 全站失败次数在窗口内超过上限时，短暂拒绝新的登录尝试——这是节流而不是封禁：窗口只有
+# 1 分钟，上限远高于管理员自己会失败的次数，避免被用来把管理员锁在门外。
+LOGIN_GLOBAL_WINDOW = 60.0
+LOGIN_GLOBAL_MAX_FAILS = 20
+
+# 可选的管理入口白名单（CIDR，逗号分隔，如 "203.0.113.0/24,198.51.100.7/32"）。
+# 配置后只允许这些网段访问面板；回环地址始终放行（容器内就绪探针与本地排障）。
+# 留空 = 不限制（默认，行为不变）。
+ADMIN_ALLOW_CIDRS = os.environ.get("WB2API_ADMIN_ALLOW_CIDRS", "")
 COOKIE_NAME = "wb2a_admin"
 
 # 可信反向代理网段（CIDR，逗号分隔）。只有直连对端落在这些网段内，才采信
@@ -128,7 +139,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.4.2"
+PANEL_VERSION = "2.4.4"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -194,7 +205,8 @@ _lock = document_lock(lambda: CONFIG_PATH)
 
 ITOA64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _cred_lock = document_lock(lambda: CRED_PATH)
-_fails = {}          # ip -> [timestamp, ...]
+_fails = {}          # 分桶键 -> [timestamp, ...]（IPv6 归并到 /64）
+_global_fails = []   # 全站失败时间戳，用于分布式爆破的全局节流
 _revoked = set()     # 已签出但被主动作废的 nonce
 
 
@@ -485,7 +497,63 @@ def _is_trusted_proxy(peer):
     return False
 
 
+def _bucket_key(ip):
+    """登录限流分桶键：IPv6 归并到 /64。
+
+    一个 IPv6 /64 里可以随意换地址，按 /128 分桶等于把限流交给攻击者；同一网段归一个
+    桶才能挡住轮换地址的爆破。IPv4 与无法解析的输入原样作为键。
+    """
+    try:
+        address = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return str(ip)
+    if address.version == 6:
+        return str(ipaddress.ip_network("%s/64" % address, strict=False))
+    return str(address)
+
+
+def _admin_allow_networks():
+    networks = []
+    for entry in ADMIN_ALLOW_CIDRS.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            sys.stderr.write("ignoring invalid WB2API_ADMIN_ALLOW_CIDRS entry: %s\n" % entry)
+    return networks
+
+
+_ADMIN_ALLOW_NETWORKS = _admin_allow_networks()
+
+
+def admin_client_allowed(handler):
+    """管理入口白名单：未配置 = 全部放行；回环始终放行（就绪探针与本地排障）。"""
+    if not _ADMIN_ALLOW_NETWORKS:
+        return True
+    try:
+        address = ipaddress.ip_address(str(_client_ip(handler)).strip())
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return any(address.version == network.version and address in network
+               for network in _ADMIN_ALLOW_NETWORKS)
+
+
+def login_global_retry_after():
+    """全局节流：返回需要等待的秒数，0 表示可以继续尝试登录。"""
+    now = time.time()
+    with _cred_lock:
+        _global_fails[:] = [t for t in _global_fails if now - t < LOGIN_GLOBAL_WINDOW]
+        if len(_global_fails) < LOGIN_GLOBAL_MAX_FAILS:
+            return 0
+        return max(1, int(LOGIN_GLOBAL_WINDOW - (now - _global_fails[0])) + 1)
+
+
 def login_blocked(ip):
+    ip = _bucket_key(ip)
     now = time.time()
     with _cred_lock:
         hits = [t for t in _fails.get(ip, []) if now - t < LOGIN_WINDOW]
@@ -502,12 +570,15 @@ def login_blocked(ip):
 def login_failed(ip):
     with _cred_lock:
         _trim_login_buckets_locked()
-        _fails.setdefault(ip, []).append(time.time())
+        now = time.time()
+        _fails.setdefault(_bucket_key(ip), []).append(now)
+        _global_fails.append(now)
+        del _global_fails[:-2 * LOGIN_GLOBAL_MAX_FAILS]
 
 
 def login_ok(ip):
     with _cred_lock:
-        _fails.pop(ip, None)
+        _fails.pop(_bucket_key(ip), None)
 
 
 def _trim_login_buckets_locked():
@@ -1085,6 +1156,8 @@ class Handler(BaseHTTPRequestHandler):
                 for path in ("/", "/admin/")]
 
     def do_GET(self):
+        if not admin_client_allowed(self):
+            return self._json(403, {"ok": False, "message": "当前来源不在管理入口白名单内"})
         path = self.path.split("?")[0]
         if path == "/__health" and os.environ.get("WB2API_RUNTIME") == "native":
             return self._json(200, {"ok": True, "version": PANEL_VERSION})
@@ -1196,12 +1269,16 @@ class Handler(BaseHTTPRequestHandler):
             raw = "\n".join(part for part in (out, err) if part)
             rows, other = parse_request_log(raw)
             rows = rows[-want:]
-            return self._json(200, {"ok": rc == 0, "logs": raw, "rows": rows, "other": other,
+            # 不回传原始日志文本：前端只用解析后的 rows/other，
+            # 而这个界面每 5 秒轮询一次，原文白白占带宽。
+            return self._json(200, {"ok": rc == 0, "rows": rows, "other": other,
                                     "count": len(rows), "rc": rc})
 
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not admin_client_allowed(self):
+            return self._json(403, {"ok": False, "message": "当前来源不在管理入口白名单内"})
         path = self.path.split("?")[0]
         if path in ("/api/keys", "/api/keys/update", "/api/keys/delete", "/api/keys/copy"):
             return self.keys_post(path)
@@ -1476,6 +1553,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── 登录 / 改密 ────────────────────────────────────────────────────
     def auth_login(self, body):
+        retry_after = login_global_retry_after()
+        if retry_after:
+            return self._json(429, {
+                "ok": False,
+                "message": "登录尝试过于频繁，请 %d 秒后再试" % retry_after,
+            }, {"Retry-After": str(retry_after)})
         ip = _client_ip(self)
         with _cred_lock:
             blocked, hits = login_blocked(ip)
