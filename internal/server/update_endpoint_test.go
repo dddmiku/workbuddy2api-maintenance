@@ -130,3 +130,20 @@ func TestHealthzReportsVersion(t *testing.T) {
 		}
 	}
 }
+
+// 关掉热更新后，apply 必须如实拒绝：此前会回「已开始热更新」而实际什么都没发生。
+func TestUpdateApplyRefusesWhenDisabled(t *testing.T) {
+	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: false}))
+	recorder := httptest.NewRecorder()
+	handler.InternalHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}")))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"ok":false`) || !strings.Contains(body, "未启用") {
+		t.Fatalf("disabled apply was not refused honestly: %s", body)
+	}
+	if strings.Contains(body, "已开始热更新") {
+		t.Fatalf("disabled apply claimed to have started: %s", body)
+	}
+}

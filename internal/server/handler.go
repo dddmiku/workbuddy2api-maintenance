@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：/update/apply 在未启用时如实拒绝（此前谎报已开始）。
 // 2026-09-26：压制期回调接线（HoldProgress）；已开流时的失败走流内交付。
 // 2026-09-26：错误信封 type 按状态码映射；n<1 拒绝。
 // 2026-09-26：拒绝 n>1（上游只返回单个选择），避免静默降级。
@@ -478,6 +479,14 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	status := h.cfg.Update.Status()
+	if !status.Enabled {
+		// 关掉热更新后必须如实拒绝：此前这里不检查开关，接口会回「已开始热更新」，
+		// 而实际什么都没发生（只留一条 ERROR 日志），面板显示"正在更新"却永远不动。
+		_ = writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "message": "自更新未启用（config update.enabled=false）；升级请手工部署", "status": status,
+		})
+		return
+	}
 	switch status.State {
 	case hotupdate.StateChecking, hotupdate.StateDownloading, hotupdate.StateHandover:
 		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "已有更新任务在进行中", "status": status})

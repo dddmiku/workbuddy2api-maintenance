@@ -2,9 +2,9 @@
 
 将已授权的 WorkBuddy / CodeBuddy 账号接入常用 ai 工具的自托管中转。网关与管理台合在一个镜像、一个容器内：同一端口提供 `/v1/`、`/v1beta/` 接口和 `/admin/` 页面。
 
-本轮源码版本为 **v2.4.0**，增加每密钥限流、请求消费明细、实际调度原因和官方 SDK 持续兼容测试。见 [运维功能](docs/operations-observability.md)、[版本变更](CHANGELOG.md) 与 [NarraFork 六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
+源码版本见仓库根 `VERSION` 与 [版本变更](CHANGELOG.md)；运维功能见 [运维功能](docs/operations-observability.md)，NarraFork 配置见 [六模式配置](docs/narrafork.md)。站点是否已升级，以实际 `/healthz` 和管理台版本为准。
 
-公开发布仓库为 [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
+维护仓库为 **私有的** [dddmiku/workbuddy2api-maintenance](https://github.com/dddmiku/workbuddy2api-maintenance)：自 2026-09-26 起只用于维护代码，不再作为开源分发，匿名访问历史发布返回 404。本项目基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，保留 MIT 许可证；架构改进重点参考 new-api 与 sub2api，按实际上游能力独立实现。
 
 ## 能力
 
@@ -93,9 +93,16 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 
 在密钥页点击“设置限流”可限制请求数、并发和等待时间，已有密钥默认保持不限。在“请求明细”按调用密钥、完整模型、状态或请求 ID 筛选并展开重试/调度记录。明细保留 7 天、最多 10000 条或 64 MiB，与累计账本独立；未上报的消费显示未知，不乘固定倍率补算。详见 [限流与明细](docs/operations-observability.md)。
 
-统一运行版从公开 Release 下载 `wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`，校验压缩包与固定文件清单后交接。`update.repo` 默认仍为 `dddmiku/workbuddy2api-maintenance`，公开下载时 `update.token` 可留空。旧 `2.1.29` Release 保留用于历史维护与回滚。
+**面板热更新已关闭**（`config update.enabled=false`，2026-09-26 起）：`/update/*` 一律拒绝，更新页显示「已关闭」。升级改为手工部署：
 
-运行包包含内嵌面板和辅助程序；基础镜像、Python/Bash 或 `docker-entrypoint.sh` 改动仍需重建镜像。首次从旧两容器迁移同样使用完整镜像。候选就绪后旧进程最多等待 15 分钟收尾，超时仍可能中断。详见 [管理台部署](docs/panel.md) 和 [配置说明](docs/configuration.md#热更新)。
+1. 本地构建运行包：`python tools/private_gateway_release_20260925.py prepare --tag <tag> --runtime`（产物 `runtime-<arch>/` 与 `wb2api-runtime-linux-<arch>.tar.gz`，构建时注入发布公钥）；
+2. 上传到服务器任意临时目录，解压到 `/opt/workbuddy2api/data/updates/runtime-<时间戳>/`；
+3. 把 `/opt/workbuddy2api/data/updates/current` 指向新目录里的 `wb2api`；
+4. `docker restart workbuddy2api`（数秒中断），再核对 `/healthz` 的版本与提交。
+
+想把热更新开回来：`update.enabled` 改回 `true` 并重载网关；私有仓库下还需配置 `update.token`（只读令牌），否则下载会 404。
+
+运行包包含内嵌面板和辅助程序；基础镜像、Python/Bash 或 `docker-entrypoint.sh` 改动仍需重建镜像。首次从旧两容器迁移同样使用完整镜像。详见 [管理台部署](docs/panel.md) 和 [配置说明](docs/configuration.md#热更新)。
 
 ## 开发与构建
 

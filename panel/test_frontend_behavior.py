@@ -17,7 +17,7 @@ NODE = shutil.which("node")
 
 @unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
 class FrontendBehaviorTests(unittest.TestCase):
-    def run_frontend(self, expression):
+    def run_frontend(self, expression, extra_sources=()):
         program = r"""
 const vm = require('vm'), fs = require('fs'), path = require('path');
 const nodes = new Map();
@@ -36,14 +36,14 @@ const context = {console, Date, Promise, Map,
   document:{readyState:'loading',hidden:false,documentElement:node('html'),
     querySelector:node,querySelectorAll(){return []},addEventListener(){}}};
 vm.createContext(context);
-for (const source of ['app.js','usage.js'])
+for (const source of ['app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
   vm.runInContext(fs.readFileSync(path.join(process.argv[1],source),'utf8'),context);
 Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',context))
   .then(result=>console.log(JSON.stringify(result)))
   .catch(error=>{console.error(error);process.exitCode=1});
 """
         env = dict(os.environ, TZ="Asia/Shanghai")
-        result = subprocess.run([NODE, "-e", program, str(PANEL), expression],
+        result = subprocess.run([NODE, "-e", program, str(PANEL), expression, ",".join(extra_sources)],
                                 capture_output=True, text=True, encoding="utf-8", env=env, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -196,3 +196,27 @@ CURRENT_VIEW='logs';location.hash='#logs';$('#btnRefresh').events.click();return
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_update_page_reports_a_disabled_gateway(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:false,current:'v2.4.10',commit:'111b07023e0a',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, check:$('#btnUpdCheck').disabled,
+        state:$('#updState').textContent, hint:$('#updHint').textContent,
+        body:$('#updBody').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "关闭热更新后「立即更新」按钮必须禁用")
+        self.assertTrue(result["check"], "关闭热更新后「检查更新」按钮必须禁用")
+        self.assertEqual(result["state"], "已关闭")
+        self.assertIn("update.enabled", result["body"])
+        self.assertIn("手工部署", result["body"])
+
+    def test_update_page_keeps_the_normal_ui_when_enabled(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v2.4.10',state:'idle',latest_tag:'v2.4.11',update_ready:true}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"])
+        self.assertIn("v2.4.11", result["hint"])

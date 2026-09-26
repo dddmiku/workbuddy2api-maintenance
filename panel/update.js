@@ -37,6 +37,18 @@ function renderUpdate(){
     return;
   }
   var s = r.status || {};
+  if (s.enabled === false){
+    // 网关关掉了热更新（config update.enabled=false）：如实显示，按钮禁用，
+    // 不再让「立即更新」点下去只弹一句"已开始"却什么也不做。
+    box.innerHTML = '<div class="upd-empty">热更新已在网关关闭（config update.enabled=false）</div>' +
+      mrow('当前版本', (s.current || '—') + (s.commit && s.commit !== 'unknown' ? ' · ' + s.commit.slice(0, 7) : '')) +
+      mrow('升级方式', '手工部署：本地构建运行包后上传替换，或让维护方协助');
+    $('#updState').textContent = '已关闭';
+    $('#updHint').textContent = '如需恢复热更新，把 config 的 update.enabled 改回 true 并重载网关。';
+    $('#btnUpdApply').disabled = true;
+    $('#btnUpdCheck').disabled = true;
+    return;
+  }
   var busy = !!UP_BUSY[s.state];
   var current = s.current || '—';
   var commit = (s.commit && s.commit !== 'unknown') ? ' · ' + s.commit.slice(0, 7) : '';
