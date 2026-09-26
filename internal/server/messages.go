@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：顶层不支持块同样占位（不再整条 400）；工具调用 id 允许跨轮复用；空工具结果回退空串。
 // 2026-09-26：历史里上游无法承载的内容块（document/tool_reference 等）改为文字占位，不再让整段会话永久 400。
 // 2026-09-26：thinking.type=adaptive 映射为上游可识别的 enabled（不带预算），不再原样转发。
 // 2026-09-25：Anthropic messages 输入复用现有请求执行模块，保留工具配对、图片、思考与模型权限。
@@ -197,7 +198,6 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 		return nil, "", false, fmt.Errorf("messages must be a nonempty array")
 	}
 	pending := map[string]bool{}
-	seen := map[string]bool{}
 	for index, raw := range input {
 		path := fmt.Sprintf("messages[%d]", index)
 		message, err := requestValidationObject(raw, path)
@@ -214,6 +214,9 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 		}
 		var parts, calls, results []any
 		var reasoning strings.Builder
+		// seen 只在单条 assistant 消息内查重：跨轮复用同一个工具调用 id（很多客户端
+		// 每轮重新编号）是合法的，只有「同一轮内重复」和「上一轮尚未配对又出现」才是错。
+		seen := map[string]bool{}
 		for bi, block := range blocks {
 			bp := fmt.Sprintf("%s.content[%d]", path, bi)
 			switch block["type"] {
@@ -245,7 +248,7 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 				}
 				id, _ := block["id"].(string)
 				name, _ := block["name"].(string)
-				if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" || seen[id] {
+				if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" || seen[id] || pending[id] {
 					return nil, "", false, fmt.Errorf("%s requires a unique tool id and name", bp)
 				}
 				params, err := requestValidationObject(block["input"], bp+".input")
@@ -277,10 +280,17 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 				if block["is_error"] == true {
 					parts = append([]any{map[string]any{"type": "text", "text": "[tool execution error]"}}, parts...)
 				}
-				results = append(results, map[string]any{"role": "tool", "tool_call_id": id, "content": parts})
+				results = append(results, map[string]any{"role": "tool", "tool_call_id": id, "content": toolResultContent(parts)})
 				delete(pending, id)
 			default:
-				return nil, "", false, fmt.Errorf("%s.type %q is not supported", bp, block["type"])
+				// 顶层的不支持块（document、search_result、web_search_tool_result、
+				// server_tool_use、tool_reference 等）同样用文字占位：这些块客户端
+				// 一旦用过就会一直留在历史里，硬拒等于让整个会话永久 400。
+				part, err := unsupportedPlaceholder(block)
+				if err != nil {
+					return nil, "", false, err
+				}
+				parts = append(parts, part)
 			}
 		}
 		if len(pending) > 0 {
@@ -417,6 +427,25 @@ func anthropicParts(value any, path string, images bool) ([]any, error) {
 		parts = append(parts, part)
 	}
 	return parts, nil
+}
+
+// toolResultContent 归一化工具结果正文：全是空文本时退回空串。
+// 空 text part（`[{"type":"text","text":""}]`）是上游常见的 400 触发形状，
+// 而"没有输出"本身是合法结果，用空串表达即可。
+func toolResultContent(parts []any) any {
+	for _, raw := range parts {
+		part, ok := raw.(map[string]any)
+		if !ok {
+			return parts
+		}
+		if text, _ := part["text"].(string); strings.TrimSpace(text) != "" {
+			return parts
+		}
+		if part["type"] != "text" {
+			return parts
+		}
+	}
+	return ""
 }
 
 // unsupportedPlaceholder 把上游无法承载的内容块替换成文字占位。

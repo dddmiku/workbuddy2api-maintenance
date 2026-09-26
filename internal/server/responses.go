@@ -1,4 +1,7 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：拒答文本按正文交付（Codex 解析不了 refusal 条目，会整条丢弃）。
+// 2026-09-26：运行约定同样追加到 part 数组形态的首条 system，不再另起一条 system。
+// 2026-09-26：响应中的 model 一律为调用方请求的名字，不再被上游裸名覆盖（流式与非流式一致）。
 // 2026-09-26：禁止并行时上游多返回的工具调用只交付第一个（此前整轮失败）；纯工具调用的非流式结果不再多出空消息。
 // 2026-09-25：整组工具校验后才交付身份/参数，封堵 NF 提前执行；限制缓冲并在工具生成期间保活，拒绝密文静默丢失。
 // 2026-09-25：告知默认内置工具的兼容过滤，保留网络 flush 错误，防止客户端没收到终态却记成功。
@@ -85,12 +88,17 @@ func applyActNote(body []byte, note string, hasTools bool) []byte {
 		if !strings.EqualFold(strings.TrimSpace(role), "system") {
 			continue
 		}
-		content, ok := msg["content"].(string)
-		if !ok {
-			// 结构化 content（part 数组）形态少见，保持原样不猜。
+		switch content := msg["content"].(type) {
+		case string:
+			msg["content"] = strings.TrimRight(content, "\n") + "\n\n" + note
+		case []any:
+			// Anthropic Messages 等路径的系统提示是 part 数组：把约定作为最后一个 text part
+			// 追加，而不是另起一条 system——否则客户端系统提示会掉到第二条，只认首条 system
+			// 的上游会直接忽略它。
+			msg["content"] = append(content, map[string]any{"type": "text", "text": note})
+		default:
 			continue
 		}
-		msg["content"] = strings.TrimRight(content, "\n") + "\n\n" + note
 		appended = true
 		break
 	}
@@ -1182,7 +1190,6 @@ type responsesWriter struct {
 	respID    string
 	msgID     string
 	rsID      string
-	modelName string
 	created   int64
 	seq       int
 	nextIdx   int
@@ -1369,10 +1376,13 @@ func (rw *responsesWriter) finishJSON() {
 	rw.writeErr = writeJSON(rw.inner, http.StatusOK, result)
 }
 
+// resolvedModel 一律回报调用方请求的模型名。
+//
+// 此前会从上游分片里抓裸模型名覆盖它，于是同一个响应里 response.created（尚无分片时）
+// 报 `global:deepseek-v4.1-flash`、response.completed 与非流式响应体报
+// `deepseek-v4.1-flash`；客户端按模型名对账/展示时会看到两个不同的值。上游实际服务
+// 的模型只用于服务端观测，不进客户端响应。
 func (rw *responsesWriter) resolvedModel() string {
-	if rw.modelName != "" {
-		return rw.modelName
-	}
 	if rw.req != nil && rw.req.Model != "" {
 		return rw.req.Model
 	}
@@ -1484,9 +1494,6 @@ func (rw *responsesWriter) handleChunk(chunk map[string]any) {
 	}
 	if v, ok := chunk["id"].(string); ok && v != "" && rw.respID == "" {
 		rw.respID = "resp_" + v
-	}
-	if v, ok := chunk["model"].(string); ok && v != "" && rw.modelName == "" {
-		rw.modelName = v
 	}
 	if u, ok := chunk["usage"].(map[string]any); ok {
 		rw.usage = upstream.MergeUsage(rw.usage, u)
@@ -1610,10 +1617,7 @@ func (rw *responsesWriter) ensureMessagePart(kind string) int {
 	}
 	index := len(rw.messageParts)
 	rw.messageParts = append(rw.messageParts, kind)
-	part := map[string]any{"type": "refusal", "refusal": ""}
-	if kind == "output_text" {
-		part = map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
-	}
+	part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
 	rw.emit(evPartAdded, map[string]any{
 		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "part": part,
 	})
@@ -1622,12 +1626,8 @@ func (rw *responsesWriter) ensureMessagePart(kind string) int {
 
 func (rw *responsesWriter) messageContent() []any {
 	content := []any{}
-	for _, kind := range rw.messageParts {
-		if kind == "refusal" {
-			content = append(content, map[string]any{"type": "refusal", "refusal": rw.refusal.String()})
-		} else {
-			content = append(content, map[string]any{"type": "output_text", "text": rw.text.String(), "annotations": []any{}})
-		}
+	for range rw.messageParts {
+		content = append(content, map[string]any{"type": "output_text", "text": rw.text.String(), "annotations": []any{}})
 	}
 	return content
 }
@@ -1655,10 +1655,15 @@ func (rw *responsesWriter) textDelta(s string) {
 	rw.emit(evTextDelta, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "delta": s})
 }
 
+// refusalDelta 把上游的拒答文本按正文交付。
+//
+// 面向 Responses 的客户端（Codex）的条目模型只认 output_text/input_text 等类型，收到
+// 带 refusal 的条目会解析失败并**整条丢弃**，用户看到的是一个空回合；SDK 客户端虽然
+// 支持 refusal 内容块，但把拒答当正文显示同样可读。refusal 计数仍保留，用于工具契约
+// 判定（拒答时不强制要求工具调用）。
 func (rw *responsesWriter) refusalDelta(s string) {
-	index := rw.ensureMessagePart("refusal")
 	rw.refusal.WriteString(s)
-	rw.emit(evRefusalDelta, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "delta": s})
+	rw.textDelta(s)
 }
 
 // openCall 等名称与 call_id 确定后开出条目，避免 custom 工具在 added 后才改变类型。
@@ -2224,9 +2229,6 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 	if v, ok := chat["id"].(string); ok && v != "" {
 		respID = "resp_" + v
 	}
-	if v, ok := chat["model"].(string); ok && v != "" {
-		model = v
-	}
 	items := []any{}
 	var msg map[string]any
 	status := "completed"
@@ -2259,8 +2261,9 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 		if txt != "" || (refusal == "" && !deliversCalls) {
 			content = append(content, map[string]any{"type": "output_text", "text": txt, "annotations": []any{}})
 		}
-		if refusal != "" {
-			content = append(content, map[string]any{"type": "refusal", "refusal": refusal})
+		if refusal != "" && txt == "" {
+			// 拒答文本按正文交付，避免客户端因条目含 refusal 而整条丢弃。
+			content = append(content, map[string]any{"type": "output_text", "text": refusal, "annotations": []any{}})
 		}
 		if len(content) > 0 {
 			items = append(items, map[string]any{

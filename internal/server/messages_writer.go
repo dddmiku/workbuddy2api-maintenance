@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：上游已发出但首帧迟到时先开流（message_start + ping），并在静默期周期性 ping；writer 加锁。
 // 2026-09-25：保留逐密钥频率与并发响应头，客户端可读取共享额度与重试提示。
 // 2026-09-25：将已校验的Chat结果转为Anthropic消息与流事件，错误不产生成功终态，缓存用量避免重复相加。
 // 2026-09-25：流式工具保留参数增量并延迟完成，透传心跳与写失败，保留上下文错误类别和缓存创建用量。
@@ -16,11 +17,22 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/upstream"
 )
+
+// anthropicFirstFrameGrace 上游请求已发出、却迟迟没有首帧时，先把流开起来的等待时长。
+// 循环保护最多会压住 60 秒推理输出，期间客户端一个字节都收不到；先发
+// message_start + ping 让客户端的空闲计时器有东西可吃。
+//
+// 用变量而非常量：测试里缩短等待，避免每个用例多花 5 秒。
+var anthropicFirstFrameGrace = 5 * time.Second
+
+// anthropicIdlePing 静默期的 ping 间隔（Anthropic 官方流也会周期性发 ping）。
+var anthropicIdlePing = 10 * time.Second
 
 const messagesBufferLimit = 16 << 20
 
@@ -44,16 +56,69 @@ type messagesWriter struct {
 	stop                   string
 	err                    error
 	lastEvent              time.Time
+	mu                     sync.Mutex
+	keepAlive              bool
+	done                   chan struct{}
+	// 构造时快照的保活时序：goroutine 只读字段，不去读包级变量（否则测试改动
+	// 包级变量时会与 goroutine 竞争）。
+	firstFrameGrace time.Duration
+	idlePing        time.Duration
 }
 
 func newMessagesWriter(w http.ResponseWriter) *messagesWriter {
-	return &messagesWriter{inner: w, hdr: make(http.Header), status: 200, id: "msg_" + rand.Text(), tools: make(map[int]*messagesTool), index: -1}
+	return &messagesWriter{inner: w, hdr: make(http.Header), status: 200, id: "msg_" + rand.Text(), tools: make(map[int]*messagesTool), index: -1, done: make(chan struct{}),
+		firstFrameGrace: anthropicFirstFrameGrace, idlePing: anthropicIdlePing}
+}
+
+// UpstreamStarted 由 handler 在上游请求真正发出时调用（前置拒绝如 429/503 不会走到这里，
+// 因此那些路径仍保留真实状态码）。此后若长时间没有首帧，就先把流开起来并周期性 ping。
+func (m *messagesWriter) UpstreamStarted() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.stream || m.started || m.ended || m.keepAlive {
+		return
+	}
+	m.keepAlive = true
+	go m.keepAliveLoop()
+}
+
+func (m *messagesWriter) keepAliveLoop() {
+	timer := time.NewTimer(m.firstFrameGrace)
+	defer timer.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-timer.C:
+		}
+		m.mu.Lock()
+		if m.ended || m.err != nil {
+			m.mu.Unlock()
+			return
+		}
+		if !m.started {
+			m.beginLocked()
+		}
+		if time.Since(m.lastEvent) >= m.idlePing {
+			m.eventLocked("ping", map[string]any{})
+		}
+		m.mu.Unlock()
+		timer.Reset(m.idlePing)
+	}
 }
 
 func (m *messagesWriter) Header() http.Header  { return m.hdr }
 func (m *messagesWriter) WriteHeader(code int) { m.status = code }
 func (m *messagesWriter) Flush()               { _ = m.FlushError() }
 func (m *messagesWriter) FlushError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.flushLocked()
+}
+
+// flushLocked 是加锁后的刷新实现：调用方须持 m.mu（eventLocked 等内部路径使用，
+// 避免非重入锁自锁）。
+func (m *messagesWriter) flushLocked() error {
 	if !m.started || m.err != nil {
 		return m.err
 	}
@@ -286,6 +351,12 @@ func (m *messagesWriter) copyHeaders() {
 }
 
 func (m *messagesWriter) event(kind string, payload map[string]any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventLocked(kind, payload)
+}
+
+func (m *messagesWriter) eventLocked(kind string, payload map[string]any) {
 	if m.err != nil {
 		return
 	}
@@ -298,10 +369,18 @@ func (m *messagesWriter) event(kind string, payload map[string]any) {
 		}
 	}
 	m.err = err
-	m.Flush()
+	if flushErr := m.flushLocked(); flushErr != nil {
+		m.err = flushErr
+	}
 }
 
 func (m *messagesWriter) begin() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.beginLocked()
+}
+
+func (m *messagesWriter) beginLocked() {
 	if m.started || m.ended || m.err != nil {
 		return
 	}
@@ -323,7 +402,7 @@ func (m *messagesWriter) begin() {
 	// from message_delta but do not merge extension fields, so an early true
 	// flag would incorrectly survive even after complete usage was reported.
 	delete(usage, "gateway_usage_incomplete")
-	m.event("message_start", map[string]any{"message": map[string]any{"id": m.id, "type": "message", "role": "assistant", "model": m.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": usage}})
+	m.eventLocked("message_start", map[string]any{"message": map[string]any{"id": m.id, "type": "message", "role": "assistant", "model": m.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": usage}})
 }
 
 func (m *messagesWriter) closeBlock() {
@@ -520,6 +599,12 @@ func (m *messagesWriter) upstreamFailure(status int, problem map[string]any) {
 }
 
 func (m *messagesWriter) failure(status int, code, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failureLocked(status, code, message)
+}
+
+func (m *messagesWriter) failureLocked(status int, code, message string) {
 	if m.ended {
 		return
 	}
@@ -548,7 +633,7 @@ func (m *messagesWriter) failure(status int, code, message string) {
 	}
 	payload := map[string]any{"type": "error", "error": map[string]any{"type": kind, "message": message, "code": code}}
 	if m.started {
-		m.event("error", payload)
+		m.eventLocked("error", payload)
 	} else {
 		m.copyHeaders()
 		m.err = writeJSON(m.inner, status, payload)
@@ -560,6 +645,12 @@ func (m *messagesWriter) failure(status int, code, message string) {
 }
 
 func (m *messagesWriter) finish() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.done != nil && m.keepAlive {
+		close(m.done)
+		m.keepAlive = false
+	}
 	if m.ended {
 		return
 	}
@@ -568,8 +659,8 @@ func (m *messagesWriter) finish() {
 		return
 	}
 	if m.stream && m.started {
-		m.failure(502, "upstream_incomplete", "upstream stream ended without a complete response")
+		m.failureLocked(502, "upstream_incomplete", "upstream stream ended without a complete response")
 		return
 	}
-	m.failure(502, "upstream_parse", "upstream returned an incomplete response")
+	m.failureLocked(502, "upstream_parse", "upstream returned an incomplete response")
 }

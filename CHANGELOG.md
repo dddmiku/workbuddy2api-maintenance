@@ -2,6 +2,34 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.7 — 2026-09-26
+
+按两路独立审查（Anthropic 与 Responses 各一路）与线上报文实测修协议缺陷。
+
+### Anthropic Messages
+
+- 顶层不支持的内容块（`document`、`search_result`、`web_search_tool_result`、`server_tool_use`、`tool_reference` 等）改为文字占位。此前只有嵌套位置（tool_result.system）生效，顶层仍整条 400——客户端用过一次 PDF 或引用，该会话之后每个请求都会失败。
+- 工具调用 id 只要求「同一条 assistant 消息内唯一、且不与尚未配对的上一个调用重复」。此前按整段请求查重，客户端每轮重新编号（常见做法）会永久 400。
+- 运行约定（ActNote）同样追加到 part 数组形态的首条 system。Anthropic 路径的系统提示必然是 part 数组，此前会另起一条 system 顶在最前面，客户端系统提示掉到第二位——只认首条 system 的上游会直接忽略它。
+- 上游请求已发出但 5 秒内无首帧时先发 `message_start` 并周期性 `ping`：循环保护最多压制 60 秒，此前客户端零字节等待。写入器因此加锁（修掉一处非重入锁自锁）。
+- 空工具结果不再发空 text part（上游常见 400 形状），回退为空串。
+
+### Responses
+
+- 响应里的 `model` 一律回报调用方请求的名字。此前流式 `response.created` 报 `global:…`、`response.completed` 与非流式响应体报上游裸名，客户端按模型名对账会看到两个值。
+- 拒答文本按 `output_text` 交付：Codex 的条目模型无法解析含 `refusal` 的内容块，会把整条 item 丢弃，用户看到空回合。
+
+### 审查结论（未改动，如实记录）
+
+- Responses 文本 schema 不符仍按契约整轮失败（`response_format_violation`），与既有测试锁定的一致；审查建议改为「交付正文 + 记日志」，属产品语义变更，未擅自改动。
+- `parallel_tool_calls=false`、`stop_sequence`、`message_start` 用量字段、思考签名的现状与限制见 [兼容性](docs/compatibility.md) 的「已知限制」。
+
+### 验证
+
+服务器隔离副本：测试、race、vet、staticcheck、gosec、面板与官方 SDK 全绿；线上另做真实报文对照（事件序列、工具流、非流式形状、错误信封）。
+
+首轮服务器验证抓出两处自带问题并已修正：新增的开流保活与测试并发读 `httptest.ResponseRecorder` 造成数据竞争（改用带锁写入器），以及 `flushLocked` 返回值未处理（gosec G104）。
+
 ## v2.4.6 — 2026-09-26
 
 自更新加发布者签名，并修掉一个会让 Claude Code 会话永久失败的兼容问题。

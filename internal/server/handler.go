@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：上游请求发出时通知响应适配器（供静默期先开流与 ping）。
 // 2026-09-26：请求模型名限长 256 字节，防止超长名字撑爆用量账本写盘上限。
 // 2026-09-26：参数错误、WAF、渠道与内容拦截等请求决定的终态不再解绑会话，保留同号提示缓存。
 // 2026-09-26：会话键交给出站层并记录每轮上游实报输入，用于长会话主动收缩输出预算。
@@ -1102,7 +1103,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
 	chatMeta.GatewayRequestID = st.requestID
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
-	chatContext = upstream.WithChatAttemptObserver(chatContext, st.observeAttempt)
+	chatContext = upstream.WithChatAttemptObserver(chatContext, func(event upstream.ChatAttemptEvent) {
+		st.observeAttempt(event)
+		if event.Stage == "start" {
+			// 让流式适配器知道上游请求已经发出：此后长时间没有首帧就可以先开流并 ping，
+			// 避免客户端在循环保护压制期（最长 60 秒）一个字节都收不到。
+			for current := w; current != nil; {
+				if starter, ok := current.(interface{ UpstreamStarted() }); ok {
+					starter.UpstreamStarted()
+					break
+				}
+				next, ok := current.(interface{ Unwrap() http.ResponseWriter })
+				if !ok {
+					break
+				}
+				current = next.Unwrap()
+			}
+		}
+	})
 	// 输出预算按会话推算：会话键交给出站层；成功后记录本轮上游实报输入，供下一轮主动收缩预算。
 	chatContext = upstream.WithBudgetSession(chatContext, stickyKey)
 	defer func() {

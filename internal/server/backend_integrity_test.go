@@ -195,3 +195,44 @@ func TestGatewayIntegrityAggregateToolsHonorParallelLimit(t *testing.T) {
 		t.Fatalf("delivered %d calls, want exactly the first: %s", calls, rec.Body)
 	}
 }
+
+// 响应里的 model 必须与调用方请求的一致：此前流式 created 报带前缀的名字、
+// completed 与非流式响应体报上游裸名，客户端会看到两个不同的值。
+func TestResponsesReportRequestedModelConsistently(t *testing.T) {
+	raw := string(sseStream(`{"choices":[{"index":0,"delta":{"content":"hi"}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`))
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, raw, true })
+	p := testPoolWith(&auth.Auth{UID: "model-name", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","input":"hi","stream":true,"store":false}`)))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	models := map[string]bool{}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) != nil {
+			continue
+		}
+		if response, ok := event["response"].(map[string]any); ok {
+			if model, ok := response["model"].(string); ok {
+				models[model] = true
+			}
+		}
+	}
+	if len(models) != 1 || !models["cn:deepseek-v4.1-flash"] {
+		t.Fatalf("stream reported inconsistent models: %v", models)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","input":"hi","stream":false,"store":false}`)))
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "cn:deepseek-v4.1-flash" {
+		t.Fatalf("non-stream model = %v", body["model"])
+	}
+}

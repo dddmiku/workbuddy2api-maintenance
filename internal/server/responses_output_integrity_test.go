@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：拒答按正文交付的回归。
 // 2026-09-25：失败/截断不能携带工具身份与参数，覆盖提前执行客户端的终态安全边界。
 // 2026-09-16：通过真实 SSE 转换链锁定迟到工具元数据、legacy 调用、refusal 及错误后的工具终态。
 package server
@@ -193,7 +194,7 @@ func TestResponsesOutputLegacyFunctionSurvivesSchema(t *testing.T) {
 	}
 }
 
-func TestResponsesOutputRefusalSurvivesSchema(t *testing.T) {
+func TestResponsesOutputRefusalIsDeliveredAsText(t *testing.T) {
 	const refusal = "Cannot fulfill this request."
 	raw := outputIntegritySSE(`{"choices":[{"index":0,"delta":{"refusal":"Cannot fulfill "}}]}`, `{"choices":[{"index":0,"delta":{"refusal":"this request."},"finish_reason":"stop"}]}`)
 	names, values, err := outputIntegrityStream(t, outputIntegrityRequest(t, false, true), raw)
@@ -201,42 +202,39 @@ func TestResponsesOutputRefusalSurvivesSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	final := outputIntegrityFinal(t, names, values, "response.completed")
+	// 拒答文本按正文交付：面向 Responses 的客户端（Codex）解析不了 refusal 条目，
+	// 会把整条 item 丢掉，用户只能看到空回合。
 	var deltas strings.Builder
-	done := false
 	for i, event := range names {
-		if event == "response.refusal.delta" {
+		if event == "response.output_text.delta" {
 			deltas.WriteString(values[i]["delta"].(string))
 		}
-		if event == "response.refusal.done" {
-			done = values[i]["refusal"] == refusal
-		}
-		if event == "response.output_text.delta" {
-			t.Error("refusal misclassified as output_text")
+		if event == "response.refusal.delta" || event == "response.refusal.done" {
+			t.Errorf("refusal events are no longer emitted: %s", event)
 		}
 	}
-	if deltas.String() != refusal || !done {
-		t.Fatalf("refusal stream lost: deltas=%q done=%t", deltas.String(), done)
+	if deltas.String() != refusal {
+		t.Fatalf("refusal text lost from the stream: %q", deltas.String())
 	}
-	assertRefusal := func(result map[string]any) {
-		t.Helper()
-		found := false
-		for _, value := range result["output"].([]any) {
-			item := value.(map[string]any)
-			if item["type"] != "message" {
-				continue
+	found := false
+	for _, value := range final["output"].([]any) {
+		item := value.(map[string]any)
+		if item["type"] != "message" {
+			continue
+		}
+		for _, rawPart := range item["content"].([]any) {
+			part := rawPart.(map[string]any)
+			if part["type"] == "output_text" && part["text"] == refusal {
+				found = true
 			}
-			for _, rawPart := range item["content"].([]any) {
-				part := rawPart.(map[string]any)
-				if part["type"] == "refusal" && part["refusal"] == refusal {
-					found = true
-				}
+			if part["type"] == "refusal" {
+				t.Errorf("refusal content part would be dropped by clients: %#v", part)
 			}
 		}
-		if !found {
-			t.Fatalf("refusal content lost: %#v", result)
-		}
 	}
-	assertRefusal(final)
+	if !found {
+		t.Fatalf("refusal text missing from the final item: %#v", final)
+	}
 	chat, err := upstream.Aggregate(strings.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
@@ -252,6 +250,25 @@ func TestResponsesOutputRefusalSurvivesSchema(t *testing.T) {
 	var result map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
+	}
+	assertRefusal := func(result map[string]any) {
+		t.Helper()
+		for _, value := range result["output"].([]any) {
+			item := value.(map[string]any)
+			if item["type"] != "message" {
+				continue
+			}
+			for _, rawPart := range item["content"].([]any) {
+				part := rawPart.(map[string]any)
+				if part["type"] == "refusal" {
+					t.Errorf("non-stream refusal part would be dropped by clients: %#v", part)
+				}
+				if part["type"] == "output_text" && part["text"] == "Cannot fulfill this request." {
+					return
+				}
+			}
+		}
+		t.Fatalf("non-stream refusal text missing: %#v", result)
 	}
 	assertRefusal(result)
 }

@@ -14,6 +14,10 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
 | namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
+| Anthropic 顶层不支持块 | `document`、`search_result`、`web_search_tool_result`、`server_tool_use`、`tool_reference` 等在上游没有对应形态，一律替换为文字占位 `[unsupported content block: …]`（2.4.7 起覆盖顶层与嵌套位置），不再整条 400 |
+| Anthropic 工具调用 id | 只要求「同一条 assistant 消息内唯一、且不与尚未配对的上一个调用重复」；跨轮复用同一个 id（很多客户端每轮重新编号）已放行（2.4.7 起） |
+| Anthropic 流起始 | 上游请求已发出但 5 秒内没有首帧时，网关先发 `message_start` 并每 10 秒 `ping`，避免循环保护压制期客户端零字节等待 |
+| Responses 拒答 | 拒答文本按 `output_text` 交付：面向 Responses 的客户端（Codex）无法解析含 `refusal` 的条目，会把整条 item 丢弃，用户只能看到空回合（2.4.7 起） |
 | Anthropic 内容块 | 上游可承载的只有 text/image；历史里出现 `document`、`tool_reference`、`search_result` 等块时替换为文字占位，不再整条请求 400（2.4.6 起） |
 | 客户端渠道校验 | 上游会按系统提示里的「客户端归属」句判定未批准渠道（11128）。网关先原样发送，被拒后按档位断词重发：已实测指纹（Codex、Claude Code）→ 通用归属句 → 消息正文全量断词。零宽字符不改变语义，正常请求正文不变，任何客户端都不会因为自称是谁而被挡在门外 |
 | `parallel_tool_calls` | 保留；显式 false 而上游仍返回多个调用时，2.4.2 起只交付第一个并记日志（此前整轮失败） |
@@ -157,3 +161,11 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 公开回归使用合成数据，覆盖工具子集与选择、严格/非严格参数、长名往返、refusal、未知历史项隔离、正文/图片保留、SSE 增量、截断与迟到错误，以及交错推理的条目生命周期和重复推理保护。可检查 [协议回归](../internal/server/protocol_diagnosis_test.go)、[输出完整性回归](../internal/server/responses_output_integrity_test.go)、[请求结构校验](../internal/server/request_validation_test.go)、[推理生命周期回归](../internal/server/responses_reasoning_lifecycle_test.go) 和 [保护及用量回归](../internal/server/reasoning_loop_guard_test.go)。
 
 这些检查不能等同于全部账号、模型、渠道和客户端组合均已实测通过。开源实现的固定提交、采用原则及未照搬的边界见 [协议实现参考](protocol-references.md)。
+
+## 已知限制（如实记录，不伪造）
+
+- `message_start.usage` 的输入与缓存字段在上游首帧时还不可知，网关按 0 上报，真实值在 `message_delta` 给出（上游只在流末尾报用量，网关不编造数字）。
+- Anthropic `tool_use.id` 沿用上游的 `call_…` 形状而非 `toolu_…`；回填配对按原样工作，客户端一般不校验前缀。
+- thinking 块不带 `signature`：上游不提供可用签名，伪造一个「Anthropic 签名」会更糟；客户端把思考块放回历史时，网关按无签名历史接收。
+- `stop_sequence` 无法报告：上游不回显命中的停止串，仍按 `end_turn` 收尾（不做猜测）。
+- Responses 协议没有 Anthropic 那样的提前开流：循环保护压制期（最长 60 秒）客户端可能收不到任何字节，需要给写入器加锁并发写才能安全补齐，留待后续版本。
