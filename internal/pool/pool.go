@@ -35,6 +35,9 @@ type Pool struct {
 	idleWeightMax     float64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
+	// sourceGateEnabled 来源级限流闸门开关（SetSourceRateGate 注入；默认开启）。
+	// 关闭后上游限流时继续换号，不按 realm 暂停选号。
+	sourceGateEnabled bool
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -70,6 +73,7 @@ type Pool struct {
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
+		sourceGateEnabled:  sourceGateDefault,
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
 		breakerCooldown:    defaultBreakerCooldown,

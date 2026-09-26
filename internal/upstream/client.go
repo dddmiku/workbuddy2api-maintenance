@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-26：重置时间同时认中英文写法（code 6004 英文文案不再被当成无重置限流）。
 // 2026-09-26：明确的参数错误（invalid_request_error/11101/11133）先于限流关键词分类，"too many images" 等不再冷却健康账号。
 // 2026-09-26：出站补齐目录输出预算；超限或窗口边界 11133 时只收缩网关自选预算同号重发（最多两次），不改历史。
 // 2026-09-25：上下文超限直接返回上游原文，移除自动删历史重发，交由客户端完成真正的压缩。
@@ -343,15 +344,22 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 const modelRateLimitCode = "6004"
 
 // softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+const (
+	softRateResetPattern = `将在 (.+?) 重置`
+	// softRateResetPatternEN 上游英文文案：`... your usage will reset at 2026-09-27 05:03:51 UTC+8 ...`
+	// （code 6004 的英文形态）。此前只认中文，英文形态解析不出重置时间，于是被
+	// 当成「无重置时间的 429」喂给来源级闸门，把模型级限额误判成来源限流。
+	softRateResetPatternEN = `(?i)reset at ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?: UTC\+8)?)`
+)
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateReset   = regexp.MustCompile(softRateResetPattern)
+	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
@@ -428,6 +436,9 @@ func IsModelBlocked(status int, body string) bool {
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
 	m := reSoftRateReset.FindStringSubmatch(body)
+	if len(m) < 2 {
+		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
 	if len(m) < 2 {
 		return time.Time{}, false
 	}

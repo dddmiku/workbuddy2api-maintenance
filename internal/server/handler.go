@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：导出 DefaultMaxRotate，供启动日志与配置对齐。
 // 2026-09-26：/update/apply 在未启用时如实拒绝（此前谎报已开始）。
 // 2026-09-26：压制期回调接线（HoldProgress）；已开流时的失败走流内交付。
 // 2026-09-26：错误信封 type 按状态码映射；n<1 拒绝。
@@ -73,12 +74,15 @@ import (
 const maxReasoningLoopRetries = 1
 
 // Config handler 依赖。
+// DefaultMaxRotate 单请求默认最多换号次数：一次客户端请求最多消耗几个账号。
+const DefaultMaxRotate = 3
+
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	APIKey    string         // 空 = 不鉴权
 	APIKeys   *apikeys.Store // 配置后以持久化密钥库为准，空库不放行。
-	MaxRotate int            // 单请求最多换号次数，默认 3
+	MaxRotate int            // 单请求最多换号次数，默认 DefaultMaxRotate
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
@@ -173,7 +177,7 @@ func (h *Handler) reasoningLoopStopOnly() bool {
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
-		cfg.MaxRotate = 3
+		cfg.MaxRotate = DefaultMaxRotate
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）

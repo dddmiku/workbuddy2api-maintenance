@@ -76,3 +76,26 @@ func TestSourceRateGateExpiresAndReopens(t *testing.T) {
 		t.Fatal("gate must not reopen on a single new account")
 	}
 }
+
+// 闸门关闭后：命中不再累计、也不报告暂停 —— 上游限流时继续换号。
+func TestSourceRateGateCanBeDisabled(t *testing.T) {
+	p := New("")
+	defer p.Close()
+	p.SetSourceRateGate(false) // 默认开启；这里先关掉验证开关生效
+	for _, uid := range []string{"a", "b", "c", "d"} {
+		if p.NoteSourceRateLimit("global", uid) {
+			t.Fatalf("disabled gate reported a trip on %s", uid)
+		}
+	}
+	if limited, wait := p.SourceRateGate("global"); limited || wait != 0 {
+		t.Fatalf("disabled gate is still pausing: limited=%v wait=%s", limited, wait)
+	}
+	p.SetSourceRateGate(true)
+	tripped := false
+	for _, uid := range []string{"e", "f", "g"} {
+		tripped = tripped || p.NoteSourceRateLimit("global", uid)
+	}
+	if !tripped {
+		t.Fatal("re-enabled gate did not trip after three distinct accounts")
+	}
+}

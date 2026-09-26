@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：注入来源闸门开关与轮转上限，并打一行生效策略日志。
 // 2026-09-26：预热模型目录；内嵌面板首次启动失败时网关继续服务，面板后台重试。
 // 2026-09-25：启用共享密钥限流与有界请求明细，热交接/信号退出均在在途结束后关闭。
 // 2026-09-25：单容器内托管同版管理台及完整更新包，信号退出同样等待长流和最终状态落盘。
@@ -135,6 +136,18 @@ func main() {
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 来源级限流闸门开关（缺省开启）；关掉后上游限流时继续换号，不按域暂停选号。
+	gateEnabled := cfg.Pool.SourceRateGate == nil || *cfg.Pool.SourceRateGate
+	p.SetSourceRateGate(gateEnabled)
+	rotate := cfg.Pool.MaxRotate
+	if rotate <= 0 {
+		rotate = server.DefaultMaxRotate
+	}
+	gateLabel := "开启（上游限流时暂停该域选号）"
+	if !gateEnabled {
+		gateLabel = "关闭（上游限流时继续换号）"
+	}
+	log.Printf("号池策略：单请求最多换号 %d 次；来源级限流闸门%s", rotate, gateLabel)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -338,6 +351,7 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
+		MaxRotate:             cfg.Pool.MaxRotate,
 		ReasoningLoopGuard:    &cfg.Features.ReasoningLoopGuard,
 		ReasoningLoopStopOnly: cfg.Features.ReasoningLoopStopOnly,
 		Pool:                  p,

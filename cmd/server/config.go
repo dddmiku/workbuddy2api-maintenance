@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：pool 新增 max_rotate 与 source_rate_gate。
 // 2026-09-22：密钥管理默认启用：api_keys_file 留空（含历史示例里的空串）都走
 //
 //	./data/api_keys.json，修掉新装用户照抄 config.example.json 时管理台报
@@ -199,6 +200,13 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
 		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// MaxRotate 单请求最多换号次数（0 = 默认 3）。号多时调大能提高成功率，
+		// 代价是上游持续限流时客户端等得更久。
+		MaxRotate int `json:"max_rotate"`
+		// SourceRateGate 是否启用「来源级限流闸门」（默认 true）。上游短时间内让多个
+		// 不同账号都回「无重置时间的 429」时，闸门会暂停该 realm 的选号并直接回 429；
+		// 关掉后改为继续换号（号多时更实用）。
+		SourceRateGate *bool `json:"source_rate_gate"`
 	} `json:"pool"`
 
 	SessionSticky struct {

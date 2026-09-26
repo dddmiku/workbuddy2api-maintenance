@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-26：来源级闸门可关闭（关后限流继续换号）。
 // 2026-09-23：新增「来源级限流闸门」：上游 14003（too many requests，无重置时间）
 // 在短时间内打中多个不同账号时，判定为出口/来源级限流，按 realm 暂停选号一段时间，
 // 不再把账号一个个送去撞墙。闸门挂在 Pool 实例上，不跨实例共享。
@@ -22,6 +23,10 @@
 package pool
 
 import "time"
+
+// sourceGateDefault 来源级限流闸门默认开关。关掉后不按 realm 暂停选号：
+// 上游限流时继续换号（号多时更实用），代价是账号被逐个送去撞墙。
+const sourceGateDefault = true
 
 const (
 	// sourceRateThreshold 触发闸门所需的不同账号数。
@@ -51,6 +56,9 @@ func (p *Pool) NoteSourceRateLimit(realm, uid string) bool {
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.sourceGateEnabled {
+		return false
+	}
 	if p.sourceRateGates == nil {
 		p.sourceRateGates = map[string]*sourceRateGate{}
 	}
@@ -79,11 +87,21 @@ func (p *Pool) NoteSourceRateLimit(realm, uid string) bool {
 // 用途仅限**同一请求内的轮转决策**：闸门说明「现在再打上游也是白打」，handler 据此
 // 提前收手并如实回 429，而不是把剩余账号一个个送去撞墙。它不是全局熔断——新请求
 // 仍会正常选号（上游限流通常只持续很短一段时间，一刀切拒绝所有新请求反而伤可用性）。
+// SetSourceRateGate 设置来源级限流闸门开关（进程启动时注入；默认开启）。
+func (p *Pool) SetSourceRateGate(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sourceGateEnabled = enabled
+}
+
 func (p *Pool) SourceRateGate(realm string) (bool, time.Duration) {
 	key := realmKeyOr(realm)
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.sourceGateEnabled {
+		return false, 0
+	}
 	gate := p.sourceRateGates[key]
 	if gate == nil || gate.until.IsZero() {
 		return false, 0
