@@ -103,6 +103,8 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 
 旧运行目录不会自动清理（热更新关闭后没有清理逻辑），可定期删除 `data/updates/runtime-*` 中不再需要回滚的那些。
 
+仓库转私有后，`.github/workflows/client-compatibility.yml` 的任务级门禁（要求仓库公开）会让它在每次 push 时**跳过**而不是失败——这是有意保留的公开分发门禁。权威的兼容回归是服务器隔离副本上的完整测试 + 官方 SDK 矩阵，见下文。
+
 想把热更新开回来：`update.enabled` 改回 `true` 并重载网关；私有仓库下还需配置 `update.token`（只读令牌），否则下载会 404。
 
 运行包包含内嵌面板和辅助程序；基础镜像、Python/Bash 或 `docker-entrypoint.sh` 改动仍需重建镜像。首次从旧两容器迁移同样使用完整镜像。详见 [管理台部署](docs/panel.md) 和 [配置说明](docs/configuration.md#热更新)。
