@@ -22,7 +22,11 @@ class CredentialGenerationTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / 'credentials.json'
         self.patchers = [patch.object(app, 'CRED_PATH', str(self.path)),
-                         patch.object(app, 'AUTH_DIR', self.directory.name)]
+                         patch.object(app, 'AUTH_DIR', self.directory.name),
+                         # 登录限流与全站节流的计数不能跨用例沉积，
+                         # 否则后面的合法登录会被误拦。
+                         patch.object(app, '_fails', {}),
+                         patch.object(app, '_global_fails', [])]
         for item in self.patchers:
             item.start()
             self.addCleanup(item.stop)

@@ -173,7 +173,7 @@ class SessionBoundaryTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.doc), encoding="utf-8")
         for name, value in [("AUTH_DIR", self.directory.name), ("CRED_PATH", str(self.path)),
                             ("HTPASSWD_PATH", str(Path(self.directory.name) / "missing-htpasswd")),
-                            ("_revoked", set()), ("_fails", {})]:
+                            ("_revoked", set()), ("_fails", {}), ("_global_fails", [])]:
             patcher = patch.object(app, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)

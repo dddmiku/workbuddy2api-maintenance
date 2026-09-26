@@ -139,7 +139,7 @@ TRUSTED_PROXIES_RAW = os.environ.get(
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7")
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
-PANEL_VERSION = "2.4.4"
+PANEL_VERSION = "2.4.5"
 
 # 网关请求行（logging.go 的表格日志）：
 # | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
@@ -579,6 +579,8 @@ def login_failed(ip):
 def login_ok(ip):
     with _cred_lock:
         _fails.pop(_bucket_key(ip), None)
+        # 管理员成功登录即解除全站节流：真人到场时不应被别人的失败连坐。
+        _global_fails.clear()
 
 
 def _trim_login_buckets_locked():
