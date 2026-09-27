@@ -2,6 +2,7 @@
 // 连登兑换 / 成长抽奖 / 补签 —— 多类独立排程，各自独立开关与独立时点。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 // ═══ 更新日志 ═══
+// 2026-09-28：保活对停用号探活，refresh 成功即自动复活（避免误停用后永远靠人工）。
 // 2026-09-24：签到预刷新成功清除旧会话失效计数，避免间断 12153 累积成永久禁用。
 // 2026-09-17：保留较新调度上下文及奖励幂等，统一凭据快照读取。
 // 2026-09-16：定时任务的凭据存在性判断改读快照，避免与聊天触发的刷新并发竞争。
@@ -777,21 +778,31 @@ func (s *Scheduler) RunKeepaliveNow() {
 func (s *Scheduler) runKeepalive(ctx context.Context) {
 	// 成功路径本来完全静默（只在失败时打 WARN），面板上会是一片空白。
 	// 统计后补一行汇总，至少能看出"刷了几个号、失败几个"。
-	okCnt, failCnt, skipCnt, repairCnt := 0, 0, 0, 0
+	okCnt, failCnt, skipCnt, repairCnt, reviveCnt := 0, 0, 0, 0, 0
 	defer func() {
-		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d，补注册地 %d", okCnt, failCnt, skipCnt, repairCnt)
+		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d，补注册地 %d，自动复活 %d",
+			okCnt, failCnt, skipCnt, repairCnt, reviveCnt)
 	}()
 	for _, st := range s.cfg.Pool.List() {
 		if ctx.Err() != nil {
 			return
 		}
-		if st.Disabled {
-			skipCnt++
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.Snapshot().RefreshToken == "" {
 			skipCnt++
+			continue
+		}
+		if st.Disabled {
+			// 停用号不再永久躺平：refresh 成功即证明账号在鉴权层还活着（P0-1 实测：13 个
+			// 被误停用的号 refresh 全部成功，是历史误判的受害者），据此自动复活回到池中。
+			// 真正被封的号复活后会因连续两次账号故障再次被禁用——代价只是两次很快的失败。
+			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				skipCnt++
+				continue
+			}
+			s.cfg.Pool.ReviveDisabled(st.UID)
+			reviveCnt++
+			log.Printf("INFO: keepalive %s: 处于停用但 refresh 成功 — 自动复活并回到池中", logfmt.UID8(st.UID))
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
