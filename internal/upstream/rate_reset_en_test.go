@@ -27,3 +27,19 @@ func TestParseRateResetAcceptsEnglishUsageLimit(t *testing.T) {
 		})
 	}
 }
+
+// 11140 的两种含义：displayMsg 指明内容审核拒绝时按请求级处理，不判账号故障。
+func TestClassifySeparatesContentReviewFromAccountBan(t *testing.T) {
+	review := `{"code":11140,"msg":"request illegal","requestId":"af11e881","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请修改后重试。"}}`
+	if got := Classify(403, review); got != ErrContentBlocked {
+		t.Fatalf("content review classified as %s, want content_blocked", got)
+	}
+	zhOnly := `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"内容未通过安全审核，请修改后重试。"}}`
+	if got := Classify(403, zhOnly); got != ErrContentBlocked {
+		t.Fatalf("chinese content review classified as %s, want content_blocked", got)
+	}
+	ban := `{"code":11140,"msg":"request illegal","requestId":"x","displayMsg":{"en":"Forbidden","zh":"无权限"}}`
+	if got := Classify(403, ban); got != ErrAccountFault {
+		t.Fatalf("genuine authorization fault classified as %s, want account_fault", got)
+	}
+}

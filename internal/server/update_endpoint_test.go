@@ -147,3 +147,34 @@ func TestUpdateApplyRefusesWhenDisabled(t *testing.T) {
 		t.Fatalf("disabled apply claimed to have started: %s", body)
 	}
 }
+
+// 人工复活被停用账号：仅管理通道，清除 disabled 后可立即被选中。
+func TestReviveAccountEndpoint(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "revive-me", AccessToken: "at", ExpiresAt: 9999999999})
+	p.Disable("revive-me", "test disable")
+	handler := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return http.StatusOK, sseOK, true }), APIKey: "legacy-key"})
+
+	// 调用密钥（非本机管理通道）不能复活账号。
+	recorder := httptest.NewRecorder()
+	forged := httptest.NewRequest(http.MethodPost, "/accounts/revive", strings.NewReader(`{"uid":"revive-me"}`))
+	forged.Header.Set("Authorization", "Bearer legacy-key")
+	handler.ServeHTTP(recorder, forged)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("外部调用复活接口应 401，实际 %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.InternalHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/accounts/revive", strings.NewReader(`{"uid":"revive-me"}`)))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok":true`) {
+		t.Fatalf("复活失败: %d %s", recorder.Code, recorder.Body)
+	}
+	if state, _ := p.Status("revive-me"); state.Disabled {
+		t.Fatalf("账号仍处于禁用: %+v", state)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.InternalHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/accounts/revive", strings.NewReader(`{"uid":"missing"}`)))
+	if !strings.Contains(recorder.Body.String(), "账号不存在") {
+		t.Fatalf("未知 uid 应如实报错: %s", recorder.Body)
+	}
+}

@@ -1,6 +1,7 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
 // 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 // ═══ 更新日志 ═══
+// 2026-09-28：新增 NoteAccountFault；成功与复活时清零计数。
 // 2026-09-25：粘性旧入口复用锁内选择实现，保留原语义并为新接口提供真实决策事实。
 // 2026-09-25：每次成败同时衰减相反观测，避免近期成功率被历史记录永久钉在约 50%。
 // 2026-09-24：余额恢复仅解除余额冷却，探活始终服从账号级冷却与熔断。
@@ -63,6 +64,26 @@ func (p *Pool) ClearSessionDead(uid string) {
 	}
 }
 
+// NoteAccountFault 记录一次账号级授权故障（ErrAccountFault，11140 "request illegal"），
+// 返回是否达到阈值并已禁用。未达阈值时只记账（换号继续，不冷却）：阈值保护见
+// accountFaultThreshold 的注释。
+func (p *Pool) NoteAccountFault(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.accountFaultFails++
+	if e.accountFaultFails < accountFaultThreshold {
+		p.dirty.Store(true)
+		return false
+	}
+	e.accountFaultFails = 0
+	p.disableLocked(e, accountFaultReason)
+	return true
+}
+
 // ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
@@ -74,7 +95,8 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
-		p.markStateFieldsLocked(uid, "disabled", "reason", "session_dead_fails")
+		e.accountFaultFails = 0
+		p.markStateFieldsLocked(uid, "disabled", "reason", "session_dead_fails", "account_fault_fails")
 	}
 }
 
@@ -224,7 +246,8 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
-		p.markStateFieldsLocked(uid, "breaker_until", "retry_count", "soft_streak", "session_dead_fails")
+		e.accountFaultFails = 0
+		p.markStateFieldsLocked(uid, "breaker_until", "retry_count", "soft_streak", "session_dead_fails", "account_fault_fails")
 	}
 }
 

@@ -1,5 +1,6 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 // ═══ 更新日志 ═══
+// 2026-09-28：新增账号级授权故障连续计数（与 12153 同款保护）。
 // 2026-09-25：健康判断与调度解释共用同一首个阻断条件，保留账号优先于模型限制的既有顺序。
 // 2026-09-24：移除绕过账号冷却的旧模型豁免判据，保持模型与账号限制正交。
 // 2026-09-24：11102 到期后有界保留命中计数，使半开重试失败能继续退避。
@@ -135,6 +136,9 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// accountFaultFails 连续 ErrAccountFault（11140 "request illegal" 等账号级授权故障）
+	// 计数：与 12153 同款保护，一次 403 不再直接永久禁用。持久化语义同 sessionDeadFails。
+	accountFaultFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
@@ -268,6 +272,8 @@ type stateAccount struct {
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
 	// 零值也显式写出（运维口径，见 err_total 注释）。
 	SessionDeadFails int `json:"session_dead_fails"`
+	// AccountFaultFails 连续账号级授权故障计数（零值省略：多数账号从未出现过）。
+	AccountFaultFails int `json:"account_fault_fails,omitempty"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
@@ -367,6 +373,20 @@ const sessionDeadReason = "12153 session dead"
 
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }
+
+// accountFaultThreshold 连续 ErrAccountFault（11140）达到该次数才永久禁用。
+//
+// 与 12153 同款保护：一次 403 就永久杀号会误杀健康账号——2026-09-27 实测上游把
+// **内容未通过安全审核**的请求也回成 11140 + 泛化 "request illegal"，两个健康号
+// 因此被停用。内容类已在 Classify 里改判为请求级；这里再留一层阈值保护，代价是
+// 真正被封的号多被选中一两次（每次失败都会立刻换号，不影响客户端成功率）。
+const accountFaultThreshold = 2
+
+// accountFaultReason 账号级授权故障达到阈值时的持久化 reason。
+const accountFaultReason = "account banned by upstream (11140 request illegal), re-login required"
+
+// AccountFaultThreshold 暴露连续 11140 的禁用阈值（供日志/运维文档引用）。
+func AccountFaultThreshold() int { return accountFaultThreshold }
 
 // softStreakShiftMax 软冷却退避的最大左移位数（防 1<<streak 溢出成负数/零）。
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。

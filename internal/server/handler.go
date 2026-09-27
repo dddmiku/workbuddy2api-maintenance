@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：新增管理通道复活账号入口 POST /accounts/revive。
+// 2026-09-28：11140 账号故障改为连续计数后才禁用。
 // 2026-09-26：导出 DefaultMaxRotate，供启动日志与配置对齐。
 // 2026-09-26：/update/apply 在未启用时如实拒绝（此前谎报已开始）。
 // 2026-09-26：压制期回调接线（HoldProgress）；已开流时的失败走流内交付。
@@ -226,6 +228,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /update", h.requireInternal(h.updateStatus))
 	h.mux.HandleFunc("POST /update/check", h.requireInternal(h.updateCheck))
 	h.mux.HandleFunc("POST /update/apply", h.requireInternal(h.updateApply))
+	h.mux.HandleFunc("POST /accounts/revive", h.requireInternal(h.reviveAccount))
 	// 重复推理保护的「命中后怎么办」热切换，同样只走本机管理通道：它改变的是所有
 	// 调用方看到的行为，不能让任一调用密钥自己改。
 	h.mux.HandleFunc("GET /features/reasoning-loop", h.requireInternal(h.reasoningLoopFeature))
@@ -433,6 +436,47 @@ func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cfg.Update.Status()})
+}
+
+// reviveAccount 人工复活被停用的账号（仅管理通道）：清除 disabled 与原因，账号回到
+// 池中（若无其他冷却/熔断则立即可选）。
+//
+// 需要它的原因：上游会把「内容未通过安全审核」也回成 11140，早前版本据此硬禁用账号
+// （2026-09-27 两个健康号被误停用）；修正分类后仍可能有其它误判，运维需要一个恢复入口。
+func (h *Handler) reviveAccount(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Pool == nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "账号池不可用"})
+		return
+	}
+	var body struct {
+		UID string `json:"uid"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "读取请求体失败"})
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体必须是 JSON 对象"})
+			return
+		}
+	}
+	uid := strings.TrimSpace(body.UID)
+	if uid == "" {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "需要 uid"})
+		return
+	}
+	before, known := h.cfg.Pool.Status(uid)
+	if !known {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "账号不存在"})
+		return
+	}
+	h.cfg.Pool.ReviveDisabled(uid)
+	after, _ := h.cfg.Pool.Status(uid)
+	log.Printf("INFO: [server] account revived uid=%s (was disabled=%v reason=%q)",
+		logfmt.UID8(uid), before.Disabled, before.DisabledReason)
+	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "disabled": after.Disabled, "was_disabled": before.Disabled})
 }
 
 // updateCheck 查询远端最新版本（只读，不改动任何东西）。
@@ -1743,14 +1787,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrAccountFault:
 		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
 		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
-		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
+		//     恢复（需重新 OAuth 登录）。**连续**达到 accountFaultThreshold 才硬禁用
+		//     （NoteAccountFault）——上游也会用同一条码回内容审核拒绝，单次即杀会误伤
+		//     健康号（2026-09-27 实测两个号因此被停用）。/status 以 disabled +
+		//     disabled_reason 呈现。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+			// 连续计数达到阈值才禁用（与 12153 同款保护）：上游会把「内容未通过安全
+			// 审核」也回成 11140 + "request illegal"，一次 403 就永久杀号会误杀健康号。
+			h.cfg.Pool.NoteAccountFault(uid)
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")

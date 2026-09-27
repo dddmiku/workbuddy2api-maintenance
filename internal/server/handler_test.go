@@ -510,8 +510,8 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 
 // TestChatAccountFault11140Disables 账号级授权封禁（11140 request illegal，实测为
 // global 账号 auth_forbidden 风控）：软冷却到期也不会自动恢复（需重新 OAuth 登录），
-// 到期后重新选号只会再撞 403 浪费轮换——故**硬禁用**（不在池中参与选号），同一请求
-// 轮换到下一个号、后续请求直接跳过。
+// 到期后重新选号只会再撞 403 浪费轮换——**连续两次**命中后硬禁用（不在池中参与选号），
+// 单次只换号不禁用：上游也会用同一条码回内容审核拒绝（2026-09-27 两个健康号被误停用）。
 // 修复前 Classify 对 403+request illegal 归 ErrClient → applyErrorPolicy 走 default
 // 只换号不罚，坏号留在可用池反复被选中刷风控；软冷却列后来只是临时止血，到期复发。
 func TestChatAccountFault11140Disables(t *testing.T) {
@@ -538,13 +538,22 @@ func TestChatAccountFault11140Disables(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	// 坏号只打一次即被禁用并轮换到 good：无无限重试。
+	// 第一次命中只记账（与 12153 同款阈值保护，避免单次误判杀号），当场换号到 good。
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
+	if st, _ := p.Status("bad"); st.Disabled {
+		t.Fatalf("单次 11140 不应直接禁用（阈值保护）: %+v", st)
+	}
+	// 第二次命中达到阈值 → 硬禁用。
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec1.Code != 200 || calls["Bearer at-bad"] != 2 {
+		t.Fatalf("第二次请求应再撞一次坏号：code=%d calls=%v", rec1.Code, calls)
+	}
 	st, _ := p.Status("bad")
 	if !st.Disabled {
-		t.Fatalf("bad 应被硬禁用（11140 封禁需重登，不可自愈）: %+v", st)
+		t.Fatalf("连续两次 11140 应硬禁用（封禁需重登，不可自愈）: %+v", st)
 	}
 	wantReason := "account banned by upstream (11140 request illegal), re-login required"
 	if st.DisabledReason != wantReason {
@@ -619,7 +628,7 @@ func TestChatAccountFault14017Rotates(t *testing.T) {
 }
 
 // TestApplyErrorPolicyAccountFaultSplit applyErrorPolicy 层直接回归：同一 ErrAccountFault
-// 分类下按 msg 分野——"request illegal"(11140) → 硬禁用；"trial"(14017) → 软冷却不禁用。
+// 分类下按 msg 分野——"request illegal"(11140) → 连续两次后硬禁用；"trial"(14017) → 软冷却不禁用。
 // 端到端接线由上方 TestChatAccountFault11140Disables / TestChatAccountFault14017Rotates 覆盖。
 func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 	const why11140 = "account banned by upstream (11140 request illegal), re-login required"
@@ -629,10 +638,15 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2")
+		const body11140 = `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, body11140, "glm-5.2")
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("单次 11140 不应直接禁用（阈值保护）: %+v", st)
+		}
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, body11140, "glm-5.2")
 		st, _ := p.Status("u1")
 		if !st.Disabled {
-			t.Fatalf("11140 应硬禁用: %+v", st)
+			t.Fatalf("连续两次 11140 应硬禁用: %+v", st)
 		}
 		if st.DisabledReason != why11140 {
 			t.Errorf("disabled_reason=%q want %q", st.DisabledReason, why11140)

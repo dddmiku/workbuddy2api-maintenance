@@ -168,21 +168,22 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			successEMA:       successEMA,
-			errorEMA:         errorEMA,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			creditsExpiring:  expiring,
+			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:           s.Credits,
+			disabled:          s.Disabled,
+			reason:            s.Reason,
+			until:             s.Until,
+			coolKind:          s.CoolKind,
+			successCount:      s.SuccessCount,
+			errTotal:          errTotal,
+			successEMA:        successEMA,
+			errorEMA:          errorEMA,
+			lastErr:           s.LastErr,
+			lastSuccess:       s.LastSuccess,
+			softStreak:        s.SoftStreak,
+			sessionDeadFails:  s.SessionDeadFails,
+			accountFaultFails: s.AccountFaultFails,
+			creditsExpiring:   expiring,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -411,23 +412,24 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		// 与 statusOf（state.go）共用 cooledReasonLocked，保证落盘与查询同口径。
 		coolKind, reason := cooledReasonLocked(e, now)
 		sf.Accounts[uid] = stateAccount{
-			Credits:          e.credits,
-			Disabled:         e.disabled,
-			Reason:           reason,
-			Until:            e.until,
-			CoolKind:         coolKind,
-			SuccessCount:     e.successCount,
-			ErrTotal:         e.errTotal,
-			SuccessEMA:       e.successEMA,
-			ErrorEMA:         e.errorEMA,
-			LastSuccess:      e.lastSuccess,
-			LastErr:          e.lastErr,
-			SoftStreak:       e.softStreak,
-			SessionDeadFails: e.sessionDeadFails,
-			BreakerUntil:     breakerUntil,
-			RetryCount:       retryCount,
-			CreditsExpiring:  e.creditsExpiring,
-			ModelCooldowns:   mcs,
+			Credits:           e.credits,
+			Disabled:          e.disabled,
+			Reason:            reason,
+			Until:             e.until,
+			CoolKind:          coolKind,
+			SuccessCount:      e.successCount,
+			ErrTotal:          e.errTotal,
+			SuccessEMA:        e.successEMA,
+			ErrorEMA:          e.errorEMA,
+			LastSuccess:       e.lastSuccess,
+			LastErr:           e.lastErr,
+			SoftStreak:        e.softStreak,
+			SessionDeadFails:  e.sessionDeadFails,
+			AccountFaultFails: e.accountFaultFails,
+			BreakerUntil:      breakerUntil,
+			RetryCount:        retryCount,
+			CreditsExpiring:   e.creditsExpiring,
+			ModelCooldowns:    mcs,
 		}
 	}
 	return sf

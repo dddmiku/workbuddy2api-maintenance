@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-28：11140 的内容审核拒绝（displayMsg）先于账号故障判定，不再误禁健康号。
 // 2026-09-26：重置时间同时认中英文写法（code 6004 英文文案不再被当成无重置限流）。
 // 2026-09-26：明确的参数错误（invalid_request_error/11101/11133）先于限流关键词分类，"too many images" 等不再冷却健康账号。
 // 2026-09-26：出站补齐目录输出预算；超限或窗口边界 11133 时只收缩网关自选预算同号重发（最多两次），不改历史。
@@ -183,6 +184,15 @@ var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns
 // Classify 会先返回 ErrChannelRejected，不能据此给调用者安上内容违规原因。
 var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, patterns: []string{
 	"blocked by security policy",
+	// 2026-09-27 实测：上游对「内容未通过安全审核」的请求回 403 + code 11140，主 msg 是
+	// 泛化的 "request illegal"，真实原因只在 displayMsg 里（en: The content did not pass
+	// the safety review. / zh: 内容未通过安全审核）。只认主 msg 会把请求级内容拦截当成
+	// 账号级封禁——两个健康号因此被停用。
+	"did not pass the safety review",
+	"failed the safety review",
+	"content review",
+	"未通过安全审核",
+	"安全审核不通过",
 }}
 
 // wafBlockRule 上游 WAF 拦截页特征：返回的是 HTML 页面而不是 JSON 信封。
@@ -529,6 +539,12 @@ func Classify(status int, body string) ErrKind {
 	// 被拒」把整段 HTML 回显给调用方（见 isUpstreamGatewayPage 注释）。
 	if isUpstreamGatewayPage(body) {
 		return ErrUpstreamGateway
+	}
+	// 内容审核拦截先于账号级判定：同一条 11140 既表示账号授权封禁、也表示内容审核拒绝，
+	// 区别只在 displayMsg（见 contentBlockedRule 注释）。先判内容，避免把请求级拦截
+	// 当成账号故障去禁用健康号。
+	if contentBlockedRule.hit(body, lower) {
+		return ErrContentBlocked
 	}
 	if hardRule.hit(body, lower) {
 		return ErrHardCredit
