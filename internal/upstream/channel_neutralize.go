@@ -368,8 +368,6 @@ func wordBreakPoints(text string, start, end int) []int {
 //
 // 只提前断这里列出的字符串，不动任何其他内容：零宽空格不改变模型读到的文字，也不影响
 // 任何客户端的解析；触发词之外的正文一律原样发送。
-// zwsp 是零宽空格：上游看到的文字不变，但渠道校验的字符串匹配被断开。
-const zwsp = "\u200b"
 
 var billingHeaderTriggers = []string{
 	// 2026-09-28 实测：Claude Code 2.1.283 系统提示首行的计费归属头。整行被拒、只留头名
