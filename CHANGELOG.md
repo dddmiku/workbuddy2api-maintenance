@@ -2,6 +2,15 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.21 — 2026-09-28
+
+面板请求明细的协议显示名改用全称，避免和别的协议混淆。
+
+- 「协议」列与详情页原来把 Anthropic Messages 显示成 `Messages`、Gemini generateContent 显示成
+  `Gemini`。现在统一为 `Anthropic Messages` 与 `Gemini generateContent`（与文档、README 的写法一致）。
+- 文档与 README 里的大小写一并归一（`Anthropic messages` → `Anthropic Messages`，
+  `Gemini generate content` → `Gemini generateContent`）。
+
 ## v2.4.20 — 2026-09-28
 
 把计费头断词从「撞墙后补救」改成「发送前处理」，消掉每个请求白花的那一次往返。
