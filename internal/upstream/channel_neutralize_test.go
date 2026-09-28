@@ -103,14 +103,15 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("attempts=%d want 2 (one neutralised retry)", len(bodies))
 	}
-	if !bytes.Contains(bodies[0], []byte(channelTriggerSentence)) {
-		t.Fatalf("first attempt should keep the original sentence: %s", bodies[0])
+	// 2026-09-28 起，已实测指纹（含这条 Codex 归属句）在**发送前**就断词，所以第一次请求
+	// 里触发句已被断开；重试（若发生）必须同样不含原文。
+	for index, sent := range bodies {
+		if bytes.Contains(sent, []byte(channelTriggerSentence)) {
+			t.Fatalf("attempt %d still carries the raw trigger sentence: %s", index+1, sent)
+		}
 	}
-	if bytes.Contains(bodies[1], []byte(channelTriggerSentence)) {
-		t.Fatalf("retry still carries the trigger sentence: %s", bodies[1])
-	}
-	if !bytes.Contains(bodies[1], []byte(wafBreakMarker)) {
-		t.Fatalf("retry carries no break marker: %s", bodies[1])
+	if !bytes.Contains(bodies[0], []byte(wafBreakMarker)) {
+		t.Fatalf("pre-neutralised first attempt carries no break marker: %s", bodies[0])
 	}
 }
 
@@ -236,15 +237,15 @@ func TestTriggerTablesHoldCleanStrings(t *testing.T) {
 			t.Errorf("channelTriggerSentences entry is not a clean literal: %q", entry)
 		}
 	}
-	for _, entry := range billingHeaderTriggers {
+	for _, entry := range preNeutralizeTriggers {
 		if strings.Contains(entry, zwspChar) {
-			t.Errorf("billingHeaderTriggers entry is not a clean literal: %q", entry)
+			t.Errorf("preNeutralizeTriggers entry is not a clean literal: %q", entry)
 		}
 	}
 	// 干净串必须能匹配客户端原文并触发断词
 	clean := "x-anthropic-billing-header: cc_version=2.1.283.a2f;"
 	matched := false
-	for _, entry := range billingHeaderTriggers {
+	for _, entry := range preNeutralizeTriggers {
 		if strings.Contains(clean, entry) {
 			matched = true
 		}

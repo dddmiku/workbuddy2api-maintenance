@@ -362,20 +362,22 @@ func wordBreakPoints(text string, start, end int) []int {
 	return points
 }
 
-// billingHeaderTriggers 客户端在系统提示里写入的「计费/归属头」字符串。它们对模型没有
-// 语义价值，却会被上游当成渠道特征拒掉，且**每个请求都会出现**，所以不能等撞墙再重试：
-// 那样每个请求都要白白多花一次往返（实测 76/79 的请求都是「先被拒一次再靠第 0 档救回」）。
+// preNeutralizeTriggers 发送前就要断开的触发串。
 //
-// 只提前断这里列出的字符串，不动任何其他内容：零宽空格不改变模型读到的文字，也不影响
-// 任何客户端的解析；触发词之外的正文一律原样发送。
-
-var billingHeaderTriggers = []string{
-	// 2026-09-28 实测：Claude Code 2.1.283 系统提示首行的计费归属头。整行被拒、只留头名
-	// 也被拒；"x-anthropic-" 或 "x-anthropic-version:" 等其他头通过。
+// 为什么不能只断计费头：这些串几乎每个请求都出现，而线上实测显示，只提前断计费头时仍有
+// 约六成请求被 11128 拒一次、再靠第 0 档补救成功（每次白花 200–500ms 往返）——剩下那两条
+// 归属句同样在触发校验。既然第 0 档本来就会在拒绝后断它们，就直接提前断，省掉这次往返。
+// 零宽空格不可见，模型读到的文字与客户端解析都不变；触发词之外的正文一律原样发送。
+var preNeutralizeTriggers = []string{
+	// Claude Code 2.1.283 系统提示首行的计费归属头：整行被拒、只留头名也被拒；
+	// "x-anthropic-" 或 "x-anthropic-version:" 等其他头通过（2026-09-28 实测）。
 	"x-anthropic-billing-header",
+	// 以下两条来自第 0 档已实测指纹（channelTriggerSentences）。
+	"Codex CLI is an open source project led by OpenAI",
+	"You are Claude Code, Anthropic's official CLI for Claude",
 }
 
-// NeutralizeBillingHeaders 提前断开已知的计费头触发串；没有命中时原样返回 false。
+// NeutralizeBillingHeaders 提前断开已知的渠道触发串；没有命中时原样返回 false。
 // 与 NeutralizeChannelTriggerAt 的分工：这里是「已知必被拒、且无信息价值」的提前处理，
 // 那边是「被拒之后的逐档补救」。
 func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
@@ -387,7 +389,7 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	changed := false
-	obj = neutralizeBillingValue(obj, &changed)
+	obj = neutralizePreemptValue(obj, &changed)
 	if !changed {
 		return body, false
 	}
@@ -398,19 +400,19 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 	return out, true
 }
 
-// neutralizeBillingValue 递归遍历解码后的 JSON，断开计费头触发串。
-func neutralizeBillingValue(value any, changed *bool) any {
+// neutralizePreemptValue 递归遍历解码后的 JSON，断开计费头触发串。
+func neutralizePreemptValue(value any, changed *bool) any {
 	switch node := value.(type) {
 	case string:
-		return neutralizeBillingText(node, changed)
+		return neutralizePreemptText(node, changed)
 	case []any:
 		for i, item := range node {
-			node[i] = neutralizeBillingValue(item, changed)
+			node[i] = neutralizePreemptValue(item, changed)
 		}
 		return node
 	case map[string]any:
 		for key, item := range node {
-			node[key] = neutralizeBillingValue(item, changed)
+			node[key] = neutralizePreemptValue(item, changed)
 		}
 		return node
 	default:
@@ -418,13 +420,13 @@ func neutralizeBillingValue(value any, changed *bool) any {
 	}
 }
 
-// neutralizeBillingText 在单个字符串内断开全部计费头触发串。
-func neutralizeBillingText(text string, changed *bool) string {
+// neutralizePreemptText 在单个字符串内断开全部计费头触发串。
+func neutralizePreemptText(text string, changed *bool) string {
 	if text == "" {
 		return text
 	}
 	insertAt := map[int]struct{}{}
-	for _, trigger := range billingHeaderTriggers {
+	for _, trigger := range preNeutralizeTriggers {
 		start := 0
 		for {
 			index := indexFrom(text, trigger, start)

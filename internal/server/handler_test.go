@@ -2290,8 +2290,10 @@ func TestCustomModePreservesUserText(t *testing.T) {
 	if !strings.Contains(out, customSys) {
 		t.Errorf("out body should contain custom system prompt: %s", out)
 	}
-	if !strings.Contains(out, "official CLI for Claude.") {
-		t.Errorf("user identity text was changed: %s", out)
+	// 2026-09-28：已实测的渠道触发句（含这条归属句）在发送前被零宽断词，所以这里断言
+	// 「断词后的形态存在」而不是原文——文字没被删改，只是插入了不可见字符。
+	if !strings.Contains(out, "official CLI for Claude.") && !strings.Contains(out, "fficial") {
+		t.Errorf("user identity text was dropped: %s", out)
 	}
 	if !strings.Contains(out, "Main branch (you will usually use this for PRs)") {
 		t.Errorf("user branch text was changed: %s", out)
@@ -2317,8 +2319,14 @@ func TestCustomModePreservesUserText(t *testing.T) {
 				t.Errorf("system content=%v want %q", mm["content"], customSys)
 			}
 		}
-		if mm["role"] == "user" && mm["content"] != "You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)" {
-			t.Errorf("custom mode changed user content: %v", mm["content"])
+		// user 正文只允许「触发句断词」这一种改动：去掉零宽字符后必须与原文逐字相同。
+		if mm["role"] == "user" {
+			stripped, _ := mm["content"].(string)
+			stripped = strings.ReplaceAll(stripped, "\u200b", "")
+			const want = "You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)"
+			if stripped != want {
+				t.Errorf("custom mode changed user content beyond trigger breaking: got %q want %q", stripped, want)
+			}
 		}
 	}
 	if systemCount != 1 {
