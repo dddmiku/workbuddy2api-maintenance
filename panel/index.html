@@ -3410,13 +3410,18 @@ function renderUpdate(){
   box.innerHTML = rows;
   $('#updState').innerHTML = upState(s.state);
   $('#btnUpdCheck').disabled = busy;
-  // 未检查过远端时也允许点「立即更新」：网关自己会先查一次远端版本。
-  $('#btnUpdApply').disabled = busy;
+  // 「立即更新」只在**确实有可升级版本**时可用：
+  //   - 检查过且 update_ready=true → 可点；
+  //   - 还没检查过（latest_tag 为空且无 checked_at）→ 可点，网关会先查一次远端；
+  //   - 检查过但没有可升级版本（已是最新）→ 禁用，否则点下去会把服务白重启一遍。
+  var checked = !!s.checked_at;
+  var canApply = !busy && (!checked || !!s.update_ready);
+  $('#btnUpdApply').disabled = !canApply;
   var hint;
   if (s.state === 'failed') hint = s.last_error || '更新失败';
   else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
-  else if (s.checked_at) hint = '已是最新版本';
+  else if (s.checked_at) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
   else hint = '点「立即更新」会先检查远端版本';
   $('#updHint').textContent = hint;
 }
@@ -3465,6 +3470,11 @@ async function actUpdateCheck(){
 
 async function actUpdateApply(){
   var s = (UP.data && UP.data.status) || {};
+  // 兜底：按钮已按 update_ready 禁用，这里再挡一次，避免通过其它入口触发无意义的重启。
+  if (s.checked_at && !s.update_ready){
+    toast('已是最新版本（' + (s.latest_tag || s.current || '') + '），无需更新', 'ok');
+    return;
+  }
   ask('立即更新',
     '将下载并切换到 ' + (s.latest_tag || '最新版本') + '。升级时正在进行的对话会继续跑完，不会中断；' +
     '控制台页面可能会短暂失去响应，稍后自动恢复。',

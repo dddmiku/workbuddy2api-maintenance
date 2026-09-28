@@ -194,17 +194,13 @@ CURRENT_VIEW='logs';location.hash='#logs';$('#btnRefresh').events.click();return
         self.assertEqual(result, ["state", "usage", "state", "logs"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
     def test_update_page_reports_a_disabled_gateway(self):
         result = self.run_frontend("""
 UP.data={ok:true,status:{enabled:false,current:'v2.4.10',commit:'111b07023e0a',state:'idle'}};
 renderUpdate();
 return {apply:$('#btnUpdApply').disabled, check:$('#btnUpdCheck').disabled,
         state:$('#updState').textContent, hint:$('#updHint').textContent,
-        body:$('#updBody').innerHTML};
+        body:$('#updRows').innerHTML};
 """, extra_sources=("update.js",))
         self.assertTrue(result["apply"], "关闭热更新后「立即更新」按钮必须禁用")
         self.assertTrue(result["check"], "关闭热更新后「检查更新」按钮必须禁用")
@@ -220,3 +216,57 @@ return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
 """, extra_sources=("update.js",))
         self.assertFalse(result["apply"])
         self.assertIn("v2.4.11", result["hint"])
+
+    def test_update_apply_disabled_when_already_latest(self):
+        """已是最新版本时「立即更新」必须禁用。
+
+        2026-09-28 实测 bug：面板只看 busy，没看 update_ready，于是显示「已是最新版本」
+        的同时按钮仍可点——点下去会白下载、白验签、白交接一次，把服务重启一遍而版本号不变。
+        """
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.23',
+  latest_tag:'v2.4.23',update_ready:false,checked_at:'2026-09-28T14:36:17Z',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, check:$('#btnUpdCheck').disabled,
+        hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "已是最新版本时「立即更新」必须禁用")
+        self.assertFalse(result["check"], "已是最新版本时「检查更新」仍应可用")
+        self.assertIn("已是最新版本", result["hint"])
+
+    def test_update_apply_enabled_when_an_update_exists(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.22',
+  latest_tag:'v2.4.23',update_ready:true,checked_at:'2026-09-28T14:36:17Z',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"], "有可升级版本时「立即更新」必须可用")
+        self.assertIn("可升级到", result["hint"])
+
+    def test_update_apply_enabled_before_first_check(self):
+        """还没检查过远端时允许点「立即更新」：网关会先查一次远端版本。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.22',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"], "未检查过远端时应允许点，由网关先查一次")
+        self.assertIn("检查远端版本", result["hint"])
+
+    def test_update_page_reports_private_repo_without_token(self):
+        """私有仓库未配令牌：不可用，且必须说明原因（而不是一个无法解释的失败）。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'private',current:'v2.4.23',
+  unavailable_reason:'发布仓库已转为私有，匿名读不到 Release；把仓库改回公开，或配置 update.token'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, state:$('#updState').textContent,
+        hint:$('#updHint').textContent, body:$('#updRows').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "私有仓库未配令牌时「立即更新」必须禁用")
+        self.assertEqual(result["state"], "不可用")
+        self.assertIn("update.token", result["body"])
+
+
+if __name__ == "__main__":
+    unittest.main()
