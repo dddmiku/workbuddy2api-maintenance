@@ -169,6 +169,18 @@ func TestChatStreamWireBodyPreservesBusinessContent(t *testing.T) {
 				t.Fatal(err)
 			}
 			messages[1].(map[string]any)["role"] = "system"
+			// 计费头会在发送前断词（2026-09-28）：它没有语义价值却被上游当渠道特征拒掉。
+			// 期望值按同一规则断词，其余内容必须逐字节一致。
+			for _, raw := range messages {
+				m, _ := raw.(map[string]any)
+				if text, ok := m["content"].(string); ok {
+					if broken, changed := NeutralizeBillingHeaders([]byte(`{"c":` + mustJSON(text) + `}`)); changed {
+						var wrap map[string]any
+						_ = json.Unmarshal(broken, &wrap)
+						m["content"] = wrap["c"]
+					}
+				}
+			}
 			if !reflect.DeepEqual(got["messages"], messages) {
 				t.Errorf("business content changed on the wire\ngot:  %#v\nwant: %#v", got["messages"], messages)
 			}
@@ -193,4 +205,10 @@ func fidelityMessagesForRole(role string, content any) []any {
 		}},
 		message,
 	}
+}
+
+// mustJSON 把字符串编码为 JSON 字面量，供测试拼装请求体。
+func mustJSON(value string) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
 }

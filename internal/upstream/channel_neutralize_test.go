@@ -195,7 +195,8 @@ func TestChannelTriggerCoversClaudeCodeBillingHeader(t *testing.T) {
 // TestNeutralizeBillingHeadersPreemptsTheRetry 计费头必须在发送前就断词：
 // 它几乎每个请求都出现，等到被拒再重试等于每个请求白花一次往返。
 func TestNeutralizeBillingHeadersPreemptsTheRetry(t *testing.T) {
-	header := "x​-a​nthropic-b​illing-h​eader"
+	// 客户端发来的是干净原文；断词由中性化函数负责。
+	header := ccHeader
 	body := []byte(`{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"` + header +
 		`: cc_version=2.1.283.a2f;"}]},{"role":"user","content":"hi"}]}`)
 	out, changed := NeutralizeBillingHeaders(body)
@@ -220,5 +221,38 @@ func TestNeutralizeBillingHeadersPreemptsTheRetry(t *testing.T) {
 	clean := []byte(`{"model":"m","messages":[{"role":"user","content":"x-anthropic-version: 1"}]}`)
 	if out, changed := NeutralizeBillingHeaders(clean); changed {
 		t.Fatalf("must not touch a body without the trigger: %s", out)
+	}
+}
+
+// TestTriggerTablesHoldCleanStrings 触发词表里必须是「干净原文」。
+//
+// 这个检查有实际来历：2026-09-28 那次修复里，触发串在编辑过程中被写成了带零宽空格的
+// 形式，于是它永远匹配不到客户端发来的干净原文，第 0 档「命中」却救不回来——现象是
+// 每个请求仍然被拒、仍要多花一次往返。断词必须由中性化函数在匹配之后插入。
+func TestTriggerTablesHoldCleanStrings(t *testing.T) {
+	zwspChar := "\u200b"
+	for _, entry := range channelTriggerSentences {
+		if strings.Contains(entry, zwspChar) {
+			t.Errorf("channelTriggerSentences entry is not a clean literal: %q", entry)
+		}
+	}
+	for _, entry := range billingHeaderTriggers {
+		if strings.Contains(entry, zwspChar) {
+			t.Errorf("billingHeaderTriggers entry is not a clean literal: %q", entry)
+		}
+	}
+	// 干净串必须能匹配客户端原文并触发断词
+	clean := "x-anthropic-billing-header: cc_version=2.1.283.a2f;"
+	matched := false
+	for _, entry := range billingHeaderTriggers {
+		if strings.Contains(clean, entry) {
+			matched = true
+		}
+	}
+	if !matched {
+		t.Fatalf("billing trigger must match the clean client text %q", clean)
+	}
+	if _, changed := NeutralizeBillingHeaders([]byte(`{"messages":[{"role":"system","content":"` + clean + `"}]}`)); !changed {
+		t.Fatal("pre-neutralisation must fire on the clean client text")
 	}
 }
