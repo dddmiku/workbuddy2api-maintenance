@@ -17,6 +17,7 @@ v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另�
 | 压制期心跳与提前开流 | 循环保护压住输出时（最长 60 秒），网关会先开流或发心跳：Responses 先发 `response.created`/`in_progress`，Messages 先发 `message_start` 并周期 `ping`，Chat 契约路径在已开流后发 SSE 注释。回调与读上游在同一 goroutine，不引入并发写 |
 | 已开始流的失败 | 流已经开始后，失败在流内交付（Responses `response.failed`、Messages `error` 事件、Chat SSE `error` 帧），不再往已开始的 SSE 流里写 JSON 体 |
 | 11140（`request illegal`） | 按 `displayMsg` 分野：带内容审核标记（`did not pass the safety review` / `未通过安全审核`）→ 请求级内容拦截，不罚账号；默认直接回给调用方，配置 `pool.max_soft_rotations` 后先换号再试。无该标记 → 账号级授权故障，**连续两次**才硬禁用（第一次只换号） |
+| 模型名 `[1m]` 后缀 | 接受 Anthropic 的 1M 别名（`model[1m]`／`[1M]`）：去掉后缀后按同一模型路由并把请求体里的名字归一（v2.4.17 起）；仅含后缀的畸形名字不改动 |
 | 原生 Chat 用量帧 | 按 OpenAI 规范：仅显式 `stream_options.include_usage=true` 时下发（缺省与 `false` 都不发）；内部账本与协议校验始终读取完整上游用量 |
 | Anthropic 顶层不支持块 | `document`、`search_result`、`web_search_tool_result`、`server_tool_use`、`tool_reference` 等在上游没有对应形态，一律替换为文字占位 `[unsupported content block: …]`（2.4.7 起覆盖顶层与嵌套位置），不再整条 400 |
 | Anthropic 工具调用 id | 只要求「同一条 assistant 消息内唯一、且不与尚未配对的上一个调用重复」；跨轮复用同一个 id（很多客户端每轮重新编号）已放行（2.4.7 起） |

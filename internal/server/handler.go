@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：接受 Anthropic 的 `[1m]` 模型后缀（去后缀后按同一模型路由）。
 // 2026-09-28：未知 4xx 换号可选（pool.rotate_on_client_error，默认保持旧契约）。
 // 2026-09-28：换号重试上限可配（pool.max_soft_rotations）。
 // 2026-09-28：内容审核与未知 4xx 可按配置先换号重试（pool.max_soft_rotations，默认 0 = 旧行为）；重试时解绑会话粘性才能真正换到另一个号。
@@ -916,6 +917,18 @@ func rejectUnsupportedChoiceCount(body []byte) error {
 	return nil
 }
 
+// stripContextMarker 去掉 Anthropic 的上下文窗口别名后缀（`[1m]`／`[1M]`）。
+// 返回清理后的名字与是否发生了改动；去掉后为空则原样返回（不改动畸形输入）。
+func stripContextMarker(name string) (string, bool) {
+	trimmed := strings.TrimSpace(name)
+	if len(trimmed) > 4 && strings.EqualFold(trimmed[len(trimmed)-4:], "[1m]") {
+		if base := strings.TrimSpace(trimmed[:len(trimmed)-4]); base != "" {
+			return base, true
+		}
+	}
+	return name, false
+}
+
 // maxModelNameBytes 请求模型名长度上限（含 realm 前缀）。
 const maxModelNameBytes = 256
 
@@ -961,6 +974,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err := rejectUnsupportedChoiceCount(body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	// Anthropic 的 1M 上下文别名（`model[1m]`／`[1M]`）：Claude Code 会把带后缀的模型名
+	// 原样发出来（cc-switch 的「声明支持 1M」开关就会产生它），而本网关的模型目录与
+	// 密钥白名单只有裸名。按同一模型处理：去掉后缀，并把请求体里的模型名一并归一。
+	if clean, stripped := stripContextMarker(peek.Model); stripped {
+		log.Printf("INFO: [server] model context marker stripped: %q -> %q", peek.Model, clean)
+		peek.Model = clean
+		body = rewriteModel(body, clean)
 	}
 	if err := validateChatRequest(body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
