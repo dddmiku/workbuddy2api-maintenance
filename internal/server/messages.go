@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：messages 里的 role=system/developer 折进系统提示、role=tool/function 按 user 处理，不再整条 400。
 // 2026-09-26：顶层不支持块同样占位（不再整条 400）；工具调用 id 允许跨轮复用；空工具结果回退空串。
 // 2026-09-26：历史里上游无法承载的内容块（document/tool_reference 等）改为文字占位，不再让整段会话永久 400。
 // 2026-09-26：thinking.type=adaptive 映射为上游可识别的 enabled（不带预算），不再原样转发。
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -186,13 +188,21 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 		}
 	}
 	var messages []any
+	var systemEntry map[string]any
 	if system, present := source["system"]; present && system != nil {
 		parts, err := anthropicParts(system, "system", false)
 		if err != nil {
 			return nil, "", false, err
 		}
-		messages = append(messages, map[string]any{"role": "system", "content": parts})
+		systemEntry = map[string]any{"role": "system", "content": parts}
+		messages = append(messages, systemEntry)
 	}
+	// 2026-09-28：把系统提示整段放进 messages 的客户端确实存在——Claude Code 2.1.283 遇到
+	// 它不认识的模型名时就会额外发一条 role=system 的消息（内容是 Environment 段）。官方
+	// 端点容忍这种写法，这里硬拒等于让这类客户端每一轮都 400，所以改为并回系统提示。合并
+	// 放在循环之后，与这条消息出现的位置无关。
+	var systemParts []any
+	turns := 0
 	input, ok := source["messages"].([]any)
 	if !ok || len(input) == 0 {
 		return nil, "", false, fmt.Errorf("messages must be a nonempty array")
@@ -204,9 +214,39 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 		if err != nil {
 			return nil, "", false, err
 		}
-		role, _ := message["role"].(string)
-		if role != "user" && role != "assistant" {
-			return nil, "", false, fmt.Errorf("%s.role must be user or assistant", path)
+		role := strings.ToLower(strings.TrimSpace(stringField(message, "role")))
+		switch role {
+		case "user", "assistant":
+		case "system", "developer":
+			blocks, err := anthropicBlocks(message["content"], path+".content")
+			if err != nil {
+				return nil, "", false, err
+			}
+			for bi, block := range blocks {
+				bp := fmt.Sprintf("%s.content[%d]", path, bi)
+				switch block["type"] {
+				case "text", "image":
+					part, err := anthropicPart(block, bp, false)
+					if err != nil {
+						return nil, "", false, err
+					}
+					systemParts = append(systemParts, part)
+				default:
+					part, err := unsupportedPlaceholder(block)
+					if err != nil {
+						return nil, "", false, err
+					}
+					systemParts = append(systemParts, part)
+				}
+			}
+			log.Printf("INFO: [server] merged %s (role=%s) into the system prompt", path, role)
+			continue
+		case "tool", "function":
+			// Chat 协议用 tool/function 角色承载工具结果；Anthropic 语义里工具结果属于
+			// user 轮，直接按 user 处理，别让客户端因为换了个端点就整条被拒。
+			role = "user"
+		default:
+			return nil, "", false, fmt.Errorf("%s.role must be user, assistant, system or tool", path)
 		}
 		blocks, err := anthropicBlocks(message["content"], path+".content")
 		if err != nil {
@@ -313,9 +353,22 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 			}
 			messages = append(messages, m)
 		}
+		turns++
 	}
 	if len(pending) > 0 {
 		return nil, "", false, fmt.Errorf("tool_use history requires matching tool_result blocks")
+	}
+	if len(systemParts) > 0 {
+		if systemEntry != nil {
+			existing, _ := systemEntry["content"].([]any)
+			systemEntry["content"] = append(existing, systemParts...)
+		} else {
+			messages = append([]any{map[string]any{"role": "system", "content": systemParts}}, messages...)
+		}
+	}
+	// 只有 system 消息的请求在上游同样无法成立，早点给客户端一个能看懂的错。
+	if turns == 0 {
+		return nil, "", false, fmt.Errorf("messages must contain at least one user or assistant message")
 	}
 	chat["messages"] = messages
 	if value, exists := source["tools"]; exists && value != nil {

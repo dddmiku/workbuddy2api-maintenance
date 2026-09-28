@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：messages 里 role=system/developer 折进系统提示、role=tool 按 user 处理；只有 system 的请求仍拒。
 // 2026-09-26：顶层 document 块改为占位（不再算无效输入），无效输入清单同步。
 // 2026-09-25：通过真实HTTP入口验证messages工具、流事件、缓存口径、鉴权、压缩和失败终态。
 package server
@@ -241,5 +242,84 @@ func TestApplyActNoteAppendsToArraySystem(t *testing.T) {
 	}
 	if systems != 1 || noteIndex != 1 {
 		t.Fatalf("systems=%d noteIndex=%d messages=%v", systems, noteIndex, parsed.Messages)
+	}
+}
+
+// Claude Code 2.1.283 遇到它不认识的模型名（中转站常态，例如 global:deepseek-v4.1-flash[1M]）
+// 会把 Environment 段单独作为 role=system 的消息放进 messages。官方端点容忍这种写法，网关
+// 早期版本按「只能 user/assistant」整条 400（用户看到的就是 messages[1].role must be…），
+// 这组用例守住「并回系统提示，而不是拒绝」。
+func TestMessagesSystemRoleFoldsIntoSystemPrompt(t *testing.T) {
+	cases := map[string]struct {
+		input  string
+		wanted []string
+	}{
+		"trailing with system field": {
+			input:  `{"model":"cn:fixture","max_tokens":64,"system":[{"type":"text","text":"top instructions"}],"messages":[{"role":"user","content":"hello"},{"role":"system","content":[{"type":"text","text":"# Environment\ncwd is here"}]}]}`,
+			wanted: []string{"top instructions", "cwd is here"},
+		},
+		"leading without system field": {
+			input:  `{"model":"cn:fixture","max_tokens":64,"messages":[{"role":"system","content":"no system field"},{"role":"user","content":"hello"}]}`,
+			wanted: []string{"no system field"},
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			chat, _, _, err := messagesToChat([]byte(test.input))
+			if err != nil {
+				t.Fatalf("system-role message rejected: %v", err)
+			}
+			if err := validateChatRequest(chat); err != nil {
+				t.Fatalf("folded request no longer validates: %v", err)
+			}
+			var object map[string]any
+			if err := json.Unmarshal(chat, &object); err != nil {
+				t.Fatal(err)
+			}
+			messages := object["messages"].([]any)
+			if len(messages) != 2 {
+				t.Fatalf("system message was not folded into the prompt: %s", chat)
+			}
+			system, _ := messages[0].(map[string]any)
+			if system["role"] != "system" {
+				t.Fatalf("system prompt is not the first message: %s", chat)
+			}
+			if messages[1].(map[string]any)["role"] != "user" {
+				t.Fatalf("user turn lost: %s", chat)
+			}
+			encoded := string(chat)
+			for _, wanted := range test.wanted {
+				if !strings.Contains(encoded, wanted) {
+					t.Fatalf("system text %q lost: %s", wanted, chat)
+				}
+			}
+		})
+	}
+}
+
+func TestMessagesToolRoleBecomesUserTurn(t *testing.T) {
+	input := `{"model":"cn:fixture","max_tokens":64,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{}}]},{"role":"tool","content":[{"type":"tool_result","tool_use_id":"t1","content":"output"}]}]}`
+	chat, _, _, err := messagesToChat([]byte(input))
+	if err != nil {
+		t.Fatalf("tool-role message rejected: %v", err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(chat, &object); err != nil {
+		t.Fatal(err)
+	}
+	messages := object["messages"].([]any)
+	if len(messages) != 3 || messages[2].(map[string]any)["role"] != "tool" || messages[2].(map[string]any)["tool_call_id"] != "t1" {
+		t.Fatalf("tool result pairing lost: %s", chat)
+	}
+}
+
+func TestMessagesStillRejectsUnusableRoles(t *testing.T) {
+	for name, input := range map[string]string{
+		"unknown role": `{"model":"cn:fixture","max_tokens":64,"messages":[{"role":"user","content":"x"},{"role":"observer","content":"y"}]}`,
+		"system only":  `{"model":"cn:fixture","max_tokens":64,"messages":[{"role":"system","content":"only system"}]}`,
+	} {
+		if _, _, _, err := messagesToChat([]byte(input)); err == nil {
+			t.Fatalf("%s must stay rejected", name)
+		}
 	}
 }

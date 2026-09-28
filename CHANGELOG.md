@@ -2,6 +2,15 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.18 — 2026-09-28
+
+修掉 Claude Code 报 `400 messages[1].role must be user or assistant` 的兼容缺口：接受 `messages` 里的 `system`/`tool` 角色。
+
+- 根因（本地抓包实测）：Claude Code 2.1.283 **遇到它不认识的模型名**时，会把系统提示的 Environment 段单独作为一条 `role:"system"` 的消息放进 `messages`；同名但被它认识的模型（如 `claude-sonnet-4-5-…`）下，同一段走顶层 `system` 字段。官方端点容忍这种写法，而网关此前按「只能 user/assistant」整条 400——用户侧看到的就是这行 400，且**每一轮都复现**。中转站的模型名几乎都是自定义的，所以这是常态而非边角。
+- 现在 `messages[].role` 接受 `user`/`assistant`/`system`/`developer`/`tool`/`function`（大小写与首尾空白不敏感）：`system`/`developer` 并回系统提示（与顶层 `system` 合并成一条，与其出现位置无关），`tool`/`function` 按 `user` 轮处理。只有 `system` 的请求、以及未知角色仍拒绝，文案更新为 `messages[N].role must be user, assistant, system or tool`。
+- 定位工具：新增 `tools/capture_proxy_20260928.py`（本地抓包代理：原样转发到网关并把请求体落盘），本轮就是用它把 Claude Code 的真实请求抓出来对照的。
+- 回归测试：`TestMessagesSystemRoleFoldsIntoSystemPrompt`、`TestMessagesToolRoleBecomesUserTurn`、`TestMessagesStillRejectsUnusableRoles`。
+
 ## v2.4.17 — 2026-09-28
 
 接受 Anthropic 的 `[1m]` 模型别名后缀，修掉 Claude Code 用 cc-switch「声明支持 1M」时报「模型不存在」。

@@ -4,6 +4,17 @@
 
 nf 的 Anthropic 兼容与 ClaudeCode 中转共用该入口，但 nf 自行追加的是 `/messages`，因此两者在 nf 中都填到 `/v1`。前者通常用 `x-api-key`，后者用 Bearer 并带 `?beta=true`。`beta=true` 不代表所有官方平台 beta 能力都可用，详见 [六模式配置](narrafork.md)。
 
+## 消息角色
+
+`messages[].role` 接受 `user`、`assistant`，以及两种客户端常见写法（大小写与首尾空白不敏感）：
+
+- `system` / `developer`：**并回系统提示**——与顶层 `system` 合并成一条，和它在数组里的位置无关，因此不会出现「第二条 system 被上游忽略」。
+- `tool` / `function`：按 `user` 轮处理（工具结果在 Anthropic 语义里属于 user 轮），工具配对规则不变。
+
+这条兼容是实测需要：Claude Code 2.1.283 **遇到它不认识的模型名**（中转站的常态，例如 `global:deepseek-v4.1-flash[1M]`）会把系统提示的 Environment 段单独作为一条 `role:"system"` 的消息放进 `messages`；认识的模型名下同一段走顶层 `system` 字段。官方端点容忍这种写法，早期网关按「只能 user/assistant」整条 400，客户端显示 `400 messages[1].role must be user or assistant`，且每一轮都复现。
+
+只有 `system` 而没有 user/assistant 轮的请求仍拒绝（上游无法成立），未知角色（如 `observer`）同样拒绝；错误文案为 `messages[N].role must be user, assistant, system or tool`。
+
 ## nf 思考与上下文设置
 
 支持 nf 的精确保留请求 `context_management={"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`：它表示保留全部思考，不执行裁剪。其它主动清理/压缩/服务端上下文动作仍拒绝。`output_config.effort` 接受 low、medium、high、xhigh、max，后续按实际模型的既有规则处理，不伪造精确思考预算。
