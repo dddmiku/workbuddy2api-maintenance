@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"workbuddy2api/internal/session"
 
 	"workbuddy2api/internal/auth"
 )
@@ -80,5 +82,46 @@ func TestUnknownClientErrorRotatesBeforeFailing(t *testing.T) {
 	}
 	if len(*seen) != 2 {
 		t.Fatalf("应先试 a 再换 b，实际 %v", *seen)
+	}
+}
+
+// 粘性会话下也必须真的换号：被风控标记的号否则会被反复选中（线上实测）。
+func TestContentReviewRotationUnbindsStickySession(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		uid := strings.TrimPrefix(authz, "Bearer ")
+		mu.Lock()
+		seen = append(seen, uid)
+		mu.Unlock()
+		if uid == "sticky-a" {
+			return 403, contentReviewBody, false
+		}
+		return 200, sseOK, true
+	})
+	pool := testPoolWith(
+		&auth.Auth{UID: "sticky-a", AccessToken: "sticky-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "sticky-b", AccessToken: "sticky-b", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{
+		Pool:             pool,
+		Upstream:         up,
+		MaxSoftRotations: 2,
+		Session:          session.New(session.Config{TTL: time.Hour, Store: newBindStore(), Available: pool.AvailableUIDs}),
+	})
+	// 先让会话粘到 sticky-a（首次请求成功不了，但绑定在失败前已建立）。
+	body := `{"model":"cn:hy3","stream":true,"metadata":{"conversation_id":"poisoned"},"messages":[{"role":"user","content":"OK"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("换号后应成功: %d %s", rec.Code, rec.Body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 2 {
+		t.Fatalf("应至少尝试两个账号，实际 %v", seen)
+	}
+	if seen[0] == seen[1] {
+		t.Fatalf("重试没有真正换号（粘性未解绑）: %v", seen)
 	}
 }

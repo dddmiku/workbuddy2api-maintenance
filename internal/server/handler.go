@@ -1,7 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-28：未知 4xx 换号可选（pool.rotate_on_client_error，默认保持旧契约）。
 // 2026-09-28：换号重试上限可配（pool.max_soft_rotations）。
-// 2026-09-28：内容审核与未知 4xx 可按配置先换号重试（pool.max_soft_rotations，默认 0 = 旧行为）。
+// 2026-09-28：内容审核与未知 4xx 可按配置先换号重试（pool.max_soft_rotations，默认 0 = 旧行为）；重试时解绑会话粘性才能真正换到另一个号。
 // 2026-09-28：新增管理通道复活账号入口 POST /accounts/revive。
 // 2026-09-28：11140 账号故障改为连续计数后才禁用。
 // 2026-09-26：导出 DefaultMaxRotate，供启动日志与配置对齐。
@@ -1437,7 +1437,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					softRotate++
 					log.Printf("INFO: [server] content review rejection — trying another account (%d/%d) uid=%s model=%s",
 						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel)
-					releaseHeld()
+					// fail 而不是 releaseHeld：必须解绑会话粘性，否则下一轮又会选中同一个
+					// 账号（实测：被风控标记的号在粘性会话里被反复选中，换号形同虚设）。
+					fail(acct.UID)
 					continue
 				}
 				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
@@ -1472,7 +1474,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					softRotate++
 					log.Printf("INFO: [server] upstream client error — trying another account (%d/%d) uid=%s model=%s status=%d",
 						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel, status)
-					releaseHeld()
+					fail(acct.UID) // 同上：解绑粘性才能真正换号
 					continue
 				}
 				releaseHeld()
