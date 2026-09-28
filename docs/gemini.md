@@ -1,4 +1,4 @@
-# Gemini generate content 兼容说明
+# Gemini generateContent 兼容说明
 
 v2.3.0 增加 Gemini 的生成与模型发现入口，底层仍复用现有 chat 调度、密钥权限、会话隔离和原始用量账本。它是协议适配，不会把所选 WorkBuddy 模型变成原生 Google 模型。
 

@@ -8,7 +8,7 @@
   var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null)};
   var detail = {revision:0, active:false, requestID:'', opener:null};
   var statusNames = {success:'成功', error:'失败', canceled:'已取消', rejected:'已拒绝'};
-  var protocolNames = {chat_completions:'Chat Completions', responses:'Responses', anthropic_messages:'Messages', gemini_generate_content:'Gemini'};
+  var protocolNames = {chat_completions:'Chat Completions', responses:'Responses', anthropic_messages:'Anthropic Messages', gemini_generate_content:'Gemini generateContent'};
   var finishNames = {stop:'正常结束',end_turn:'正常结束',stop_sequence:'命中停止条件',length:'达到输出上限',max_tokens:'达到输出上限',max_completion_tokens:'达到输出上限',content_filter:'内容受到过滤',tool_calls:'转为工具调用',function_call:'转为工具调用',pause_turn:'等待继续'};
   var reasonNames = {
     sticky_hit:'继续使用会话绑定账号', sticky_unavailable:'会话绑定账号暂不可用',

@@ -2,7 +2,7 @@
 
 网关适配 `/v1/responses` 与 `/v1/chat/completions`，把请求转换为上游格式，并把结果还原给客户端。请求结构可以接受，不代表选定的上游模型、账号或渠道一定支持该能力。
 
-v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另外两种协议见 [Anthropic messages](anthropic-messages.md) 与 [Gemini](gemini.md)，nf 地址填写见 [六模式指南](narrafork.md)。
+v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另外两种协议见 [Anthropic Messages](anthropic-messages.md) 与 [Gemini generateContent](gemini.md)，nf 地址填写见 [六模式指南](narrafork.md)。
 
 ## Responses
 

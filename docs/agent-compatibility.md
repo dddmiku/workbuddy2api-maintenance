@@ -10,7 +10,7 @@ v2.3.0 支持四种协议；nf 的六种界面模式如何填写地址见 [六�
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat，Bearer |
 | `POST /v1/responses` | 无状态 Responses，Bearer；Codex 等客户端使用完整历史续接 |
-| `POST /v1/messages` | Anthropic messages 适配，`x-api-key` 或 Bearer |
+| `POST /v1/messages` | Anthropic Messages 适配，`x-api-key` 或 Bearer |
 | `POST /v1beta/models/{模型}:generateContent`、`:streamGenerateContent?alt=sse` | Gemini 生成，`x-goog-api-key`、Bearer 或查询 key；支持 `/v1/models/` 同功能别名 |
 | `GET /v1beta/models`、`GET /v1beta/models/{模型}` | Gemini 模型发现，按同一密钥权限过滤 |
 | `GET /v1/models`、`GET /v1/models/{model}` | 按密钥白名单返回 OpenAI 模型对象，接受上述两种密钥头 |

@@ -8,7 +8,7 @@
 
 ## 能力
 
-- OpenAI chat、Responses、Anthropic messages 与 Gemini generate content 共用鉴权、账号池、会话隔离、错误处理和原始用量账本。
+- OpenAI chat、Responses、Anthropic Messages 与 Gemini generateContent 共用鉴权、账号池、会话隔离、错误处理和原始用量账本。
 - 支持流式与非流式响应、函数工具、Responses 自定义工具和命名空间桥接、JSON schema 校验。
 - 管理台提供账号、密钥复制、模型白名单、到期时间、重复推理保护、任务、日志和用量管理。
 - 每密钥的请求频率、并发和排队策略由四协议共用；请求明细保留每次重试的已知消费、缺失项和当时的选号依据。

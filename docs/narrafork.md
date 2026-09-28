@@ -41,4 +41,4 @@
 - nf Anthropic 用量合并可能忽略合法的零修正；Gemini 展示对候选输出和思考的取值也可能不同。网关不会为修正客户端显示而放大、伪造或重复相加 token。
 - 本轮已做提取后的原 nf 解析函数重放、真实本地 Handler 与假上游、固定 SDK 等有界验证。这不是对完整 nf GUI 或所有真实模型的验收，也不是百万上下文压缩测试。
 
-更完整的能力、用量和限制见 [agent 接入](agent-compatibility.md)、[messages](anthropic-messages.md) 与 [Gemini](gemini.md)。
+更完整的能力、用量和限制见 [agent 接入](agent-compatibility.md)、[Anthropic Messages](anthropic-messages.md) 与 [Gemini generateContent](gemini.md)。

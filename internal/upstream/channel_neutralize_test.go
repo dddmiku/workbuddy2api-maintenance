@@ -164,3 +164,30 @@ func TestChatStreamChannelRejectionWithoutAnyTextStaysTerminal(t *testing.T) {
 		t.Fatalf("attempts=%d want 1 (nothing to neutralize)", attempts)
 	}
 }
+
+// TestChannelTriggerCoversClaudeCodeBillingHeader 2026-09-28 实测（逐段二分 + 对照）：
+// Claude Code 2.1.283 在系统提示开头写入的计费归属头字符串本身命中 11128。
+// 整行、只留头名都被拒；"x-anthropic-" 或 "x-anthropic-version:" 通过；断词后 200。
+// 它必须落在第 0 档精确指纹里，否则每一轮都要先撞两次墙才升级。
+func TestChannelTriggerCoversClaudeCodeBillingHeader(t *testing.T) {
+	header := "x-anthropic-billing-header"
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":"` + header +
+		`: cc_version=2.1.283.a2f; cc_entrypoint=sdk-cli;You are a Claude agent."},{"role":"user","content":"hi"}]}`)
+	first, changed := NeutralizeChannelTriggerAt(body, channelLevelFingerprint)
+	if !changed {
+		t.Fatal("level 0 must neutralise the billing header without any retry")
+	}
+	if bytes.Contains(first, []byte(header)) {
+		t.Fatalf("billing header survived level 0: %s", first)
+	}
+	if !bytes.Contains(first, []byte(wafBreakMarker)) {
+		t.Fatalf("no break marker inserted: %s", first)
+	}
+	// 其他 anthropic 头不触发（实测通过），断词器不得误伤它们。
+	for _, safe := range []string{"x-anthropic-version: 2023-06-01", "x-stainless-lang: js"} {
+		clean := []byte(`{"model":"m","messages":[{"role":"system","content":"` + safe + `"},{"role":"user","content":"hi"}]}`)
+		if out, changed := NeutralizeChannelTriggerAt(clean, channelLevelFingerprint); changed {
+			t.Fatalf("level 0 must not touch %q: %s", safe, out)
+		}
+	}
+}

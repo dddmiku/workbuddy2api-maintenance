@@ -1,4 +1,4 @@
-# Anthropic messages 兼容说明
+# Anthropic Messages 兼容说明
 
 `POST /v1/messages` 复用网关的账号调度、权限、原始计量和上游错误处理。官方 JavaScript SDK 的 `baseURL` 应指向站点根地址，由 SDK 添加 `/v1/messages`。`x-api-key` 可用于鉴权；显式 `Authorization` 始终优先，包括其值无效时。
 

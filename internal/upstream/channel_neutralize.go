@@ -22,6 +22,11 @@ var channelTriggerSentences = []string{
 	// 2026-09-26 实测（CLI 端到本网关）：Claude Code 系统提示首行命中同一校验，
 	// 原样发送返回 400/11128，断词后 200。
 	"You are Claude Code, Anthropic's official CLI for Claude",
+	// 2026-09-28 实测（逐段二分 + 对照）：Claude Code 2.1.283 在系统提示开头塞入的
+	// 计费归属头字符串本身命中同一校验。整行、只留头名、甚至只留到 "…billing-header"
+	// 都被拒；"x-anthropic-" 或 "x-anthropic-version:" 等其他头通过；断词后 200。
+	// 这是字符串级触发，与它出现在哪条消息无关，所以按精确指纹在第 0 档处理（零误伤）。
+	"x-anthropic-billing-header",
 }
 
 // channelTriggerFingerprints 组合指纹：同一段文本内同时出现全部片段才断词，

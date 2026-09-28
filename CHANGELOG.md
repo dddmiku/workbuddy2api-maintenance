@@ -2,6 +2,21 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.19 — 2026-09-28
+
+修掉 Claude Code 2.1.283 每一轮都被上游 11128 拒、网关要连撞三次墙才恢复的问题：新增计费头触发指纹。
+
+- 根因（逐段二分 + 对照实验，服务器上直连上游实测）：Claude Code 2.1.283 在系统提示开头写入
+  `x-anthropic-billing-header: cc_version=…; cc_entrypoint=…;`。这个**字符串本身**命中上游的
+  「未授权渠道」校验：整行被拒、只留头名 `x-anthropic-billing-header` 也被拒；而
+  `x-anthropic-`、`x-anthropic-version:`、`x-stainless-lang:` 等其他头都通过；零宽断词后 200。
+  对照：把同一段换成 `You are a helpful assistant.` 返回 200。
+- 该串不在原有指纹表里，于是每个请求都要经历「原样 → 通用归属句 → 正文全量」两次无效重试
+  （每次 200–500ms）才在第 2 档恢复。请求明细里 `attempt_count=8` 的记录就是它。
+- 修复：把 `x-anthropic-billing-header` 加入第 0 档精确指纹（零误伤，只断这个词，不动其他头），
+  第一个请求即通过。同时补测试锁住「该串必须被第 0 档处理」与「其他 anthropic 头不得被误伤」。
+- 实测：同一份真实抓包请求体，修复前上游 400/11128，修复后 200。
+
 ## v2.4.18 — 2026-09-28
 
 修掉 Claude Code 报 `400 messages[1].role must be user or assistant` 的兼容缺口：接受 `messages` 里的 `system`/`tool` 角色。
@@ -238,7 +253,7 @@ v2.4.1 上线后的实测修正与全项目审查修复。
 
 ## v2.3.0 — 2026-09-25
 
-新增 Gemini generate content，使 OpenAI Chat、Responses、Anthropic Messages、Gemini 四种协议共用同一调度与账本。nf 六种界面模式的配置见 [接入指南](docs/narrafork.md)。
+新增 Gemini generateContent，使 OpenAI Chat、Responses、Anthropic Messages、Gemini 四种协议共用同一调度与账本。nf 六种界面模式的配置见 [接入指南](docs/narrafork.md)。
 
 ### 需要注意的变化
 
