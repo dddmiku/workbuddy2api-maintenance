@@ -1,4 +1,7 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：未知 4xx 换号可选（pool.rotate_on_client_error，默认保持旧契约）。
+// 2026-09-28：换号重试上限可配（pool.max_soft_rotations）。
+// 2026-09-28：内容审核与未知 4xx 可按配置先换号重试（pool.max_soft_rotations，默认 0 = 旧行为）。
 // 2026-09-28：新增管理通道复活账号入口 POST /accounts/revive。
 // 2026-09-28：11140 账号故障改为连续计数后才禁用。
 // 2026-09-26：导出 DefaultMaxRotate，供启动日志与配置对齐。
@@ -75,6 +78,10 @@ import (
 // 回报错误，不能无限重试。
 const maxReasoningLoopRetries = 1
 
+// 换号重试上限由 config 的 pool.max_soft_rotations 决定（0/未配置 = 保持既有契约：
+// 内容审核与未知 4xx 直接回给调用方，不换号）。上游的内容审核可能是内容维度而非账号
+// 维度，换号未必能过、却会拖慢失败——所以默认关闭，由部署方按需打开。
+
 // Config handler 依赖。
 // DefaultMaxRotate 单请求默认最多换号次数：一次客户端请求最多消耗几个账号。
 const DefaultMaxRotate = 3
@@ -85,6 +92,12 @@ type Config struct {
 	APIKey    string         // 空 = 不鉴权
 	APIKeys   *apikeys.Store // 配置后以持久化密钥库为准，空库不放行。
 	MaxRotate int            // 单请求最多换号次数，默认 DefaultMaxRotate
+	// MaxSoftRotations 「内容审核 / 未知 4xx」在回给调用方前的换号次数上限，
+	// 默认 DefaultMaxSoftRotations（负数 = 0，即不换号，维持旧行为）。
+	MaxSoftRotations int
+	// RotateOnClientError 未知 4xx 是否也换号再试（默认 false，保持既有契约：
+	// 未知 4xx 通常由请求本身决定，换号会掩盖真实错误、放大无效请求）。
+	RotateOnClientError bool
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
@@ -180,6 +193,9 @@ func (h *Handler) reasoningLoopStopOnly() bool {
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = DefaultMaxRotate
+	}
+	if cfg.MaxSoftRotations < 0 {
+		cfg.MaxSoftRotations = 0
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
@@ -1076,6 +1092,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上限见 maxReasoningLoopRetries：循环是上游模型行为，重发通常能拿到干净的一轮，
 	// 但持续循环时必须收手并如实回报错误，不能无限重试。
 	loopRetries := 0
+	// softRotate 统计「语义上可换号再试」的终态错误（内容审核、未知 4xx）已重试的次数：
+	// 这些错误此前直接回给调用方，但内容审核可能带账号/风控维度、未知 4xx 也可能是该账号
+	// 的权限问题，换号成本只是延迟（被拒请求不产生上游计费）。试满 maxSoftRotations 次
+	// 仍失败才把上游原文交给调用方。
+	softRotate := 0
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
@@ -1410,8 +1431,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 上游内容拒绝属于当前请求；直接返回，不修改其他会话或替换正文重试。
 			if kind == upstream.ErrContentBlocked {
-				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一
-				// 审核，轮转纯属浪费时间。不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
+				// 内容审核：先换号再试（审核可能带账号/风控维度；换号成本只是延迟，
+				// 被拒请求不计费），试满才把上游原文交给调用方。
+				if softRotate < h.cfg.MaxSoftRotations {
+					softRotate++
+					log.Printf("INFO: [server] content review rejection — trying another account (%d/%d) uid=%s model=%s",
+						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel)
+					releaseHeld()
+					continue
+				}
+				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
 				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样，
 				// 任务书授权上游错误码/账号语义对客户端可见），不再改写成网关固定文案。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
@@ -1437,6 +1466,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			if kind == upstream.ErrBadParams || kind == upstream.ErrClient {
+				// 未知 4xx 也可能是该账号的权限/状态问题：同样先换号再试；
+				// 请求体本身有问题（ErrBadParams）换号无意义，维持原行为。
+				if kind == upstream.ErrClient && h.cfg.RotateOnClientError && softRotate < h.cfg.MaxSoftRotations {
+					softRotate++
+					log.Printf("INFO: [server] upstream client error — trying another account (%d/%d) uid=%s model=%s status=%d",
+						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel, status)
+					releaseHeld()
+					continue
+				}
 				releaseHeld()
 				detail := string(respBody)
 				acct.Lock()

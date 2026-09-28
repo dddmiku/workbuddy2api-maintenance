@@ -352,6 +352,8 @@ func main() {
 
 	h := server.NewHandler(server.Config{
 		MaxRotate:             cfg.Pool.MaxRotate,
+		MaxSoftRotations:      cfg.Pool.MaxSoftRotations,
+		RotateOnClientError:   cfg.Pool.RotateOnClientError != nil && *cfg.Pool.RotateOnClientError,
 		ReasoningLoopGuard:    &cfg.Features.ReasoningLoopGuard,
 		ReasoningLoopStopOnly: cfg.Features.ReasoningLoopStopOnly,
 		Pool:                  p,

@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-28：pool 新增 rotate_on_client_error。
+// 2026-09-28：pool 新增 max_soft_rotations。
 // 2026-09-26：pool 新增 max_rotate 与 source_rate_gate。
 // 2026-09-22：密钥管理默认启用：api_keys_file 留空（含历史示例里的空串）都走
 //
@@ -207,6 +209,12 @@ type Config struct {
 		// 不同账号都回「无重置时间的 429」时，闸门会暂停该 realm 的选号并直接回 429；
 		// 关掉后改为继续换号（号多时更实用）。
 		SourceRateGate *bool `json:"source_rate_gate"`
+		// MaxSoftRotations 「内容审核 / 未知 4xx」在回给调用方前的换号次数上限。
+		// 0（默认）= 保持既有契约：这两类错误直接回给调用方，不换号。
+		MaxSoftRotations int `json:"max_soft_rotations"`
+		// RotateOnClientError 未知 4xx 是否也换号再试（默认 false）。开启后，
+		// 换号成本只是一个多出来的上游请求；关掉可避免用轮转掩盖真实请求错误。
+		RotateOnClientError *bool `json:"rotate_on_client_error"`
 	} `json:"pool"`
 
 	SessionSticky struct {
