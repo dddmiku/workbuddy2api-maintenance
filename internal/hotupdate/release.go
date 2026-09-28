@@ -313,7 +313,14 @@ func validRepo(repo string) bool {
 // credentials or cookies there, even when the redirect stays on the same host.
 func (c *Client) authorizedURL(target *url.URL) bool {
 	base, err := url.Parse(c.apiBase())
-	return err == nil && validRepo(c.Repo) && target.User == nil && target.Scheme == base.Scheme && target.Host == base.Host && strings.HasPrefix(target.Path, strings.TrimRight(base.Path, "/")+"/repos/"+c.Repo+"/")
+	if err != nil || !validRepo(c.Repo) || target.User != nil || target.Scheme != base.Scheme || target.Host != base.Host {
+		return false
+	}
+	// 仓库前缀要么精确等于 /repos/<repo>（元数据接口），要么以它加斜杠开头（其下的资源）。
+	// 只认带尾斜杠的形式会让「查仓库可见性」这类不带尾斜杠的接口拿不到令牌，
+	// 于是私有仓库连检查更新都失败——2026-09-28 实测到。
+	prefix := strings.TrimRight(base.Path, "/") + "/repos/" + c.Repo
+	return target.Path == prefix || strings.HasPrefix(target.Path, prefix+"/")
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
@@ -343,4 +350,79 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		return nil
 	}
 	return copy.Do(req)
+}
+
+// Visibility 仓库可见性探测结果。
+type Visibility string
+
+const (
+	// VisibilityPublic 公开仓库：匿名即可读发布，热更新无需令牌。
+	VisibilityPublic Visibility = "public"
+	// VisibilityPrivate 私有仓库：匿名读不到发布，热更新需要令牌；
+	// 未配令牌时网关应明确拒绝而不是给出 404。
+	VisibilityPrivate Visibility = "private"
+	// VisibilityUnknown 探测失败（网络不可达、令牌无效、仓库不存在等）。
+	VisibilityUnknown Visibility = "unknown"
+)
+
+// RepoVisibility 探测发布仓库的可见性。
+//
+// 热更新的可用性由「仓库是否开放」决定，而不是一个需要人工同步的开关：仓库公开时
+// 任何人都能读到 Release（含 SHA256SUMS 与签名），热更新天然可用；仓库转私有后匿名
+// 读取会 404，热更新必须带令牌才有意义，否则只会给使用者一个无法解释的失败。
+//
+// 判定依据是 GitHub 的仓库元数据接口：匿名请求 200 = 公开；匿名 404 = 私有或不存在。
+// 带令牌时用令牌再问一次，用于区分「私有」与「根本不存在/无权限」。
+func (c *Client) RepoVisibility(ctx context.Context) Visibility {
+	if !validRepo(c.Repo) {
+		return VisibilityUnknown
+	}
+	// 匿名探测必须真的不带凭据：do() 会按 c.Token 自动加 Authorization，
+	// 所以这里显式用一个 Token 为空的副本，而不是依赖调用方恰好没配令牌。
+	anonymous := &Client{Repo: c.Repo, HTTP: c.HTTP, APIBase: c.APIBase}
+	status, err := anonymous.repoMetaStatus(ctx)
+	if err != nil {
+		return VisibilityUnknown
+	}
+	switch status {
+	case http.StatusOK:
+		return VisibilityPublic
+	case http.StatusNotFound:
+		// 匿名读不到：要么私有，要么不存在。带令牌确认一次。
+		if c.Token == "" {
+			return VisibilityPrivate
+		}
+		authed, err := c.repoMetaStatus(ctx)
+		if err != nil {
+			return VisibilityUnknown
+		}
+		if authed == http.StatusOK {
+			return VisibilityPrivate
+		}
+		return VisibilityUnknown
+	default:
+		return VisibilityUnknown
+	}
+}
+
+// repoMetaStatus 请求仓库元数据，只回状态码（不读正文，避免把错误页当数据）。
+func (c *Client) repoMetaStatus(ctx context.Context) (int, error) {
+	if !validRepo(c.Repo) {
+		return 0, errors.New("invalid update repository")
+	}
+	_ = c.HTTP // do() 在 HTTP 为 nil 时自行构造，这里只是显式说明可为 nil
+	url := fmt.Sprintf("%s/repos/%s", c.apiBase(), c.Repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "workbuddy2api-self-update")
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	return resp.StatusCode, nil
 }

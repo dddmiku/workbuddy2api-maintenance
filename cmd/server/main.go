@@ -350,6 +350,23 @@ func main() {
 		},
 	})
 
+	// 启动时后台探测一次发布仓库可见性：热更新是否可用由「仓库是否开放」决定，
+	// 探测放在后台，不阻塞监听；结果随 /update 状态返回给面板。
+	if cfg.Update.Enabled {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			switch visibility := updateManager.RefreshVisibility(ctx); visibility {
+			case hotupdate.VisibilityPublic:
+				log.Printf("INFO: [update] 发布仓库公开，热更新可用（repo=%s）", cfg.Update.Repo)
+			case hotupdate.VisibilityPrivate:
+				log.Printf("WARN: [update] 发布仓库为私有，匿名读不到 Release；需配置 update.token 才能热更新（repo=%s）", cfg.Update.Repo)
+			default:
+				log.Printf("WARN: [update] 无法确认发布仓库可见性（repo=%s），热更新暂不可用", cfg.Update.Repo)
+			}
+		}()
+	}
+
 	h := server.NewHandler(server.Config{
 		MaxRotate:             cfg.Pool.MaxRotate,
 		MaxSoftRotations:      cfg.Pool.MaxSoftRotations,

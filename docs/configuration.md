@@ -21,7 +21,7 @@
 | `prompt.mode` | `passthrough` | 保留客户端指令；`custom` 才执行显式替换 |
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
 | `prompt.act_note` | 内置运行约定 | 追加到「带工具的请求」第一条 system 末尾，Chat Completions 与 Responses 两条路径都生效；强调待执行动作必须同次返回工具调用；`off` 关闭，也可写自定义文本 |
-| `update.enabled` | `true` | 是否允许管理台一键热更新 |
+| `update.enabled` | `true` | 热更新总开关。**是否真正可用还取决于发布仓库可见性**（见下） |
 | `update.repo` | `dddmiku/workbuddy2api-maintenance` | 公开发布仓库（`owner/name`），空值使用此默认值 |
 | `update.token` | 空 | 公开仓库可留空；自选私有仓库时使用其读取凭据，只保存在本机实际配置，不是调用 API key |
 | `update.dir` | 数据目录下 `updates/` | 下载件与 `current` 指针的存放目录 |
@@ -239,6 +239,8 @@
   }
 }
 ```
+
+热更新是否可用由**发布仓库是否开放**决定，而不是靠一个需要人工同步的开关：公开仓库匿名就能读到 Release（含 `SHA256SUMS.txt` 与签名），热更新可用；仓库转为私有后匿名读取返回 404，必须配置 `update.token` 才可用。网关在启动时后台探测一次，`/update` 的 `visibility` 字段（`public`/`private`/`unknown`）与 `unavailable_reason` 会如实说明当前状态；私有且未配令牌时明确拒绝并说明原因，不会给出无法解释的 404。
 
 默认公开源无需下载凭据，`update.token` 可留空。只有自选私有源时才需要配置其读取凭据，并限制配置权限；不要提交到 Git 或放进镜像、日志、截图。仓库名称和默认值仍为 `dddmiku/workbuddy2api-maintenance`，已有同名设置无需修改；其他非空 `update.repo` 保持原值，迁移时应核对实际目标。更新检查失败不影响已有调用密钥的鉴权。`update.enabled:false` 关闭远程版本更新。
 

@@ -3372,14 +3372,24 @@ function renderUpdate(){
     return;
   }
   var s = r.status || {};
-  if (s.enabled === false){
-    // 网关关掉了热更新（config update.enabled=false）：如实显示，按钮禁用，
-    // 不再让「立即更新」点下去只弹一句"已开始"却什么也不做。
-    box.innerHTML = '<div class="upd-empty">热更新已在网关关闭（config update.enabled=false）</div>' +
+  // 不可用有两种来源：配置关掉了（update.enabled=false），或发布仓库不开放
+  // （私有且没配令牌）。两者都要如实说明原因，而不是让按钮点下去无声失败。
+  var unavailable = (s.enabled === false) || !!s.unavailable_reason;
+  if (unavailable){
+    var why = s.enabled === false
+      ? '热更新已在网关关闭（config update.enabled=false）'
+      : (s.unavailable_reason || '发布仓库当前不可读');
+    var mode = (s.visibility === 'private')
+      ? '发布仓库为私有：把仓库改回公开，或配置 update.token'
+      : '手工部署：本地构建运行包后上传替换，或让维护方协助';
+    box.innerHTML = '<div class="upd-empty">' + esc(why) + '</div>' +
       mrow('当前版本', (s.current || '—') + (s.commit && s.commit !== 'unknown' ? ' · ' + s.commit.slice(0, 7) : '')) +
-      mrow('升级方式', '手工部署：本地构建运行包后上传替换，或让维护方协助');
-    $('#updState').textContent = '已关闭';
-    $('#updHint').textContent = '如需恢复热更新，把 config 的 update.enabled 改回 true 并重载网关。';
+      mrow('发布仓库', (s.repo || '—') + (s.visibility ? ' · ' + s.visibility : '')) +
+      mrow('升级方式', mode);
+    $('#updState').textContent = s.enabled === false ? '已关闭' : '不可用';
+    $('#updHint').textContent = s.enabled === false
+      ? '如需恢复热更新，把 config 的 update.enabled 改回 true 并重载网关。'
+      : (s.unavailable_reason || '');
     $('#btnUpdApply').disabled = true;
     $('#btnUpdCheck').disabled = true;
     return;

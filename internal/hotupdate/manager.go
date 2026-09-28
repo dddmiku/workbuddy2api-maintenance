@@ -43,8 +43,13 @@ const (
 
 // Status 对外暴露的更新状态。
 type Status struct {
-	Enabled     bool      `json:"enabled"`
-	Current     string    `json:"current"`
+	Enabled bool `json:"enabled"`
+	// Visibility 发布仓库可见性（public/private/unknown）。热更新是否可用由它决定：
+	// 公开仓库匿名可读发布，热更新可用；私有仓库需要令牌，未配令牌时明确不可用。
+	Visibility Visibility `json:"visibility"`
+	// UnavailableReason 不可用时的原因（给面板与运维看的中文说明）；可用时为空。
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	Current           string `json:"current"`
 	Commit      string    `json:"commit"`
 	BuiltAt     string    `json:"built_at"`
 	Repo        string    `json:"repo"`
@@ -81,12 +86,13 @@ type Manager struct {
 	opts   Options
 	client *Client
 
-	mu        sync.Mutex
-	state     State
-	latest    Release
-	checkedAt time.Time
-	lastError string
-	busy      bool
+	mu         sync.Mutex
+	state      State
+	latest     Release
+	checkedAt  time.Time
+	lastError  string
+	busy       bool
+	visibility Visibility
 }
 
 // NewManager 构造管理器；Dir 为空时回落到系统临时目录下的固定子目录。
@@ -113,10 +119,60 @@ func (m *Manager) Status() Status {
 	return m.statusLocked()
 }
 
+// availabilityLocked 报告当前是否可用热更新，以及不可用的原因。
+//
+// 可用性由「发布仓库是否开放」决定，而不是靠人工维护一个与仓库状态同步的开关：
+//   - 公开仓库：匿名就能读到 Release（含 SHA256SUMS 与签名），可用；
+//   - 私有仓库：匿名读不到，必须配 update.token 才可用；
+//   - 未确认：探测失败，先不声称可用（如实报告，不猜）。
+//
+// config update.enabled 仍是总开关：显式关掉时一律不可用。
+func (m *Manager) availabilityLocked() (bool, string) {
+	if m == nil {
+		return false, "热更新未初始化"
+	}
+	if !m.opts.Enabled {
+		return false, "热更新已在配置中关闭（config update.enabled=false）"
+	}
+	switch m.visibility {
+	case VisibilityPublic:
+		return true, ""
+	case VisibilityPrivate:
+		if strings.TrimSpace(m.client.Token) != "" {
+			return true, ""
+		}
+		return false, "发布仓库已转为私有，匿名读不到 Release；把仓库改回公开，或配置 update.token"
+	default:
+		return false, "尚未确认发布仓库可见性，请稍后重试「检查更新」"
+	}
+}
+
+// RefreshVisibility 探测并记录发布仓库可见性。启动时后台调用一次，Check/Apply 各再确认一次。
+func (m *Manager) RefreshVisibility(ctx context.Context) Visibility {
+	if m == nil {
+		return VisibilityUnknown
+	}
+	visibility := m.client.RepoVisibility(ctx)
+	m.mu.Lock()
+	m.visibility = visibility
+	m.mu.Unlock()
+	return visibility
+}
+
 // Check 查询最新版本并更新状态。
 func (m *Manager) Check(ctx context.Context) (Status, error) {
 	if m == nil || !m.opts.Enabled {
 		return m.Status(), errors.New("自更新未启用（config update.enabled=false）")
+	}
+	if visibility := m.RefreshVisibility(ctx); visibility != VisibilityPublic {
+		m.mu.Lock()
+		available, reason := m.availabilityLocked()
+		m.mu.Unlock()
+		if !available {
+			err := errors.New(reason)
+			m.fail(err)
+			return m.Status(), err
+		}
 	}
 	m.mu.Lock()
 	if m.busy {
@@ -155,6 +211,16 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	if m == nil || !m.opts.Enabled {
 		return m.Status(), errors.New("自更新未启用（config update.enabled=false）")
+	}
+	if visibility := m.RefreshVisibility(ctx); visibility != VisibilityPublic {
+		m.mu.Lock()
+		available, reason := m.availabilityLocked()
+		m.mu.Unlock()
+		if !available {
+			err := errors.New(reason)
+			m.fail(err)
+			return m.Status(), err
+		}
 	}
 	m.mu.Lock()
 	if m.busy {
@@ -375,9 +441,12 @@ func CurrentBinary(dir string) string {
 }
 
 func (m *Manager) statusLocked() Status {
+	available, reason := m.availabilityLocked()
 	return Status{
-		Enabled:     m.opts.Enabled,
-		Current:     version.Version,
+		Enabled:           m.opts.Enabled,
+		Visibility:        m.visibility,
+		UnavailableReason: reason,
+		Current:           version.Version,
 		Commit:      version.Commit,
 		BuiltAt:     version.BuiltAt,
 		Repo:        m.client.Repo,
@@ -385,7 +454,7 @@ func (m *Manager) statusLocked() Status {
 		State:       m.state,
 		LatestTag:   m.latest.Tag,
 		LatestAt:    m.latest.PublishedAt,
-		UpdateReady: m.opts.Enabled && m.latest.Tag != "" && m.latest.UpdateAvailable(),
+		UpdateReady: available && m.latest.Tag != "" && m.latest.UpdateAvailable(),
 		AssetName:   m.latest.AssetName,
 		AssetSize:   m.latest.AssetSize,
 		CheckedAt:   m.checkedAt,
