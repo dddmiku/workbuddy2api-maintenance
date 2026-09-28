@@ -191,3 +191,34 @@ func TestChannelTriggerCoversClaudeCodeBillingHeader(t *testing.T) {
 		}
 	}
 }
+
+// TestNeutralizeBillingHeadersPreemptsTheRetry 计费头必须在发送前就断词：
+// 它几乎每个请求都出现，等到被拒再重试等于每个请求白花一次往返。
+func TestNeutralizeBillingHeadersPreemptsTheRetry(t *testing.T) {
+	header := "x​-a​nthropic-b​illing-h​eader"
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"` + header +
+		`: cc_version=2.1.283.a2f;"}]},{"role":"user","content":"hi"}]}`)
+	out, changed := NeutralizeBillingHeaders(body)
+	if !changed {
+		t.Fatal("billing header must be neutralised before sending")
+	}
+	if bytes.Contains(out, []byte(header)) {
+		t.Fatalf("billing header survived: %s", out)
+	}
+	if !bytes.Contains(out, []byte(wafBreakMarker)) {
+		t.Fatalf("no break marker inserted: %s", out)
+	}
+	// 其他内容与结构必须原样保留
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["model"] != "m" {
+		t.Fatalf("unrelated field changed: %v", obj["model"])
+	}
+	// 不含触发串时不得改动任何字节
+	clean := []byte(`{"model":"m","messages":[{"role":"user","content":"x-anthropic-version: 1"}]}`)
+	if out, changed := NeutralizeBillingHeaders(clean); changed {
+		t.Fatalf("must not touch a body without the trigger: %s", out)
+	}
+}

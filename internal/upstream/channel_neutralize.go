@@ -361,3 +361,88 @@ func wordBreakPoints(text string, start, end int) []int {
 	}
 	return points
 }
+
+// billingHeaderTriggers 客户端在系统提示里写入的「计费/归属头」字符串。它们对模型没有
+// 语义价值，却会被上游当成渠道特征拒掉，且**每个请求都会出现**，所以不能等撞墙再重试：
+// 那样每个请求都要白白多花一次往返（实测 76/79 的请求都是「先被拒一次再靠第 0 档救回」）。
+//
+// 只提前断这里列出的字符串，不动任何其他内容：零宽空格不改变模型读到的文字，也不影响
+// 任何客户端的解析；触发词之外的正文一律原样发送。
+var billingHeaderTriggers = []string{
+	// 2026-09-28 实测：Claude Code 2.1.283 系统提示首行的计费归属头。整行被拒、只留头名
+	// 也被拒；"x-anthropic-" 或 "x-anthropic-version:" 等其他头通过。
+	"x​-a​nthropic-b​illing-h​eader",
+}
+
+// NeutralizeBillingHeaders 提前断开已知的计费头触发串；没有命中时原样返回 false。
+// 与 NeutralizeChannelTriggerAt 的分工：这里是「已知必被拒、且无信息价值」的提前处理，
+// 那边是「被拒之后的逐档补救」。
+func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	var obj any
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
+		return body, false
+	}
+	changed := false
+	obj = neutralizeBillingValue(obj, &changed)
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// neutralizeBillingValue 递归遍历解码后的 JSON，断开计费头触发串。
+func neutralizeBillingValue(value any, changed *bool) any {
+	switch node := value.(type) {
+	case string:
+		return neutralizeBillingText(node, changed)
+	case []any:
+		for i, item := range node {
+			node[i] = neutralizeBillingValue(item, changed)
+		}
+		return node
+	case map[string]any:
+		for key, item := range node {
+			node[key] = neutralizeBillingValue(item, changed)
+		}
+		return node
+	default:
+		return value
+	}
+}
+
+// neutralizeBillingText 在单个字符串内断开全部计费头触发串。
+func neutralizeBillingText(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	insertAt := map[int]struct{}{}
+	for _, trigger := range billingHeaderTriggers {
+		start := 0
+		for {
+			index := indexFrom(text, trigger, start)
+			if index < 0 {
+				break
+			}
+			for _, pos := range wordBreakPoints(text, index, index+len(trigger)) {
+				insertAt[pos] = struct{}{}
+			}
+			start = index + len(trigger)
+		}
+	}
+	if len(insertAt) == 0 {
+		return text
+	}
+	points := make([]int, 0, len(insertAt))
+	for pos := range insertAt {
+		points = append(points, pos)
+	}
+	*changed = true
+	return insertBreaks(text, points)
+}

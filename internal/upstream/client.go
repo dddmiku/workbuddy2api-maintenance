@@ -830,6 +830,12 @@ func (c *Client) prepareBodyWithBudget(body []byte, realm, uid, conversationID s
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// 计费头提前断词：这类串对模型没有语义价值，却会被上游当渠道特征拒掉，而且几乎每个
+	// 请求都带着它。提前处理省掉「先被拒一次再重试」的往返（实测 76/79 的请求都白撞一次）。
+	if neutralized, changed := NeutralizeBillingHeaders(body); changed {
+		log.Printf("INFO: [upstream] billing header pre-neutralized uid=%s", logfmt.UID8(uid))
+		body = neutralized
+	}
 	// 出站图片预算（最后一环）：前面所有改写都可能让体积膨胀，这里统一按字节收口。
 	// 放在 prompt_cache_key 之后：裁剪只动图片 part，缓存键不受影响。
 	body = ShrinkOutboundImages(body, c.OutboundImageBudgetBytes)
