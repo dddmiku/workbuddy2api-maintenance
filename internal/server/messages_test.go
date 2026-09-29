@@ -323,3 +323,52 @@ func TestMessagesStillRejectsUnusableRoles(t *testing.T) {
 		}
 	}
 }
+
+// TestMessagesAcceptBuiltinToolDeclarations Anthropic Messages 路径必须与
+// Chat / Responses 一致：客户端默认携带的服务端内置工具（Claude Code 的 WebSearch
+// 就是 web_search_20250305）只接受声明、不转发，而不是整条请求 400。
+//
+// 2026-09-29 实测：Claude Code 一用联网搜索就整条会话不可用，报
+// `400 server tools are not supported; provide client tools with input_schema`。
+func TestMessagesAcceptBuiltinToolDeclarations(t *testing.T) {
+	input := `{"model":"cn:fixture","max_tokens":1024,` +
+		`"messages":[{"role":"user","content":"search something"}],` +
+		`"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":5},` +
+		`{"name":"read","input_schema":{"type":"object"}}]}`
+	chat, _, _, err := messagesToChat([]byte(input))
+	if err != nil {
+		t.Fatalf("内置工具声明不应让整条请求失败: %v", err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(chat, &object); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := object["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("上游只应看到 1 个客户端工具，实际 %d: %s", len(tools), chat)
+	}
+	function, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if function["name"] != "read" {
+		t.Fatalf("保留的应是客户端自定义工具: %s", chat)
+	}
+}
+
+// TestMessagesBuiltinOnlyToolsOmitField 只有内置工具时不得留空 tools 数组：
+// 「没有可调用工具」用省略字段表达，空数组对上游行为没有保证。
+func TestMessagesBuiltinOnlyToolsOmitField(t *testing.T) {
+	input := `{"model":"cn:fixture","max_tokens":1024,` +
+		`"messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
+	chat, _, _, err := messagesToChat([]byte(input))
+	if err != nil {
+		t.Fatalf("仅内置工具时不应报错: %v", err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(chat, &object); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := object["tools"]; exists {
+		t.Fatalf("仅内置工具时应省略 tools 字段: %s", chat)
+	}
+}
+

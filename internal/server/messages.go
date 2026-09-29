@@ -382,6 +382,13 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 			if err != nil {
 				return nil, "", false, err
 			}
+			// Anthropic 的服务端内置工具（web_search_20250305 等）网关侧没有实现，
+			// 但客户端默认就可能带上它。与 Chat / Responses 两条路径保持一致：
+			// **接受声明、丢弃不转发**，而不是整条请求 400——否则客户端一开联网搜索
+			// 就整个会话不可用（2026-09-29 实测：Claude Code 的 WebSearch 直接 400）。
+			if kind, _ := tool["type"].(string); isUnimplementedBuiltinTool(kind) {
+				continue
+			}
 			if kind := tool["type"]; kind != nil && kind != "custom" {
 				return nil, "", false, fmt.Errorf("server tools are not supported; provide client tools with input_schema")
 			}
@@ -400,7 +407,11 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 			}
 			functions = append(functions, map[string]any{"type": "function", "function": function})
 		}
-		chat["tools"] = functions
+		// 全部声明都是网关不实现的内置工具时不要留空数组：上游对空 tools 的处理
+		// 没有保证，而「没有可调用工具」用省略字段表达最清楚（与 Responses 路径一致）。
+		if len(functions) > 0 {
+			chat["tools"] = functions
+		}
 	}
 	if value := source["tool_choice"]; value != nil {
 		choice, err := requestValidationObject(value, "tool_choice")

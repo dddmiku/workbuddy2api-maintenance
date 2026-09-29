@@ -2,6 +2,22 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## v2.4.25 — 2026-09-29
+
+修掉 Claude Code 一开联网搜索就整条请求失败的问题：Anthropic Messages 路径对服务端内置工具由「硬拒」改为「接受声明、不转发」。
+
+- 根因：客户端发的是 Anthropic 服务端内置工具（Claude Code 的 WebSearch 就是
+  `{"type":"web_search_20250305","name":"web_search"}`），而 **Messages 路径对 `type` 非
+  `custom` 的工具一律整条 400**（`server tools are not supported; provide client tools with
+  input_schema`）。Chat 与 Responses 两条路径早已实现「接受声明、丢弃不转发」——三条路径
+  行为不一致，导致同一个客户端换个协议就完全不可用。
+- 现在 Messages 路径与另两条一致：已实测的内置工具族（`web_search*`、`tool_search*`、
+  `image_generation`）只接受声明、不转发给上游；其余服务端能力（`file_search`、`mcp`、
+  `computer_use`、`local_shell` 等）仍**明确拒绝**——静默丢弃会让用户以为这些能力在生效。
+- 顺带修一处疏漏：全部声明都是内置工具时**省略 `tools` 字段**，不再留空数组
+  （上游对空 `tools` 的行为没有保证）。
+- 新增 2 项测试（内置工具声明被接受且不转发、仅内置工具时省略字段），全量 24 包通过。
+
 ## v2.4.24 — 2026-09-28
 
 修掉「已是最新版本」时「立即更新」按钮仍可点的问题——点下去会把服务白重启一遍。
