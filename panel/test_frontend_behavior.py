@@ -332,9 +332,37 @@ return Promise.resolve().then(function(){}).then(function(){}).then(function(){
 });
 """, extra_sources=("requests.js",))
         self.assertTrue(any('facets' in u for u in result["asked"]), "必须请求 /requests/facets")
-        self.assertIn('value="legacy"', result["keys"], "调用密钥下拉应含 legacy")
-        self.assertIn('label="dddmiku"', result["keys"], "密钥下拉应带展示名")
+        # 下拉只显示名称：value 是展示名，不再同时带 label（否则同一密钥显示两行）。
+        self.assertIn('value="dddmiku"', result["keys"], "密钥下拉应显示名称")
+        self.assertNotIn('label=', result["keys"], "不应再用 label 渲染第二行")
+        self.assertNotIn('value="legacy"', result["keys"], "不应把管理 ID 当显示项")
         self.assertIn('global:deepseek-v4.1-flash', result["models"], "模型下拉应含完整模型名")
+
+    def test_request_key_filter_resolves_name_back_to_id(self):
+        """下拉显示名称，但提交必须换回管理 ID——否则筛选会查不到任何记录。"""
+        result = self.run_frontend("""
+var sent=[];
+api=function(url){
+  if(String(url).indexOf('facets')>=0)
+    return Promise.resolve({ok:true,keys:[{id:'legacy',name:'dddmiku'}],models:['m'],truncated:false});
+  sent.push(url);
+  return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});
+};
+window.loadRequests();
+var wait=Promise.resolve();
+for(var i=0;i<8;i++) wait=wait.then(function(){});
+return wait.then(function(){
+  $('#requestKeyFilter').value='dddmiku';
+  $('#requestFilters').events.submit({preventDefault:function(){}});
+  var w2=Promise.resolve();
+  for(var j=0;j<8;j++) w2=w2.then(function(){});
+  return w2.then(function(){ return sent; });
+});
+""", extra_sources=("requests.js",))
+        # facets 桩数据里 dddmiku 对应 legacy
+        joined = " ".join(result)
+        self.assertIn("key_id=legacy", joined, "名称应被解析回管理 ID")
+        self.assertNotIn("key_id=dddmiku", joined, "不应把名称直接当 ID 发出")
 
     def test_overview_credit_breaks_down_by_realm(self):
         """首页积分要分列国际与国内。

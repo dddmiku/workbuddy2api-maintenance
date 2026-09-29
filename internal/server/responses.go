@@ -1263,6 +1263,12 @@ func (rw *responsesWriter) FinishResponse() error {
 	return nil
 }
 
+// DeliveredContent 报告是否已把客户端可见内容推下去（正文/思考/工具/拒答）。
+// 只开了流（response.created 等信封事件）不算——那种情况换号重试不会重复输出。
+func (rw *responsesWriter) DeliveredContent() bool {
+	return rw.text.Len() > 0 || rw.refusal.Len() > 0 || rw.reason.Len() > 0 || len(rw.calls) > 0
+}
+
 func (rw *responsesWriter) WriteHeader(code int) {
 	rw.status = code
 	if code >= 400 {

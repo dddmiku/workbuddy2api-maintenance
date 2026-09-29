@@ -79,6 +79,11 @@ import (
 // 回报错误，不能无限重试。
 const maxReasoningLoopRetries = 1
 
+// maxReadRotations 上游掐流（且客户端未收到任何内容）时换号重试的上限。
+// 取 2：偶发故障换一次通常就好；连换两次仍失败说明上游整体不稳，
+// 继续重试只会拖长客户端等待，不如如实报错。
+const maxReadRotations = 2
+
 // 换号重试上限由 config 的 pool.max_soft_rotations 决定（0/未配置 = 保持既有契约：
 // 内容审核与未知 4xx 直接回给调用方，不换号）。上游的内容审核可能是内容维度而非账号
 // 维度，换号未必能过、却会拖慢失败——所以默认关闭，由部署方按需打开。
@@ -1121,6 +1126,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 的权限问题，换号成本只是延迟（被拒请求不产生上游计费）。试满 maxSoftRotations 次
 	// 仍失败才把上游原文交给调用方。
 	softRotate := 0
+	// readRotate 统计「上游掐流且客户端还没收到任何内容」时已换号重试的次数。
+	// 上游偶发 INTERNAL_ERROR / 连接中断（2026-09-30 实测约占请求的 0.7%），此时换号
+	// 重发往往能成功；但只在**客户端还什么都没收到**时才安全——已经推过内容再重发
+	// 会让客户端看到重复或矛盾的两段输出。上限见 maxReadRotations。
+	readRotate := 0
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
@@ -1641,10 +1651,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				if r.Context().Err() != nil {
 					st.status = 499
-				} else {
-					st.status = http.StatusBadGateway
-					log.Printf("WARN: [server] stream incomplete uid=%s model=%s error=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
+					fail(acct.UID)
+					return
 				}
+				// 上游掐流（INTERNAL_ERROR / 连接中断）且客户端**还没收到任何内容**时换号重试：
+				// 这是可恢复的偶发上游故障，重发通常直接成功。已交付过内容则不能重试——
+				// 客户端会看到重复输出，只能如实报错。
+				if upstream.IsUpstreamReadError(streamErr) && !deliveredContent(w) && readRotate < maxReadRotations {
+					readRotate++
+					log.Printf("WARN: [server] upstream stream cut before any content uid=%s model=%s — rotating to another account (attempt %d/%d)",
+						logfmt.UID8(acct.UID), bareModel, readRotate, maxReadRotations)
+					// fail 而非 releaseHeld：必须解绑会话粘性，否则下一轮又选中同一个号。
+					fail(acct.UID)
+					tried[acct.UID] = true
+					continue
+				}
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] stream incomplete uid=%s model=%s error=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
 				fail(acct.UID)
 				return
 			}
@@ -1924,6 +1947,32 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 // streamFailureWriter 由「已经开始流」的适配器实现：把失败交付在流内而不是 JSON。
 type streamFailureWriter interface {
 	StreamFailure(code, message string) bool
+}
+
+// deliveredContentWriter 由流式适配器实现：报告是否已经把**客户端可见的内容**
+// 推下去了（正文、思考、工具调用参数等），而不是只有 ping 之类的保活帧。
+//
+// 用途：上游掐流（upstream_read_error）后想换号重试，但只有「客户端还什么都没收到」
+// 时才安全——已经推过内容再重试，客户端会看到重复或矛盾的两段输出。
+// 保活 ping 不算内容，重试不会造成重复。
+type deliveredContentWriter interface {
+	DeliveredContent() bool
+}
+
+// deliveredContent 沿写入器链询问是否已交付内容；没有适配器时保守返回 true
+// （宁可放弃重试，也不要冒着重复输出的风险）。
+func deliveredContent(w http.ResponseWriter) bool {
+	for current := w; current != nil; {
+		if probe, ok := current.(deliveredContentWriter); ok {
+			return probe.DeliveredContent()
+		}
+		next, ok := current.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		current = next.Unwrap()
+	}
+	return true
 }
 
 // deliverStreamFailure 沿写入器链找一个能把失败写进流的适配器；返回是否已交付。

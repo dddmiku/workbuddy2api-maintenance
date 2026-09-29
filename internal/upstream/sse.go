@@ -46,6 +46,19 @@ type StreamError struct {
 func (e *StreamError) Error() string { return e.Message }
 func (e *StreamError) Unwrap() error { return e.Cause }
 
+// IsUpstreamReadError 报告是否为「上游流读到一半断了」。
+//
+// 上游偶发 INTERNAL_ERROR / 连接中断（2026-09-30 实测约占请求的 0.7%），
+// 这类失败是可恢复的：换号重发通常直接成功。是否真的重试由调用方决定——
+// 只有当客户端**还没收到任何内容**时才安全（见 handler 的 deliveredContent 探针）。
+func IsUpstreamReadError(err error) bool {
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) {
+		return false
+	}
+	return streamErr.Code == "upstream_read_error" || streamErr.Code == "upstream_parse"
+}
+
 // ErrorObject 返回 OpenAI SSE error 字段的值；上游对象不做字段删改。
 func (e *StreamError) ErrorObject() map[string]any {
 	if e.Upstream != nil {

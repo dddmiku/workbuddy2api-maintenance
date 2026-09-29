@@ -58,6 +58,7 @@ type messagesWriter struct {
 	stop                   string
 	err                    error
 	lastEvent              time.Time
+	delivered              bool
 	mu                     sync.Mutex
 	keepAlive              bool
 	done                   chan struct{}
@@ -107,6 +108,15 @@ func (m *messagesWriter) keepAliveLoop() {
 		m.mu.Unlock()
 		timer.Reset(m.idlePing)
 	}
+}
+
+// DeliveredContent 报告是否已把客户端可见的内容推下去。
+// 只发过 ping（保活）不算：那种情况下换号重试不会造成重复输出。
+// message_start 也不算——它只是流已开启的声明，正文/思考/工具都还没到。
+func (m *messagesWriter) DeliveredContent() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.delivered
 }
 
 func (m *messagesWriter) Header() http.Header  { return m.hdr }
@@ -363,6 +373,10 @@ func (m *messagesWriter) eventLocked(kind string, payload map[string]any) {
 		return
 	}
 	payload["type"] = kind
+	// ping 只是保活、message_start 只是开流声明，都不算客户端可见内容。
+	if kind != "ping" && kind != "message_start" {
+		m.delivered = true
+	}
 	data, err := json.Marshal(payload)
 	if err == nil {
 		_, err = fmt.Fprintf(m.inner, "event: %s\ndata: %s\n\n", kind, data)

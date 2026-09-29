@@ -3051,7 +3051,7 @@ usageInit();
 // 2026-09-25：显示服务报告的明细写入失败次数，避免把可见记录误当成完整历史。
 // 2026-09-25：显示真实调度总数与截断提示，保留记录不再冒充完整调度历史。
 (function(){
-  var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null), facetsLoaded:false, facetsLoading:false, facetsTruncated:false};
+  var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null), facetsLoaded:false, facetsLoading:false, facetsTruncated:false, keyDisplay:Object.create(null)};
   var detail = {revision:0, active:false, requestID:'', opener:null};
   var statusNames = {success:'成功', error:'失败', canceled:'已取消', rejected:'已拒绝'};
   var protocolNames = {chat_completions:'Chat Completions', responses:'Responses', anthropic_messages:'Anthropic Messages', gemini_generate_content:'Gemini generateContent'};
@@ -3165,9 +3165,33 @@ usageInit();
   // 筛选项来自服务端的 /requests/facets，而不是当前这一页的 20 条。
   // 旧实现只从本页凑：不在本页的密钥与模型永远选不到，首次加载前下拉更是空的，
   // 用户点开箭头什么都看不到（2026-09-30 反馈）。列表变化很慢，拉一次缓存即可。
+  // 下拉只显示名称。<option> 的 value 决定选中后写进输入框的内容，label 会让浏览器
+  // 再渲染一行，于是同一个密钥出现两行（ID + 名称）——用户只需要认名称（2026-09-30 反馈）。
+  // 改为 value 直接放展示名，提交时解析回 ID；名称重复或为空时退回显示 ID，避免歧义。
+  function keyDisplayName(id){
+    var name=String(state.keyOptions[id]||'');
+    if(!name || name===id) return id;
+    var clash=Object.keys(state.keyOptions).some(function(other){ return other!==id && String(state.keyOptions[other])===name; });
+    return clash ? id : name;
+  }
   function renderOptions(){
-    node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){return '<option value="'+escapeHTML(id)+'" label="'+escapeHTML(state.keyOptions[id])+'"></option>';}).join('');
+    var byName={};
+    node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){
+      var shown=keyDisplayName(id);
+      byName[shown]=id;
+      return '<option value="'+escapeHTML(shown)+'"></option>';
+    }).join('');
+    state.keyDisplay=byName;
     node('requestModelOptions').innerHTML=Object.keys(state.modelOptions).map(function(model){return '<option value="'+escapeHTML(model)+'"></option>';}).join('');
+  }
+  // 输入框里可能是下拉选的名称，也可能是直接粘贴的管理 ID；能解析成 ID 就用 ID。
+  function resolveKeyID(value){
+    var trimmed=String(value||'').trim();
+    if(!trimmed) return '';
+    if(state.keyDisplay && Object.prototype.hasOwnProperty.call(state.keyDisplay,trimmed)) return state.keyDisplay[trimmed];
+    // 兜底：按名称在已知密钥里找唯一匹配（例如从「查看该密钥的明细」跳进来时还没渲染过下拉）。
+    var matches=Object.keys(state.keyOptions).filter(function(id){return String(state.keyOptions[id])===trimmed;});
+    return matches.length===1 ? matches[0] : trimmed;
   }
   async function loadFacets(){
     if(state.facetsLoaded || state.facetsLoading) return;
@@ -3203,7 +3227,7 @@ usageInit();
   function updateOptions(){ collectFromPage(); }
   function errorMessage(error){ return error && error.message ? String(error.message).slice(0,240) : '加载失败，请重试'; }
   function readFilters(){
-    return {key_id:node('requestKeyFilter').value.trim(),model:node('requestModelFilter').value.trim(),status:node('requestStatusFilter').value,request_id:node('requestIDFilter').value.trim()};
+    return {key_id:resolveKeyID(node('requestKeyFilter').value),model:node('requestModelFilter').value.trim(),status:node('requestStatusFilter').value,request_id:node('requestIDFilter').value.trim()};
   }
   async function fetchPage(){
     var revision=++state.revision, offset=state.offset, limit=state.limit, filters=Object.assign({},state.filters);
@@ -3368,7 +3392,7 @@ usageInit();
     if(!init() || typeof keyID!=='string' || !keyID) return Promise.resolve();
     closeDetail();
     state.keyOptions[keyID]=String(keyName || keyID);
-    node('requestKeyFilter').value=keyID;
+    node('requestKeyFilter').value=keyDisplayName(keyID);
     ['requestModelFilter','requestStatusFilter','requestIDFilter'].forEach(function(id){node(id).value='';});
     state.filters=readFilters();state.offset=0;state.loaded=false;
     // Start the selected-key load before navigation so go() cannot launch an

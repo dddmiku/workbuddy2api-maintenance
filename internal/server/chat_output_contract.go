@@ -251,6 +251,10 @@ type chatContractWriter struct {
 	lastWrite     time.Time
 }
 
+// DeliveredContent 报告是否已把客户端可见内容推下去（正文/思考/工具参数）。
+// 只发过空帧或用量帧不算，那种情况换号重试不会重复输出。
+func (w *chatContractWriter) DeliveredContent() bool { return len(w.marked) > 0 }
+
 func (w *chatContractWriter) Header() http.Header         { return w.inner.Header() }
 func (w *chatContractWriter) WriteHeader(status int)      { w.inner.WriteHeader(status) }
 func (w *chatContractWriter) Unwrap() http.ResponseWriter { return w.inner }
