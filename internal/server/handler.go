@@ -240,6 +240,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
 	h.mux.HandleFunc("GET /key-limits", h.requireInternal(h.keyLimitStatus))
 	h.mux.HandleFunc("GET /requests", h.requireInternal(h.requestHistory))
+	// 筛选项必须注册在 /requests/{requestID} **之前**：Go 的 mux 按最具体模式优先，
+	// 但显式排序让意图明确，也避免将来改成前缀匹配时把 facets 当成请求 ID。
+	h.mux.HandleFunc("GET /requests/facets", h.requireInternal(h.requestFacets))
 	h.mux.HandleFunc("GET /requests/{requestID}", h.requireInternal(h.requestDetail))
 	// 热更新同样只走本机管理通道：能触发版本切换的入口不能暴露给调用密钥。
 	h.mux.HandleFunc("GET /update", h.requireInternal(h.updateStatus))

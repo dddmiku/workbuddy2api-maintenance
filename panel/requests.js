@@ -5,7 +5,7 @@
 // 2026-09-25：显示服务报告的明细写入失败次数，避免把可见记录误当成完整历史。
 // 2026-09-25：显示真实调度总数与截断提示，保留记录不再冒充完整调度历史。
 (function(){
-  var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null)};
+  var state = {ready:false, loaded:false, loading:false, error:'', revision:0, offset:0, limit:20, total:0, items:[], filters:{}, keyOptions:Object.create(null), modelOptions:Object.create(null), facetsLoaded:false, facetsLoading:false, facetsTruncated:false};
   var detail = {revision:0, active:false, requestID:'', opener:null};
   var statusNames = {success:'成功', error:'失败', canceled:'已取消', rejected:'已拒绝'};
   var protocolNames = {chat_completions:'Chat Completions', responses:'Responses', anthropic_messages:'Anthropic Messages', gemini_generate_content:'Gemini generateContent'};
@@ -116,14 +116,45 @@
     node('btnRequestsReload').disabled=state.loading;
     node('requestsPanel').setAttribute('aria-busy',state.loading ? 'true' : 'false');
   }
-  function updateOptions(){
+  // 筛选项来自服务端的 /requests/facets，而不是当前这一页的 20 条。
+  // 旧实现只从本页凑：不在本页的密钥与模型永远选不到，首次加载前下拉更是空的，
+  // 用户点开箭头什么都看不到（2026-09-30 反馈）。列表变化很慢，拉一次缓存即可。
+  function renderOptions(){
+    node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){return '<option value="'+escapeHTML(id)+'" label="'+escapeHTML(state.keyOptions[id])+'"></option>';}).join('');
+    node('requestModelOptions').innerHTML=Object.keys(state.modelOptions).map(function(model){return '<option value="'+escapeHTML(model)+'"></option>';}).join('');
+  }
+  async function loadFacets(){
+    if(state.facetsLoaded || state.facetsLoading) return;
+    state.facetsLoading=true;
+    try{
+      var result=await api('api/requests/facets');
+      if(result && result.ok===true){
+        (result.keys||[]).forEach(function(item){
+          if(item && typeof item.id==='string' && item.id) state.keyOptions[item.id]=String(item.name||item.id);
+        });
+        (result.models||[]).forEach(function(model){
+          if(typeof model==='string' && model) state.modelOptions[model]=true;
+        });
+        state.facetsLoaded=true;
+        state.facetsTruncated=result.truncated===true;
+        renderOptions();
+      }
+    }catch(error){
+      // 拉不到就退回「从当前页凑」，至少不阻断主流程。
+      collectFromPage();
+    }finally{
+      state.facetsLoading=false;
+    }
+  }
+  // 兜底：服务端筛选项不可用时，仍用当前页已有的记录填下拉。
+  function collectFromPage(){
     state.items.forEach(function(item){
       if(item.key_id && Object.keys(state.keyOptions).length < 300) state.keyOptions[item.key_id]=String(item.key_name || item.key_id);
       if(item.model && Object.keys(state.modelOptions).length < 300) state.modelOptions[item.model]=true;
     });
-    node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){return '<option value="'+escapeHTML(id)+'" label="'+escapeHTML(state.keyOptions[id])+'"></option>';}).join('');
-    node('requestModelOptions').innerHTML=Object.keys(state.modelOptions).map(function(model){return '<option value="'+escapeHTML(model)+'"></option>';}).join('');
+    renderOptions();
   }
+  function updateOptions(){ collectFromPage(); }
   function errorMessage(error){ return error && error.message ? String(error.message).slice(0,240) : '加载失败，请重试'; }
   function readFilters(){
     return {key_id:node('requestKeyFilter').value.trim(),model:node('requestModelFilter').value.trim(),status:node('requestStatusFilter').value,request_id:node('requestIDFilter').value.trim()};
@@ -261,6 +292,8 @@
       state.filters={};state.offset=0;return fetchPage();
     });
     node('btnRequestsReload').addEventListener('click',function(){state.offset=0;return fetchPage();});
+    // 进页面就拉筛选项，用户点箭头时下拉已经有内容。
+    loadFacets();
     node('requestPageSize').addEventListener('change',function(){state.limit=node('requestPageSize').value==='50' ? 50 : 20;state.offset=0;return fetchPage();});
     node('requestsPrevious').addEventListener('click',function(){if(state.loading || state.offset===0) return;state.offset=Math.max(0,state.offset-state.limit);return fetchPage();});
     node('requestsNext').addEventListener('click',function(){if(state.loading || !state.items.length || state.offset+state.items.length>=state.total) return;state.offset+=state.limit;return fetchPage();});

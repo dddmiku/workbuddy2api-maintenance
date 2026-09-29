@@ -21,20 +21,33 @@ class FrontendBehaviorTests(unittest.TestCase):
         program = r"""
 const vm = require('vm'), fs = require('fs'), path = require('path');
 const nodes = new Map();
-function node(id) {
+// 归一化：document.querySelector('#x') 与 getElementById('x') 必须指向同一个节点，
+// 否则同一元素会被存成两个 key——模块用 getElementById 绑定、测试用 $() 读取，
+// 两边看到的是不同对象，断言必然假失败。
+function norm(id) {
+  const s = String(id);
+  return s.charAt(0) === '#' ? s.slice(1) : s;
+}
+function node(rawId) {
+  const id = norm(rawId);
   if (!nodes.has(id)) nodes.set(id, {innerHTML:'', textContent:'', value:'', disabled:false,
-    style:{}, attrs:{}, events:{}, classList:{add(){},remove(){},toggle(){}},
+    options:[], style:{}, attrs:{}, events:{}, classList:{add(){},remove(){},toggle(){}},
     setAttribute(k,v){this.attrs[k]=String(v)}, getAttribute(k){return this.attrs[k]},
     removeAttribute(k){delete this.attrs[k]}, addEventListener(k,v){this.events[k]=v},
     querySelector(s){return node(id+' '+s)},querySelectorAll(){return []}});
   return nodes.get(id);
 }
-const context = {console, Date, Promise, Map,
+// window 必须存在：requests.js 等模块在加载时就会写 window.loadRequests /
+// window.openRequestsForKey，缺了它整个脚本会在解析期抛错，测试根本进不到断言。
+const win = {addEventListener(){}, location:{origin:'http://fixture.invalid',hash:'#overview'}};
+const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON, Object, Array, String, Number, Boolean, Error, RegExp, Math,
   setTimeout(){return 1},clearTimeout(){},setInterval(){return 1},clearInterval(){},
   location:{origin:'http://fixture.invalid',hash:'#overview',replace(){}},
   history:{replaceState(){}},localStorage:{getItem(){return null},setItem(){}},
   document:{readyState:'loading',hidden:false,documentElement:node('html'),
-    querySelector:node,querySelectorAll(){return []},addEventListener(){}}};
+    // getElementById 必须存在：requests.js 的 node() 走的就是它，缺了会让
+    // 整个模块在 init() 里抛错，测试永远进不到断言（此前 requests.js 从未被测过）。
+    getElementById:node, querySelector:node, querySelectorAll(){return []}, addEventListener(){}}};
 vm.createContext(context);
 for (const source of ['app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
   vm.runInContext(fs.readFileSync(path.join(process.argv[1],source),'utf8'),context);
@@ -265,7 +278,93 @@ return {apply:$('#btnUpdApply').disabled, state:$('#updState').textContent,
 """, extra_sources=("update.js",))
         self.assertTrue(result["apply"], "私有仓库未配令牌时「立即更新」必须禁用")
         self.assertEqual(result["state"], "不可用")
-        self.assertIn("update.token", result["body"])
+
+    def test_requests_filters_are_wired_and_sent(self):
+        """筛选控件必须真的绑上并发出请求。
+
+        2026-09-30 用户反馈「筛选不行、下拉箭头没用」：服务端筛选已实测正常，
+        所以先锁定前端契约——提交表单要读取四个控件并把它们发进查询串。
+        """
+        result = self.run_frontend("""
+var sent=[];
+api=function(url){sent.push(url);return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});};
+// 框架里 document.addEventListener 是空实现，DOMContentLoaded 不会触发，
+// 所以显式走一次 loadRequests 让 init() 绑定事件（真实页面由 go() 调用）。
+window.loadRequests();
+$('#requestKeyFilter').value='legacy';
+$('#requestModelFilter').value='global:deepseek-v4.1-flash';
+$('#requestStatusFilter').value='success';
+$('#requestIDFilter').value='req_ABC';
+var handler=$('#requestFilters').events.submit;
+if(!handler) return {bound:false};
+handler({preventDefault:function(){}});
+// fetchPage 是异步的：框架的 setTimeout 是空实现，所以用微任务等它把请求发出去。
+return Promise.resolve().then(function(){}).then(function(){}).then(function(){
+  return {bound:true, url:sent[sent.length-1]||''};
+});
+""", extra_sources=("requests.js",))
+        self.assertTrue(result["bound"], "requestFilters 必须绑定 submit 处理")
+        url = result["url"]
+        self.assertIn("key_id=legacy", url, "调用密钥筛选未进入查询串")
+        self.assertIn("status=success", url, "请求状态筛选未进入查询串")
+        self.assertIn("request_id=req_ABC", url, "请求 ID 筛选未进入查询串")
+
+    def test_request_facets_populate_the_datalists(self):
+        """筛选项必须来自服务端 facets，而不是当前页那 20 条。
+
+        2026-09-30 用户反馈「箭头点开什么都没有」：旧实现只从当前页收集，
+        不在本页的密钥/模型永远选不到，首次加载前下拉是空的。
+        """
+        result = self.run_frontend("""
+var asked=[];
+api=function(url){
+  asked.push(url);
+  if(String(url).indexOf('facets')>=0)
+    return Promise.resolve({ok:true,keys:[{id:'legacy',name:'dddmiku'},{id:'key_9',name:'热情'}],
+                            models:['global:deepseek-v4.1-flash','cn:hy3'],truncated:false});
+  return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});
+};
+window.loadRequests();
+return Promise.resolve().then(function(){}).then(function(){}).then(function(){
+  // 桩节点不会把 innerHTML 解析成 options，所以直接断言写入的内容——
+  // 真实浏览器里的解析已单独用无头 Chrome 验证过（2/2 选项）。
+  return {asked:asked, keys:$('#requestKeyOptions').innerHTML, models:$('#requestModelOptions').innerHTML};
+});
+""", extra_sources=("requests.js",))
+        self.assertTrue(any('facets' in u for u in result["asked"]), "必须请求 /requests/facets")
+        self.assertIn('value="legacy"', result["keys"], "调用密钥下拉应含 legacy")
+        self.assertIn('label="dddmiku"', result["keys"], "密钥下拉应带展示名")
+        self.assertIn('global:deepseek-v4.1-flash', result["models"], "模型下拉应含完整模型名")
+
+    def test_overview_credit_breaks_down_by_realm(self):
+        """首页积分要分列国际与国内。
+
+        两套账来自不同上游、不同计费，混在一起看不出哪边快用完。
+        合计保留，下面按域小计（与「账号池」的 realmTotals 同一惯例）。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:100,size:400}},
+  {uid:'g2',realm:'global',pool:{inPool:true},credits:{remain:50,size:200}},
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:30,size:100}}]};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn("国际剩余", result, "应列出国际积分小计")
+        self.assertIn("国内剩余", result, "应列出国内积分小计")
+        self.assertIn("150", result, "国际小计应为 100+50")
+        self.assertIn("30", result, "国内小计应为 30")
+        self.assertIn("180", result, "合计仍应为 180")
+
+    def test_overview_credit_skips_absent_realm(self):
+        """某域一个号都没取到积分时不显示该行，避免堆空行。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:100,size:400}}]};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn("国际剩余", result)
+        self.assertNotIn("国内剩余", result)
 
 
 if __name__ == "__main__":

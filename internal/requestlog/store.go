@@ -574,3 +574,49 @@ func (s *Store) cleanupTempsLocked() error {
 	}
 	return nil
 }
+
+// MaxFacets 限制返回的筛选项条数：管理通道有界，且下拉本身不适合放太多项。
+const MaxFacets = 500
+
+// Facets 返回去重后的可筛选调用密钥与模型名，按最近出现顺序（新在前）。
+//
+// 只遍历内存快照，不重读文件；与 List 共用同一把锁与刷新路径，因此与分页
+// 结果看到的是同一份状态。达到 MaxFacets 后停止收集并置 Truncated，如实
+// 说明列表被截断，而不是让调用方以为这就是全部。
+func (s *Store) Facets() (Facets, error) {
+	out := Facets{Keys: []FacetKey{}, Models: []string{}}
+	seenKey := make(map[string]bool)
+	seenModel := make(map[string]bool)
+	err := s.locked(func() error {
+		if err := s.refreshLocked(false); err != nil {
+			return err
+		}
+		if err := s.retainLocked(); err != nil {
+			return err
+		}
+		for i := len(s.state.entries) - 1; i >= 0; i-- {
+			r := s.state.entries[i].summary
+			if r.KeyID != "" && !seenKey[r.KeyID] {
+				if len(out.Keys) >= MaxFacets {
+					out.Truncated = true
+					return nil
+				}
+				seenKey[r.KeyID] = true
+				out.Keys = append(out.Keys, FacetKey{ID: r.KeyID, Name: r.KeyName})
+			}
+			if r.Model != "" && !seenModel[r.Model] {
+				if len(out.Models) >= MaxFacets {
+					out.Truncated = true
+					return nil
+				}
+				seenModel[r.Model] = true
+				out.Models = append(out.Models, r.Model)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return Facets{}, err
+	}
+	return out, nil
+}

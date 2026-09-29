@@ -74,3 +74,25 @@ func (h *Handler) requestHistoryError(w http.ResponseWriter, err error) {
 	}
 	_ = writeJSON(w, status, map[string]any{"ok": false, "message": message})
 }
+
+// requestFacets 返回筛选下拉的可选值（调用密钥、完整模型名）。
+//
+// 为什么不复用 /requests：分页只带 20 条，下拉若从当前页凑，不在本页的密钥与
+// 模型就永远选不到，首次加载前更是空的——用户点开箭头什么也看不到。
+// 这里一次给全（有上限并如实标记截断），前端缓存即可。
+func (h *Handler) requestFacets(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Requests == nil {
+		_ = writeJSON(w, 503, map[string]any{"ok": false, "message": "请求明细尚未启用"})
+		return
+	}
+	if r.URL.RawQuery != "" {
+		_ = writeJSON(w, 400, map[string]any{"ok": false, "message": "筛选项接口不接受参数"})
+		return
+	}
+	facets, err := h.cfg.Requests.Facets()
+	if err != nil {
+		h.requestHistoryError(w, err)
+		return
+	}
+	_ = writeJSON(w, 200, map[string]any{"ok": true, "keys": facets.Keys, "models": facets.Models, "truncated": facets.Truncated})
+}

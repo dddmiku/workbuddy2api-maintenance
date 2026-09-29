@@ -507,10 +507,16 @@ function renderCredit(){
       mrow('原因', d.creditError);
     return;
   }
-  var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
-  var size = have.reduce(function(s, x){
-    return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
-  var used = Math.max(0, size - remain);
+  // 按域汇总：国际与国内的积分是两套账（不同上游、不同计费），混在一起看不出
+  // 哪边快用完。合计保留在最上面，下面分列，与「账号池」的 realmTotals 同一惯例。
+  function sumOf(list){
+    var remain = list.reduce(function(s, x){ return s + x.credits.remain; }, 0);
+    var size = list.reduce(function(s, x){
+      return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
+    return {remain: remain, size: size, used: Math.max(0, size - remain), count: list.length};
+  }
+  var total = sumOf(have);
+  var remain = total.remain, size = total.size, used = total.used;
   var pct = size ? Math.round(remain / size * 100) : 0;
   var html = '<div class="big"><span class="v">' + num(remain) + '</span><span class="u">剩余</span></div>' +
     '<div class="comp">' +
@@ -520,6 +526,15 @@ function renderCredit(){
     mrow('已用', num(used)) +
     mrow('总额度', num(size)) +
     mrow('取到积分', have.length + ' / ' + a.length);
+  // 分域小计：只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
+  [['global', '国际'], ['cn', '国内']].forEach(function(pair){
+    var realm = pair[0], label = pair[1];
+    var subset = have.filter(function(x){ return String(x.realm || '') === realm; });
+    if (!subset.length) return;
+    var part = sumOf(subset);
+    var share = remain ? Math.round(part.remain / remain * 100) : 0;
+    html += mrow(label + '剩余', num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）');
+  });
   if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
   else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
   $('#creditPanel').innerHTML = html;

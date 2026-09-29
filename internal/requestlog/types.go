@@ -174,6 +174,24 @@ type Page struct {
 	Recovery *RecoveryInfo `json:"recovery,omitempty"`
 }
 
+// Facets 是筛选下拉的可选值：管理台用它把「调用密钥」「完整模型名」列全，
+// 而不是从当前这一页的 20 条里凑——那样不在本页的密钥/模型永远选不到，
+// 而且首次加载前下拉是空的（2026-09-30 用户反馈「箭头点开什么都没有」）。
+//
+// 选项按最近出现顺序排列（新在前），去重；容量有上限，超出时按 Truncated
+// 如实标记，不静默截断。只含标识与展示名，不含请求正文或任何密钥明文。
+type Facets struct {
+	Keys      []FacetKey `json:"keys"`
+	Models    []string   `json:"models"`
+	Truncated bool       `json:"truncated"`
+}
+
+// FacetKey 是一个可筛选的调用密钥：ID 用于查询，Name 用于显示。
+type FacetKey struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 // Summary is deliberately small: the management channel is bounded to 1 MiB,
 // so attempt/decision arrays are available through Get only. Metrics are sums
 // of observed values, never estimates for attempts that did not report usage.

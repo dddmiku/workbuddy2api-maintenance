@@ -1400,6 +1400,12 @@ class Handler(BaseHTTPRequestHandler):
             if query:
                 return self._json(400, {"ok": False, "message": "限流状态接口不接受筛选参数"})
             return self.keys_request("GET", "/key-limits")
+        if path == "/api/requests/facets":
+            # 筛选项列表：不接受参数（与网关同语义），必须排在请求 ID 路由之前，
+            # 否则会被当成 request_id="facets" 转发。
+            if query:
+                return self._json(400, {"ok": False, "message": "筛选项接口不接受参数"})
+            return self.keys_request("GET", "/requests/facets")
         if path.startswith("/api/requests/"):
             try:
                 request_id = unquote(path[len("/api/requests/"):], errors="strict")
