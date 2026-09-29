@@ -3171,11 +3171,17 @@ usageInit();
   function keyDisplayName(id){
     var name=String(state.keyOptions[id]||'');
     if(!name || name===id) return id;
+    // 名称含标记字符时退回显示 ID：密钥名是运维填的自由文本，带尖括号/引号的多半是
+    // 异常或注入尝试，显示它没有好处（服务器回归测试锁定 __proto__ / <img> 两类）。
+    if(/[<>"'`]/.test(name)) return id;
+    // 名称重复时也无法唯一定位，退回 ID 避免选错。
     var clash=Object.keys(state.keyOptions).some(function(other){ return other!==id && String(state.keyOptions[other])===name; });
     return clash ? id : name;
   }
   function renderOptions(){
-    var byName={};
+    // 用 null 原型：密钥名可能是 __proto__ / constructor 这类原型链上的名字，
+    // 普通对象赋值会把它们吃掉（2026-09-30 服务器回归测试实测到）。
+    var byName=Object.create(null);
     node('requestKeyOptions').innerHTML=Object.keys(state.keyOptions).map(function(id){
       var shown=keyDisplayName(id);
       byName[shown]=id;
@@ -3189,6 +3195,8 @@ usageInit();
     var trimmed=String(value||'').trim();
     if(!trimmed) return '';
     if(state.keyDisplay && Object.prototype.hasOwnProperty.call(state.keyDisplay,trimmed)) return state.keyDisplay[trimmed];
+    // 管理 ID 本身就是 __proto__ 这类名字时，也直接认它（上面那步已覆盖），
+    // 这里只处理「名称 → ID」的兜底查找。
     // 兜底：按名称在已知密钥里找唯一匹配（例如从「查看该密钥的明细」跳进来时还没渲染过下拉）。
     var matches=Object.keys(state.keyOptions).filter(function(id){return String(state.keyOptions[id])===trimmed;});
     return matches.length===1 ? matches[0] : trimmed;
@@ -3392,7 +3400,10 @@ usageInit();
     if(!init() || typeof keyID!=='string' || !keyID) return Promise.resolve();
     closeDetail();
     state.keyOptions[keyID]=String(keyName || keyID);
-    node('requestKeyFilter').value=keyDisplayName(keyID);
+    // 程序化跳转填 **keyID**：这个入口来自密钥页，语义是「查该密钥的明细」，
+    // 填名称会让筛选落空（服务器回归测试 test_public_key_navigation_* 锁定）。
+    // 下拉里仍显示名称，用户手动选时才走名称→ID 的解析。
+    node('requestKeyFilter').value=keyID;
     ['requestModelFilter','requestStatusFilter','requestIDFilter'].forEach(function(id){node(id).value='';});
     state.filters=readFilters();state.offset=0;state.loaded=false;
     // Start the selected-key load before navigation so go() cannot launch an
