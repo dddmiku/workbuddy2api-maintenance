@@ -129,6 +129,15 @@ func (p *Pool) load() {
 	}
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
+		// 损坏的持久化文件必须隔离，不能只 return：mergedStateLocked 会反复读同一个
+		// 文件并解析失败，于是此后每一次保存都失败，账号状态/冷却/配额全部不再落盘
+		// （2026-09-30 审计发现）。重命名保留证据，让下一次保存从干净状态重建。
+		quarantine := p.stateFp + ".corrupt"
+		if renameErr := os.Rename(p.stateFp, quarantine); renameErr != nil {
+			log.Printf("WARN: [pool] state file is corrupt and cannot be quarantined: %v", renameErr)
+		} else {
+			log.Printf("WARN: [pool] state file is corrupt; moved to %s and starting from empty state", quarantine)
+		}
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
@@ -208,6 +217,9 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			if len(e.modelCooldowns) == 0 {
 				e.modelCooldowns = nil
 			}
+			// 旧版本写下的 state.json 可能带任意多条模型级冷却，读入即裁剪到上限，
+			// 否则重启后立刻又占住一份无界内存（2026-09-30 深度体检发现）。
+			e.trimModelCooldowns()
 		}
 		p.byUID[uid] = e
 	}
@@ -300,6 +312,12 @@ func (p *Pool) saveLocked() {
 	if err := os.Rename(tmp.Name(), p.stateFp); err != nil {
 		p.notePersistFail(err)
 		return
+	}
+	// 目录 fsync：rename 只保证「目录项替换」对已刷盘的文件生效，崩溃时若不刷目录，
+	// 重命名可能丢失（旧文件回来或新文件消失）。tmp.Sync() 只覆盖内容（2026-09-30 审计）。
+	if dir, openErr := os.Open(filepath.Dir(p.stateFp)); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	current.AccountEpochs = cloneAccountEpochs(sf.AccountEpochs)
 	p.persistBase = current

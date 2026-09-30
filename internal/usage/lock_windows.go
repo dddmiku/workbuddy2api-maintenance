@@ -30,6 +30,10 @@ func replaceLedger(source, target string) error {
 	}
 }
 
+// syncLedgerDir Windows 上没有可 fsync 的目录句柄（os.File.Sync 不作用于目录），
+// 目录项持久化由文件系统负责，与 requestlog/apikeys 的 Windows 实现同口径。
+func syncLedgerDir(string) error { return nil }
+
 func lockLedger(path string) (func(), error) {
 	// #nosec G304 -- 锁文件路径由账本路径推导，来自管理员配置，非请求输入
 	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)

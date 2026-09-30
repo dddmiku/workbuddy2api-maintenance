@@ -113,6 +113,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
+			e.trimModelCooldowns()
 			p.markStateModelLocked(uid, model)
 		} else {
 			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
@@ -179,6 +180,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		Reason: reason,
 		Hits:   hits,
 	}
+	e.trimModelCooldowns()
 	p.markStateModelLocked(uid, model)
 }
 

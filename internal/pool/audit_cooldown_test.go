@@ -5,6 +5,7 @@ package pool
 
 import (
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -148,5 +149,56 @@ func TestAuditExpiredModelBlockHistoryRemainsBounded(t *testing.T) {
 	p.mu.RUnlock()
 	if retained {
 		t.Fatal("expired 11102 history was retained beyond the bounded recovery window")
+	}
+}
+
+// TestAuditModelCooldownsAreBounded 模型名是客户端自选字段，模型级冷却条目必须有上限：
+// 无上限时每个新名字都会留下一条 6-24h 的条目并写进 state.json（2026-09-30 深度体检发现）。
+// 超限时先丢最早到期的，正在生效的冷却保留优先权。
+func TestAuditModelCooldownsAreBounded(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	// 一条到期最晚的冷却（11102 连打到 24h 封顶）与大量 6h 短退避混排：
+	// 裁剪丢最早到期的，24h 的条目必须仍在。
+	for i := 0; i < 8; i++ {
+		p.BlockModelBackoff("u1", "keep-me", "11102 model not available")
+	}
+	for i := 0; i < maxModelCooldowns*3; i++ {
+		p.BlockModelBackoff("u1", "filler-"+strconv.Itoa(i), "11102 model not available")
+	}
+
+	p.mu.RLock()
+	n := len(p.byUID["u1"].modelCooldowns)
+	_, kept := p.byUID["u1"].modelCooldowns["keep-me"]
+	p.mu.RUnlock()
+	if n > maxModelCooldowns {
+		t.Fatalf("模型级冷却条目=%d 超过上限 %d（客户端自选模型名可把 state.json 撑大）", n, maxModelCooldowns)
+	}
+	if !kept {
+		t.Fatal("裁剪应丢最早到期的条目，24h 封顶的 keep-me 不得被 6h 退避挤掉")
+	}
+}
+
+// TestAuditModelCooldownsTrimmedOnLoad 旧版本写下的 state.json 可能带任意多条模型级冷却，
+// 读入时必须裁剪，否则重启后立刻又占住一份无界内存（2026-09-30 深度体检发现）。
+func TestAuditModelCooldownsTrimmedOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	seed := New(fp)
+	seed.Add(&auth.Auth{UID: "u1"})
+	for i := 0; i < maxModelCooldowns*2; i++ {
+		seed.BlockModelBackoff("u1", "m-"+strconv.Itoa(i), "11102 model not available")
+	}
+	seed.Close()
+
+	reopened := New(fp)
+	t.Cleanup(reopened.Close)
+	reopened.Add(&auth.Auth{UID: "u1"})
+	reopened.mu.RLock()
+	n := len(reopened.byUID["u1"].modelCooldowns)
+	reopened.mu.RUnlock()
+	if n > maxModelCooldowns {
+		t.Fatalf("读入后模型级冷却=%d 超过上限 %d", n, maxModelCooldowns)
 	}
 }

@@ -7,11 +7,24 @@
 package usage
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
 
 func replaceLedger(source, target string) error { return os.Rename(source, target) }
+
+// syncLedgerDir 在 rename 之后同步父目录，让「目录项替换」本身落盘。
+// 只刷 tmp 文件内容不够：崩溃发生在 rename 返回后、目录元数据落盘前时，
+// 重启看到的仍是旧账本（2026-09-30 深度体检发现，与 requestlog/apikeys 同口径）。
+func syncLedgerDir(dir string) error {
+	// #nosec G304 -- 账本目录由账本路径推导，来自管理员配置，非请求输入
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(handle.Sync(), handle.Close())
+}
 
 // lockLedger 对账本旁路文件加排他锁；返回的解锁函数必须调用。
 //

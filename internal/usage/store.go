@@ -17,6 +17,8 @@
 // 2026-09-19：已调用上游的失败与取消请求保留已知用量，累计失败/未完整上报计数并穿过全部持久化维度。
 // 2026-09-24：跨实例合并只携带真实增量，以磁盘起算时间为准，防止清零后旧密钥和日期复活。
 // 2026-09-24：启动和跨实例快照读取也取得账本锁，避免 Windows 读句柄使原子替换失败。
+// 2026-09-30：单密钥模型桶设上限并淘汰消耗最小的桶，防止客户端自选模型名把账本撑过体积上限而永久停写。
+// 2026-09-30：rename 后补父目录 fsync，与 requestlog/apikeys 口径一致（2026-09-30 深度体检发现）。
 package usage
 
 import (
@@ -44,6 +46,12 @@ const defaultFlushInterval = 5 * time.Second
 
 // maxDayBuckets 账本保留的天桶数量（约 4 个月）。超过后裁掉最旧的天，账本不会无限增长。
 const maxDayBuckets = 120
+
+// maxModelsPerKey 单密钥保留的模型桶数量上限。模型名是客户端自选字段（handler 只限
+// 长度 256 字节，不限取值），只增不减会让账本内存与每次落盘的序列化体积无上限增长，
+// 一旦序列化超过 maxLedgerBytes 所有用量都不再落盘。超限时淘汰总量最小的模型桶，
+// 面板仍能看到消耗最大的那些模型（2026-09-30 深度体检发现）。
+const maxModelsPerKey = 128
 
 // dayKeyLayout 天桶键格式（服务端本地时区的日历日）。
 const dayKeyLayout = "2006-01-02"
@@ -220,6 +228,12 @@ func (s *Store) load() error {
 		doc.Since = time.Now().UTC()
 	}
 	doc.Version = Version
+	// 读入时同样裁剪：旧文件可能是在没有上限的版本里写下的（2026-09-30 深度体检发现）。
+	for _, record := range doc.Keys {
+		if record != nil {
+			trimModelBuckets(record.Models)
+		}
+	}
 	s.doc = doc
 	s.written = cloneDocument(doc)
 	return nil
@@ -307,6 +321,7 @@ func (s *Store) RecordOutcome(keyID, name, maskedKey, model string, prompt, comp
 			record.Models[model] = counter
 		}
 		counter.add(prompt, completion, cached, credit, hasCredit, outcome)
+		trimModelBuckets(record.Models)
 	}
 	s.dirty = true
 }
@@ -323,6 +338,39 @@ func trimDayBuckets(buckets map[string]*Totals) {
 	sort.Strings(keys)
 	for _, key := range keys[:len(keys)-maxDayBuckets] {
 		delete(buckets, key)
+	}
+}
+
+// syncLedgerDir 在 rename 之后同步父目录，让「目录项替换」本身落盘。
+// 只刷 tmp 文件内容不够：崩溃发生在 rename 返回后、目录元数据落盘前时，
+// 重启看到的仍是旧账本（2026-09-30 深度体检发现，与 requestlog/apikeys 同口径）。
+// 抽成变量便于测试断言这一步确实发生（崩溃窗口本身无法在用例里复现）。
+var ledgerDirSync = syncLedgerDir
+
+// trimModelBuckets 把单密钥的模型桶裁到 maxModelsPerKey。模型名由客户端自选，
+// 与天桶不同它没有自然上限，必须显式裁剪（2026-09-30 深度体检发现）。
+// 按总 token 升序淘汰，消耗最大的模型保留在面板上；总量相同时按名称序，保证
+// 裁剪结果稳定可复现（同一输入无论 map 遍历顺序如何都裁掉同一批）。
+func trimModelBuckets(models map[string]*Totals) {
+	if len(models) <= maxModelsPerKey {
+		return
+	}
+	keys := make([]string, 0, len(models))
+	for key := range models {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := models[keys[i]], models[keys[j]]
+		if left == nil || right == nil {
+			return keys[i] < keys[j]
+		}
+		if left.TotalTokens != right.TotalTokens {
+			return left.TotalTokens < right.TotalTokens
+		}
+		return keys[i] < keys[j]
+	})
+	for _, key := range keys[:len(keys)-maxModelsPerKey] {
+		delete(models, key)
 	}
 }
 
@@ -501,6 +549,11 @@ func (s *Store) persistDocument(doc document, merge bool) error {
 		return closeErr
 	}
 	if err := replaceLedger(tmp, s.path); err != nil {
+		return err
+	}
+	// 目录 fsync：rename 只保证目录项替换对已刷盘的内容生效，崩溃时若不刷目录，
+	// 重命名可能丢失（旧账本回来）。tmp.Sync() 只覆盖文件内容（2026-09-30 深度体检发现）。
+	if err := ledgerDirSync(filepath.Dir(s.path)); err != nil {
 		return err
 	}
 	s.commit(doc, snapshot, merge)

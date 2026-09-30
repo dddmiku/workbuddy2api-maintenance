@@ -1,6 +1,8 @@
 package session
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -293,5 +295,57 @@ func TestLoadFromStoreRestores(t *testing.T) {
 	u, ok := r.Resolve("c1")
 	if !ok || u != "a1" {
 		t.Errorf("restored c1 -> %s want a1", u)
+	}
+}
+
+// TestOversizedSessionKeyRejected 单密钥/legacy 模式下绑定键是客户端原文，超过
+// maxKeyBytes 必须拒绝：不设限时一条请求就能用接近请求体上限的 conversation_id
+// 长期占住内存并镜像进 Redis（2026-09-30 深度体检发现）。
+func TestOversizedSessionKeyRejected(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"a1"}, time.Minute)
+
+	huge := strings.Repeat("k", maxKeyBytes+1)
+	if uid, ok := r.ResolveForModel(huge, "m"); ok || uid != "" {
+		t.Fatalf("超长会话键必须拒绝，got uid=%q ok=%v", uid, ok)
+	}
+	r.Bind(huge, "a1")
+	if r.Count() != 0 {
+		t.Fatalf("超长会话键不得进入绑定表，count=%d", r.Count())
+	}
+	st.mu.Lock()
+	mirrored := len(st.binds)
+	st.mu.Unlock()
+	if mirrored != 0 {
+		t.Fatalf("超长会话键不得镜像到 Redis，mirrored=%d", mirrored)
+	}
+
+	// 上限内的长键仍正常工作（拒绝的是无界，不是长）。
+	bounded := strings.Repeat("k", maxKeyBytes)
+	if _, ok := r.ResolveForModel(bounded, "m"); !ok {
+		t.Fatal("上限内的会话键应正常绑定")
+	}
+}
+
+// TestEntryCountBounded 条目数必须有上限：原本只靠 TTL 兜底，客户端用随机会话键
+// 就能把内存推成请求速率 × TTL（且每次未命中全表扫描），2026-09-30 深度体检发现。
+func TestEntryCountBounded(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"a1", "a2"}, time.Hour)
+
+	for i := 0; i < maxEntries+64; i++ {
+		if _, ok := r.ResolveForModel("sess-"+strconv.Itoa(i), "m"); !ok {
+			t.Fatalf("resolve sess-%d failed", i)
+		}
+	}
+	if got := r.Count(); got > maxEntries {
+		t.Fatalf("绑定条目=%d 超过上限 %d", got, maxEntries)
+	}
+	// 淘汰必须同步镜像删除，否则 Redis 恢复会把淘汰掉的键再带回来。
+	st.mu.Lock()
+	mirrored := len(st.binds)
+	st.mu.Unlock()
+	if mirrored > maxEntries {
+		t.Fatalf("Redis 镜像条目=%d 超过上限 %d", mirrored, maxEntries)
 	}
 }

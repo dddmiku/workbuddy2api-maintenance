@@ -4,10 +4,12 @@
 // 2026-09-25：健康判断与调度解释共用同一首个阻断条件，保留账号优先于模型限制的既有顺序。
 // 2026-09-24：移除绕过账号冷却的旧模型豁免判据，保持模型与账号限制正交。
 // 2026-09-24：11102 到期后有界保留命中计数，使半开重试失败能继续退避。
+// 2026-09-30：模型级冷却条目设上限并裁掉最早到期的，防止客户端自选模型名把内存与 state.json 撑大。
 // 2026-09-18：状态文件保存账号删除代次，阻止尚未落盘的旧创建意图越过已完成的删除。
 package pool
 
 import (
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -215,6 +217,33 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 			delete(e.modelCooldowns, m)
 		}
 	}
+	e.trimModelCooldowns()
+}
+
+// trimModelCooldowns 把模型级冷却裁到 maxModelCooldowns 条（超出时丢最早到期的）。
+// 模型名是客户端自选字段，不裁剪的话每个新名字都会留下一条 6-24h 的条目并写进
+// state.json，内存与文件都会无上限增长（2026-09-30 深度体检发现）。
+// 只丢最早到期的：正在生效的冷却（含半开探测所需的 11102 退避历史）保留优先权。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) trimModelCooldowns() {
+	if len(e.modelCooldowns) <= maxModelCooldowns {
+		return
+	}
+	keys := make([]string, 0, len(e.modelCooldowns))
+	for m := range e.modelCooldowns {
+		keys = append(keys, m)
+	}
+	// 最早到期在前；到期时间相同时按模型名，保证裁剪结果稳定可复现。
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := e.modelCooldowns[keys[i]], e.modelCooldowns[keys[j]]
+		if !left.Until.Equal(right.Until) {
+			return left.Until.Before(right.Until)
+		}
+		return keys[i] < keys[j]
+	})
+	for _, m := range keys[:len(keys)-maxModelCooldowns] {
+		delete(e.modelCooldowns, m)
+	}
 }
 
 // expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
@@ -361,6 +390,12 @@ const (
 	modelBlockMaxTTL  = 24 * time.Hour
 	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
 )
+
+// maxModelCooldowns 单账号模型级冷却条目数上限。模型名是客户端自选字段（handler 只限
+// 长度 256 字节），每个被 11102/6004 拒绝的新名字都会新增一条并按 6-24h 写进 state.json，
+// 只增不减时内存与 state.json 都会随请求量无上限增长（2026-09-30 深度体检发现）。
+// 超限时先丢已过期条目，仍超则丢最早到期的——正在生效的冷却保留，被丢的是最不紧迫的。
+const maxModelCooldowns = 64
 
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为

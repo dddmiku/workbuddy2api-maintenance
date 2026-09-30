@@ -13,11 +13,14 @@
 // 2026-09-20：会话标识缺失时的对话级回退键由 handler 用 ContentKey 派生（见 ids.go）；这里保持 ExtractKey 的识别顺序不变。
 // 2026-09-19：显式会话标识优先于共享缓存键，避免不同会话被缓存提示合并。
 // 2026-09-18：GC 捕获本轮停止信号并等待退出，避免停止/重启后旧协程继续清理会话。
+// 2026-09-30：绑定键设长度上限、条目数设上限并按最久未活跃淘汰，堵住单密钥模式下客户端
+// 自选会话 ID 造成的无界内存与 Redis 镜像增长（2026-09-30 深度体检发现）。
 package session
 
 import (
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,6 +32,16 @@ type entry struct {
 	uid        string
 	lastActive time.Time
 }
+
+// maxKeyBytes 会话键长度上限。多密钥模式下 ScopeKey 输出恒为 32 位 hex，但单密钥/
+// legacy 模式下它原样透传客户端字符串，不设上限时单条请求就能用接近请求体上限的
+// conversation_id 长期占住内存并镜像进 Redis（2026-09-30 深度体检发现）。
+const maxKeyBytes = 512
+
+// maxEntries 绑定条目数上限。条目原本只靠 TTL 兜底，稳态内存 = 唯一键数 × TTL，
+// 客户端用随机 conversation_id 就能把内存推成无上限（且每次未命中都全表扫描）；
+// 超限时淘汰最久未活跃的绑定，热点会话仍保持粘性（2026-09-30 深度体检发现）。
+const maxEntries = 20000
 
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
@@ -122,9 +135,14 @@ func (r *Router) LoadFromStore() {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
+		// Redis 里的键同样可能来自旧版本写下的超长 legacy 键，恢复时一并过滤。
+		if _, ok := normalizeKey(key); !ok {
+			continue
+		}
 		r.entries[key] = entry{uid: uid, lastActive: now}
 		loaded++
 	}
+	r.evictLocked()
 	r.mu.Unlock()
 	if loaded > 0 {
 		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
@@ -139,7 +157,8 @@ func (r *Router) LoadFromStore() {
 // 对其他模型仍可用（见 pool.healthyForModel 的模型级冷却豁免）。若只按账号级
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
-	if key == "" {
+	key, ok := normalizeKey(key)
+	if !ok {
 		return "", false
 	}
 	uids := r.availableSlice(model)
@@ -185,6 +204,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	uid := pool2[hashIndex(key, len(pool2))]
 
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.evictLocked()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	return uid, true
 }
@@ -193,12 +213,14 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 // 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
 // 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
 func (r *Router) Bind(key, uid string) {
-	if key == "" || uid == "" {
+	key, ok := normalizeKey(key)
+	if !ok || uid == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries[key] = entry{uid: uid, lastActive: time.Now()}
+	r.evictLocked()
 	// Store 只提交异步写入；在锁内提交让镜像顺序与内存变更保持一致。
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
@@ -271,6 +293,44 @@ func (r *Router) availableSlice(model string) []string {
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {
 	return now.Sub(e.lastActive) > ttl
+}
+
+// normalizeKey 校验绑定键：空键不绑定；超过 maxKeyBytes 的键直接拒绝（不截断，
+// 截断会把不同会话并到同一键上）。多密钥模式下 ScopeKey 输出定长，正常客户端不会
+// 触及上限（2026-09-30 深度体检发现）。
+func normalizeKey(key string) (string, bool) {
+	if key == "" || len(key) > maxKeyBytes {
+		return "", false
+	}
+	return key, true
+}
+
+// evictLocked 在绑定数超过 maxEntries 时淘汰最久未活跃的条目，直到回落到上限以内。
+// 必须与插入共用写锁；淘汰时同步镜像删除，否则 Redis 恢复会把它们再带回来。
+// 调用方必须已持有 r.mu。
+func (r *Router) evictLocked() {
+	if len(r.entries) <= maxEntries {
+		return
+	}
+	type candidate struct {
+		key        string
+		lastActive time.Time
+	}
+	all := make([]candidate, 0, len(r.entries))
+	for key, e := range r.entries {
+		all = append(all, candidate{key: key, lastActive: e.lastActive})
+	}
+	// 最久未活跃在前；lastActive 相同时按键序，保证淘汰结果稳定可复现。
+	sort.Slice(all, func(i, j int) bool {
+		if !all[i].lastActive.Equal(all[j].lastActive) {
+			return all[i].lastActive.Before(all[j].lastActive)
+		}
+		return all[i].key < all[j].key
+	})
+	for _, c := range all[:len(all)-maxEntries] {
+		delete(r.entries, c.key)
+		r.cfg.Store.DelBind(c.key)
+	}
 }
 
 // hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。

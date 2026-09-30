@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -420,5 +421,129 @@ func TestMergePreservesBrokenLedger(t *testing.T) {
 	}
 	if string(raw) != "{not json" {
 		t.Fatal("original broken ledger was modified")
+	}
+}
+
+// TestModelBucketsAreBounded 模型名是客户端自选字段，单密钥模型桶必须有上限：
+// 无上限时账本会随请求数无限增长，序列化超过 maxLedgerBytes 后所有用量都不再落盘
+// （2026-09-30 深度体检发现）。超限时淘汰消耗最小的桶，保留消耗最大的。
+func TestModelBucketsAreBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	// 消耗最大的模型最先记，后面灌入大量零消耗的随机模型名。
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:hot", 1000, 1000, 0, 0, false, at)
+	for i := 0; i < maxModelsPerKey*3; i++ {
+		store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:filler-"+strconv.Itoa(i), 1, 0, 0, 0, false, at)
+	}
+
+	store.mu.Lock()
+	kept := len(store.doc.Keys["key_a"].Models)
+	_, hotKept := store.doc.Keys["key_a"].Models["cn:hot"]
+	store.mu.Unlock()
+	if kept > maxModelsPerKey {
+		t.Fatalf("模型桶=%d 超过上限 %d（客户端自选模型名可把账本撑爆）", kept, maxModelsPerKey)
+	}
+	if !hotKept {
+		t.Fatal("裁剪应淘汰消耗最小的桶，保留消耗最大的 cn:hot")
+	}
+
+	// 落盘后重开：裁剪结果必须持久化，否则重启后旧的大 map 会回来。
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	reopened, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	snapshot := reopened.Snapshot()
+	for _, key := range snapshot.Keys {
+		if len(key.Models) > maxModelsPerKey {
+			t.Fatalf("重开后模型桶=%d 超过上限", len(key.Models))
+		}
+	}
+}
+
+// TestModelBucketsTrimmedOnLoad 旧版本写下的超大账本在读取时就要裁掉，不能等下一次
+// 记录才收敛（否则打开即占住超大内存）。
+func TestModelBucketsTrimmedOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	doc := document{
+		Version: Version,
+		Since:   time.Now().UTC(),
+		Keys: map[string]*keyRecord{
+			"key_a": {
+				Name:   "团队 A",
+				Totals: Totals{Requests: 1, TotalTokens: 10},
+				Models: map[string]*Totals{},
+			},
+		},
+	}
+	for i := 0; i < maxModelsPerKey*2; i++ {
+		doc.Keys["key_a"].Models["cn:m-"+strconv.Itoa(i)] = &Totals{Requests: 1, TotalTokens: int64(i)}
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	store.mu.Lock()
+	kept := len(store.doc.Keys["key_a"].Models)
+	_, biggestKept := store.doc.Keys["key_a"].Models["cn:m-"+strconv.Itoa(maxModelsPerKey*2-1)]
+	store.mu.Unlock()
+	if kept > maxModelsPerKey {
+		t.Fatalf("读入后模型桶=%d 超过上限 %d", kept, maxModelsPerKey)
+	}
+	if !biggestKept {
+		t.Fatal("读入裁剪同样应保留消耗最大的桶")
+	}
+}
+
+// TestLedgerRenameSyncsDirectory rename 后必须同步父目录：崩溃发生在 rename 返回后、
+// 目录元数据落盘前时，只刷 tmp 文件内容不足以让新账本可见（2026-09-30 深度体检发现）。
+// 崩溃窗口无法在用例里复现，这里断言该步骤确实被调用。
+func TestLedgerRenameSyncsDirectory(t *testing.T) {
+	var synced []string
+	original := ledgerDirSync
+	ledgerDirSync = func(dir string) error {
+		synced = append(synced, dir)
+		return nil
+	}
+	t.Cleanup(func() { ledgerDirSync = original })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:m", 1, 1, 0, 0, false, time.Now())
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if len(synced) == 0 {
+		t.Fatal("rename 后未同步父目录：崩溃时新账本可能丢失")
+	}
+	for _, got := range synced {
+		if got != dir {
+			t.Fatalf("同步了错误的目录 %q want %q", got, dir)
+		}
 	}
 }
