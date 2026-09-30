@@ -2,6 +2,103 @@
 
 本文记录源码版本内容，实际部署版本以 `/healthz` 和管理台为准。发行目标在根 `VERSION`，正式二进制由构建参数写入版本、提交和时间；未注入的开发构建保持 `dev`。
 
+## 版本号规则
+
+按语义化版本递增（`v<major>.<minor>.<patch>`），让版本号本身说明改动的性质：
+
+| 改动性质 | 递增 | 示例 |
+|---|---|---|
+| **新能力**（新增配置项、新增协议行为、新增端点） | minor +1，patch 归零 | `v2.4.27` → `v2.5.0` |
+| **修复 / 优化**（改错、提性能、补边界） | patch +1 | `v2.5.0` → `v2.5.1` |
+| **破坏性变更**（既有客户端或配置不再兼容） | major +1 | `v2.5.x` → `v3.0.0` |
+| **只改文档 / 版本号本身 / 注释** | 不单独发版，并入下一次实质改动 | — |
+
+判断依据是**用户或客户端能否观察到新东西**：能 → minor；只是行为更正确 → patch。同一批发版里既有新能力又有修复时，按最高的一档走（新能力优先）。
+
+历史说明：`v2.4.1`–`v2.4.27` 期间补丁号被当作计数器使用，其中多数是修复、少数是新能力，未按本规则区分。规则自 `v2.5.0` 起生效。
+
+## v2.5.0 — 2026-09-30
+
+深度体检（九维度审计 + 逐条对抗性复核）后的一组修复。审计确认 24 项、驳回 20 项；
+确认项**全部处理**（其中 6 项在本版之前的工作树里已修），另修掉 2 项审计未覆盖、
+复核时发现的同类缺陷（Anthropic 无参数工具、Gemini 的 strict schema 复校）。
+
+### 协议正确性
+
+- **无参数工具调用不再让整轮失败**（Gemini、Anthropic）。上游对无参数工具回
+  `arguments:""`（上游层已认定为合法，Chat 与 Responses 早已接受），而这两条路径用
+  `Decode("")` 判死（返回 EOF），Gemini 非流 502、流内 `finishReason=OTHER`，
+  Anthropic 报 incomplete arguments。空串现按空对象处理，语义等价。
+- **Gemini 接受旧式 `function_call` 结束原因**。上游的 `validFinishReason` 接受它，
+  Anthropic 与 Chat 也都认得；Gemini 只映射 `stop`/`tool_calls`，把已完整成功的一轮
+  报成失败。
+- **`thinkingBudget: -1` 按文档接受**。`-1` 是官方 SDK 的 AUTOMATIC，也是文档承诺支持的
+  取值，但通用数值校验器要求非负整数，抢在区间检查前把它拒掉；按文档使用的客户端直接
+  400 且请求到不了上游。越界值仍拒绝。
+- **`nullable` 联合 schema 不再被拒**。`@google/genai` 会为可空联合发
+  `{"nullable":true,"anyOf":[…]}`、为可空枚举发 `{"nullable":true,"enum":[…]}`，
+  此前一律 400。现在包一层 `anyOf` 并追加 `{"type":"null"}` 分支，是合法 JSON Schema。
+- **非流式 Chat 归一 `finish_reason` 与空工具参数**，与流式一致。此前非流客户端会同时
+  拿到 `"finish_reason":"stop"` 和填好的 `tool_calls`，按 `finish_reason` 分支的客户端
+  直接丢掉这一轮工具调用。
+- **`tool_result` 标记 `is_error` 且正文为空时不再转发空 text part**。错误标记本身是非空
+  文本，会让「全空则折叠为空串」的规则失效，上游收到
+  `[{text:"[tool execution error]"},{text:""}]`——正是本仓库注释点名要避免的 400 形状。
+
+### 掐流重试（v2.4.27 引入）的回归与缺陷
+
+- **Responses 的 `sequence_number` 不再归零**。`beginStream` 已把 `response.created`(seq 0)
+  与 `response.in_progress`(seq 1) 发给客户端，而归零会让整条流变成 `[0 1 0 1 …]`，
+  严格按单调递增消费的客户端（官方 SDK 流排序、Codex 类聚合器）会丢弃事件。
+- **轮转重试无法建立时不再把裸 JSON 写进已开的 SSE 流**。修法在 `writeOpenAIError`
+  一处收口：只要写入器已开流就先问适配器能否把失败交付在流内（Responses 走
+  `response.failed`、Anthropic 走 `error` 事件、Chat 走 error 帧 + `[DONE]`），
+  避免任何调用点再往流中间粘不可解析的 JSON、且流里没有任何终态。
+- **拒答帧计入「已交付」**。拒答是立即下发的可见内容，不标记的话掐流重试会在用户已经
+  读到拒答后重发，用户看到两段互相矛盾的回答。工具调用帧**刻意不计**——它们在
+  `frame()` 里被删除、要等整组参数校验通过才交付，标记它们会让重试白白失效。
+- **`StreamFailure` 幂等**：此前没有「已完成」检查，被调用两次会写出两个 error 帧与
+  两个 `[DONE]`。
+
+### 并发
+
+- **`messagesWriter.Write` 全程持锁**。上游首帧迟到超过 5 秒时保活 goroutine 会与读上游
+  goroutine 并发跑，两者碰同一批字段：`m.usage` 是 map，并发读写可能让 Go 运行时以
+  `fatal error: concurrent map read and map write` 直接终止进程（单进程承载全部账号与
+  四种协议）；`m.err` 是接口值，撕裂读可能拿到损坏的类型指针。内部改走 `*Locked` 变体，
+  避免非重入锁自锁。
+
+### 资源上限
+
+- 每密钥模型桶（`usage.json`）、会话粘性条目与键长、模型级冷却条目（`state.json`）
+  三处此前只靠 TTL 兜底，客户端可用自选模型名/会话键无限撑大，其中用量账本超过 64 MiB
+  后**所有**用量都不再落盘。现分别设上限并按消耗/到期顺序裁剪，读入时同样裁剪。
+- 损坏的 `state.json` 改为隔离为 `.corrupt` 并告警，不再静默返回零状态——否则此后每次
+  保存都会因解析失败而失败，账号状态、冷却、配额**永久不再落盘**。
+- 用量账本的 rename 后补目录 fsync，与 requestlog、apikeys 口径一致。
+
+### 配置与运维
+
+- **`prompt.act_note` 在 `prompt.mode=custom` 下不再丢失**。`prompt.Rewrite` 会删掉所有
+  system/developer 消息再插入配置提示词，而约定正是追加到 system 里；注入移到 Rewrite
+  **之后**，文档承诺的「一定到达模型」才成立。Responses 与原生 Chat 两条路径一并修正。
+- **热更新期间迟到解冻不再抹掉另一个实例刚记的 429 软冷却**（合并守卫原先只覆盖
+  `CoolHard` 方向）。热更新当前已停用，此项为提前修复。
+- **`cmd/server` 缺配置的兜底分支不再是死代码**：`Load` 返回的是包装错误，`os.IsNotExist`
+  不拆包、永远为 false，于是「只用 `WB2A_*` 环境变量、无 config.json」的部署会在启动时
+  `log.Fatalf`。改用 `errors.Is(err, os.ErrNotExist)`。
+- **面板与脚本的 auth 文件名识别对齐网关**：网关按 `workbuddy*.json` 加载，面板正则却要求
+  有连字符，脚本还假定只有嵌套形状——扁平形状的 auth 文件会让整轮调度任务以
+  `KeyError` 崩掉，无连字符命名的账号在面板里不可见、无法启停/删除/复活。三处统一。
+
+### 验证
+
+`go build`/`go vet`/`staticcheck` 全绿，全量 24 包测试通过；`scripts` 11 项、`panel` 185 项
+Python 测试通过。审计驳回的 20 项含 3 项误报（非流 `finish_reason`、logprobs 静默 null、
+`keepText` 收窄），后者已在本版以注释说明为何维持原样。
+并发修复的定论验证需在 Linux 上用 `-race` 复跑（本机无 gcc，`-race` 不可用），
+已附带覆盖该路径的冒烟测试并在注释中如实标注其局限。
+
 ## v2.4.27 — 2026-09-30
 
 上游偶发掐流时自动换号重试，并把请求明细的密钥下拉改为只显示名称。
