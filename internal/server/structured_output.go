@@ -168,7 +168,16 @@ func (policy *responseToolPolicy) validate(calls []responseToolInvocation, refus
 			return fmt.Errorf("model called tool %q outside tool_choice", call.name)
 		}
 		if schema := policy.schemas[call.name]; schema != nil {
-			decoder := json.NewDecoder(strings.NewReader(call.arguments))
+			// 无参数工具的空参数串是上游层认可的合法形状（validateResponseToolCall
+			// 已按合法放行，Chat/Responses/Anthropic/Gemini 都接受）。这里若直接
+			// Decode("") 会得到 EOF，把「模型调用了一个无参数工具」判成
+			// invalid JSON arguments 而整轮失败（2026-09-30 深度体检发现：
+			// Gemini 非流 502、流内 OTHER 终态）。空串按空对象校验，语义等价。
+			arguments := strings.TrimSpace(call.arguments)
+			if arguments == "" {
+				arguments = "{}"
+			}
+			decoder := json.NewDecoder(strings.NewReader(arguments))
 			decoder.UseNumber()
 			var value any
 			if err := decoder.Decode(&value); err != nil {

@@ -1136,8 +1136,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	warnIgnoredBuiltinTools(w, r, req.Tools)
-	// 运行约定：只在带工具的请求上追加，抑制「一句话一个命令」的叙述式输出。
-	chatBody = applyActNote(chatBody, h.cfg.PromptActNote, len(req.Tools) > 0)
+	// 运行约定不在这里注入：chatCompletions 内部统一在 prompt.Rewrite 之后追加，
+	// 否则 custom 提示词模式会把这里注入的约定连同 system 消息一起删掉
+	// （2026-09-30 深度体检发现）。工具声明由 chatCompletions 从 req.Tools 取。
 
 	// Extract routing identity before conversion strips client-only metadata.
 	// It stays in request context; upstream does not need client_metadata fields.
@@ -1247,6 +1248,45 @@ func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responses
 	}
 }
 
+// ResetForRetry 在「上游掐流且客户端零内容」后换号重发前清空上一轮的内容累积。
+//
+// 流本身已经开启（响应头与 response.created 已经发给客户端，无法收回），所以
+// begun/created/respID 等必须保留；要清的是**内容状态**：正文/思考/工具缓冲、
+// 已发序号与输出索引，否则重试的内容会接在上一轮后面，或因为 nextIdx 已推进而
+// 让客户端收到错乱的下标（2026-09-30 审计发现：轮转重试在 Responses 上因此完全失效）。
+//
+// 调用前提由 handler 保证：deliveredContent 为 false，即客户端还没收到任何内容。
+func (rw *responsesWriter) ResetForRetry() {
+	rw.text.Reset()
+	rw.refusal.Reset()
+	rw.reason.Reset()
+	rw.messageParts = nil
+	rw.legacyCallID = ""
+	rw.calls = map[int]*respToolCall{}
+	rw.order = nil
+	rw.toolBytes = 0
+	rw.toolsValidated = false
+	rw.msgOpen = false
+	rw.rsOpen = false
+	rw.rsPart = false
+	rw.streamErr = nil
+	rw.terminalStatus = ""
+	rw.finishReason = ""
+	rw.usage = nil
+	rw.sawDone = false
+	// 输出索引归零：上一轮没有 emit 过内容事件（调用前提），从这里重新编号不会跳号。
+	//
+	// seq 绝不能归零：beginStream 已经把 response.created(seq 0) 与
+	// response.in_progress(seq 1) 写给客户端了，而那两帧不算「内容」，所以
+	// DeliveredContent() 仍是 false、重试照样会发生。归零会让整条流的
+	// sequence_number 变成 [0 1 0 1 2 …]，严格按单调递增消费的客户端
+	// （官方 SDK 的流排序、Codex 类聚合器）会认为流中途重启并丢弃事件
+	// （2026-09-30 深度体检发现：这是掐流重试功能引入的回归）。
+	rw.nextIdx = 0
+	rw.rsOutIdx = 0
+	rw.msgOutIdx = 0
+}
+
 func (rw *responsesWriter) Header() http.Header         { return rw.hdr }
 func (rw *responsesWriter) Unwrap() http.ResponseWriter { return rw.inner }
 func (rw *responsesWriter) FinishResponse() error {
@@ -1263,10 +1303,26 @@ func (rw *responsesWriter) FinishResponse() error {
 	return nil
 }
 
-// DeliveredContent 报告是否已把客户端可见内容推下去（正文/思考/工具/拒答）。
+// DeliveredContent 报告是否已把客户端可见内容推下去（正文/思考/拒答/工具）。
+//
+// 判定依据是「已经 emit 给客户端」，不是「内部缓冲里有」：
+//   - 正文/思考/拒答：一旦写入就立刻 emit，字段非空即为已交付；
+//   - 工具调用：rw.calls 只是内部缓冲，要等 flushReadyCalls 真正 emit 出
+//     response.output_item.added 与 arguments.delta 才算交付。只看 len(rw.calls)
+//     会把「刚收到 id/name、参数还没发出去」误判成已交付，于是掐流重试被放弃
+//     （2026-09-30 审计发现）。
+//
 // 只开了流（response.created 等信封事件）不算——那种情况换号重试不会重复输出。
 func (rw *responsesWriter) DeliveredContent() bool {
-	return rw.text.Len() > 0 || rw.refusal.Len() > 0 || rw.reason.Len() > 0 || len(rw.calls) > 0
+	if rw.text.Len() > 0 || rw.refusal.Len() > 0 || rw.reason.Len() > 0 {
+		return true
+	}
+	for _, call := range rw.calls {
+		if call != nil && (call.opened || call.sentArgs > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rw *responsesWriter) WriteHeader(code int) {

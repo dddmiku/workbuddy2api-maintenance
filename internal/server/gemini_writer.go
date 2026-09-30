@@ -430,7 +430,16 @@ func (g *geminiWriter) validatedTools() ([]any, error) {
 	for _, index := range indices {
 		tool := g.tools[index]
 		var args map[string]any
-		if strings.TrimSpace(tool.id) == "" || strings.TrimSpace(tool.name) == "" || jsonutil.Decode([]byte(tool.arguments.String()), &args) != nil || args == nil {
+		// 无参数工具的空串是上游层认可的合法形状（见 chat_output_contract.go 交付时归一为
+		// {}、responses.go 的 validateResponseToolCall）。jsonutil.Decode("") 返回 EOF，
+		// 直接判死会让「模型调用了一个无参数工具」整轮失败（非流 502 / 流内 OTHER 终态），
+		// 而 Chat、Responses、Anthropic 都能交付同一个上游帧——只有 Gemini 拒绝，属于
+		// 协议间行为不一致（2026-09-30 深度体检发现）。空串按空对象处理，语义等价。
+		arguments := tool.arguments.String()
+		if strings.TrimSpace(arguments) == "" {
+			arguments = "{}"
+		}
+		if strings.TrimSpace(tool.id) == "" || strings.TrimSpace(tool.name) == "" || jsonutil.Decode([]byte(arguments), &args) != nil || args == nil {
 			return nil, fmt.Errorf("upstream ended with incomplete or invalid tool arguments")
 		}
 		part := map[string]any{"functionCall": map[string]any{"id": tool.id, "name": tool.name, "args": args}}
@@ -576,7 +585,12 @@ func (g *geminiWriter) failure(status int, code, message string) {
 
 func geminiFinishReason(reason string) string {
 	switch reason {
-	case "stop", "tool_calls":
+	// function_call 是旧式工具结束原因，上游自己的校验接受它
+	// （internal/upstream/sse.go 的 validFinishReason），Anthropic 与 Chat 两条
+	// 路径也都认得它。Gemini 此前只映射 stop/tool_calls，于是同一个上游帧在这里
+	// 变成「没有合法结束原因」→ 非流 502、流内 OTHER 终态，客户端看到一次其实
+	// 已经完整成功的生成失败（2026-09-30 深度体检发现）。
+	case "stop", "tool_calls", "function_call":
 		return "STOP"
 	case "length":
 		return "MAX_TOKENS"

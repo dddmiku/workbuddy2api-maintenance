@@ -124,11 +124,11 @@ func TestAvailabilityFollowsRepoVisibility(t *testing.T) {
 // 匿名 404 且无令牌 = 私有（无需再问）；非 200/404 = 未知。
 func TestRepoVisibilityProbe(t *testing.T) {
 	cases := []struct {
-		name        string
-		anonStatus  int
+		name         string
+		anonStatus   int
 		authedStatus int
-		token       string
-		want        Visibility
+		token        string
+		want         Visibility
 	}{
 		{"匿名可读即公开", 200, 0, "", VisibilityPublic},
 		{"匿名 404 且无令牌判为私有", 404, 0, "", VisibilityPrivate},

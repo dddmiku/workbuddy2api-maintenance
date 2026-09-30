@@ -38,6 +38,44 @@ func TestMessagesStreamStartsBeforeFirstUpstreamFrame(t *testing.T) {
 	t.Fatalf("client saw nothing while waiting for the first frame: %q", sink.body())
 }
 
+// TestMessagesWriteIsSafeAgainstKeepAlive 覆盖「Write 与保活 goroutine 并发」这条路径。
+//
+// 上游请求已发出但首帧迟到时，UpstreamStarted 会起 keepAliveLoop；此后上游帧经
+// 读 goroutine 进 Write，两条 goroutine 碰的是同一批字段（m.err / m.ended /
+// m.usage / m.lastEvent）。修复前 Write 全程不加锁：m.usage 是 map，并发读
+// （保活路径 beginLocked → anthropicUsage）与写（Write 里的 MergeUsage 赋值）
+// 可能触发 Go 运行时的 "fatal error: concurrent map read and map write"；
+// m.err 是接口值，撕裂读可能拿到损坏的类型指针。
+//
+// 局限（如实说明）：这是**冒烟测试**，不是竞态的判定性证据。真正重叠的窗口很窄
+// （保活只在开流前读一次 m.usage），本用例在修复前后都可能通过。定论要靠服务器上
+// 带 -race 跑同一路径（本机 Windows 无 gcc，-race 不可用）。修复后 Write 全程持锁、
+// 内部只调 *Locked 变体，本用例稳定通过。
+func TestMessagesWriteIsSafeAgainstKeepAlive(t *testing.T) {
+	grace, ping := anthropicFirstFrameGrace, anthropicIdlePing
+	anthropicFirstFrameGrace, anthropicIdlePing = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { anthropicFirstFrameGrace, anthropicIdlePing = grace, ping })
+
+	sink := newLockedRecorder()
+	writer := newMessagesWriter(sink)
+	writer.model, writer.stream = "cn:fixture", true
+	writer.UpstreamStarted()
+
+	// 与保活 goroutine 并发地喂入带用量的帧：每帧都写 m.usage（map），
+	// 保活路径的 beginLocked/anthropicUsage 会读同一个 map。
+	frame := []byte(`data: {"choices":[{"index":0,"delta":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n")
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := writer.Write(frame); err != nil {
+			break
+		}
+	}
+	writer.finish()
+	if !strings.Contains(sink.body(), "message_start") {
+		t.Fatalf("保活路径未开流：%q", sink.body())
+	}
+}
+
 // lockedRecorder 给 ResponseRecorder 加锁：保活 goroutine 与测试读取并发访问。
 type lockedRecorder struct {
 	mu sync.Mutex

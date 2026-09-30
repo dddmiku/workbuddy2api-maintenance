@@ -149,7 +149,19 @@ func (m *messagesWriter) FinishResponse() error {
 	return m.CompletionError()
 }
 
+// Write 全程持锁：上游已发出、首帧迟到时 keepAliveLoop 会与读上游的 goroutine
+// 并发跑，两者碰的是同一批字段（m.err / m.ended / m.usage / m.lastEvent）。
+// 不加锁是真实数据竞争——m.err 是接口值，撕裂读可能拿到损坏的类型指针；
+// m.usage 的并发 map 读写会让 Go 运行时直接以 fatal error 终止进程
+// （2026-09-30 深度体检发现，-race 可复现）。因此本函数只调用 *Locked 变体，
+// 不再经过会自行加锁的公开包装，避免非重入锁自锁。
 func (m *messagesWriter) Write(data []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.writeLocked(data)
+}
+
+func (m *messagesWriter) writeLocked(data []byte) (int, error) {
 	if m.err != nil {
 		return 0, m.err
 	}
@@ -158,7 +170,7 @@ func (m *messagesWriter) Write(data []byte) (int, error) {
 	}
 	m.buffer = append(m.buffer, data...)
 	if len(m.buffer) > messagesBufferLimit {
-		m.failure(502, "upstream_response_too_large", "upstream response exceeds the adapter limit")
+		m.failureLocked(502, "upstream_response_too_large", "upstream response exceeds the adapter limit")
 		return 0, m.err
 	}
 	if !strings.HasPrefix(m.hdr.Get("Content-Type"), "text/event-stream") {
@@ -167,17 +179,17 @@ func (m *messagesWriter) Write(data []byte) (int, error) {
 			return len(data), nil
 		}
 		if err := jsonutil.Decode(m.buffer, &object); err != nil {
-			m.failure(502, "upstream_parse", "invalid upstream response")
+			m.failureLocked(502, "upstream_parse", "invalid upstream response")
 			return 0, m.err
 		}
 		m.buffer = nil
 		if problem, ok := object["error"].(map[string]any); ok {
-			m.upstreamFailure(m.status, problem)
+			m.upstreamFailureLocked(m.status, problem)
 			return len(data), nil
 		}
 		converted, err := m.convert(object)
 		if err != nil {
-			m.failure(502, "response_contract_violation", err.Error())
+			m.failureLocked(502, "response_contract_violation", err.Error())
 			return 0, m.err
 		}
 		m.copyHeaders()
@@ -204,40 +216,40 @@ func (m *messagesWriter) Write(data []byte) (int, error) {
 		}
 		if len(lines) == 0 {
 			if comment {
-				m.begin()
-				m.event("ping", map[string]any{})
+				m.beginLocked()
+				m.eventLocked("ping", map[string]any{})
 			}
 			continue
 		}
 		payload := strings.Join(lines, "\n")
 		if payload == "[DONE]" {
-			m.complete()
+			m.completeLocked()
 			break
 		}
 		var object map[string]any
 		if err := jsonutil.Decode([]byte(payload), &object); err != nil {
-			m.failure(502, "upstream_parse", "invalid stream event")
+			m.failureLocked(502, "upstream_parse", "invalid stream event")
 			break
 		}
 		if usage, ok := object["usage"].(map[string]any); ok {
 			m.usage = upstream.MergeUsage(m.usage, usage)
 		}
 		if problem, ok := object["error"].(map[string]any); ok {
-			m.upstreamFailure(502, problem)
+			m.upstreamFailureLocked(502, problem)
 			break
 		}
 		choices := responseArray(object["choices"])
 		if len(choices) > 1 {
-			m.failure(502, "response_contract_violation", "messages expects exactly one output choice")
+			m.failureLocked(502, "response_contract_violation", "messages expects exactly one output choice")
 			break
 		}
-		m.begin()
+		m.beginLocked()
 		for _, raw := range choices {
 			choice, _ := raw.(map[string]any)
 			if value := choice["index"]; value != nil {
 				index, ok := upstream.UsageCount(value)
 				if !ok || index != 0 {
-					m.failure(502, "response_contract_violation", "messages expects output choice index zero")
+					m.failureLocked(502, "response_contract_violation", "messages expects output choice index zero")
 					break
 				}
 			}
@@ -254,17 +266,17 @@ func (m *messagesWriter) Write(data []byte) (int, error) {
 				if field == "reasoning_content" {
 					kind = "thinking"
 				}
-				m.text(kind, text)
+				m.textLocked(kind, text)
 			}
 			for _, raw := range responseArray(delta["tool_calls"]) {
 				call, _ := raw.(map[string]any)
-				if err := m.toolDelta(call); err != nil {
-					m.failure(502, "response_contract_violation", err.Error())
+				if err := m.toolDeltaLocked(call); err != nil {
+					m.failureLocked(502, "response_contract_violation", err.Error())
 					break
 				}
 			}
 			if delta["function_call"] != nil {
-				m.failure(502, "response_contract_violation", "messages requires tool_calls; legacy function_call cannot be replayed with a tool id")
+				m.failureLocked(502, "response_contract_violation", "messages requires tool_calls; legacy function_call cannot be replayed with a tool id")
 			}
 		}
 	}
@@ -286,7 +298,7 @@ func messagesFrameEnd(buffer []byte) (int, int) {
 	return index, length
 }
 
-func (m *messagesWriter) toolDelta(call map[string]any) error {
+func (m *messagesWriter) toolDeltaLocked(call map[string]any) error {
 	index, ok := upstream.UsageCount(call["index"])
 	if !ok {
 		return fmt.Errorf("upstream tool index must be a nonnegative integer")
@@ -341,7 +353,7 @@ func (m *messagesWriter) toolDelta(call map[string]any) error {
 	// time. Buffer tools until all arguments validate, then deliver complete
 	// blocks sequentially; early stops could make an invalid tool executable.
 	if m.started && time.Since(m.lastEvent) >= 10*time.Second {
-		m.event("ping", map[string]any{})
+		m.eventLocked("ping", map[string]any{})
 	}
 	return m.err
 }
@@ -362,12 +374,9 @@ func (m *messagesWriter) copyHeaders() {
 	}
 }
 
-func (m *messagesWriter) event(kind string, payload map[string]any) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.eventLocked(kind, payload)
-}
-
+// eventLocked 是加锁后的发帧实现：调用方须持 m.mu。
+// 原先另有一个自行加锁的 event() 包装，Write 改为全程持锁后它没有调用者
+// （所有路径都已在锁内），已移除。
 func (m *messagesWriter) eventLocked(kind string, payload map[string]any) {
 	if m.err != nil {
 		return
@@ -448,38 +457,38 @@ func (m *messagesWriter) HoldProgress() {
 	}
 }
 
-func (m *messagesWriter) closeBlock() {
+func (m *messagesWriter) closeBlockLocked() {
 	if m.block != "" {
-		m.event("content_block_stop", map[string]any{"index": m.index})
+		m.eventLocked("content_block_stop", map[string]any{"index": m.index})
 		m.block = ""
 	}
 }
 
-func (m *messagesWriter) text(kind, text string) {
+func (m *messagesWriter) textLocked(kind, text string) {
 	if m.block != kind {
-		m.closeBlock()
+		m.closeBlockLocked()
 		m.index++
 		m.block = kind
 		block := map[string]any{"type": kind, kind: ""}
 		if kind == "thinking" {
 			block["signature"] = ""
 		}
-		m.event("content_block_start", map[string]any{"index": m.index, "content_block": block})
+		m.eventLocked("content_block_start", map[string]any{"index": m.index, "content_block": block})
 	}
-	m.event("content_block_delta", map[string]any{"index": m.index, "delta": map[string]any{"type": kind + "_delta", kind: text}})
+	m.eventLocked("content_block_delta", map[string]any{"index": m.index, "delta": map[string]any{"type": kind + "_delta", kind: text}})
 }
 
-func (m *messagesWriter) complete() {
+func (m *messagesWriter) completeLocked() {
 	if m.ended || m.err != nil {
 		return
 	}
 	if m.stop == "" {
-		m.failure(502, "upstream_incomplete", "upstream did not provide a finish reason")
+		m.failureLocked(502, "upstream_incomplete", "upstream did not provide a finish reason")
 		return
 	}
 	stop := anthropicStop(m.stop, len(m.tools) > 0)
 	if stop == "" || (stop == "tool_use" && len(m.tools) == 0) {
-		m.failure(502, "response_contract_violation", "upstream finish reason does not describe a valid message")
+		m.failureLocked(502, "response_contract_violation", "upstream finish reason does not describe a valid message")
 		return
 	}
 	indices := make([]int, 0, len(m.tools))
@@ -489,27 +498,35 @@ func (m *messagesWriter) complete() {
 	sort.Ints(indices)
 	for _, index := range indices {
 		if _, err := m.tools[index].input(); err != nil {
-			m.failure(502, "invalid_tool_arguments", err.Error())
+			m.failureLocked(502, "invalid_tool_arguments", err.Error())
 			return
 		}
 	}
-	m.begin()
-	m.closeBlock()
+	m.beginLocked()
+	m.closeBlockLocked()
 	for _, index := range indices {
 		tool := m.tools[index]
 		m.index++
-		m.event("content_block_start", map[string]any{"index": m.index, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name, "input": map[string]any{}}})
-		m.event("content_block_delta", map[string]any{"index": m.index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tool.arguments.String()}})
-		m.event("content_block_stop", map[string]any{"index": m.index})
+		m.eventLocked("content_block_start", map[string]any{"index": m.index, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name, "input": map[string]any{}}})
+		m.eventLocked("content_block_delta", map[string]any{"index": m.index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tool.arguments.String()}})
+		m.eventLocked("content_block_stop", map[string]any{"index": m.index})
 	}
-	m.event("message_delta", map[string]any{"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": anthropicUsage(m.usage)})
-	m.event("message_stop", map[string]any{})
+	m.eventLocked("message_delta", map[string]any{"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": anthropicUsage(m.usage)})
+	m.eventLocked("message_stop", map[string]any{})
 	m.ended = true
 }
 
 func (t *messagesTool) input() (map[string]any, error) {
 	var input map[string]any
-	if strings.TrimSpace(t.id) == "" || strings.TrimSpace(t.name) == "" || jsonutil.Decode([]byte(t.arguments.String()), &input) != nil || input == nil {
+	// 无参数工具的空串是上游层认可的合法形状（见 chat_output_contract.go 交付时归一为
+	// {}、responses.go 的 validateResponseToolCall）。jsonutil.Decode("") 返回 EOF，
+	// 直接判死会让「模型调用了一个无参数工具」整轮失败——Chat 与 Responses 早已接受，
+	// Anthropic 漏了（2026-09-30 深度体检发现）。空串按空对象处理，语义等价。
+	arguments := t.arguments.String()
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
+	}
+	if strings.TrimSpace(t.id) == "" || strings.TrimSpace(t.name) == "" || jsonutil.Decode([]byte(arguments), &input) != nil || input == nil {
 		return nil, fmt.Errorf("upstream ended with incomplete or invalid tool arguments")
 	}
 	return input, nil
@@ -607,9 +624,9 @@ func anthropicStop(reason string, hasTools bool) string {
 	return ""
 }
 
-func (m *messagesWriter) upstreamFailure(status int, problem map[string]any) {
+func (m *messagesWriter) upstreamFailureLocked(status int, problem map[string]any) {
 	if detail, ok := upstream.ContextTooLongErrorDetail(problem); ok {
-		m.failure(http.StatusBadRequest, "context_length_exceeded", detail)
+		m.failureLocked(http.StatusBadRequest, "context_length_exceeded", detail)
 		return
 	}
 	if status < 400 || status == http.StatusBadGateway {
@@ -638,7 +655,7 @@ func (m *messagesWriter) upstreamFailure(status int, problem map[string]any) {
 	if number, ok := problem["code"].(json.Number); ok {
 		code = number.String()
 	}
-	m.failure(status, code, message)
+	m.failureLocked(status, code, message)
 }
 
 func (m *messagesWriter) failure(status int, code, message string) {

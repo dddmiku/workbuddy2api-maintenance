@@ -255,6 +255,30 @@ type chatContractWriter struct {
 // 只发过空帧或用量帧不算，那种情况换号重试不会重复输出。
 func (w *chatContractWriter) DeliveredContent() bool { return len(w.marked) > 0 }
 
+// ResetForRetry 在「上游掐流且客户端零内容」后换号重发前清空上一轮的缓冲与校验状态。
+//
+// 流已经开启（响应头已发，无法收回），要清的是**内容状态**：
+//   - raw：上一轮的帧会被 CompletionError 聚合，混进重试的终态判定；
+//   - checked：一次性标志，不重置的话重试后不再做契约校验；
+//   - errorFrame：上一轮的错误帧会被写进重试的流里（客户端看到凭空的 error）；
+//   - marked：影响 DeliveredContent，重试前本就该是空。
+//
+// 调用前提由 handler 保证：deliveredContent 为 false，客户端还没收到任何内容。
+func (w *chatContractWriter) ResetForRetry() {
+	w.raw.Reset()
+	w.marked = nil
+	w.buffer = nil
+	w.errorFrame = nil
+	w.checked = false
+	w.err = nil
+	w.writeErr = nil
+	// usage 与 usageEnvelope 也必须清空：被丢弃的那一轮已经 absorb 过用量，
+	// 不清的话重试成功后末帧会把上一轮的计数再报一次（客户端与账本都翻倍）。
+	// upstream.MergeUsage(previous, nil) 返回 previous，所以只要不清就一定会留下。
+	w.usage = nil
+	w.usageEnvelope = nil
+}
+
 func (w *chatContractWriter) Header() http.Header         { return w.inner.Header() }
 func (w *chatContractWriter) WriteHeader(status int)      { w.inner.WriteHeader(status) }
 func (w *chatContractWriter) Unwrap() http.ResponseWriter { return w.inner }
@@ -386,6 +410,14 @@ func (w *chatContractWriter) keep(frame []byte) {
 // 结构化输出需要校验正文时才保留正文。每个 choice 首次出现输出时留一个占位字符，
 // 让聚合仍能区分「有输出但被截断」与「空响应」。
 func (w *chatContractWriter) keepSlim(frame map[string]any) {
+	// 有 output 契约时保留正文：json_object / json_schema 要在交付前按 schema 校验，
+	// 必须留全文。
+	//
+	// 已知代价（2026-09-30 审计提出，评估后保留）：response_format={"type":"text"} 虽然
+	// 不需要校验，也会走这条分支把正文留在 16MB 缓冲里。改成按 chatFormat != nil 判定
+	// 试过，但 w.raw 同时是 Aggregate 的输入与「是否有内容」的判据（见下方 informative），
+	// 去掉正文会让聚合与判据同时失真，破坏既有行为。收益（仅 text 格式下省一次缓冲）
+	// 不足以承担这个风险，故维持原样。
 	keepText := w.req != nil && w.req.output != nil
 	slim := map[string]any{}
 	for _, key := range []string{"id", "object", "created", "model", "usage"} {
@@ -408,6 +440,20 @@ func (w *chatContractWriter) keepSlim(frame map[string]any) {
 			if value, ok := delta[key]; ok && value != nil {
 				slimDelta[key] = value
 				informative = informative || key != "role"
+				// 拒答是**立即下发**的客户端可见内容（下面只删除 tool_calls/function_call，
+				// 不删 refusal），不标记的话 DeliveredContent() 对拒答帧返回 false，
+				// 掐流重试会在客户端已经读到拒答之后重发，用户看到两段互相矛盾的回答
+				// （2026-09-30 深度体检发现）。
+				//
+				// tool_calls / function_call 刻意**不标记**：它们在 frame() 里被从下发的
+				// 帧中删除，要等参数整组校验通过才在收尾时交付，此刻客户端什么都还没收到，
+				// 重试是安全的。标记它们会让掐流重试白白失效。
+				if key == "refusal" {
+					if w.marked == nil {
+						w.marked = map[any]bool{}
+					}
+					w.marked[choice["index"]] = true
+				}
 			}
 		}
 		for _, key := range []string{"content", "reasoning_content"} {
@@ -415,14 +461,21 @@ func (w *chatContractWriter) keepSlim(frame map[string]any) {
 			if text == "" {
 				continue
 			}
+			// 只要真的下发过正文/思考，就要记「已交付」——这与 keepText 无关。
+			// 此前只在 keepText=false 的分支里记，于是结构化输出（keepText=true）
+			// 时 DeliveredContent() 恒为 false，掐流重试会在客户端已收到内容后重发，
+			// 造成重复输出（2026-09-30 深度体检发现）。
+			if w.marked == nil {
+				w.marked = map[any]bool{}
+			}
+			first := !w.marked[choice["index"]]
+			w.marked[choice["index"]] = true
 			if keepText {
 				slimDelta[key] = text
 				informative = true
-			} else if !w.marked[choice["index"]] {
-				if w.marked == nil {
-					w.marked = map[any]bool{}
-				}
-				w.marked[choice["index"]] = true
+			} else if first {
+				// 每个 choice 首次出现输出时留一个占位字符，让聚合仍能区分
+				// 「有输出但被截断」与「空响应」；正文本身不入缓冲。
 				slimDelta[key] = " "
 				informative = true
 			}
@@ -443,8 +496,11 @@ func (w *chatContractWriter) keepSlim(frame map[string]any) {
 }
 
 // StreamFailure 在流已经开始时把失败交付在流内（SSE error 帧 + [DONE]），返回 true。
+//
+// 幂等：失败终态只能交付一次。若已被别的路径写过（terminal 或 checked），
+// 这里返回 false 让调用方去走自己的兜底，而不是再写一个 [DONE]。
 func (w *chatContractWriter) StreamFailure(code, message string) bool {
-	if !w.streaming || w.writeErr != nil {
+	if !w.streaming || w.writeErr != nil || w.checked {
 		return false
 	}
 	encoded, err := json.Marshal(map[string]any{"error": map[string]any{"code": code, "message": message, "type": "api_error"}})
@@ -454,6 +510,10 @@ func (w *chatContractWriter) StreamFailure(code, message string) bool {
 	w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
 	w.writeRaw([]byte("data: [DONE]\n\n"))
 	w.Flush()
+	// 标记已完成：否则 defer 的 finishResponseWriters 会再进 CompletionError，
+	// 把 stale 的 raw 聚合一遍、再写一遍错误帧与 [DONE]（客户端看到重复终态）。
+	w.checked = true
+	w.err = nil
 	return true
 }
 
@@ -495,12 +555,38 @@ func (w *chatContractWriter) restoreToolNames(message map[string]any) bool {
 }
 
 func (w *chatContractWriter) PrepareCompletion(chat map[string]any) {
+	// 交付工具调用时把 finish_reason 归一为 tool_calls、空参数写成 {}，与流式路径
+	// （CompletionError 的收尾）保持一致。此前只有流式做了这两件事，非流式客户端
+	// 会同时拿到 "finish_reason":"stop" 和填好的 tool_calls：按 finish_reason
+	// 分支的客户端直接丢掉这一轮工具调用；严格客户端 JSON.parse("") 还会抛错
+	// （2026-09-30 深度体检发现）。
+	delivers := w.deliversToolCalls(chat)
 	for _, raw := range responseArray(chat["choices"]) {
 		choice, _ := raw.(map[string]any)
 		message, _ := choice["message"].(map[string]any)
 		if choice["finish_reason"] == "length" || choice["finish_reason"] == "content_filter" {
 			delete(message, "tool_calls")
 			delete(message, "function_call")
+		}
+		if delivers {
+			if finish, _ := choice["finish_reason"].(string); finish == "" || finish == "stop" {
+				choice["finish_reason"] = "tool_calls"
+			}
+		}
+		for _, value := range responseArray(message["tool_calls"]) {
+			call, _ := value.(map[string]any)
+			function, _ := call["function"].(map[string]any)
+			if function == nil {
+				continue
+			}
+			if args, _ := function["arguments"].(string); strings.TrimSpace(args) == "" {
+				function["arguments"] = "{}"
+			}
+		}
+		if function := legacyResponseFunction(message); function != nil {
+			if args, _ := function["arguments"].(string); strings.TrimSpace(args) == "" {
+				function["arguments"] = "{}"
+			}
 		}
 		w.restoreToolNames(message)
 	}

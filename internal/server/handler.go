@@ -1100,17 +1100,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 运行约定：原生 Chat Completions 路径同样注入（见 prompt.ActNote）。
-	//
-	// 此前只在 /v1/responses 里调用 applyActNote，走 /v1/chat/completions 的客户端
-	// （Devin、narrafork 等）拿不到这条约定：模型回一句「让我先确认…」就结束本轮，
-	// 客户端不再自动继续，用户只能手动发「继续」。这里按出站 chat 体的实际声明判断
-	// 有没有工具，避免用 responsesRequest 的工具字段（原生 chat 请求里根本没有）。
-	if _, responses := w.(*responsesWriter); !responses {
-		hasTools := chatBodyHasTools(body)
-		body = applyActNote(body, h.cfg.PromptActNote, hasTools)
-	}
-
 	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
 	if info, ok := requestKeyInfo(r); ok && info.ReasoningLoopGuard != nil {
 		reasoningLoopGuard = *info.ReasoningLoopGuard
@@ -1223,6 +1212,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	}
+
+	// 运行约定：带工具的请求注入（见 prompt.ActNote）。
+	//
+	// 此前只在 /v1/responses 里调用 applyActNote，走 /v1/chat/completions 的客户端
+	// （Devin、narrafork 等）拿不到这条约定：模型回一句「让我先确认…」就结束本轮，
+	// 客户端不再自动继续，用户只能手动发「继续」。
+	//
+	// **必须在 prompt.Rewrite 之后**：Rewrite 会删掉所有 system/developer 消息再
+	// 插入配置提示词，而约定正是追加到 system 消息里。放在它前面时，custom 模式下
+	// 约定会被连同旧 system 一起删掉，永远到不了模型——文档却承诺它一定生效
+	// （2026-09-30 深度体检发现）。
+	//
+	// 工具声明看出站 chat 体（Responses 路径转换后同样带 tools 字段）。
+	body = applyActNote(body, h.cfg.PromptActNote, chatBodyHasTools(body))
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
@@ -1608,8 +1611,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 的错误帧，这里必须把失败如实交给客户端，否则会静默结束。
 					retryErr := st.absorbRetryFailure(r.Context(), status, respBody, terr)
 					observeResponseError(w, retryErr.Code)
-					if !upstream.WriteStreamError(w, retryErr) {
-						writeOpenAIError(w, http.StatusBadGateway, retryErr.Code, retryErr.Message)
+					// writeOpenAIError 自己会先问适配器能不能把失败交付在流内，
+					// 因此这里只需按「已开流优先适配器、否则原始 SSE 错误帧」的顺序调用。
+					if !deliverStreamFailure(w, retryErr.Code, retryErr.Message) {
+						upstream.WriteStreamError(w, retryErr)
 					}
 					st.unreported = true
 					st.status = http.StatusBadGateway
@@ -1664,6 +1669,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// fail 而非 releaseHeld：必须解绑会话粘性，否则下一轮又选中同一个号。
 					fail(acct.UID)
 					tried[acct.UID] = true
+					// 关闭本轮上游 body 再重发（与轮转循环出口的 rc.Close 同理，避免 fd 堆积）。
+					// stats 无需手工重建：它由每轮循环开头的 newChatStatsReaderSince(rc, …)
+					// 新建，因此上一轮已入账的用量不会被重复累加。
+					_ = rc.Close()
+					// Responses 的写入器贯穿整个轮转循环，必须清掉上一轮的内容累积，
+					// 否则重试的内容接在旧状态后面（客户端已收到的只是信封事件）。
+					resetForRetry(w)
 					continue
 				}
 				st.status = http.StatusBadGateway
@@ -1812,7 +1824,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			msg = s
 		}
 	}
-	writeOpenAIError(w, status, code, msg)
+	// 已经开始的流里不能再写 JSON 错误体：客户端会把它当成 SSE 事件解析，得到
+	// 半截响应且没有终态事件（2026-09-30 审计发现）。流内交付失败交给适配器，
+	// 它会按各自协议发出终止事件（Responses 的 response.failed、Anthropic 的
+	// error 事件、Chat 的 error 帧 + [DONE]）。
+	if !deliverStreamFailure(w, code, msg) {
+		writeOpenAIError(w, status, code, msg)
+	}
 	st.status = status
 }
 
@@ -1959,6 +1977,29 @@ type deliveredContentWriter interface {
 	DeliveredContent() bool
 }
 
+// retryResetWriter 由「内容状态需要跨重发重置」的适配器实现。
+// Responses 的写入器在构造时就确定、贯穿整个轮转循环，重发前必须清空上一轮的
+// 内容累积，否则重试的内容无法正确交付（2026-09-30 审计发现）。
+type retryResetWriter interface {
+	ResetForRetry()
+}
+
+// resetForRetry 沿写入器链调用一次重置；没有适配器的路径（Chat 原生、Anthropic）
+// 由各自的重发逻辑保证状态干净，这里静默跳过。
+func resetForRetry(w http.ResponseWriter) {
+	for current := w; current != nil; {
+		if reset, ok := current.(retryResetWriter); ok {
+			reset.ResetForRetry()
+			return
+		}
+		next, ok := current.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		current = next.Unwrap()
+	}
+}
+
 // deliveredContent 沿写入器链询问是否已交付内容；没有适配器时保守返回 true
 // （宁可放弃重试，也不要冒着重复输出的风险）。
 func deliveredContent(w http.ResponseWriter) bool {
@@ -2006,8 +2047,21 @@ func holdProgress(w http.ResponseWriter) {
 	}
 }
 
+// writeOpenAIError 写一个 OpenAI 形状的错误响应体。
+//
+// 流已经开始时必须走适配器把失败交付在流内：往已开的 SSE 流里写 JSON 错误体
+// （无 data: 前缀、无空行分隔）会让客户端解析失败，而且流里没有任何终态事件，
+// 客户端只能等到超时。适配器（Responses 的 response.failed、Anthropic 的
+// error 事件、Chat 的 error 帧 + [DONE]）各自按协议收尾；没有适配器时才退回
+// 原始写法——那是尚未开流、或原生 Chat 无契约的路径。
+//
+// 放在这里而不是各个调用点：只要写入器已经开始流，任何调用点都不能再直写 JSON
+// （2026-09-30 深度体检发现：换号重试没能建立时正是从这条路径漏出去的）。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	observeResponseError(w, code)
+	if deliverStreamFailure(w, code, msg) {
+		return
+	}
 	_ = writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,

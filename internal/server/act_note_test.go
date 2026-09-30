@@ -17,8 +17,13 @@ import (
 	"strings"
 	"testing"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/upstream"
 )
+
+// outbound 保存最近一次到达假上游的请求体（供本文件用例断言）。
+var outbound []byte
 
 // firstSystem 取首条 system 消息的文本（decodeChat 复用 responses_test.go 里的同名助手）。
 func firstSystem(t *testing.T, obj map[string]any) string {
@@ -216,5 +221,57 @@ func TestActNoteNotInjectedTwiceOnResponsesPath(t *testing.T) {
 	}
 	if got := strings.Count(string(captured), prompt.ActNote); got != 1 {
 		t.Fatalf("运行约定被注入 %d 次，want 1", got)
+	}
+}
+
+// TestActNoteSurvivesCustomPromptMode custom 模式下 prompt.Rewrite 会删掉所有
+// system/developer 消息再插入配置提示词，而运行约定正是追加到 system 里。
+// 注入若排在 Rewrite 之前，约定会被连同旧 system 一起删掉，永远到不了模型，
+// 而文档承诺它一定生效。
+//
+// 2026-09-30 深度体检发现。
+func TestActNoteSurvivesCustomPromptMode(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			outbound = raw
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+						"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" +
+						"data: [DONE]\n\n")),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{
+		APIKey:        "k",
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "t", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		PromptMode:    "custom",
+		PromptText:    "You are the gateway prompt.",
+		PromptActNote: prompt.ActNote,
+	})
+	body := `{"model":"cn:fixture","stream":true,"max_tokens":64,"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{}}}}],"messages":[{"role":"system","content":"client system"},{"role":"user","content":"hi"}]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer k")
+	h.ServeHTTP(w, r)
+	if outbound == nil {
+		t.Fatal("请求未到达上游")
+	}
+	obj := decodeChat(t, outbound)
+	system := firstSystem(t, obj)
+	if !strings.Contains(system, "You are the gateway prompt.") {
+		t.Fatalf("custom 提示词未生效: %q", system)
+	}
+	if !strings.Contains(system, prompt.ActNote) {
+		t.Fatalf("运行约定在 custom 模式下丢失（被 prompt.Rewrite 删掉）: %q", system)
+	}
+	if strings.Contains(system, "client system") {
+		t.Fatalf("custom 模式应替换客户端 system: %q", system)
 	}
 }

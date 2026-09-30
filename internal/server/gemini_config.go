@@ -100,8 +100,19 @@ func geminiGenerationConfig(value any, chat map[string]any) (bool, error) {
 	if err := requestValidationOptionalStrings(thinking, "generationConfig.thinkingConfig", "thinkingLevel"); err != nil {
 		return false, err
 	}
-	if err := requestValidationOptionalNumbers(thinking, "generationConfig.thinkingConfig", true, "thinkingBudget"); err != nil {
-		return false, err
+	// thinkingBudget 只校验「是整数」，取值范围交给下面的检查。
+	// 通用的 requestValidationOptionalNumbers(…, true, …) 要求非负整数，会抢在
+	// 区间检查之前把 -1 拒掉，而 -1 是官方 SDK 的 AUTOMATIC、也是本文档承诺支持的
+	// 取值（docs/gemini.md 写明支持 0 或 -1），于是按文档使用的客户端直接拿到 400
+	// 且请求根本到不了上游（2026-09-30 深度体检发现）。
+	if raw := thinking["thinkingBudget"]; raw != nil {
+		number, ok := raw.(json.Number)
+		if !ok {
+			return false, fmt.Errorf("generationConfig.thinkingConfig.thinkingBudget must be a number")
+		}
+		if _, err := number.Int64(); err != nil {
+			return false, fmt.Errorf("generationConfig.thinkingConfig.thinkingBudget must be an integer")
+		}
 	}
 	level := strings.ToLower(stringField(thinking, "thinkingLevel"))
 	if level != "" && level != "low" && level != "medium" && level != "high" {

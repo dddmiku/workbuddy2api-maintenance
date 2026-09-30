@@ -371,4 +371,3 @@ func TestMessagesBuiltinOnlyToolsOmitField(t *testing.T) {
 		t.Fatalf("仅内置工具时应省略 tools 字段: %s", chat)
 	}
 }
-

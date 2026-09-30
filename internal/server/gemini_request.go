@@ -424,11 +424,23 @@ func geminiSchemaDepth(value any, path string, depth int) (map[string]any, error
 		}
 		delete(out, "nullable")
 		if nullable == true {
-			kind, ok := out["type"].(string)
-			if !ok || kind == "null" {
-				return nil, fmt.Errorf("%s.nullable requires a single non-null schema type", path)
+			if kind, ok := out["type"].(string); ok && kind != "null" {
+				out["type"] = []any{kind, "null"}
+			} else if len(out) > 0 {
+				// 没有单一 type 的联合形状（@google/genai 会为可空联合发
+				// {"nullable":true,"anyOf":[…]}，枚举发 {"nullable":true,"enum":[…]}）：
+				// 此前一律 400，而这是 SDK 正常产出的合法 schema，客户端根本到不了上游。
+				// 用 anyOf 包一层并追加 {"type":"null"} 分支，语义等价、且是合法
+				// JSON Schema（strict 校验走 santhosh jsonschema，支持 anyOf）。
+				inner := make(map[string]any, len(out))
+				for key, value := range out {
+					inner[key] = value
+				}
+				out = map[string]any{"anyOf": []any{inner, map[string]any{"type": "null"}}}
+			} else {
+				// 只有一个孤零零的 nullable：没有任何可空化的结构，保持原样拒绝。
+				return nil, fmt.Errorf("%s.nullable requires a schema to make nullable", path)
 			}
-			out["type"] = []any{kind, "null"}
 		}
 	}
 	return out, nil

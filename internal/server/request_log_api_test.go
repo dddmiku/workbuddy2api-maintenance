@@ -13,7 +13,6 @@ import (
 	"workbuddy2api/internal/requestlog"
 )
 
-
 // facetsFixture 建一个带若干条已完成记录的请求明细 store。
 func facetsFixture(t *testing.T, records []requestlog.Record) *Handler {
 	t.Helper()

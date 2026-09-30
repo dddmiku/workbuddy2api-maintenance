@@ -48,21 +48,21 @@ type Status struct {
 	// 公开仓库匿名可读发布，热更新可用；私有仓库需要令牌，未配令牌时明确不可用。
 	Visibility Visibility `json:"visibility"`
 	// UnavailableReason 不可用时的原因（给面板与运维看的中文说明）；可用时为空。
-	UnavailableReason string `json:"unavailable_reason,omitempty"`
-	Current           string `json:"current"`
-	Commit      string    `json:"commit"`
-	BuiltAt     string    `json:"built_at"`
-	Repo        string    `json:"repo"`
-	Dir         string    `json:"dir"`
-	State       State     `json:"state"`
-	LatestTag   string    `json:"latest_tag"`
-	LatestAt    time.Time `json:"latest_at"`
-	UpdateReady bool      `json:"update_ready"`
-	AssetName   string    `json:"asset_name"`
-	AssetSize   int64     `json:"asset_size"`
-	CheckedAt   time.Time `json:"checked_at"`
-	LastError   string    `json:"last_error"`
-	InheritedFD bool      `json:"inherited_fd"`
+	UnavailableReason string    `json:"unavailable_reason,omitempty"`
+	Current           string    `json:"current"`
+	Commit            string    `json:"commit"`
+	BuiltAt           string    `json:"built_at"`
+	Repo              string    `json:"repo"`
+	Dir               string    `json:"dir"`
+	State             State     `json:"state"`
+	LatestTag         string    `json:"latest_tag"`
+	LatestAt          time.Time `json:"latest_at"`
+	UpdateReady       bool      `json:"update_ready"`
+	AssetName         string    `json:"asset_name"`
+	AssetSize         int64     `json:"asset_size"`
+	CheckedAt         time.Time `json:"checked_at"`
+	LastError         string    `json:"last_error"`
+	InheritedFD       bool      `json:"inherited_fd"`
 }
 
 // Options 构造参数。
@@ -447,19 +447,19 @@ func (m *Manager) statusLocked() Status {
 		Visibility:        m.visibility,
 		UnavailableReason: reason,
 		Current:           version.Version,
-		Commit:      version.Commit,
-		BuiltAt:     version.BuiltAt,
-		Repo:        m.client.Repo,
-		Dir:         m.opts.Dir,
-		State:       m.state,
-		LatestTag:   m.latest.Tag,
-		LatestAt:    m.latest.PublishedAt,
-		UpdateReady: available && m.latest.Tag != "" && m.latest.UpdateAvailable(),
-		AssetName:   m.latest.AssetName,
-		AssetSize:   m.latest.AssetSize,
-		CheckedAt:   m.checkedAt,
-		LastError:   m.lastError,
-		InheritedFD: Inherited(),
+		Commit:            version.Commit,
+		BuiltAt:           version.BuiltAt,
+		Repo:              m.client.Repo,
+		Dir:               m.opts.Dir,
+		State:             m.state,
+		LatestTag:         m.latest.Tag,
+		LatestAt:          m.latest.PublishedAt,
+		UpdateReady:       available && m.latest.Tag != "" && m.latest.UpdateAvailable(),
+		AssetName:         m.latest.AssetName,
+		AssetSize:         m.latest.AssetSize,
+		CheckedAt:         m.checkedAt,
+		LastError:         m.lastError,
+		InheritedFD:       Inherited(),
 	}
 }
 

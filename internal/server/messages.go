@@ -318,7 +318,12 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 					return nil, "", false, err
 				}
 				if block["is_error"] == true {
-					parts = append([]any{map[string]any{"type": "text", "text": "[tool execution error]"}}, parts...)
+					// 先剔掉正文为空的 text part 再插入错误标记：标记本身是非空文本，
+					// 会让下面的 toolResultContent 认为「有内容」而把空 text part 一起
+					// 留下，于是上游收到 `[{text:"[tool execution error]"},{text:""}]`
+					// ——正是本文件 toolResultContent 注释里点名要避免的 400 形状
+					// （2026-09-30 深度体检发现）。
+					parts = append([]any{map[string]any{"type": "text", "text": "[tool execution error]"}}, stripEmptyTextParts(parts)...)
 				}
 				results = append(results, map[string]any{"role": "tool", "tool_call_id": id, "content": toolResultContent(parts)})
 				delete(pending, id)
@@ -510,6 +515,24 @@ func toolResultContent(parts []any) any {
 		}
 	}
 	return ""
+}
+
+// stripEmptyTextParts 去掉正文为空的 text part，保留其余块。
+// 供 is_error 的 tool_result 使用：错误标记插入后整体不再「全空」，
+// toolResultContent 不会折叠，此时必须先把空 text part 摘掉。
+func stripEmptyTextParts(parts []any) []any {
+	kept := make([]any, 0, len(parts))
+	for _, raw := range parts {
+		if part, ok := raw.(map[string]any); ok {
+			if kind, _ := part["type"].(string); kind == "text" {
+				if text, _ := part["text"].(string); strings.TrimSpace(text) == "" {
+					continue
+				}
+			}
+		}
+		kept = append(kept, raw)
+	}
+	return kept
 }
 
 // unsupportedPlaceholder 把上游无法承载的内容块替换成文字占位。
