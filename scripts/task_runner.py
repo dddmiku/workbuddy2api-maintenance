@@ -62,7 +62,7 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go �
     machineId/sessionId 由 uid+盐 md5 稳定派生，勿每次随机）；library 走 web 域 web 指纹。
   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
 """
-import sys, os, json, time, argparse, glob, urllib.request
+import sys, os, json, time, argparse, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc
@@ -1009,8 +1009,9 @@ def main():
     prefixes = []
     for acc in a.accounts:
         if acc.upper() == "ALL":
-            prefixes += [os.path.basename(p)[10:18]
-                         for p in sorted(glob.glob(tc.AUTHS + "/workbuddy-*.json"))]
+            # 枚举走 tc.all_auth_files()（宽 glob workbuddy*.json，与网关 AuthFileGlob 同口径）；
+            # 传完整路径，不靠 basename 切片切 uid（切片假定文件名带连字符，审查发现 19）。
+            prefixes += list(tc.all_auth_files())
         else:
             prefixes.append(acc)
     # 去重保序

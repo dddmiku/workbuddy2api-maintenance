@@ -33,7 +33,7 @@
 依赖：复用 scripts/task_common.py 的 load_auth / AUTHS 常量；
 账号凭证位于 auths/ 目录下 workbuddy-<uid8>.json。
 """
-import sys, os, json, time, hashlib, argparse, glob, uuid, urllib.request, urllib.error
+import sys, os, json, time, hashlib, argparse, uuid, urllib.request, urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc  # 仅复用 load_auth / AUTHS 常量，不复用其 _headers（头不同源）
@@ -807,8 +807,9 @@ def main():
     else:
         prefixes = []
         if not a.accounts or (len(a.accounts) == 1 and a.accounts[0].upper() == "ALL"):
-            prefixes = [os.path.basename(p)[10:18]
-                        for p in sorted(glob.glob(tc.AUTHS + "/workbuddy-*.json"))]
+            # 枚举走 tc.all_auth_files()（宽 glob workbuddy*.json，与网关 AuthFileGlob 同口径）；
+            # 传完整路径，不靠 basename 切片切 uid（切片假定文件名带连字符，审查发现 19）。
+            prefixes = list(tc.all_auth_files())
         else:
             prefixes = a.accounts
         seen, prefixes2 = set(), []

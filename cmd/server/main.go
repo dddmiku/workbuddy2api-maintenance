@@ -44,16 +44,9 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
-	cfg, err := Load(*cfgPath)
+	cfg, err := loadConfigOrEnv(*cfgPath)
 	if err != nil {
-		// 配置文件不存在时给一次机会用纯默认 + env
-		if os.IsNotExist(err) {
-			log.Printf("config %s not found, using defaults+env", *cfgPath)
-			cfg, err = Load("")
-		}
-		if err != nil {
-			log.Fatalf("load config: %v", err)
-		}
+		log.Fatalf("load config: %v", err)
 	}
 
 	layout, err := prepareUnified(cfg, *cfgPath)

@@ -22,6 +22,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -297,6 +298,24 @@ func updateDir(c *Config) string {
 		return filepath.Join("data", "updates")
 	}
 	return filepath.Join(stateDir, "updates")
+}
+
+// loadConfigOrEnv 读配置：配置文件不存在时回落「纯默认 + WB2A_* env」，其余错误原样返回。
+//
+// 这里是启动兜底的唯一判定点。必须用 errors.Is 而不是 os.IsNotExist：Load 返回的是
+// fmt.Errorf("read config: %w", err) 包装过的错误，os.IsNotExist 不拆包，对包装后的
+// fs.ErrNotExist 恒为 false，兜底分支会变成死代码，让「无 config.json、只用环境变量」
+// 的部署在启动时 log.Fatalf（审查发现 20）。
+func loadConfigOrEnv(path string) (*Config, error) {
+	cfg, err := Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	log.Printf("config %s not found, using defaults+env", path)
+	return Load("")
 }
 
 // Load 从文件读，再用 WB2A_* env 覆盖。

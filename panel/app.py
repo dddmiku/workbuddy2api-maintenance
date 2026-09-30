@@ -189,7 +189,11 @@ except ValueError:
 
 REALMS = ("cn", "global")
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-AUTH_FILE_RE = re.compile(r"^workbuddy-(?P<uid>.+?)\.json(?P<disabled>\.disabled)?$")
+# auth 文件命名口径的单一来源：与网关 internal/auth/auth.go 的 AuthFileGlob（`workbuddy*.json`）
+# 保持同一宽度。网关会加载不带连字符的名字（如 workbuddy_new.json，auth.go 的注释里就点了这个
+# 文件名），面板必须看到同一批文件，否则网关在服务、面板却列不出也管不了（审查发现 19）。
+# uid 组可缺省：缺省时用文件名兜底，真正的 uid 优先从文件内容读（见 _auth_doc_uid）。
+AUTH_FILE_RE = re.compile(r"^workbuddy(?P<uid>.*)\.json(?P<disabled>\.disabled)?$")
 
 # 首屏读取缓存，手动刷新等待同一次后台查询；失败不丢弃最后一次成功结果。
 CREDIT_TTL = 60.0
@@ -743,6 +747,21 @@ def chown_app(path):
         sys.stderr.write("chmod %s failed: %s\n" % (path, exc))
 
 
+def _auth_doc_uid(raw):
+    """从 auth 文件内容取 uid，兼容嵌套形与扁平形（与网关 auth.Parse 同口径）。
+
+    嵌套形取 account.uid，扁平形取顶层 uid；取不到返回空串（由调用方回落到文件名）。
+    """
+    if not isinstance(raw, dict):
+        return ""
+    acct = raw.get("account")
+    if isinstance(acct, dict) and acct.get("uid"):
+        return str(acct["uid"])
+    if raw.get("uid"):
+        return str(raw["uid"])
+    return ""
+
+
 def list_auth_files():
     items = []
     if not os.path.isdir(AUTHS_DIR):
@@ -751,11 +770,17 @@ def list_auth_files():
         m = AUTH_FILE_RE.match(name)
         if not m:
             continue
+        path = os.path.join(AUTHS_DIR, name)
+        # uid 优先取文件内容：网关按内容里的 uid 索引账号，面板的启停/删除也按 uid 匹配；
+        # 只靠文件名会在无连字符命名（workbuddy_new.json）下与网关的 uid 对不上。
+        # 内容读不到（损坏/权限）时回落到文件名的中间段（去掉惯用的连字符前缀），
+        # 保持这类账号仍可启停/删除，而不是整条消失。
+        uid = _auth_doc_uid(read_auth(path)) or m.group("uid").lstrip("-")
         items.append({
-            "uid": m.group("uid"),
+            "uid": uid,
             "file": name,
             "disabled": bool(m.group("disabled")),
-            "path": os.path.join(AUTHS_DIR, name),
+            "path": path,
         })
     return items
 
@@ -770,8 +795,11 @@ def read_auth(path):
 
 def auth_summary(entry):
     raw = read_auth(entry["path"]) or {}
-    acct = raw.get("account") or {}
-    auth = raw.get("auth") or {}
+    # 兼容两种落盘形态（与网关 auth.Parse 同口径）：嵌套形取 auth/account 段，
+    # 扁平形（手写/旧版，顶层 accessToken/uid/realm）两段都指向顶层。
+    nested = raw.get("auth")
+    auth = nested if isinstance(nested, dict) else raw
+    acct = raw.get("account") if isinstance(raw.get("account"), dict) else raw
     exp = auth.get("expiresAt") or 0
     try:
         exp = int(exp)
@@ -781,7 +809,7 @@ def auth_summary(entry):
         "uid": entry["uid"],
         "nickname": acct.get("nickname") or acct.get("uid") or entry["uid"][:8],
         "enterpriseId": acct.get("enterpriseId") or "",
-        "realm": auth.get("realm") or "",
+        "realm": auth.get("realm") or raw.get("realm") or "",
         "domain": auth.get("domain") or "",
         "expiresAt": exp,
         "disabled": entry["disabled"],

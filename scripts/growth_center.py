@@ -29,7 +29,7 @@ growth 接口，与 task_common.py 已有的请求助手（headers / base / clie
   python3 growth_center.py ALL --yes --redeem-only
   python3 growth_center.py ALL --yes --lottery-only
 """
-import sys, os, time, uuid, argparse, glob
+import sys, os, time, uuid, argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc  # noqa: E402  仅复用 load_auth / AUTHS / 请求助手
@@ -248,8 +248,11 @@ def collect_accounts(accounts):
     if accounts and not (len(accounts) == 1 and accounts[0].upper() == "ALL"):
         prefixes = accounts
     else:
-        prefixes = [os.path.basename(p)[10:18]
-                    for p in sorted(glob.glob(tc.AUTHS + "/workbuddy-*.json"))]
+        # 枚举走 tc.all_auth_files()（宽 glob workbuddy*.json，与网关 AuthFileGlob 同口径），
+        # 不再本地拼窄 glob：否则网关加载的 workbuddy_new.json 这类账号会被漏掉（审查发现 19）。
+        # 直接传完整路径（load_auth 认 .json 后缀），不再靠 `basename[10:18]` 切 uid——
+        # 那个切片假定文件名带连字符，无连字符的文件会被切出乱码前缀而找不到。
+        prefixes = list(tc.all_auth_files())
     seen, uniq = set(), []
     for p in prefixes:
         if p not in seen:

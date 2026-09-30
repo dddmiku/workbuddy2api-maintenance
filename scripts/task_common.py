@@ -32,6 +32,11 @@ AUTHS = _resolve_auths_dir()
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
 BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 
+# auth 文件命名口径的单一来源：与网关 internal/auth/auth.go 的 AuthFileGlob
+# （`workbuddy*.json`）保持一致。脚本侧的 ALL 枚举与按前缀查找都走这里，
+# 避免各处再拼一个更窄的 glob 而漏掉网关实际加载的账号（审查发现 19）。
+AUTH_GLOB = "workbuddy*.json"
+
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS   = "/v2/activity/growth/tasks/accept"
@@ -44,10 +49,38 @@ PATH_CHAT           = "/v2/chat/completions"
 CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 
+def all_auth_files() -> list:
+    """auths/ 下全部 auth 文件路径（宽 glob，与网关 auth.AuthFileGlob 同一口径）。
+
+    `workbuddy*.json` 是网关 internal/auth/auth.go 里 AuthFileGlob 的宽度：只要网关
+    会加载的账号文件，脚本也必须枚举到。此前各脚本各自用窄 glob `workbuddy-*.json`，
+    不带连字符的文件（如 workbuddy_new.json）被网关加载却被脚本漏掉（审查发现 19），
+    所以 ALL 枚举统一走这里，不再各自拼 glob。
+    `.disabled` 文件结尾不是 .json，不匹配——与网关「禁用账号不加载」一致。
+    """
+    return sorted(glob.glob(os.path.join(AUTHS, AUTH_GLOB)))
+
+
+def _auth_parts(d: dict) -> tuple:
+    """把两种落盘形态归一为 (auth 段, account 段)，与 Go auth.Parse 同口径。
+
+    嵌套形 {"auth":{...},"account":{...}}（插件 OAuth 输出）
+    扁平形 {"accessToken":...,"uid":...}（手写/旧版，网关同样支持）
+    扁平形下两段都指向顶层，故 a["accessToken"] / acc["uid"] 仍然成立。
+    """
+    nested = d.get("auth")
+    if isinstance(nested, dict):
+        acc = d.get("account")
+        return nested, (acc if isinstance(acc, dict) else {})
+    return d, d
+
+
 def load_auth(uid_or_file: str) -> dict:
     """从 auths/ 加载账号凭证，uid_or_file 为 uid 前缀或 auths 文件名。
 
     返回 {token, uid, domain, nick, file, realm} 六元组。
+    兼容嵌套形与扁平形两种落盘形态（见 _auth_parts）：网关 auth.Parse 两种都解析并
+    对外服务，脚本遇到扁平形不能再以 KeyError 整轮崩溃（审查发现 8）。
     realm 读取兼容嵌套形（`auth.realm`，login.sh --realm=global 落盘形态）与
     扁平形（顶层 `realm`）；两种都缺省 → "cn"（老 CN 凭证零回归）。
     """
@@ -57,7 +90,8 @@ def load_auth(uid_or_file: str) -> dict:
             p = os.path.join(AUTHS, p)
     else:
         pre = uid_or_file
-        hits = glob.glob(os.path.join(AUTHS, f"workbuddy-{pre}*.json"))
+        # 前缀匹配同样用宽命名空间：网关加载 workbuddy*.json，脚本按前缀找号也要能命中。
+        hits = glob.glob(os.path.join(AUTHS, f"workbuddy*{pre}*.json"))
         if not hits:
             raise SystemExit(f"no auth for {pre}")
         p = hits[0]
@@ -65,10 +99,16 @@ def load_auth(uid_or_file: str) -> dict:
     # （中文系统为 GBK），而 auth 文件是 UTF-8 写入的，非 ASCII 昵称会触发
     # UnicodeDecodeError，使所有脚本类任务（school/cat/trial 等）直接中断。
     d = json.load(open(p, encoding="utf-8"))
-    a, acc = d["auth"], d["account"]
+    a, acc = _auth_parts(d)
     realm = a.get("realm") or d.get("realm") or ""
-    return {"token": a["accessToken"], "domain": a.get("domain") or "",
-            "uid": acc["uid"], "nick": acc.get("nickname", ""),
+    # 必填字段缺失时抛 SystemExit（调用方已统一 except SystemExit），而不是 KeyError：
+    # 单个损坏文件不该让整轮调度在所有账号上崩掉（审查发现 8 的影响面）。
+    try:
+        token, uid = a["accessToken"], acc["uid"]
+    except (KeyError, TypeError) as exc:
+        raise SystemExit(f"auth file {os.path.basename(p)} 缺少必填字段: {exc}")
+    return {"token": token, "domain": a.get("domain") or "",
+            "uid": uid, "nick": acc.get("nickname", ""),
             "file": os.path.basename(p), "realm": realm}
 
 
