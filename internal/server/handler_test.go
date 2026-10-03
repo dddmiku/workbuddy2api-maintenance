@@ -1140,21 +1140,40 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
+// TestChatSessionDeadDisables 12153 走**连续计数**，不是一次即禁用。
+//
+// 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败就永久杀号
+// 会误杀健康账号（pool.NoteSessionDead 的注释记录了 13 个被误停用账号的先例）。
+// 2026-10-02 第二轮体检发现 applyErrorPolicy 此前直接调 Pool.Disable，把这层
+// 保护整个绕过去了；本用例锁定「未达阈值不停用、达到阈值才停用」。
 func TestChatSessionDeadDisables(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+
+	// 前 pool.SessionDeadThreshold()-1 次：只记账，不停用。
+	for i := 0; i < pool.SessionDeadThreshold()-1; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		if rec.Code != 503 {
+			t.Errorf("第 %d 次 code=%d", i+1, rec.Code)
+		}
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次就停用了——一次 12153 不该杀号（临时触发会误杀健康号）: %+v", i+1, st)
+		}
+	}
+
+	// 第 pool.SessionDeadThreshold() 次：达到阈值，停用。
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Errorf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("连续 %d 次 12153 后应停用: %+v", pool.SessionDeadThreshold(), st)
 	}
 }
 

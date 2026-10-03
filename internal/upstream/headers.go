@@ -294,7 +294,7 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	}
 	messageID := session.NewMessageID()
 	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+		req.Header.Set("X-Conversation-ID", sanitizeHeaderValue(meta.ConversationID))
 	}
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
@@ -339,6 +339,48 @@ func validTraceID(s string) bool {
 		}
 	}
 	return true
+}
+
+// sanitizeHeaderValue 清掉头值里 Go 拒绝的字节，避免客户端可控字段直接进 HTTP 头。
+//
+// 背景（2026-10-02 第二轮体检发现）：conversation_id 来自请求体，在免鉴权部署里
+// 客户端完全可控。若含 \r\n 或其它非法字节，net/http 在写请求时返回错误，整个
+// /v1/chat/completions 以 transport error（503）失败，还会把该账号记一次失败
+// ——客户端可以据此稳定地打掉自己的请求并消耗账号。
+//
+// 这里的处理是**丢弃**非法字节而不是报错：会话标识只是聚合用的旁路信息，不值得
+// 让整条请求失败；清掉后仍保留可读前缀，聚合键的稳定性由网关自己生成的
+// X-Conversation-Request-ID 保证（那个值不来自客户端）。
+func sanitizeHeaderValue(value string) string {
+	// 快路径：绝大多数值本就干净，不必分配。
+	clean := true
+	for i := 0; i < len(value); i++ {
+		if !validHeaderByte(value[i]) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return value
+	}
+	out := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		if validHeaderByte(value[i]) {
+			out = append(out, value[i])
+		}
+	}
+	return string(out)
+}
+
+// validHeaderByte 报告 b 是否可以安全出现在 HTTP 头值里。
+// 按 RFC 7230 field-value：可见 ASCII（0x21-0x7E）加空格与水平制表符；
+// 其余（含 CR/LF/DEL/0x80+）一律丢弃——0x80+ 会被 net/http 按 latin-1 原样送出，
+// 上游日志里会变成乱码。
+func validHeaderByte(b byte) bool {
+	if b == ' ' || b == '\t' {
+		return true
+	}
+	return b >= 0x21 && b <= 0x7E
 }
 
 // attributionClientName 生效的用量归属名：ClientName 非空取之；

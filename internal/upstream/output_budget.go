@@ -240,14 +240,56 @@ func estimateInputTokens(body []byte, sessionPrompt int64) int64 {
 	return max(estimatePromptTokens(body), (textBytes(body)*2+4)/5, sessionPrompt)
 }
 
+// dataURIScan 在单次遍历中识别 base64 data URI，并缓存「已知不含 base64 标记」的区间。
+//
+// 两处扫描共用。**必须缓存**：此前每个位置都调一次 bytes.IndexByte(body[i:], '"')
+// 加 bytes.Contains(body[i:i+end], ";base64,")。当正文里出现长串 'd'（例如 `data:`
+// 重复多次、直到很后面才有闭合引号）时，每一步都会扫到那个引号，实测复杂度 O(n²)：
+// 200KB→103ms、400KB→418ms、800KB→1.69s、2MB→10.7s。而 estimateInputTokens 会同时
+// 调用这两个函数，11133/上下文路径还会对同一 body 反复调用——单个请求即可烧掉
+// 几十秒 CPU，拖垮整个单进程网关（2026-10-02 第二轮体检发现）。
+//
+// 关键洞察：一次失败的前探是有信息量的。若在 i 处探到「下一个引号之前没有
+// `;base64,`」，那么位于 i 与该引号之间的任何 `data:` 同样不可能构成 base64 URI
+// ——它们的前探会得出相同结论。于是把该引号位置记下来，区间内直接短路，整体降为线性。
+type dataURIScan struct {
+	// noBase64Until 在该位置之前，`data:` 之后到下一个引号之间确定没有 `;base64,`。
+	noBase64Until int
+}
+
+const dataURIPrefix = "data:"
+
+// skip 报告 body[i:] 是否是一个 base64 data URI，返回需要跳过的字节数（0 表示不是）。
+func (s *dataURIScan) skip(body []byte, i int) int {
+	if !bytes.HasPrefix(body[i:], []byte(dataURIPrefix)) {
+		return 0
+	}
+	if i < s.noBase64Until {
+		// 该区间已被前一次前探证明不含 base64 标记，无需重扫。
+		return 0
+	}
+	rest := body[i+len(dataURIPrefix):]
+	quote := bytes.IndexByte(rest, '"')
+	if quote <= 0 {
+		return 0
+	}
+	if !bytes.Contains(rest[:quote], []byte(";base64,")) {
+		// 记下边界：到该引号为止，任何 data: 都不是 base64 URI。
+		s.noBase64Until = i + len(dataURIPrefix) + quote
+		return 0
+	}
+	// 返回从 i 到闭合引号（含）的总长度，调用方一次跳过整段。
+	return len(dataURIPrefix) + quote + 1
+}
+
 // textBytes 请求体中除 base64 图片数据以外的字节数。
 func textBytes(body []byte) int64 {
 	var total int64
-	dataURI := []byte("data:")
+	var scan dataURIScan
 	for i := 0; i < len(body); {
-		if body[i] == 'd' && bytes.HasPrefix(body[i:], dataURI) {
-			if end := bytes.IndexByte(body[i:], '"'); end > 0 && bytes.Contains(body[i:i+end], []byte(";base64,")) {
-				i += end
+		if body[i] == 'd' {
+			if skip := scan.skip(body, i); skip > 0 {
+				i += skip
 				continue
 			}
 		}
@@ -262,11 +304,11 @@ func textBytes(body []byte) int64 {
 // 只用于判断是否贴近窗口，不参与计量。
 func estimatePromptTokens(body []byte) int64 {
 	var cjk, other int64
-	dataURI := []byte("data:")
+	var scan dataURIScan
 	for i := 0; i < len(body); {
-		if body[i] == 'd' && bytes.HasPrefix(body[i:], dataURI) {
-			if end := bytes.IndexByte(body[i:], '"'); end > 0 && bytes.Contains(body[i:i+end], []byte(";base64,")) {
-				i += end
+		if body[i] == 'd' {
+			if skip := scan.skip(body, i); skip > 0 {
+				i += skip
 				continue
 			}
 		}

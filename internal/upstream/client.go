@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -176,7 +177,32 @@ var softRateRule = errorRule{kind: ErrSoftRate, mode: matchFold, patterns: []str
 	"请求过于频繁", "限流",
 }}
 
-var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found", "12153"}}
+// sessionDeadRule 判定「session 已失效、需要人工重登」的终态。
+//
+// "12153" 是裸数字串，用子串匹配会误伤：任何正文里恰好出现这五个数字的响应
+// （requestId、毫秒时间戳、token 计数）都会被判成死会话。而 ErrSessionDead 的
+// 处置是**永久禁用**，一次误判就把健康号移出池子直到人工复活
+// （2026-10-02 第二轮体检实测：429 限流响应带毫秒时间戳
+// {"code":6004,"msg":"rate limit","ts":1759121530123} 被判 session_dead）。
+//
+// 因此数字码必须按 JSON 的 code 字段精确匹配，不能当子串扫。词表里的自然语言
+// 串仍按子串匹配（上游文案会带前后缀，精确匹配反而漏判）。
+var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found"}}
+
+// sessionDeadCode 12153 的精确匹配形式：JSON 里作为 code 值出现。
+// 覆盖 `"code":12153`、`"code": 12153`、`"code":"12153"` 三种写法；
+// 不做数字边界判断，因为 `"code":121530` 这种畸形值上游不会产生。
+var sessionDeadCodePatterns = []string{`"code":12153`, `"code": 12153`, `"code":"12153"`}
+
+// matchSessionDeadCode 报告正文里是否把 12153 作为 code 值携带。
+func matchSessionDeadCode(body string) bool {
+	for _, pattern := range sessionDeadCodePatterns {
+		if strings.Contains(body, pattern) {
+			return true
+		}
+	}
+	return false
+}
 
 // contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
@@ -549,7 +575,7 @@ func Classify(status int, body string) ErrKind {
 	if hardRule.hit(body, lower) {
 		return ErrHardCredit
 	}
-	if sessionDeadRule.hit(body, lower) {
+	if sessionDeadRule.hit(body, lower) || matchSessionDeadCode(body) {
 		return ErrSessionDead
 	}
 	if accountFaultRule.hit(body, lower) {
@@ -756,6 +782,18 @@ func New() *Client {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
+		// 拨号与 TLS 握手必须各自有上限。ResponseHeaderTimeout 在 Go 里是
+		// 「请求写完」之后才武装的（net/http/transport.go 的 readLoop 等 writeErrCh），
+		// 覆盖不到拨号与握手阶段；ChatHTTP 的总超时又是 0，于是上游黑洞丢 SYN、
+		// 或中间设备接受 TCP 却卡住 TLS 握手时，聊天请求会**永久**挂住，连同该账号
+		// 的在途额度一起不释放（默认 max_in_flight=3，三次就把一个号占满）
+		// ——2026-10-02 第二轮体检发现。短 RPC 侧另有 120s 总超时兜底，这里补齐
+		// 聊天侧缺失的那一段。
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 15 * time.Second,
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}

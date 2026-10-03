@@ -1884,7 +1884,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
 		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 走连续计数而非直接禁用：12153 会被临时性触发（网络抖动/上游闪断/refresh
+		// 竞态），一次即永久杀号会误杀健康号——pool.NoteSessionDead 的注释记录了
+		// 13 个被误停用账号的先例。此前这里直接调 Disable，把该保护整个绕过去了
+		// （2026-10-02 第二轮体检发现：Classify 的 12153 子串匹配 + 这里的无条件
+		// Disable 叠加，使一次误判就永久停号）。连续 sessionDeadThreshold 次才禁用。
+		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
