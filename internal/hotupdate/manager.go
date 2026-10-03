@@ -463,11 +463,18 @@ func (m *Manager) statusLocked() Status {
 	}
 }
 
+// fail 记录一次失败。
+//
+// checkedAt **不在这里写**：它表示「远端版本已成功读取」，面板据此判断
+// 「已是最新版本」并禁用「立即更新」按钮。此前 fail 也盖这个时间戳，于是一次
+// 瞬时 GitHub 故障（5xx/429/网络）之后，面板会显示「已是最新版本（当前 vX，远端 ）」
+// ——没有任何远端版本被读到，这句话是假的，而且按钮被禁用、点不动，直到进程重启
+// 或下一次检查成功（2026-10-02 第二轮体检发现）。
+// 失败状态由 state=StateFailed 与 lastError 表达，面板照此显示错误。
 func (m *Manager) fail(err error) {
 	m.mu.Lock()
 	m.state = StateFailed
 	m.lastError = err.Error()
-	m.checkedAt = time.Now().UTC()
 	m.mu.Unlock()
 	log.Printf("ERROR: [update] %v", err)
 }

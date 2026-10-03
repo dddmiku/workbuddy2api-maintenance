@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -30,6 +31,18 @@ const keyTTL = 7 * 24 * time.Hour
 // writeConcurrencyLimit fire-and-forget 异步写的在途上限（发现 4：写 goroutine
 // 无信号量限制，高写入速率下可瞬时堆积）。超过的排队不丢弃——写语义不变（见 goWrite）。
 const writeConcurrencyLimit = 8
+
+// writeQueueLimit 排队中的异步写上限（含正在执行的）。
+//
+// 光有 sem 只限制**并发执行数**，不限制**排队 goroutine 数**：每个提交都会起一个
+// goroutine 并捕获自己的负载（SaveState 捕获的是整份池状态 JSON），Redis 慢或不可达
+// 时这些 goroutine 会一直挂在 sem 上，内存与 goroutine 数随提交速率无上限增长
+// ——注释承诺的「有界排队」并不成立（2026-10-02 第二轮体检发现）。
+//
+// 超过上限时丢弃新的写：这些是 fire-and-forget 的镜像写，本地状态才是权威来源
+// （见 Store 接口注释），丢弃只影响 Redis 镜像的时效性，不影响正确性；而无限堆积
+// 会拖垮进程。丢弃会打一条限频日志，避免静默。
+const writeQueueLimit = 1024
 
 var closeWaitTimeout = 10 * time.Second
 
@@ -56,6 +69,9 @@ const (
 	bindPrefix  = "wb2api:bind:"
 	stateKey    = "wb2api:state"
 	readTimeout = 3 * time.Second
+	// loadBindsScanTimeout 是启动时全量扫描绑定的整体上限（独立于每条 GET 的
+	// readTimeout）。给得比 readTimeout 宽：启动路径可以多等一会儿，但必须有界。
+	loadBindsScanTimeout = 30 * time.Second
 )
 
 // New 根据 url+token 构建 Store。
@@ -147,6 +163,13 @@ type Upstash struct {
 	pending   sync.WaitGroup
 	tails     map[string]chan struct{}
 	closeErr  error
+	// queued 排队中（含正在执行）的异步写数量，受 writeQueueLimit 约束。
+	// 由 writeMu 保护。
+	queued int
+	// dropped 因队列满被丢弃的镜像写累计次数；lastDropLog 是上次打日志的时间
+	// （限频用）。dropped 用原子读写，lastDropLog 由 writeMu 保护。
+	dropped     atomic.Int64
+	lastDropLog time.Time
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
@@ -170,10 +193,23 @@ func (u *Upstash) goWriteKey(key string, fn func()) {
 		completed = make(chan struct{})
 		u.tails[key] = completed
 	}
+	// 有界排队：超过上限就丢弃这次镜像写（见 writeQueueLimit 注释）。
+	// 用 queued 计数而非 len(sem)，因为排队中的 goroutine 还没进 sem。
+	if u.queued >= writeQueueLimit {
+		u.writeMu.Unlock()
+		u.noteDroppedWrite()
+		return
+	}
+	u.queued++
 	u.pending.Add(1)
 	u.writeMu.Unlock()
 	go func() {
-		defer u.pending.Done()
+		defer func() {
+			u.writeMu.Lock()
+			u.queued--
+			u.writeMu.Unlock()
+			u.pending.Done()
+		}()
 		if previous != nil {
 			<-previous
 		}
@@ -191,6 +227,22 @@ func (u *Upstash) goWriteKey(key string, fn func()) {
 		}
 		fn()
 	}()
+}
+
+// noteDroppedWrite 记录一次因队列满而丢弃的镜像写。限频到每分钟一条，
+// 避免 Redis 长时间不可用时把日志刷爆；计数始终累加，便于运维核对。
+func (u *Upstash) noteDroppedWrite() {
+	total := u.dropped.Add(1)
+	u.writeMu.Lock()
+	shouldLog := time.Since(u.lastDropLog) >= time.Minute
+	if shouldLog {
+		u.lastDropLog = time.Now()
+	}
+	u.writeMu.Unlock()
+	if shouldLog {
+		log.Printf("[redisstore] WARN: 异步写队列已满（上限 %d），丢弃镜像写；累计丢弃 %d 次。本地状态不受影响，Redis 镜像可能滞后",
+			writeQueueLimit, total)
+	}
 }
 
 // closeOnceGuard 防零值 Upstash（未经 New 构造）在 goWrite/Close 上 nil-map 式崩溃：
@@ -289,14 +341,26 @@ func (u *Upstash) LoadState() ([]byte, bool) {
 }
 
 // LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
+//
+// 超时按**阶段**给，不是一个 context 管到底：此前 SCAN 与随后每个 GET 共用同一个
+// 3 秒 context，重启后绑定一多（或 Redis 稍慢），后面的 GET 就集体超时，
+// 结果是**静默只恢复前缀部分**绑定——没有错误、没有日志。用户看到的是重启后
+// 会话粘性悄悄失效、同一会话换到别的上游账号，而该功能存在的意义正是防止这件事
+// （2026-10-02 第二轮体检发现）。
+//
+// 现在：SCAN 有独立的整体上限；每个 GET 有自己的短超时，个别失败只丢那一条。
+// 两者都保留上限，避免 Redis 不可达时这里无限阻塞。
 func (u *Upstash) LoadBinds() map[string]string {
 	out := map[string]string{}
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-	defer cancel()
-	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
-	for iter.Next(ctx) {
+	scanCtx, cancelScan := context.WithTimeout(context.Background(), loadBindsScanTimeout)
+	defer cancelScan()
+	iter := u.client.Scan(scanCtx, 0, bindPrefix+"*", 200).Iterator()
+	for iter.Next(scanCtx) {
 		key := iter.Val()
-		v, err := u.client.Get(ctx, key).Result()
+		// 每条 GET 独立超时：一条慢/失败不该带走整批。
+		getCtx, cancelGet := context.WithTimeout(context.Background(), readTimeout)
+		v, err := u.client.Get(getCtx, key).Result()
+		cancelGet()
 		if err != nil {
 			continue
 		}

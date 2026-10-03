@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -156,5 +157,33 @@ func TestRepoVisibilityProbe(t *testing.T) {
 				t.Fatalf("visibility=%q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestFailedCheckDoesNotStampCheckedAt 检查失败不得写 checked_at。
+//
+// checked_at 表示「远端版本已成功读取」，面板据此判断「已是最新版本」并禁用
+// 「立即更新」按钮。此前 fail() 也盖这个时间戳，于是一次瞬时 GitHub 故障之后，
+// 面板显示「已是最新版本（当前 vX，远端 ）」——没有任何远端版本被读到，这句话
+// 是假的，而且按钮被禁用、点不动。
+//
+// 2026-10-02 第二轮体检发现。
+func TestFailedCheckDoesNotStampCheckedAt(t *testing.T) {
+	m := &Manager{opts: Options{Enabled: true}, client: &Client{Repo: "x/y"}}
+	// 让 visibility 探测失败，Check 走 fail 分支。
+	m.fail(errors.New("simulated GitHub 503"))
+
+	status := m.Status()
+	if !status.CheckedAt.IsZero() {
+		t.Fatalf("检查失败却写了 checked_at=%v——面板会据此谎报「已是最新版本」并禁用按钮", status.CheckedAt)
+	}
+	if status.State != StateFailed {
+		t.Fatalf("state=%q want failed", status.State)
+	}
+	if status.LastError == "" {
+		t.Fatal("失败必须留下 last_error 供面板显示")
+	}
+	if status.UpdateReady {
+		t.Fatal("检查失败时不应报告可升级")
 	}
 }

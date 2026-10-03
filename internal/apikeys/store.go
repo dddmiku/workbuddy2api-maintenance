@@ -143,6 +143,13 @@ func Open(path, existingKey string) (*Store, error) {
 	keys, info, err := readKeyRecords(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if existingKey != "" {
+			// 超过 MaxKeyLength 的配置密钥不能迁移成一条记录：Lookup 会在比较之前
+			// 就按长度拒绝（见其 len(key) > MaxKeyLength 判断），于是这条记录永远
+			// 无法通过认证，却以「已启用」出现在管理列表里，运维查不出原因
+			// （2026-10-02 第二轮体检发现）。这里明确拒绝并说明如何修。
+			if len(existingKey) > MaxKeyLength {
+				return nil, fmt.Errorf("configured api_key is %d bytes, over the %d-byte limit; shorten it before enabling key management", len(existingKey), MaxKeyLength)
+			}
 			s.keys = append(s.keys, record{Info: Info{ID: "legacy", Name: "现有密钥", Note: "创建管理页前已在使用，原有客户端可继续使用", MaskedKey: mask(existingKey), Enabled: true, CreatedAt: time.Now().UTC(), Legacy: true}, Digest: digest(existingKey)})
 		}
 		if err := s.persist(document{Version: 1, Keys: s.keys}); err != nil {
@@ -274,12 +281,20 @@ func mask(key string) string {
 	return key[:8] + "…" + key[len(key)-4:]
 }
 
+// MaxKeyLength 是密钥的最大字节数。Lookup 在比较前按长度快速拒绝，
+// 迁移路径也用它做校验，两处必须一致。
+const MaxKeyLength = 512
+
 func validLabel(name, note string) bool {
 	if name != strings.TrimSpace(name) || name == "" || utf8.RuneCountInString(name) > 64 || utf8.RuneCountInString(note) > 256 {
 		return false
 	}
 	for _, r := range name + note {
-		if unicode.IsControl(r) {
+		// IsControl 只覆盖 Cc，**不覆盖** U+2028/U+2029（行/段分隔符，属 Zl/Zp）。
+		// 这类字符能通过校验并写进密钥名，但 requestlog 会拒绝该名字的记录，
+		// 于是该密钥的每一次请求都**静默**不进「请求明细」（2026-10-02 第二轮体检发现）。
+		// 它们还常见于从网页复制粘贴的文本，属于正常的运维误操作，不该让明细消失。
+		if unicode.IsControl(r) || r == ' ' || r == ' ' {
 			return false
 		}
 	}
@@ -368,7 +383,7 @@ func (s *Store) Resolve(key string) (Info, bool) {
 // Lookup 返回密钥信息与状态，让调用方能区分「没有这把密钥」与「密钥已过期」。
 // 未启用或已删除按 StatusUnknown 处理，不向调用方泄露密钥是否存在。
 func (s *Store) Lookup(key string) (Info, Status) {
-	if key == "" || len(key) > 512 {
+	if key == "" || len(key) > MaxKeyLength {
 		return Info{}, StatusUnknown
 	}
 	want := digest(key)

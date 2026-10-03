@@ -1,6 +1,7 @@
 package redisstore
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -141,5 +142,37 @@ func TestUpstashCloseDrainsQueuedWrites(t *testing.T) {
 	case <-closed:
 	case <-time.After(time.Second):
 		t.Fatal("全部已提交写结束后 Close 应返回")
+	}
+}
+
+// TestUpstashWriteQueueIsBounded 排队中的异步写必须有上限。
+//
+// 此前只有 sem 限制**并发执行数**，不限制**排队 goroutine 数**：Redis 慢或不可达时
+// 每个提交都起一个 goroutine 并捕获自己的负载（SaveState 捕获整份池状态 JSON），
+// 内存与 goroutine 数随提交速率无上限增长——注释承诺的「有界排队」不成立。
+//
+// 2026-10-02 第二轮体检发现。
+func TestUpstashWriteQueueIsBounded(t *testing.T) {
+	u := newTestUpstash()
+	// 占满唯一写槽，让后续提交全部排队。
+	u.sem <- struct{}{}
+	defer func() { <-u.sem }()
+
+	executed := atomic.Int64{}
+	for i := 0; i < writeQueueLimit+50; i++ {
+		u.goWrite(func() { executed.Add(1) })
+	}
+
+	u.writeMu.Lock()
+	queued := u.queued
+	u.writeMu.Unlock()
+	if queued > writeQueueLimit {
+		t.Fatalf("排队中的写=%d 超过上限 %d（goroutine 会无界堆积）", queued, writeQueueLimit)
+	}
+	if dropped := u.dropped.Load(); dropped == 0 {
+		t.Fatal("超出上限的写应被丢弃并计数，实际丢弃 0 次")
+	}
+	if executed.Load() != 0 {
+		t.Fatal("写槽被占满时不应有写执行")
 	}
 }

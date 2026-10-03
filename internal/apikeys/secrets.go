@@ -186,7 +186,7 @@ func (s *Store) openSecret(entry record) (string, error) {
 	}
 	nonce := sealed[:aead.NonceSize()]
 	plain, err := aead.Open(nil, nonce, sealed[aead.NonceSize():], secretAAD(entry))
-	if err != nil || len(plain) == 0 || len(plain) > 512 {
+	if err != nil || len(plain) == 0 || len(plain) > MaxKeyLength {
 		return "", ErrSecretUnavailable
 	}
 	secret := string(plain)
