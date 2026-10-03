@@ -68,6 +68,9 @@ func configCandidates(explicit string) []string {
 // ——与 cmd/server 的 loadConfigOrEnv 同一口径（用 errors.Is 而非 os.IsNotExist）。
 func loadConfigFile(explicit string) ([]byte, string, error) {
 	for _, path := range configCandidates(explicit) {
+		// #nosec G304 -- 配置文件路径来自命令行参数或本机环境变量，
+		// 与 cmd/server 的 loadConfigOrEnv 同一口径（那里同样标注）。
+		// 候选列表不含任何请求输入，本程序也不接受网络输入。
 		raw, err := os.ReadFile(path)
 		if err == nil {
 			return raw, path, nil

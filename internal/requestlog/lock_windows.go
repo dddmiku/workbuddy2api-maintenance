@@ -17,6 +17,8 @@ var journalLockFile = journalKernel.NewProc("LockFileEx")
 var journalUnlockFile = journalKernel.NewProc("UnlockFileEx")
 
 func platformOpen(path string, flags int, mode os.FileMode) (*os.File, error) {
+	// #nosec G304 -- path 由本包内部拼接（数据目录 + 固定文件名），
+	// 不来自请求输入；与 lock_unix.go 同一调用契约，只是平台实现不同。
 	return os.OpenFile(path, flags, mode)
 }
 
