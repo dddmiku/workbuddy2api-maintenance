@@ -73,6 +73,22 @@ class AuthFileContractTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             tc.load_auth(UID)
 
+    def test_malformed_json_raises_systemexit_not_jsondecodeerror(self):
+        # 回归（2026-10-02 第二轮体检发现 16）：畸形 JSON 此前在 try 块外抛 JSONDecodeError，
+        # 调用方只 except SystemExit，一个坏文件让整轮 ALL 崩掉；应与必填字段缺失同口径。
+        with open(os.path.join(self.auths, "workbuddy-broken.json"), "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        with self.assertRaises(SystemExit) as cm:
+            tc.load_auth("workbuddy-broken.json")
+        self.assertIn("workbuddy-broken.json", str(cm.exception))
+
+    def test_non_dict_json_raises_systemexit(self):
+        # 合法但非对象的 JSON（null/list）此前抛 AttributeError，同样逃逸出调用方。
+        with open(os.path.join(self.auths, "workbuddy-null.json"), "w", encoding="utf-8") as fh:
+            fh.write("null")
+        with self.assertRaises(SystemExit):
+            tc.load_auth("workbuddy-null.json")
+
     def test_all_auth_files_uses_wide_glob(self):
         # 回归（审查发现 19）：无连字符的名字网关会加载，脚本 ALL 枚举也必须看到。
         self.write("workbuddy-%s.json" % UID, nested_doc())

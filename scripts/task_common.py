@@ -98,7 +98,17 @@ def load_auth(uid_or_file: str) -> dict:
     # encoding="utf-8" 必须显式指定：Windows 上 open() 默认用 locale 代码页
     # （中文系统为 GBK），而 auth 文件是 UTF-8 写入的，非 ASCII 昵称会触发
     # UnicodeDecodeError，使所有脚本类任务（school/cat/trial 等）直接中断。
-    d = json.load(open(p, encoding="utf-8"))
+    # 解析失败（畸形 JSON / 非 UTF-8 字节）也归到 SystemExit：调用方统一 except
+    # SystemExit，单个损坏文件不该让整轮调度在所有账号上崩掉，与必填字段缺失同口径，
+    # 也与网关 auth.LoadDir「Parse 失败即跳过」一致（2026-10-02 第二轮体检发现 16）。
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except ValueError as exc:  # JSONDecodeError/UnicodeDecodeError 均属 ValueError
+        raise SystemExit(f"auth file {os.path.basename(p)} 解析失败: {exc}")
+    if not isinstance(d, dict):
+        # 合法但非对象的 JSON（null/list）此前在 _auth_parts 抛未捕获 AttributeError。
+        raise SystemExit(f"auth file {os.path.basename(p)} 顶层不是 JSON 对象: {type(d).__name__}")
     a, acc = _auth_parts(d)
     realm = a.get("realm") or d.get("realm") or ""
     # 必填字段缺失时抛 SystemExit（调用方已统一 except SystemExit），而不是 KeyError：

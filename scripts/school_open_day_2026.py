@@ -599,6 +599,11 @@ def run_account(auth, opts, stats):
             else:
                 rounds = max(1, (t.get("target_count") or 1) - cur_prog)
             progress_changed = False
+            # report/share 触发显式抛错（重试耗尽 = 上游/网络故障）时，下面的回读必然
+            # 无变化，若走 pending 分支会被当成「待重试的成功」，脚本退出 0、调度器记
+            # school: ok。用标志把它改判为 fail，兑现 line 853 的非零退出契约
+            # （2026-10-02 第二轮体检发现 19）。
+            report_failed = False
             for ri in range(rounds):
                 try:
                     if mode == "share":
@@ -613,6 +618,7 @@ def run_account(auth, opts, stats):
                               f"code={r.get('code') if isinstance(r, dict) else r}")
                 except (AuthError, RuntimeError) as e:
                     print(f"[school2026] {uid8} {code}: {mode} 触发 #{ri+1} 失败: {e}")
+                    report_failed = True
                     break
                 time.sleep(opts.gap)
                 # 每轮回读一次，判断是否已到 target/completed，提早终止
@@ -638,6 +644,10 @@ def run_account(auth, opts, stats):
                 print(f"[school2026] {uid8} {code}: {status}/{t.get('progress')} -> "
                       f"{after}/{after_prog}（点亮）")
                 stats["ok"] += 1
+            elif report_failed:
+                # 上报阶段显式报错：这不是「未点亮待重试」，而是本轮已失败。
+                print(f"[school2026] {uid8} {code}: {status} -> {after}（上报失败，计 fail）")
+                stats["fail"] += 1
             else:
                 print(f"[school2026] {uid8} {code}: {status} -> {after}（未变化）")
                 stats["pending"] += 1
@@ -733,6 +743,10 @@ def lottery_account(auth, opts, stats, count_account=True):
                 bal = 0  # 「no chance」边界，如实结束
                 break
             print(f"[school2026] {uid8} draw http={st} code={code} msg={msg}（未中奖，停）")
+            # 除 40900「没机会」边界外，draw 返回错误是真实失败：此前只 break 不记 fail，
+            # 脚本按 line 853 契约仍退出 0、调度器记 school: ok，抽奖静默停摆无人知
+            # （2026-10-02 第二轮体检发现 18）。
+            stats["fail"] += 1
             break
         d = (r or {}).get("data") or {}
         prize_code = d.get("prize_code") or "?"

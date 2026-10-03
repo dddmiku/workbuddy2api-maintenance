@@ -595,9 +595,12 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "cost": 0, "isSuccessful": True, "userId": uid}
 
     if kind == "template":
+        # name 必须是字符串：ids_for('template') 给的是场景名（str），build_event 会包成
+        # {"name": meta}，此前写 `m or ""` 会把整个 dict 塞进 name，上游 schema 期望字符串，
+        # 与 expert/team/skill 的 m.get("name") 口径不一致（2026-10-02 第二轮体检发现 21）。
         return {"eventCode": "agent_task_created_with_template", "timestamp": now,
                 "reportDelay": 0, "isCustomModel": True, "id": str(obj_id),
-                "name": m or "", "requestId": rid, "conversationId": cid, "userId": uid}
+                "name": m.get("name") or "", "requestId": rid, "conversationId": cid, "userId": uid}
 
     if kind == "expert":
         return {"eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
@@ -1041,7 +1044,15 @@ def main():
             print(f"[skip] {uid8} global realm 不适用 CN 任务")
             stats["skip"] += 1
             continue
-        process_account(c, a, stats)
+        # 单账号内部任何异常（如 task_status 在上游非 200 时抛 RuntimeError）都按既有约定
+        # 计入 fail 并继续下一个账号：此前只 except SystemExit，异常逃逸会中断整轮 ALL、
+        # 丢弃后续账号且不打印汇总（2026-10-02 第二轮体检发现 17）。
+        try:
+            process_account(c, a, stats)
+        except Exception as e:
+            uid8 = (c.get("uid") or "")[:8] or "?"
+            print(f"ERR: [task_runner] {uid8} 处理失败: {e}")
+            stats["fail"] += 1
 
     print_summary(stats)
     return 1 if stats["fail"] or not prefixes2 else 0

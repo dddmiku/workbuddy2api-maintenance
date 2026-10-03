@@ -389,6 +389,35 @@ func applyAPIKeysDefault(c *Config) {
 	log.Printf("[config] 密钥管理已启用：%s", c.APIKeysFile)
 }
 
+// envInt 读取整数型 WB2A_* 覆盖：未设置时原样保留，设置但非法时明确报错。
+// 关键点是「非法就报错」——静默忽略会让运维以为覆盖生效了（2026-10-02 第二轮体检发现）。
+func envInt(name string, dst *int) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q 非法（需为整数）", name, v)
+	}
+	*dst = n
+	return nil
+}
+
+// envBool 同 envInt，用于布尔型覆盖：非法值报错而非静默保留默认。
+func envBool(name string, dst *bool) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q 非法（需为布尔值）", name, v)
+	}
+	*dst = b
+	return nil
+}
+
 func applyEnv(c *Config) error {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
@@ -402,15 +431,15 @@ func applyEnv(c *Config) error {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
-	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Server.MaxBodyMB = n
-		}
+	// 数值型 WB2A_* 覆盖：非法值直接报错，而不是静默忽略。
+	// 此前是 `if err == nil` 无 else——运维把 WB2A_TIMEOUT_SECONDS 打成 abc，
+	// 启动照常、日志一行没有，覆盖其实没生效（2026-10-02 第二轮体检发现）。
+	// 与 WB2A_INPUT_TOKEN_SCALE 的 fail-fast 口径一致。
+	if err := envInt("WB2A_MAX_BODY_MB", &c.Server.MaxBodyMB); err != nil {
+		return err
 	}
-	if v := os.Getenv("WB2A_OUTBOUND_IMAGE_BUDGET_MB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Server.OutboundImageBudgetMB = n
-		}
+	if err := envInt("WB2A_OUTBOUND_IMAGE_BUDGET_MB", &c.Server.OutboundImageBudgetMB); err != nil {
+		return err
 	}
 	if v := os.Getenv("WB2A_INPUT_TOKEN_SCALE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
@@ -425,20 +454,14 @@ func applyEnv(c *Config) error {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
-	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.TimeoutSeconds = n
-		}
+	if err := envInt("WB2A_TIMEOUT_SECONDS", &c.Upstream.TimeoutSeconds); err != nil {
+		return err
 	}
-	if v := os.Getenv("WB2A_HEADER_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.HeaderTimeoutSeconds = n
-		}
+	if err := envInt("WB2A_HEADER_TIMEOUT_SECONDS", &c.Upstream.HeaderTimeoutSeconds); err != nil {
+		return err
 	}
-	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.IdleTimeoutSeconds = n
-		}
+	if err := envInt("WB2A_IDLE_TIMEOUT_SECONDS", &c.Upstream.IdleTimeoutSeconds); err != nil {
+		return err
 	}
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
@@ -458,15 +481,11 @@ func applyEnv(c *Config) error {
 	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
 		c.Upstream.CliVersion = v
 	}
-	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Upstream.PassthroughIP = b
-		}
+	if err := envBool("WB2A_PASSTHROUGH_IP", &c.Upstream.PassthroughIP); err != nil {
+		return err
 	}
-	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Features.SanitizeBlacklistFingerprints = b
-		}
+	if err := envBool("WB2A_SANITIZE_FINGERPRINTS", &c.Features.SanitizeBlacklistFingerprints); err != nil {
+		return err
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
@@ -534,6 +553,22 @@ func (c *Config) normalize() error {
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
 	}
+	// 上限校验：time.Duration(n)*time.Second 在 n > ~9.2e9 时溢出为负，
+	// net/http 把负 Timeout/ResponseHeaderTimeout 当「未设置」、idle<=0 直接返回原始流，
+	// 于是超时被静默禁用。这里明确拒绝而不是让它悄悄生效（2026-10-02 第二轮体检发现）。
+	const maxTimeoutSeconds = int64(math.MaxInt64) / int64(time.Second)
+	if int64(c.Upstream.TimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.TimeoutSeconds, maxTimeoutSeconds)
+	}
+	if int64(c.Upstream.HeaderTimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.header_timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.HeaderTimeoutSeconds, maxTimeoutSeconds)
+	}
+	if int64(c.Upstream.IdleTimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.idle_timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.IdleTimeoutSeconds, maxTimeoutSeconds)
+	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
@@ -545,7 +580,14 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
-	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+	// 空 listen 回落默认端口，而不是补一个冒号变成 ":"。
+	// ":" 会让 net.Listen 绑定所有网卡的随机端口：日志仍打印原始 cfg.Listen（看不到真实端口）、
+	// 容器 HEALTHCHECK 固定打 127.0.0.1:7863 必然失败（2026-10-02 第二轮体检发现）。
+	// 选择「回落默认」而非「报错」：Default() 已置 ":7863"，历史部署里把该项留空/置 null
+	// 的很多，报错会直接让这些部署起不来；回落到文档默认端口既保住可用性又让端口可预期。
+	if strings.TrimSpace(c.Listen) == "" {
+		c.Listen = ":7863"
+	} else if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
 	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）

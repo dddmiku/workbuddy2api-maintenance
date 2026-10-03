@@ -419,13 +419,19 @@ func main() {
 		}()
 		// 库里 0 把密钥是全新部署的正常起点：库文件已建好，用户在管理台创建第一把
 		// 即可。日志里点明这一点，免得运维看到 0 以为功能没开。
+		//
+		// 用 ListChecked 而不是 List：List 把读取失败吞成空列表，于是「密钥库不可读」
+		// 会被打成「0 把密钥」，与全新部署无从区分（2026-10-02 第二轮体检发现）。
 		if keyStore == nil {
 			return
 		}
-		if count := len(keyStore.List()); count == 0 {
+		infos, err := keyStore.ListChecked()
+		if err != nil {
+			log.Printf("ERROR: API key management enabled but the key store is unreadable: %v", err)
+		} else if len(infos) == 0 {
 			log.Printf("API key management enabled (0 keys); create the first key in the admin console")
 		} else {
-			log.Printf("API key management enabled (%d keys)", count)
+			log.Printf("API key management enabled (%d keys)", len(infos))
 		}
 	}
 	shutdownAdmin := func(ctx context.Context) error {

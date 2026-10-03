@@ -1125,7 +1125,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
             raise RequestBodyError(415, "请使用 JSON 格式提交")
         lengths = self.headers.get_all("Content-Length", [])
-        if len(lengths) != 1 or not lengths[0].isdigit():
+        # 必须按 ASCII 数字严格校验：str.isdigit() 对 latin-1 数字字节（如 0xB2 → '²'）
+        # 也返回 True，但 int() 会抛 ValueError；该异常不是 RequestBodyError，会被
+        # do_POST 的兜底 except 变成 500 并把 Python 异常原文回显给客户端。
+        # 口径与 _reject_unread_body 的 re.fullmatch 保持一致——2026-10-02 第二轮体检发现。
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
             raise RequestBodyError(400, "请求长度无效")
         n = int(lengths[0])
         if n <= 0:
@@ -1591,10 +1595,13 @@ class Handler(BaseHTTPRequestHandler):
     def auth_login(self, body):
         retry_after = login_global_retry_after()
         if retry_after:
+            # extra 必须是 (name, value) 二元组列表：传字典会被 _send 迭代成键字符串，
+            # 解包 10 字符的 "Retry-After" 抛 ValueError，响应头收不了尾并多吐一个 500
+            # ——2026-10-02 第二轮体检发现。
             return self._json(429, {
                 "ok": False,
                 "message": "登录尝试过于频繁，请 %d 秒后再试" % retry_after,
-            }, {"Retry-After": str(retry_after)})
+            }, [("Retry-After", str(retry_after))])
         ip = _client_ip(self)
         with _cred_lock:
             blocked, hits = login_blocked(ip)

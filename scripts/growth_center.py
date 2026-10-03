@@ -314,6 +314,13 @@ def main():
 
     for auth in auths:
         uid8 = (auth.get("uid") or "")[:8]
+        # global 门控：连登兑换/补签/抽奖都打 CN 端点（copilot.tencent.com），
+        # 与 Go 侧 scheduler.go:674 口径一致——global 账号 GET /activity/growth/streak
+        # 返回 500，应明确跳过、不发起任何请求，避免每轮非零退出与无谓的风控流量
+        # （2026-10-02 第二轮体检发现 20）。
+        if tc.auth_is_global(auth):
+            print("[skip] " + uid8 + " global realm 不适用 CN 成长中心")
+            continue
         print("[" + uid8 + "] " + str(auth.get("nick") or ""))
 
         # 兑换与补签都读同一份 streak 快照：一次 GET 拿到连登、补签卡余量、档位状态。
