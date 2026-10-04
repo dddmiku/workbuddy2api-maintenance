@@ -156,7 +156,7 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="11">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="9">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
@@ -172,13 +172,15 @@ function renderKeys(){
         : '<span class="sub">不限制</span>') + '</td>' +
       '<td data-l="总用量" class="mono key-tokens">' + (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') + '</td>' +
       '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
-      '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
-      '<td data-l="重复推理保护"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
+      '<td data-l="状态与保护" class="key-state"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span>' +
+      '<div class="key-state-toggles">' +
+      '<button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGuardEnabled(key) +
       '" aria-label="' + esc(key.name) + '的重复推理保护" data-key-action="guard" data-id="' + esc(key.id) +
-      '" title="发现持续重复输出（推理或正文）时结束该次请求；只影响此密钥后续请求">' + (keyGuardEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
-      '<td data-l="CN 回落"><button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGlobalFallbackEnabled(key) +
+      '" title="发现持续重复输出（推理或正文）时结束该次请求；只影响此密钥后续请求">推理保护 ' + (keyGuardEnabled(key) ? '开' : '关') + '</button>' +
+      '<button type="button" class="btn sm key-guard-toggle" role="switch" aria-checked="' + keyGlobalFallbackEnabled(key) +
       '" aria-label="' + esc(key.name) + '的 CN 回落" data-key-action="fallback" data-id="' + esc(key.id) +
-      '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">' + (keyGlobalFallbackEnabled(key) ? '已开启' : '已关闭') + '</button></td>' +
+      '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">CN 回落 ' + (keyGlobalFallbackEnabled(key) ? '开' : '关') + '</button>' +
+      '</div></td>' +
       '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
       '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
       '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="requests" data-id="' + esc(key.id) + '">请求明细</button><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
