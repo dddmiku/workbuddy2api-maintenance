@@ -59,9 +59,14 @@ type messagesWriter struct {
 	err                    error
 	lastEvent              time.Time
 	delivered              bool
-	mu                     sync.Mutex
-	keepAlive              bool
-	done                   chan struct{}
+	// promptEstimate 出站请求体的输入量估算（由 messagesEntry 在转换后填入）。
+	// 只用于 message_start 的**临时** input_tokens：没有它，首帧只能报 0，
+	// Claude Code 的 workflow 会把每个 agent 的 token 计数一直显示成 0 tok，
+	// 直到轮次结束才跳变。终态（message_delta）永远用上游实报值，与它无关。
+	promptEstimate int64
+	mu             sync.Mutex
+	keepAlive      bool
+	done           chan struct{}
 	// 构造时快照的保活时序：goroutine 只读字段，不去读包级变量（否则测试改动
 	// 包级变量时会与 goroutine 竞争）。
 	firstFrameGrace time.Duration
@@ -420,8 +425,14 @@ func (m *messagesWriter) beginLocked() {
 	// noncached count. Keep this initial field provisional until the terminal
 	// snapshot instead of later correcting a fabricated split down to zero.
 	// An explicitly reported split remains visible; final counters are untouched.
+	//
+	// 2026-10-08：报 0 会让**首帧完全没有输入量**，客户端只能等到 message_delta
+	// 才知道这一轮读了多少上下文——Claude Code 的 workflow 每个 agent 的 tok 计数
+	// 正是读这里，于是整轮显示 0 tok（2026-09-29 记录过这个现象，当时判为不可修）。
+	// 现在填入出站请求体的估算值：它是**临时值**，message_delta 一到就被上游实报
+	// 覆盖，既不伪造缓存拆分，也不再让计数停在 0。
 	if _, known := upstream.CachedInputTokens(m.usage); !known {
-		usage["input_tokens"] = 0
+		usage["input_tokens"] = m.promptEstimate
 	}
 	// Initial counters are provisional. Official SDKs update standard counters
 	// from message_delta but do not merge extension fields, so an early true

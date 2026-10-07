@@ -20,6 +20,7 @@ import (
 
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/requestlog"
+	"workbuddy2api/internal/upstream"
 )
 
 func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +51,9 @@ func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		mw.model, mw.stream = model, stream
+		// 首帧 message_start 的临时 input_tokens：用与输出预算同一套估算口径，
+		// 让客户端在轮次进行中就能看到这一轮读了多少上下文（终态仍以上游实报为准）。
+		mw.promptEstimate = upstream.EstimateInputTokens(chat)
 		sub := r.Clone(r.Context())
 		sub.Body = io.NopCloser(bytes.NewReader(chat))
 		sub.ContentLength = int64(len(chat))

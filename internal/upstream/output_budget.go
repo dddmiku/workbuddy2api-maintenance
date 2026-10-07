@@ -240,6 +240,12 @@ func estimateInputTokens(body []byte, sessionPrompt int64) int64 {
 	return max(estimatePromptTokens(body), (textBytes(body)*2+4)/5, sessionPrompt)
 }
 
+// EstimateInputTokens 供包外读取输入量估算（Anthropic 首帧的临时 input_tokens）。
+// 与输出预算用的是同一套口径，避免两个地方各算一套导致数字对不上。
+func EstimateInputTokens(body []byte) int64 {
+	return estimateInputTokens(body, 0)
+}
+
 // dataURIScan 在单次遍历中识别 base64 data URI，并缓存「已知不含 base64 标记」的区间。
 //
 // 两处扫描共用。**必须缓存**：此前每个位置都调一次 bytes.IndexByte(body[i:], '"')

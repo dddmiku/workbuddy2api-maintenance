@@ -397,10 +397,20 @@ contract(
       "THINKING_FIXTURE",
     );
     assert.equal(events.filter((e) => e.type === "message_stop").length, 1);
+    // 2026-10-08：首帧不再恒为 0，而是带上出站请求体的输入量**估算**——客户端在轮次
+    // 进行中就能看到 token 计数（Claude Code 的 workflow 每个 agent 的 tok 就靠它）。
+    // 契约真正要守的是「未对账的粗口径不得冒充实测的非缓存输入」，所以断言两点：
+    //   1) 首帧不得凭空造出缓存拆分；
+    //   2) 终态必须是实测值（下面几条），不能被估算污染。
+    const startUsage = events.find((e) => e.type === "message_start").message.usage;
     assert.equal(
-      events.find((e) => e.type === "message_start").message.usage.input_tokens,
-      0,
-      "unreconciled gross input must not become uncached input",
+      Object.hasOwn(startUsage, "cache_read_input_tokens"),
+      false,
+      "the first frame must not invent a cache split",
+    );
+    assert.ok(
+      typeof startUsage.input_tokens === "number" && startUsage.input_tokens >= 0,
+      "the first frame must carry a numeric input count",
     );
     assert.equal(final.usage.input_tokens, 60);
     assert.equal(final.usage.cache_read_input_tokens, 40);

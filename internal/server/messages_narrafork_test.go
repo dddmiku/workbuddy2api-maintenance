@@ -135,8 +135,16 @@ func TestNFMessagesDefersUnknownInitialCacheSplit(t *testing.T) {
 	}
 	events := nfMessagesSSEEvents(t, w.Body.String())
 	initial := events[0]["message"].(map[string]any)["usage"].(map[string]any)
-	if initial["input_tokens"] != float64(0) {
+	// 2026-10-08：首帧不再恒报 0，而是填出站请求体的估算值——客户端（Claude Code
+	// 的 workflow 每个 agent 的 tok 计数）读的就是这个字段，报 0 会让整轮显示 0 tok。
+	// 但**不能**把 gross prompt_tokens（100）当成实测的非缓存输入：那是上游在缓存
+	// 拆分未知时的粗口径，不是"实测的非缓存量"。所以断言的是「不等于 100」，
+	// 而不是旧行为的「等于 0」。
+	if got, ok := initial["input_tokens"].(float64); !ok || got == 100 {
 		t.Errorf("unknown split treated gross prompt tokens as measured noncached input: %v", initial)
+	}
+	if _, leaked := initial["cache_read_input_tokens"]; leaked {
+		t.Errorf("first frame must not invent a cache split: %v", initial)
 	}
 	var final map[string]any
 	for _, event := range events {
@@ -153,10 +161,27 @@ func TestNFMessagesKeepsReportedInitialCacheSplit(t *testing.T) {
 	w := httptest.NewRecorder()
 	m := newMessagesWriter(w)
 	m.usage = map[string]any{"prompt_tokens": 100, "completion_tokens": 0, "prompt_cache_hit_tokens": 60}
+	// 有实测拆分时估算值必须让位：首帧报的就是实测的非缓存量，不能被估算覆盖。
+	m.promptEstimate = 999
 	m.begin()
 	usage := nfMessagesSSEEvents(t, w.Body.String())[0]["message"].(map[string]any)["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(40) || usage["cache_read_input_tokens"] != float64(60) {
 		t.Fatalf("a reported split was distorted: %v", usage)
+	}
+}
+
+// TestNFMessagesFirstFrameCarriesPromptEstimate 首帧必须带上输入量估算，
+// 否则 Claude Code 的 workflow 会把每个 agent 的 token 计数一直显示成 0 tok，
+// 直到轮次结束的 message_delta 才跳变（2026-10-08 实测现象）。
+func TestNFMessagesFirstFrameCarriesPromptEstimate(t *testing.T) {
+	w := httptest.NewRecorder()
+	m := newMessagesWriter(w)
+	m.usage = map[string]any{"prompt_tokens": 100, "completion_tokens": 0}
+	m.promptEstimate = 4321
+	m.begin()
+	usage := nfMessagesSSEEvents(t, w.Body.String())[0]["message"].(map[string]any)["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(4321) {
+		t.Fatalf("first frame dropped the prompt estimate: %v", usage)
 	}
 }
 
