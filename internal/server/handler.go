@@ -1115,6 +1115,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 的权限问题，换号成本只是延迟（被拒请求不产生上游计费）。试满 maxSoftRotations 次
 	// 仍失败才把上游原文交给调用方。
 	softRotate := 0
+	// reviewRejectedUIDs 记录本次客户端请求里「被内容审核拒绝过」的账号。
+	// 一旦同一次请求里另有账号成功返回，就说明同一批正文在别的号上能过——那些被拒
+	// 的号是账号维度被上游标记，立即停用（见 pool.FlagReviewAccount）。这比「连续 N 次」
+	// 的弱证据准确得多，且能当场止损，不用等它再被选中两次。
+	var reviewRejectedUIDs []string
 	// readRotate 统计「上游掐流且客户端还没收到任何内容」时已换号重试的次数。
 	// 上游偶发 INTERNAL_ERROR / 连接中断（2026-09-30 实测约占请求的 0.7%），此时换号
 	// 重发往往能成功；但只在**客户端还什么都没收到**时才安全——已经推过内容再重发
@@ -1468,6 +1473,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 上游内容拒绝属于当前请求；直接返回，不修改其他会话或替换正文重试。
 			if kind == upstream.ErrContentBlocked {
+				// 本次拒绝先按连续计数记账（达到阈值即停用）；同时记下这个号，
+				// 一旦本轮请求另有账号成功，就把它升级为「账号被标记」并立即停用。
+				if h.cfg.Pool.NoteContentBlocked(acct.UID) {
+					log.Printf("WARN: [server] content review rejection — disabling account "+
+						"uid=%s reason=flagged-by-review (hit the %d-rejection threshold with no success in between) model=%s",
+						logfmt.UID8(acct.UID), pool.ReviewFailThreshold(), bareModel)
+				}
+				reviewRejectedUIDs = append(reviewRejectedUIDs, acct.UID)
 				// 内容审核：先换号再试（审核可能带账号/风控维度；换号成本只是延迟，
 				// 被拒请求不计费），试满才把上游原文交给调用方。
 				if softRotate < h.cfg.MaxSoftRotations {
@@ -1685,6 +1698,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.cfg.Pool.NoteSuccess(acct.UID)
 			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			flagReviewRejectedPeers(h.cfg.Pool, reviewRejectedUIDs, acct.UID, bareModel)
 			// 绑定用 stickyKey（含无显式会话标识客户端的正文回退键）。
 			if stickyKey != "" && h.cfg.Session != nil {
 				h.cfg.Session.Bind(stickyKey, acct.UID)
@@ -1780,6 +1794,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+		flagReviewRejectedPeers(h.cfg.Pool, reviewRejectedUIDs, acct.UID, bareModel)
 		if stickyKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
@@ -1845,7 +1860,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
-//   - ErrContentBlocked → 不罚账号，直接回 400 content_blocked。
+//   - ErrContentBlocked → 不施冷却/熔断；但会累计「连续审核拒绝」计数，达到阈值
+//     （或同请求别的号成功的硬证据）时按账号级标记停用（见 pool.NoteContentBlocked
+//     与 flagReviewRejectedPeers）。停用发生在 handler 分支内，不经过本函数。
 //   - ErrBadParams → 不罚账号，直接回 400 并保留脱敏后的诊断。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
@@ -1919,9 +1936,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 上下文超限：请求体问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// 轮转循环已在该 kind 上直接 return，不消耗其他账号。
 	case upstream.ErrContentBlocked:
-		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
-		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
-		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+		// 内容策略拦截：不施冷却/熔断（无 Cooldown/NoteError）。审核拒绝的账号维度
+		// 判定（连续计数与「同请求别的号成功」硬证据）在 chatCompletions 的
+		// ErrContentBlocked 分支完成，因此这里不做任何账号处置。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
@@ -2097,4 +2114,22 @@ func openAIErrorType(status int) string {
 		return "server_error"
 	}
 	return "api_error"
+}
+
+// flagReviewRejectedPeers 用硬证据停用被内容审核拒绝的账号：本次客户端请求里
+// rejected 中的账号被上游 11140 审核拒绝过，而 succeededUID 用**同一份正文**成功返回。
+// 内容在别的号上能过，说明拒绝属于账号维度，立即停用，不再等它被反复选中。
+//
+// 只在请求内复用同一 body（换号重试）时成立，这正是调用点所在的位置；succeededUID
+// 自身不在 rejected 里（它按定义成功了），无需排除。
+func flagReviewRejectedPeers(p *pool.Pool, rejected []string, succeededUID, model string) {
+	for _, uid := range rejected {
+		if uid == succeededUID {
+			continue
+		}
+		if p.FlagReviewAccount(uid) {
+			log.Printf("WARN: [server] content review rejection — disabling account "+
+				"uid=%s reason=peer-succeeded (account-level flag) model=%s", logfmt.UID8(uid), model)
+		}
+	}
 }

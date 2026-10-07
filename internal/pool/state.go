@@ -96,8 +96,50 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.reason = ""
 		e.sessionDeadFails = 0
 		e.accountFaultFails = 0
-		p.markStateFieldsLocked(uid, "disabled", "reason", "session_dead_fails", "account_fault_fails")
+		e.reviewFails = 0
+		p.markStateFieldsLocked(uid, "disabled", "reason", "session_dead_fails", "account_fault_fails", "review_fails")
 	}
+}
+
+// NoteContentBlocked 记录一次「内容审核拒绝」（ErrContentBlocked）并累计连续计数。
+//
+// 返回 true 表示本次计数达到 reviewFailThreshold、该账号已被停用。
+//
+// 为什么不能「一拒就停」：上游对**请求内容**命中审核时回的也是同一条 11140 +
+// "did not pass the safety review"，内容问题换号也过不去，一拒即停会误杀健康号
+// （2026-09-27 已有两个号因此被停用的先例）。所以这里只做连续计数；拿到硬证据
+// （同请求别的号成功过）时由 FlagReviewAccount 立刻停用。任意成功或手工复活清零。
+func (p *Pool) NoteContentBlocked(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.reviewFails++
+	if e.reviewFails < reviewFailThreshold {
+		p.dirty.Store(true)
+		return false
+	}
+	e.reviewFails = 0
+	p.disableLocked(e, reviewFailReason)
+	return true
+}
+
+// FlagReviewAccount 用硬证据停用一个账号：同一次客户端请求里该号被内容审核拒绝，
+// 而另一个账号用同一份正文成功返回——拒绝只可能来自账号维度，不是内容维度。
+//
+// 返回 true 表示本次调用确实停用了它（之前未停用）。不存在的 uid 为空操作。
+func (p *Pool) FlagReviewAccount(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.disabled {
+		return false
+	}
+	e.reviewFails = 0
+	p.disableLocked(e, reviewFailReason)
+	return true
 }
 
 // ReenableIfCredits 在余额恢复后解除余额不足冷却。余额不证明请求频率或模型配额
@@ -247,7 +289,10 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.softStreak = 0
 		e.sessionDeadFails = 0
 		e.accountFaultFails = 0
-		p.markStateFieldsLocked(uid, "breaker_until", "retry_count", "soft_streak", "session_dead_fails", "account_fault_fails")
+		// reviewFails 必须一并清零：账号刚成功返回，证明它没有被上游标记；不清会让
+		// 健康号的偶发命中无限累计，最终被误停（自引入缺陷，2026-10-07 修）。
+		e.reviewFails = 0
+		p.markStateFieldsLocked(uid, "breaker_until", "retry_count", "soft_streak", "session_dead_fails", "account_fault_fails", "review_fails")
 	}
 }
 

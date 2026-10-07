@@ -53,6 +53,22 @@
 | `pool.max_soft_rotations` | `0` | 内容审核拒绝时先换号再试的次数上限。`0` = 直接回给调用方（旧行为，理由是审核多为内容维度、换号也过不了）；设为 `2` 表示最多再试两个账号 |
 | `pool.rotate_on_client_error` | `false` | 未知 4xx 是否也按上面的额度换号再试。开启后未知 4xx 先换号、全失败才透传；关闭可避免用轮转掩盖真实请求错误 |
 
+### 内容审核拒绝的账号维度判定（v2.6.0 起）
+
+上游对「内容未通过安全审核」回 `403 + code 11140 + displayMsg "The content did not pass the
+safety review"`，与账号授权封禁共用同一条码。网关按两条互相独立的证据区分**请求内容问题**
+与**账号被上游标记**：
+
+- **硬证据（同请求同伴成功）**：同一次客户端请求里 A 号被审核拒绝、B 号用同一份正文成功
+  返回，则 A 立刻停用。内容在别的号上能过，拒绝只可能来自账号维度。
+- **连续计数**：没有上述证据时按连续 `reviewFailThreshold = 3` 次拒绝停用。计数持久化，
+  跨重启保留；任意成功（`NoteSuccess`）与手工复活（`POST /accounts/revive`）都会清零，
+  健康号的偶发命中不会累积成误停。
+
+停用原因记为 `account flagged by upstream content review (11140 safety review), re-login
+required`，在 `/status` 的 `disabled` + `disabled_reason` 可见。请求内容本身触发审核
+（所有号都被拒）时不停用任何账号，维持既有 400 透传。
+
 另外，带重置时间的限制（code 6004，含英文文案 `your usage will reset at … UTC+8`）按**模型级**处理：只冷却「该账号 + 该模型」并换号，不计入来源闸门；只有真正不带重置时间的 429 才可能触发闸门。
 
 ## 上下文超限与客户端压缩

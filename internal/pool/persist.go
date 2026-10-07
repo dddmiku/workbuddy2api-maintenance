@@ -192,6 +192,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:        s.SoftStreak,
 			sessionDeadFails:  s.SessionDeadFails,
 			accountFaultFails: s.AccountFaultFails,
+			reviewFails:       s.ReviewFails,
 			creditsExpiring:   expiring,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
@@ -444,6 +445,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			SoftStreak:        e.softStreak,
 			SessionDeadFails:  e.sessionDeadFails,
 			AccountFaultFails: e.accountFaultFails,
+			ReviewFails:       e.reviewFails,
 			BreakerUntil:      breakerUntil,
 			RetryCount:        retryCount,
 			CreditsExpiring:   e.creditsExpiring,

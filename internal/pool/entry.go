@@ -141,6 +141,21 @@ type entry struct {
 	// accountFaultFails 连续 ErrAccountFault（11140 "request illegal" 等账号级授权故障）
 	// 计数：与 12153 同款保护，一次 403 不再直接永久禁用。持久化语义同 sessionDeadFails。
 	accountFaultFails int
+	// reviewFails 连续「内容审核拒绝」计数（ErrContentBlocked，上游 403 + code 11140
+	// + displayMsg "The content did not pass the safety review"）。
+	//
+	// 为什么需要单独计数：同一条 11140 有两个来源——**请求内容**触发（换号照样被拒，
+	// 判在请求级、不该停号），以及**账号**被上游标记（同一批内容别的号能过，只有它每次
+	// 都被拒）。2026-10-07 实测：7 个号在 48 小时内 0 次成功、121–340 次审核拒绝，
+	// 而另外 19 个号 700–1500 次成功、0 次拒绝，没有任何账号两者兼有——它们是账号级
+	// 标记，留在池里只会每轮被选中、白烧一次上游请求再换号。
+	//
+	// 判定分两条路（见 NoteContentBlocked）：
+	//   - 同一次客户端请求里，该号被拒而**另一个号成功**（getOtherSucceeded）→ 立刻停用，
+	//     这条证据最硬，一次就够；
+	//   - 没有该证据时按连续计数：达到 reviewFailThreshold 次才停用（容忍偶发误判）。
+	// 任意成功（NoteSuccess）或手工复活清零。持久化语义同 sessionDeadFails。
+	reviewFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
@@ -303,6 +318,9 @@ type stateAccount struct {
 	SessionDeadFails int `json:"session_dead_fails"`
 	// AccountFaultFails 连续账号级授权故障计数（零值省略：多数账号从未出现过）。
 	AccountFaultFails int `json:"account_fault_fails,omitempty"`
+	// ReviewFails 连续「内容审核拒绝」计数（零值省略）。持久化理由同 SessionDeadFails：
+	// 被上游标记的号在重启后必须继续保留停用进度，否则会重新吃满阈值才出池。
+	ReviewFails int `json:"review_fails,omitempty"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
@@ -422,6 +440,20 @@ const accountFaultReason = "account banned by upstream (11140 request illegal), 
 
 // AccountFaultThreshold 暴露连续 11140 的禁用阈值（供日志/运维文档引用）。
 func AccountFaultThreshold() int { return accountFaultThreshold }
+
+// reviewFailThreshold 连续「内容审核拒绝」达到该次数才停用账号。
+//
+// 取 3：与 12153 的 sessionDeadThreshold 同口径——既要让真正被上游标记的号尽快
+// 出池（实测那种号是 100% 拒绝率，3 次几秒内就会攒满），又要容忍请求内容偶发命中
+// 审核的误伤。真正的请求级内容问题会由「换号后成功」那条更硬的证据即时识别，
+// 不依赖这个阈值。
+const reviewFailThreshold = 3
+
+// reviewFailReason 连续内容审核拒绝达到阈值时的持久化 reason。
+const reviewFailReason = "account flagged by upstream content review (11140 safety review), re-login required"
+
+// ReviewFailThreshold 暴露连续内容审核拒绝的停用阈值（供日志/运维文档引用）。
+func ReviewFailThreshold() int { return reviewFailThreshold }
 
 // softStreakShiftMax 软冷却退避的最大左移位数（防 1<<streak 溢出成负数/零）。
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。
