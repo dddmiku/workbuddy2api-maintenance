@@ -635,11 +635,13 @@ function renderAccounts(){
       '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
       '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +
       (lastSub ? '<span class="sub">' + esc(lastSub) + '</span>' : '') + '</span></td>' +
-      '<td class="acts">' +
+      // 操作列：td 保持 table-cell（`class="r"` 与其它列一致地拿到 border-collapse
+      // 的底边），flex 交给内层 div——td 自己 flex 化会让折叠边框不再绘制它。
+      '<td class="r" data-l="操作"><div class="row-acts">' +
       '<button class="btn sm" data-toggle="' + esc(a.uid) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' +
       (a.disabled ? '启用' : '停用') + '</button>' +
       '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
-      '" title="删除">' + svg(IC.trash, 13) + '</button></td></tr>';
+      '" title="删除">' + svg(IC.trash, 13) + '</button></div></td></tr>';
   }).join('');
 }
 // 搜索输入防抖：账号表在输入过程中每敲一个字都重建 DOM，几十行时能感到迟滞。

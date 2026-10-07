@@ -75,7 +75,15 @@
 .tbl tbody tr{transition:background .12s var(--ease)}
 .tbl tbody tr:hover{background:var(--surface-2)}
 .tbl .r{text-align:right}
-.tbl .acts{display:flex;gap:6px;justify-content:flex-end}
+/* 操作列：flex 必须挂在 td **里面**的容器上，不能让 td 自己变成 flex。
+ *
+ * 2026-10-08 修复（用户实测反馈「这地方的线没有对齐」）：此前这里是
+ * `.tbl .acts{display:flex;…}`，直接作用于 td。td 一旦不是 table-cell，
+ * 它就被排除在 `border-collapse:collapse` 的边框合并之外——border-bottom
+ * 计算样式仍报 1px，却完全不绘制。实测：同一行在 x=1250 有线、x=1290（操作列
+ * 起点）起无线的硬断点，且行数越多越明显。
+ * 现按密钥表既有约定（td 保持 table-cell，内层 div 做 flex）。 */
+.tbl .row-acts{display:flex;gap:6px;justify-content:flex-end}
 .who{font-size:13px;font-weight:500}
 .sub{font-size:12px;color:var(--ink-3)}
 .cell-in{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;min-width:0}
@@ -187,8 +195,9 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   .tbl tbody tr:hover{background:var(--surface)}
   .tbl td{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:0}
   .tbl td::before{content:attr(data-l);color:var(--ink-3);font-size:12px;flex:none}
-  .tbl td.acts{justify-content:flex-end}
-  .tbl td.acts::before{content:""}
+  /* 窄屏卡片态：td 仍是 flex（此处没有 border-collapse 参与，不会丢线），
+     所以内层容器要让位——否则按钮会被 flex 布局挤成一列。 */
+  .tbl .row-acts{display:contents}
   .tbl td[data-l=""]::before{display:none}
   .ph .search{min-width:0;flex:1 1 100%}
   .toasts{left:14px;right:14px;align-items:stretch}

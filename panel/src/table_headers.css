@@ -15,4 +15,7 @@
   .table-scroll .tbl td{display:table-cell;padding:11px 14px;border-bottom:1px solid var(--line)}
   .table-scroll .tbl tbody tr:last-child td{border-bottom:0}
   .table-scroll .tbl td::before{display:none}
+  /* 横向滚动档把 td 还原成 table-cell（见 css_c.css 的同名规则），
+     内层 flex 容器随之恢复。 */
+  .table-scroll .tbl .row-acts{display:flex;justify-content:flex-end}
 }

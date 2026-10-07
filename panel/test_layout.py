@@ -18,6 +18,24 @@ def read_source(name):
         return fh.read()
 
 
+def strip_css_comments(css):
+    """去掉 /* … */ 注释。断言选择器时必须先剥注释：修复说明里会引用旧写法，
+    直接搜字符串会把「注释提到旧规则」误判成「旧规则还在」。"""
+    out = []
+    i = 0
+    while True:
+        start = css.find("/*", i)
+        if start < 0:
+            out.append(css[i:])
+            break
+        out.append(css[i:start])
+        end = css.find("*/", start + 2)
+        if end < 0:
+            break
+        i = end + 2
+    return "".join(out)
+
+
 class TableAlignmentTests(unittest.TestCase):
     def test_log_table_right_aligns_header_and_cells(self):
         css = read_source("logs.css")
@@ -117,6 +135,38 @@ class FirstPaintTests(unittest.TestCase):
         self.assertIn("if (!d) return", html)
         self.assertIn("loadUpdate()", html)
         self.assertIn("#updRows", html)
+
+
+class TableBorderCollapseTests(unittest.TestCase):
+    """折叠边框的前提：参与合并的单元格必须是 table-cell。
+
+    `border-collapse:collapse` 只合并**真正的 table-cell** 的边框。一旦某个 td
+    被 display:flex/grid/block 化，它就被排除在合并之外——border-bottom 计算样式
+    仍报 1px，却完全不绘制。2026-10-08 实测症状：账号表在操作列起点出现硬断点，
+    同一行左侧有线、右侧无线（行数越多越明显，看起来像"线没对齐"）。
+    """
+
+    def test_action_cells_keep_table_cell_display(self):
+        css = strip_css_comments(read_source("css_c.css"))
+        # 操作列的 flex 必须挂在 td 内层容器上，不能直接写 `.tbl .acts{display:flex}`。
+        self.assertNotIn(".tbl .acts{display:flex", css,
+                         "td 自己 flex 化会让折叠边框不再绘制它；flex 应放在内层 div 上")
+        self.assertIn(".tbl .row-acts{display:flex", css)
+
+    def test_account_rows_use_inner_container_for_actions(self):
+        with open(os.path.join(HERE, "app.js"), "r", encoding="utf-8") as fh:
+            js = fh.read()
+        self.assertIn('<td class="r" data-l="操作"><div class="row-acts">', js,
+                      "账号表操作列必须保持 td 为 table-cell，flex 交给内层 div")
+        self.assertNotIn('<td class="acts">', js)
+
+    def test_narrow_screen_still_stacks_action_buttons(self):
+        css = strip_css_comments(read_source("css_c.css"))
+        # 窄屏把 td 变成 flex 卡片行，此时内层容器要让位，否则按钮被挤成一列。
+        self.assertIn(".tbl .row-acts{display:contents}", css)
+        # 横向滚动档把 td 还原成 table-cell，内层 flex 随之恢复。
+        headers = strip_css_comments(read_source("table_headers.css"))
+        self.assertIn(".table-scroll .tbl .row-acts{display:flex", headers)
 
 
 if __name__ == "__main__":
