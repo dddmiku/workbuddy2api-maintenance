@@ -17,6 +17,25 @@
 
 历史说明：`v2.4.1`–`v2.4.27` 期间补丁号被当作计数器使用，其中多数是修复、少数是新能力，未按本规则区分。规则自 `v2.5.0` 起生效。
 
+## v2.6.2 — 2026-10-07
+
+出站指纹的版本段跟上官方 5.7.6 分发包。
+
+对国内 WorkBuddy 与国际 WorkBuddy AI 两端重新抓包（GUI 形态 + CLI 形态各一组），
+与网关真实出站逐头比对后发现：UA 三段式与 `X-IDE-Version` 的**形状**仍然正确，
+但版本号停在两个大版本之前——网关自称 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`，
+而两端 5.7.6 分发包实发 `WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0`。
+
+- `defaultClientVersion` 5.5.4 → 5.7.6（桌面端 `last-launch.json` 的 version、
+  `install-manifest.json` 的 appVersion 与 GUI 注入的 `CLIENT_INFO_PLATFORM_VERSION` /
+  `CLIENT_INFO_PRODUCT_VERSION` 三处一致）。
+- `defaultCliVersion` 2.137.1 → 2.156.0（内置 CLI 的
+  `publishConfig.customPackage.version`，同时是 `CLIENT_INFO_USER_AGENT_EXTENSION`）。
+- 影响面：出站 UA 与 `X-IDE-Version`（`X-IDE-Name`/`X-IDE-Type` 两端仍为 `WorkBuddy`，
+  `x-stainless-runtime-version` 仍为 `v22.21.1`——5.7.6 的 Electron 37.10.3 内置
+  node 版本未变，均已实测确认，不在本次改动内）。
+- 配置覆盖语义不变：`upstream.client_version` / `upstream.cli_version` 仍优先于内置默认。
+
 ## v2.6.1 — 2026-10-07
 
 内容审核标记的账号不再被保活探针自动复活。

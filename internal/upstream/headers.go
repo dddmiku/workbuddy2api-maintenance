@@ -17,14 +17,20 @@ const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
 	// X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
 	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
-	// package.json version，5.5.4 分发包即 5.5.4）。config upstream.client_version
-	// 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
+	// package.json version）。config upstream.client_version 可覆盖（空 = 内置默认）。
+	//
+	// 2026-10-07 双端重新抓包（国内 WorkBuddy / 国际 WorkBuddy AI，均为 5.7.6）：
+	// 桌面端 last-launch.json 的 version、install-manifest.json 的 appVersion、
+	// 以及 GUI 形态出站 UA 的 `WorkBuddy/<ver>` 段三者一致为 5.7.6
+	// （CLIENT_INFO_PLATFORM_VERSION / CLIENT_INFO_PRODUCT_VERSION 注入）。
+	defaultClientVersion = "5.7.6"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
-	// （step1 §1.4：cli/package.json publishConfig.customPackage version = 2.137.1
-	// → resolveBundledCliUserAgent() 返回 CLI/2.137.1）。config upstream.cli_version
-	// 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	// （cli/package.json publishConfig.customPackage.version）。
+	//
+	// 2026-10-07 双端重新抓包：5.7.6 分发包内置 CLI 已升到 2.156.0
+	// （CLIENT_INFO_USER_AGENT_EXTENSION = CLI/2.156.0，双端一致）。
+	// 该值同时是 X-IDE-Version 之外唯一随包升级而变动的版本段。
+	defaultCliVersion = "2.156.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -65,6 +71,11 @@ func (c *Client) cliVersion() string {
 // /v2/chat/completions）得到的原文是 `WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1`，
 // 即国际版分发包同样用 `WorkBuddy`，不存在 `WorkBuddy AI` 平台段。官方无任何 UA
 // 随机化（step1 §4），故默认确定性。realm 判定委托 auth.Realm()（含全局开关逃生门）。
+//
+// 2026-10-07 双端（5.7.6）重新抓包复核：GUI 形态实发
+// `WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0`，形状不变、两 realm 仍同值，
+// 仅版本段随包升级（CLIENT_INFO_PLATFORM/PRODUCT_VERSION=5.7.6 +
+// CLIENT_INFO_USER_AGENT_EXTENSION=CLI/2.156.0）。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	_ = a
 	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
