@@ -140,7 +140,12 @@ func main() {
 	if !gateEnabled {
 		gateLabel = "关闭（上游限流时继续换号）"
 	}
-	log.Printf("号池策略：单请求最多换号 %d 次；来源级限流闸门%s", rotate, gateLabel)
+	slotWaitLabel := cfg.Pool.SlotWait
+	if cfg.PoolSlotWaitDur <= 0 {
+		slotWaitLabel = "0s（关闭，健康账号全忙时立即回 503）"
+	}
+	log.Printf("号池策略：单请求最多换号 %d 次；来源级限流闸门%s；在途名额等待上限 %s",
+		rotate, gateLabel, slotWaitLabel)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -364,6 +369,7 @@ func main() {
 		MaxRotate:             cfg.Pool.MaxRotate,
 		MaxSoftRotations:      cfg.Pool.MaxSoftRotations,
 		RotateOnClientError:   cfg.Pool.RotateOnClientError != nil && *cfg.Pool.RotateOnClientError,
+		SlotWait:              &cfg.PoolSlotWaitDur,
 		ReasoningLoopGuard:    &cfg.Features.ReasoningLoopGuard,
 		ReasoningLoopStopOnly: cfg.Features.ReasoningLoopStopOnly,
 		Pool:                  p,

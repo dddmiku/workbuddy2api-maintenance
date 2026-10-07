@@ -92,6 +92,14 @@ const maxReadRotations = 2
 // DefaultMaxRotate 单请求默认最多换号次数：一次客户端请求最多消耗几个账号。
 const DefaultMaxRotate = 3
 
+// DefaultSlotWait 「健康账号全被在途名额占满」时的默认等待上限。
+//
+// 取值依据 2026-10-07 实测：池里剩 2 个健康号、每个 3 个在途名额（共 6 个），
+// 客户端并发峰值把它们全占满时，200 与 503 在同一秒内交替出现——名额是几百毫秒
+// 到几秒就释放的。等待窗口取 10s 覆盖数个名额周转周期；再长则客户端自身的超时
+// 风险开始超过收益，而且等待失败的请求会挤占连接。
+const DefaultSlotWait = 10 * time.Second
+
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
@@ -101,6 +109,12 @@ type Config struct {
 	// MaxSoftRotations 「内容审核 / 未知 4xx」在回给调用方前的换号次数上限，
 	// 默认 DefaultMaxSoftRotations（负数 = 0，即不换号，维持旧行为）。
 	MaxSoftRotations int
+	// SlotWait 「健康账号全被在途名额占满」时，本请求等待名额释放的上限。
+	// nil = 用 DefaultSlotWait；显式 0 = 不等待（立即 503，旧行为）。
+	// 用指针而不是裸 duration：需要区分「未配置」与「显式关闭」，零值 duration
+	// 两者都是 0。风格同本结构体的 ReasoningLoopGuard / RotateOnClientError。
+	// 只影响这一类失败：池里根本没有健康账号时不等待（见 slotWaitable）。
+	SlotWait *time.Duration
 	// RotateOnClientError 未知 4xx 是否也换号再试（默认 false，保持既有契约：
 	// 未知 4xx 通常由请求本身决定，换号会掩盖真实错误、放大无效请求）。
 	RotateOnClientError bool
@@ -176,7 +190,10 @@ type Handler struct {
 	// stopOnly 是 ReasoningLoopStopOnly 的运行期值（0 = 关闭，1 = 打开）。
 	// 用原子量而不是改 cfg：管理台热切换要立即作用于新请求，同时又不能让已经
 	// 开始的重发循环读到半个状态。启动时由 Config 播种，之后只由管理接口写。
-	stopOnly         atomic.Uint32
+	stopOnly atomic.Uint32
+	// slotWait 是 Config.SlotWait 解析后的值（nil → DefaultSlotWait）：
+	// 选号热路径每轮都要读，避免每次解引用指针 + 判空。
+	slotWait         time.Duration
 	requestLogErrors atomic.Uint64
 }
 
@@ -219,6 +236,14 @@ func NewHandler(cfg Config) *Handler {
 		cfg.KeyLimits = keylimit.NewMemory()
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 解析等名额上限：nil = 未配置 → 用默认；显式 0 = 关闭等待。
+	h.slotWait = DefaultSlotWait
+	if cfg.SlotWait != nil {
+		h.slotWait = *cfg.SlotWait
+	}
+	if h.slotWait < 0 {
+		h.slotWait = 0
+	}
 	// 把启动配置播种进运行期开关；之后管理台可以热切换，不必重启。
 	h.SetReasoningLoopStopOnly(cfg.ReasoningLoopStopOnly)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.withGeneration(requestlog.ProtocolChat, h.withDecodedRequest(h.chatCompletions))))
@@ -1289,6 +1314,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// 本请求等待「在途名额释放」的总截止时间：整个轮转循环共享一份预算。
+	// 若每轮换一次号都重新计一份，客户端等待会被放大到 MaxRotate 倍；
+	// 而 slotWait<=0（显式关闭）时该时刻已过期，下面的判定恒为假 → 立即 503。
+	slotWaitDeadline := time.Now().Add(h.slotWait)
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {
 			st.status = 499
@@ -1319,11 +1349,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				unbindSticky()
 			}
 		}
+		// decision 保存最近一次失败选号的事实，供下面的「等待名额」判定使用。
+		var decision pool.Decision
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			var decision pool.Decision
 			acct, decision = h.cfg.Pool.PickExcludingForRealmWithDecision(tried, bareModel, realm)
+			st.trace.decision(decision)
+		}
+		// 健康账号只是全被在途名额占满时，有界等待一个名额释放后重选。
+		// 这是秒级瞬时状态（既有请求一结束名额就释放），直接回 503 会把并发
+		// 峰值误报成「无号可用」；而「无健康账号」（全禁用/冷却）不在此列——
+		// 那种情况几秒内不会改变，等待只会白让客户端等（见 slotWaitable）。
+		if acct == nil && slotWaitDeadline.After(time.Now()) && slotWaitable(decision) {
+			acct, decision = h.waitForSlot(r.Context(), tried, bareModel, realm, slotWaitDeadline)
 			st.trace.decision(decision)
 		}
 		if acct == nil {

@@ -216,6 +216,11 @@ type Config struct {
 		// RotateOnClientError 未知 4xx 是否也换号再试（默认 false）。开启后，
 		// 换号成本只是一个多出来的上游请求；关掉可避免用轮转掩盖真实请求错误。
 		RotateOnClientError *bool `json:"rotate_on_client_error"`
+		// SlotWait 「健康账号全被在途名额占满」时，单个请求等待名额释放的上限
+		// （如 "10s"，默认 10s）。这类账号可用、只是并发名额暂时用尽，名额会在
+		// 既有请求结束时释放，等等就能正常服务。显式 "0s" = 不等待，立即回 503。
+		// 池里根本没有健康账号（全禁用 / 全冷却）时不适用——那种情况等不来结果。
+		SlotWait string `json:"slot_wait"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -227,6 +232,7 @@ type Config struct {
 	// 解析后
 	SoftRateDur         time.Duration `json:"-"`
 	SoftRateMaxDur      time.Duration `json:"-"`
+	PoolSlotWaitDur     time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
@@ -276,6 +282,7 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	c.Pool.SlotWait = "10s"      // 在途名额等满时的等待上限（0s = 不等待，立即 503）
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -527,6 +534,17 @@ func (c *Config) normalize() error {
 	}
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	// 空值回落默认 10s（Default 已置；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	// 显式 "0s" 是有效配置（= 不等待，退化为立即 503），所以只有空串才回落。
+	if c.Pool.SlotWait == "" {
+		c.Pool.SlotWait = "10s"
+	}
+	if c.PoolSlotWaitDur, err = time.ParseDuration(c.Pool.SlotWait); err != nil {
+		return fmt.Errorf("pool.slot_wait: %w", err)
+	}
+	if c.PoolSlotWaitDur < 0 {
+		c.PoolSlotWaitDur = 0 // 负值等同关闭，避免把 deadline 算到过去之外的歧义
 	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)

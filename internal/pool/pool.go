@@ -67,6 +67,15 @@ type Pool struct {
 	flusherDone chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+	// slotWaitMu/slotWaitCh 在途名额释放广播：Release 真正扣减名额后关闭当前
+	// 通道并置 nil，唤醒全部等待者；SlotFreed 在无通道时惰性新建。
+	//
+	// 用「关闭并置 nil」而不是向通道投递值：多个等待者被同一次释放唤醒后
+	// 各自重跑选号，由 Acquire 的 CAS 决出谁真正拿到名额——池里因此不需要
+	// 维护等待队列，也不存在唤醒丢失。惰性新建让「无等待者」时零分配：
+	// Release 是最热的路径（每个请求结束都走），不能为此付出固定开销。
+	slotWaitMu sync.Mutex
+	slotWaitCh chan struct{}
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
@@ -182,9 +191,41 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			// 只有真正扣减成功才广播：幂等分支（cur<=0）没有腾出名额，
+			// 唤醒等待者只会让它们白跑一轮选号。
+			p.broadcastSlotFreed()
 			return
 		}
 	}
+}
+
+// SlotFreed 返回一个在当前时刻之后「有账号释放在途名额」时被关闭的通道。
+//
+// 调用方语义：拿到通道后立刻重新选号；若选号仍然失败且失败原因是
+// in_flight_full，则等待该通道被关闭（或 ctx / 超时先到）后重试。
+//
+// 为什么要先取通道再选号：若先选号再取通道，在两步之间发生的 Release 会
+// 关闭旧通道、而调用方已经错过它，于是白等到超时——这正是"健康账号全忙"
+// 场景下最坏情况。先取通道则保证两步之间的任何释放都会让随后的等待立即返回。
+//
+// 通道在无等待者时不预先分配；每次 Release 关闭并置 nil，下次调用新建。
+func (p *Pool) SlotFreed() <-chan struct{} {
+	p.slotWaitMu.Lock()
+	defer p.slotWaitMu.Unlock()
+	if p.slotWaitCh == nil {
+		p.slotWaitCh = make(chan struct{})
+	}
+	return p.slotWaitCh
+}
+
+// broadcastSlotFreed 关闭当前等待通道唤醒全部等待者；无等待者时是空操作。
+func (p *Pool) broadcastSlotFreed() {
+	p.slotWaitMu.Lock()
+	if p.slotWaitCh != nil {
+		close(p.slotWaitCh)
+		p.slotWaitCh = nil
+	}
+	p.slotWaitMu.Unlock()
 }
 
 // SetRandomSource 仅供测试注入确定性随机源；生产代码不应调用。

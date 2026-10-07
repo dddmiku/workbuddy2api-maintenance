@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefault(t *testing.T) {
@@ -776,5 +777,49 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 	}
 	if c3.Upstream.UserAgent != "EnvAgent/9" {
 		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
+	}
+}
+
+// TestPoolSlotWaitParsed 覆盖 pool.slot_wait 的三种形态：显式值、显式关闭（"0s"）、
+// 缺省回落。三者必须可区分——"0s" 是运维关掉等待的逃生门，不能被默认值吃掉。
+func TestPoolSlotWaitParsed(t *testing.T) {
+	dir := t.TempDir()
+
+	fp := filepath.Join(dir, "explicit.json")
+	os.WriteFile(fp, []byte(`{"pool":{"slot_wait":"3s"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PoolSlotWaitDur != 3*time.Second {
+		t.Errorf("slot_wait=%v want 3s", c.PoolSlotWaitDur)
+	}
+
+	off := filepath.Join(dir, "off.json")
+	os.WriteFile(off, []byte(`{"pool":{"slot_wait":"0s"}}`), 0o600)
+	c, err = Load(off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PoolSlotWaitDur != 0 {
+		t.Errorf("slot_wait=%v want 0 (explicitly disabled)", c.PoolSlotWaitDur)
+	}
+
+	// 键缺席 → Default() 的 10s 保留（空路径 = 不读配置文件）。
+	c, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PoolSlotWaitDur != 10*time.Second {
+		t.Errorf("slot_wait=%v want 10s fallback", c.PoolSlotWaitDur)
+	}
+}
+
+func TestBadPoolSlotWait(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"slot_wait":"oops"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad pool.slot_wait")
 	}
 }
