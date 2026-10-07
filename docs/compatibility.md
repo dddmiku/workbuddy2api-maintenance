@@ -169,7 +169,7 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 
 ## 已知限制（如实记录，不伪造）
 
-- `message_start.usage` 的输入与缓存字段在上游首帧时还不可知，网关按 0 上报，真实值在 `message_delta` 给出（上游只在流末尾报用量，网关不编造数字）。
+- `message_start.usage` 的缓存拆分在上游首帧时还不可知，此时网关不编造拆分，而是给出一个**输入量估算**（`EstimateInputTokens` 口径，偏保守），让客户端在轮次进行中就能显示 token 计数；`input_tokens` 的**权威值**与缓存字段都在 `message_delta` 给出（上游只在流末尾报用量）。有实测拆分时首帧直接报实测的非缓存量，估算值让位。估算值偏高约 2 倍，量级正确但不是精确值。
 - Anthropic `tool_use.id` 沿用上游的 `call_…` 形状而非 `toolu_…`；回填配对按原样工作，客户端一般不校验前缀。
 - thinking 块不带 `signature`：上游不提供可用签名，伪造一个「Anthropic 签名」会更糟；客户端把思考块放回历史时，网关按无签名历史接收。
 - `stop_sequence` 无法报告：上游不回显命中的停止串，仍按 `end_turn` 收尾（不做猜测）。

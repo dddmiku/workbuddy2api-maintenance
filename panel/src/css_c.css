@@ -195,9 +195,10 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   .tbl tbody tr:hover{background:var(--surface)}
   .tbl td{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:0}
   .tbl td::before{content:attr(data-l);color:var(--ink-3);font-size:12px;flex:none}
-  /* 窄屏卡片态：td 仍是 flex（此处没有 border-collapse 参与，不会丢线），
-     所以内层容器要让位——否则按钮会被 flex 布局挤成一列。 */
-  .tbl .row-acts{display:contents}
+  /* 窄屏卡片态：td 变成 flex 行（label 在左、内容在右），内层容器作为它的
+     flex 子项被 space-between 推到右侧，自身再横排按钮——基础规则已足够。
+     这里**不能**用 display:contents：那会把两个按钮提升成 td 的直接子项，
+     被 space-between 撑到卡片两端（实测 430px 下间距 136px、600px 下 221px）。 */
   .tbl td[data-l=""]::before{display:none}
   .ph .search{min-width:0;flex:1 1 100%}
   .toasts{left:14px;right:14px;align-items:stretch}

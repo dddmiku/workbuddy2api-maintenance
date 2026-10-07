@@ -160,10 +160,14 @@ class TableBorderCollapseTests(unittest.TestCase):
                       "账号表操作列必须保持 td 为 table-cell，flex 交给内层 div")
         self.assertNotIn('<td class="acts">', js)
 
-    def test_narrow_screen_still_stacks_action_buttons(self):
+    def test_narrow_screen_keeps_action_buttons_grouped(self):
         css = strip_css_comments(read_source("css_c.css"))
-        # 窄屏把 td 变成 flex 卡片行，此时内层容器要让位，否则按钮被挤成一列。
-        self.assertIn(".tbl .row-acts{display:contents}", css)
+        # 窄屏卡片态：内层容器必须继续横排按钮。用 display:contents 会让按钮
+        # 变成 td 的直接 flex 子项，被 space-between 撑到卡片两端
+        # （2026-10-08 实测：430px 下间距 136px、600px 下 221px）。
+        self.assertNotIn(".tbl .row-acts{display:contents}", css)
+        # 基础规则在窄屏同样生效（不依赖任何媒体查询覆盖）。
+        self.assertIn(".tbl .row-acts{display:flex", css)
         # 横向滚动档把 td 还原成 table-cell，内层 flex 随之恢复。
         headers = strip_css_comments(read_source("table_headers.css"))
         self.assertIn(".table-scroll .tbl .row-acts{display:flex", headers)

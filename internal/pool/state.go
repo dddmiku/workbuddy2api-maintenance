@@ -19,12 +19,18 @@ import (
 // Disable 永久禁用（session 死亡 / 账号级授权封禁），需人工重登后手工恢复或文件替换。
 // 经 disableLocked：置 disabled 并清冷却域（until/coolKind/softStreak/modelCooldowns），
 // 熔断器保留（熔断是连续 5xx 信号，与授权/session 正交，见 transition.go）。
+//
+// 禁用会**减少健康账号数**，可能让「有号可用、只是全忙」变成「没有健康账号」。
+// 此时正在等名额的请求等的是一个再也不会出现的状态，必须唤醒让它们立即重判
+// （否则会一直等到 deadline 才拿到 503）。账号数少时才会走到这里——健康号多、
+// 名额总量大于并发时，禁用某个号不影响其余号的可选性。
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		p.disableLocked(e, reason)
 	}
+	p.mu.Unlock()
+	p.broadcastSlotFreed()
 }
 
 // NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
@@ -50,6 +56,11 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	}
 	e.sessionDeadFails = 0
 	p.disableLocked(e, sessionDeadReason)
+	// 禁用会减少健康账号数，可能让「有号可用、只是全忙」变成「没有健康账号」。
+	// 等名额的请求等的是一个再也不会出现的状态，必须唤醒让它们立即重判、fail fast，
+	// 而不是干等到 deadline。broadcastSlotFreed 只取 slotWaitMu（与 p.mu 无环），
+	// 因此持锁下调用是安全的——被唤醒者只会短暂阻塞在随后的 RLock 上。
+	defer p.broadcastSlotFreed()
 	return true
 }
 
@@ -81,6 +92,7 @@ func (p *Pool) NoteAccountFault(uid string) bool {
 	}
 	e.accountFaultFails = 0
 	p.disableLocked(e, accountFaultReason)
+	defer p.broadcastSlotFreed() // 同 NoteSessionDead：禁用后等待者必须立即重判
 	return true
 }
 
@@ -123,6 +135,7 @@ func (p *Pool) NoteContentBlocked(uid string) bool {
 	}
 	e.reviewFails = 0
 	p.disableLocked(e, reviewFailReason)
+	defer p.broadcastSlotFreed() // 同 NoteSessionDead：禁用后等待者必须立即重判
 	return true
 }
 
@@ -139,6 +152,7 @@ func (p *Pool) FlagReviewAccount(uid string) bool {
 	}
 	e.reviewFails = 0
 	p.disableLocked(e, reviewFailReason)
+	defer p.broadcastSlotFreed() // 同 NoteSessionDead：禁用后等待者必须立即重判
 	return true
 }
 

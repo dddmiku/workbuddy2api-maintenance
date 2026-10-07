@@ -142,3 +142,57 @@ func TestSlotFreedNoChannelNoAllocation(t *testing.T) {
 		t.Fatal("Release with no waiters must not allocate a wait channel")
 	}
 }
+
+// TestSlotFreedBroadcastsOnDisable 停用账号同样会减少健康账号数：等名额的请求等的
+// 是一个再也不会出现的状态（「有号可用、只是全忙」变成了「没有健康账号」），
+// 必须被唤醒立即重判、fail fast，而不是干等到 deadline。
+//
+// 2026-10-08 修复：此前唤醒信号只有 Release 一个来源，停用路径不广播。
+// 账号数少时（健康号数 ≤ 在途上限总量）才会显现——而那恰是 waitForSlot 服务的场景。
+func TestSlotFreedBroadcastsOnDisable(t *testing.T) {
+	cases := []struct {
+		name string
+		stop func(p *Pool, uid string) bool
+	}{
+		{"Disable", func(p *Pool, uid string) bool { p.Disable(uid, "fixture"); return true }},
+		{"NoteSessionDead", func(p *Pool, uid string) bool {
+			var hit bool
+			for i := 0; i < 8 && !hit; i++ {
+				hit = p.NoteSessionDead(uid)
+			}
+			return hit
+		}},
+		{"NoteAccountFault", func(p *Pool, uid string) bool {
+			var hit bool
+			for i := 0; i < 8 && !hit; i++ {
+				hit = p.NoteAccountFault(uid)
+			}
+			return hit
+		}},
+		{"NoteContentBlocked", func(p *Pool, uid string) bool {
+			var hit bool
+			for i := 0; i < 8 && !hit; i++ {
+				hit = p.NoteContentBlocked(uid)
+			}
+			return hit
+		}},
+		{"FlagReviewAccount", func(p *Pool, uid string) bool { return p.FlagReviewAccount(uid) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New("")
+			p.Add(&auth.Auth{UID: "u1"})
+			p.SetMaxInFlight(1)
+
+			freed := p.SlotFreed()
+			if !tc.stop(p, "u1") {
+				t.Fatal("fixture did not disable the account")
+			}
+			select {
+			case <-freed:
+			case <-time.After(time.Second):
+				t.Fatal("disabling the last healthy account must wake slot waiters")
+			}
+		})
+	}
+}
