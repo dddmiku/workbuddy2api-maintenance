@@ -455,6 +455,13 @@ const reviewFailReason = "account flagged by upstream content review (11140 safe
 // ReviewFailThreshold 暴露连续内容审核拒绝的停用阈值（供日志/运维文档引用）。
 func ReviewFailThreshold() int { return reviewFailThreshold }
 
+// ReviewFailReason 返回「内容审核标记」的停用原因。
+//
+// 供保活排程判断能否自动复活：这类号的 refresh 一定成功（令牌是好的，拒绝发生在
+// 模型调用层），用 refresh 成功当复活依据会形成「复活 → 再被拒 → 再停用」的循环，
+// 每轮白烧上游请求并拖慢客户端。故只有人工重登后经 /accounts/revive 才回到池中。
+func ReviewFailReason() string { return reviewFailReason }
+
 // softStreakShiftMax 软冷却退避的最大左移位数（防 1<<streak 溢出成负数/零）。
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。
 const softStreakShiftMax = 16

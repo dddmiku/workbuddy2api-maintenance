@@ -793,6 +793,15 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 			continue
 		}
 		if st.Disabled {
+			// 内容审核标记的号不能靠 refresh 复活：它的令牌本来就是好的（拒绝发生在
+			// 模型调用层），refresh 成功不代表上游标记已解除。自动复活只会形成
+			// 「复活 → 再被拒 → 再停用」的循环，每轮白烧上游请求并拖慢客户端
+			// （2026-10-07 实测：这类号 48h 内 0 成功、数百次拒绝）。
+			// 只有人工重登后经 /accounts/revive 才回到池中。
+			if st.DisabledReason == pool.ReviewFailReason() {
+				skipCnt++
+				continue
+			}
 			// 停用号不再永久躺平：refresh 成功即证明账号在鉴权层还活着（P0-1 实测：13 个
 			// 被误停用的号 refresh 全部成功，是历史误判的受害者），据此自动复活回到池中。
 			// 真正被封的号复活后会因连续两次账号故障再次被禁用——代价只是两次很快的失败。
