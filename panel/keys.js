@@ -9,7 +9,7 @@
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
 // 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
 
-var KS = {keys:null, loading:false, error:'', query:'', models:null, guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
+var KS = {keys:null, loading:false, error:'', query:'', models:null, modelItems:null, modelsLoading:false, guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
 var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, active:false, recoverable:false, mode:'edit'};
 
 function keyGuardEnabled(key){
@@ -74,19 +74,113 @@ async function loadKeyModels(){
   try{
     var result = await api('api/models');
     KS.models = (result && Array.isArray(result.models)) ? result.models : [];
-  }catch(error){ KS.models = []; }
+    // items 带展示字段（credits/name/vendor/能力旗标）；旧网关只回 models 纯 id 列表，
+    // 那时降级成只有 id 的条目，面板仍可用（只是没有倍率徽标）。
+    KS.modelItems = (result && Array.isArray(result.items) && result.items.length)
+      ? result.items
+      : KS.models.map(function(id){ return {id:id}; });
+  }catch(error){ KS.models = []; KS.modelItems = []; }
   finally{
     KS.modelsLoading = false;
-    var pick = $('#keyModelPick');
-    pick.innerHTML = '<option value="">从模型列表添加…</option>' + KS.models.map(function(id){
-      return '<option value="' + esc(id) + '">' + esc(id) + '</option>';
-    }).join('');
+    renderModelPanel();
   }
   return KS.models;
 }
 
+// parseRate 把上游 credits 原文（"x0.79" / "x0.11 credits" / "0.06" / 空）解析成数字。
+// 解析不出来返回 null——宁可不显示徽标，也不编一个倍率出来。
+function parseRate(raw){
+  if (raw === null || raw === undefined) return null;
+  var m = String(raw).match(/(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  var n = parseFloat(m[1]);
+  return isFinite(n) ? n : null;
+}
+
+// rateClass 按档位给徽标配色：免费（0）/ 低（<0.5）/ 高（≥0.5）。
+function rateClass(n){
+  if (n === null) return '';
+  if (n <= 0) return 'free';
+  return n < 0.5 ? 'low' : 'high';
+}
+
+function rateBadge(item){
+  var n = parseRate(item && item.credits);
+  if (n === null) return '<span class="mrate">倍率未知</span>';
+  var text = n <= 0 ? '免费' : ('x' + (String(item.credits).match(/(\d+(?:\.\d+)?)/) || [,''])[1]);
+  return '<span class="mrate ' + rateClass(n) + '">' + esc(text) + '</span>';
+}
+
+// renderModelPanel 画下拉里的每一行：模型名 + 倍率徽标 + 能力标记 + 已选对勾。
+function renderModelPanel(){
+  var panel = $('#keyModelPanel');
+  if (!panel) return;
+  var items = KS.modelItems || [];
+  if (!items.length){
+    panel.innerHTML = '<div class="mempty">' + (KS.modelsLoading ? '正在读取模型列表…' : '暂时读不到模型列表') + '</div>';
+    return;
+  }
+  var chosen = currentModels();
+  panel.innerHTML = items.map(function(item){
+    var on = chosen.indexOf(item.id) >= 0;
+    var caps = [];
+    if (item.supports_images) caps.push('图片');
+    if (item.supports_reasoning) caps.push('推理');
+    if (item.supports_tool_call) caps.push('工具');
+    return '<div class="mopt' + (on ? ' on' : '') + '" role="option" aria-selected="' + on + '" data-model="' + esc(item.id) + '">' +
+      '<div class="mopt-main"><div class="mopt-id">' + esc(item.id) + '</div>' +
+      '<div class="mopt-sub">' + (item.vendor ? '<span>' + esc(item.vendor) + '</span>' : '') +
+      (caps.length ? '<span>' + esc(caps.join(' · ')) + '</span>' : '') + '</div></div>' +
+      rateBadge(item) +
+      '<span class="mopt-check">' + (on ? '✓' : '') + '</span></div>';
+  }).join('');
+}
+
+function renderModelTags(){
+  var box = $('#keyModelTags');
+  if (!box) return;
+  var items = KS.modelItems || [];
+  var byId = {};
+  items.forEach(function(item){ byId[item.id] = item; });
+  box.innerHTML = currentModels().map(function(id){
+    return '<span class="mtag">' + esc(id) + rateBadge(byId[id] || {}) +
+      '<button type="button" class="mtag-x" data-drop-model="' + esc(id) + '" aria-label="移除 ' + esc(id) + '">×</button></span>';
+  }).join('');
+}
+
+function currentModels(){
+  var hidden = $('#keyModels');
+  if (!hidden || !hidden.value) return [];
+  return hidden.value.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+}
+
+function toggleModelPanel(open){
+  var trigger = $('#keyModelPick'), panel = $('#keyModelPanel');
+  if (!trigger || !panel) return;
+  var next = open === undefined ? panel.hidden : open;
+  panel.hidden = !next;
+  trigger.setAttribute('aria-expanded', next ? 'true' : 'false');
+}
+
+// setModelRow 就地更新下拉里某一行的选中态。
+//
+// 不能改成重建整个面板（renderModelPanel）：点击处理里重建 innerHTML 会让被点的
+// 节点脱离 DOM，随后文档级的「点外面关闭」判定在该脱离节点上 closest('.mpick')
+// 返回 null，把这次点击误判成点在外部而把面板关掉（2026-10-08 实测踩到）。
+function setModelRow(id, on){
+  var panel = $('#keyModelPanel');
+  if (!panel) return;
+  var row = panel.querySelector('[data-model="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+  if (!row) return;
+  row.classList.toggle('on', on);
+  row.setAttribute('aria-selected', on ? 'true' : 'false');
+  var check = row.querySelector('.mopt-check');
+  if (check) check.textContent = on ? '✓' : '';
+}
+
 function fillModelInput(models){
   $('#keyModels').value = models.join(', ');
+  renderModelTags();
 }
 
 async function loadKeys(){
@@ -212,7 +306,7 @@ function openKeyEditor(key){
   $('#keyExpiry').value = preset ? 'custom' : 'none';
   $('#keyExpiryCustom').value = preset;
   $('#keyExpiryCustomField').classList.toggle('hide', !preset);
-  $('#keyModelPick').value = '';
+  toggleModelPanel(false);
   $('#keySecret').value = '';
   $('#keyFields').classList.remove('hide'); $('#keyCreated').classList.add('hide');
   $('#keyDialogSave').classList.remove('hide'); $('#keyDialogSave').textContent = key ? '保存修改' : '创建密钥';
@@ -247,11 +341,33 @@ $('#keyDialogCancel').addEventListener('click', closeKeyEditor);
 $('#btnCreateKey').addEventListener('click', function(){openKeyEditor(null);});
 $('#btnKeysReload').addEventListener('click', loadKeys);
 $('#keySearch').addEventListener('input', function(){KS.query=this.value;renderKeys();});
-$('#keyModelPick').addEventListener('change', function(){
-  var value = this.value; this.value = ''; if (!value) return;
-  var models = keyModels($('#keyModels').value);
-  if (models.indexOf(value) < 0) models.push(value);
-  fillModelInput(models);
+// 自绘选择器：trigger 开关面板；面板内点一行即添加（已选的再点一次取消）；
+// 标签上的 × 移除。点击面板外或按 Esc 关闭——原生 <select> 没有倍率，
+// 且系统下拉在暗色面板里与主题令牌不符。
+$('#keyModelPick').addEventListener('click', function(){ toggleModelPanel(); });
+$('#keyModelPanel').addEventListener('click', function(event){
+  var row = event.target.closest('[data-model]');
+  if (!row || row.classList.contains('dis')) return;
+  var id = row.getAttribute('data-model');
+  var models = currentModels();
+  var at = models.indexOf(id);
+  if (at >= 0){ models.splice(at, 1); setModelRow(id, false); }
+  else { models.push(id); setModelRow(id, true); }
+  $('#keyModels').value = models.join(', ');
+  renderModelTags();
+});
+$('#keyModelTags').addEventListener('click', function(event){
+  var btn = event.target.closest('[data-drop-model]');
+  if (!btn) return;
+  var models = currentModels();
+  var at = models.indexOf(btn.getAttribute('data-drop-model'));
+  if (at >= 0){ models.splice(at, 1); fillModelInput(models); }
+});
+document.addEventListener('click', function(event){
+  if (!event.target.closest('.mpick') && !event.target.closest('#keyModelTags')) toggleModelPanel(false);
+});
+document.addEventListener('keydown', function(event){
+  if (event.key === 'Escape') toggleModelPanel(false);
 });
 $('#btnClearModels').addEventListener('click', function(){ fillModelInput([]); });
 $('#keyExpiry').addEventListener('change', function(){

@@ -394,6 +394,66 @@ return $('#creditPanel').innerHTML;
         self.assertIn("国际剩余", result)
         self.assertNotIn("国内剩余", result)
 
+    def test_model_picker_shows_multiplier_badges(self):
+        """模型选择器必须显示扣费倍率——用户此前不知道各模型倍率是多少。
+
+        倍率来自 /api/models 的 credits 字段（面板透传 /v1/models）。按档位配色：
+        免费（0）/ 低（<0.5）/ 高（≥0.5），解析不出倍率时如实标「倍率未知」。
+        """
+        result = self.run_frontend("""
+KS.modelItems=[
+  {id:'cn:hy3', credits:'x0.00', vendor:'j', supports_reasoning:true},
+  {id:'cn:deepseek-v4.1-flash', credits:'x0.11', vendor:'f', supports_tool_call:true},
+  {id:'cn:glm-5.3', credits:'x0.79', vendor:'e'},
+  {id:'cn:mystery', vendor:'?'}
+];
+$('#keyModels').value='cn:hy3, cn:glm-5.3';
+renderModelPanel();
+renderModelTags();
+return {panel:$('#keyModelPanel').innerHTML, tags:$('#keyModelTags').innerHTML};
+""", extra_sources=("keys.js",))
+        panel, tags = result["panel"], result["tags"]
+        self.assertIn("免费", panel, "零倍率应显示「免费」")
+        self.assertIn("x0.11", panel, "应显示低倍率原文")
+        self.assertIn("x0.79", panel, "应显示高倍率原文")
+        self.assertIn("mrate free", panel, "免费档应用 free 配色")
+        self.assertIn("mrate low", panel, "低倍率档应用 low 配色")
+        self.assertIn("mrate high", panel, "高倍率档应用 high 配色")
+        self.assertIn("倍率未知", panel, "解析不出倍率时如实标注，不编造")
+        # 已选中的两个模型在面板里打勾、在标签区显示为可移除的 chip。
+        self.assertEqual(panel.count("✓"), 2, "已选模型应有对勾")
+        self.assertIn("cn:hy3", tags)
+        self.assertIn('data-drop-model="cn:glm-5.3"', tags, "标签应带移除按钮")
+
+    def test_model_picker_rate_parsing(self):
+        """倍率解析要能吃下上游的各种写法，解析不出返回 null 而不是 0。"""
+        result = self.run_frontend("""
+return {
+  plain: parseRate('x0.79'),
+  suffixed: parseRate('x0.11 credits'),
+  bare: parseRate('0.06'),
+  zero: parseRate('x0.00'),
+  empty: parseRate(''),
+  missing: parseRate(undefined),
+  junk: parseRate('credits'),
+  cls_free: rateClass(0),
+  cls_low: rateClass(0.11),
+  cls_high: rateClass(0.79),
+  cls_none: rateClass(null)
+};
+""", extra_sources=("keys.js",))
+        self.assertEqual(result["plain"], 0.79)
+        self.assertEqual(result["suffixed"], 0.11)
+        self.assertEqual(result["bare"], 0.06)
+        self.assertEqual(result["zero"], 0.0)
+        self.assertIsNone(result["empty"], "空串不是 0，是未知")
+        self.assertIsNone(result["missing"])
+        self.assertIsNone(result["junk"])
+        self.assertEqual(result["cls_free"], "free")
+        self.assertEqual(result["cls_low"], "low")
+        self.assertEqual(result["cls_high"], "high")
+        self.assertEqual(result["cls_none"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

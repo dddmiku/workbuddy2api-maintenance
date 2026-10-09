@@ -419,10 +419,24 @@
       <div id="keyFields">
         <label class="fld"><span class="k">名称</span><input id="keyName" name="name" maxlength="64" required placeholder="例如：工作电脑 codex" autocomplete="off"></label>
         <label class="fld"><span class="k">备注 <span class="sub">（可选）</span></span><input id="keyNote" name="note" maxlength="256" placeholder="记录用途，方便日后管理" autocomplete="off"></label>
-        <label class="fld"><span class="k">绑定模型 <span class="sub">（留空表示不限制；必须填完整模型名）</span></span><input id="keyModels" name="models" placeholder="例如 cn:deepseek-v4.1-flash，多个用逗号分隔" autocomplete="off" spellcheck="false"></label>
-        <div class="key-model-pick">
-          <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
-          <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
+        <!-- 用 div 而不是 label 包住模型选择区：label 内含 #keyModels 输入框时，
+             点 label 内任意位置都会触发一次「激活该输入框」的额外点击，冒泡到
+             document 后被「点面板外面就关闭」的判定捕获，导致刚打开的下拉被立刻关掉
+             （2026-10-08 实测踩到）。标题用 span 呈现，样式不变。 -->
+        <div class="fld">
+          <span class="k">绑定模型 <span class="sub">（留空表示不限制）</span></span>
+          <div class="mfield">
+            <div class="mtags" id="keyModelTags" role="list" aria-label="已绑定的模型"></div>
+            <div class="mpick">
+              <button type="button" class="mtrigger" id="keyModelPick" aria-haspopup="listbox" aria-expanded="false">
+                <span class="mtrigger-t">选择模型…</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <button type="button" class="btn sm" id="btnClearModels">清空</button>
+              <div class="mpanel" id="keyModelPanel" role="listbox" hidden></div>
+            </div>
+          </div>
+          <input type="hidden" id="keyModels" name="models" value="">
         </div>
         <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复输出（推理或正文）时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
         <label class="key-guard-field"><input type="checkbox" id="keyGlobalFallback"><span><b>global 全部限流时回落同名 CN 模型</b><small>仅当此密钥的 global: 请求在对应模型上、所有 global 号都被限流时，改用同名 CN 模型继续。存在其它不可用原因（熔断、在途占满）时不回落。</small></span></label>

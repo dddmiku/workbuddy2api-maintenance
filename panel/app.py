@@ -1264,13 +1264,27 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/models":
             # 面板经本机管理通道读取完整模型列表，不受单个调用密钥的绑定限制。
+            #
+            # 2026-10-08：改为透传展示字段（倍率 credits / 名称 / 供应商 / 能力旗标），
+            # 而不是只给一串 id——密钥绑定表单要用倍率把「这个模型扣费多少」直接显示出来，
+            # 只给 id 的话用户只能靠记忆或去别处查。字段全部来自 /v1/models，原样透传，
+            # 缺字段就省略（不编造）。旧的 "models" 纯 id 列表保留，兼容既有前端。
             payload = gateway_get("/v1/models")
-            ids = []
+            ids, items = [], []
             if isinstance(payload, dict):
                 for item in payload.get("data") or []:
-                    if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
-                        ids.append(item["id"])
-            return self._json(200, {"ok": True, "models": sorted(set(ids))})
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    ids.append(item["id"])
+                    entry = {"id": item["id"]}
+                    for key in ("credits", "name", "vendor", "tags", "description"):
+                        if item.get(key):
+                            entry[key] = item[key]
+                    for key in ("supports_images", "supports_reasoning", "supports_tool_call"):
+                        if item.get(key):
+                            entry[key] = True
+                    items.append(entry)
+            return self._json(200, {"ok": True, "models": sorted(set(ids)), "items": items})
 
         if path == "/api/tasks":
             payload = gateway_get("/tasks")

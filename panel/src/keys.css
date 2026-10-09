@@ -61,8 +61,51 @@
 .key-model-tags{display:flex;flex-wrap:wrap;gap:5px;max-width:240px}
 .key-model-tag{font:11.5px/1.7 var(--mono);padding:1px 8px;border-radius:999px;color:var(--ink-2);
   background:var(--sunken);overflow-wrap:anywhere}
-.key-model-pick{display:flex;align-items:center;gap:8px;margin:-8px 0 16px}
-.key-model-pick select{flex:1;height:36px;min-width:0;border:1px solid var(--line-2);border-radius:var(--r2);
-  padding:0 10px;background:var(--surface);color:var(--ink)}
+
+/* ── 绑定模型：自绘选择器 ────────────────────────────────────────────────
+ * 2026-10-08：替换原来的原生 <select>。原生控件无法显示倍率、也跟不上面板的
+ * 主题令牌（系统深色下拉在暗色面板里非常突兀）。现在每一行显示
+ * 「模型名 + 倍率徽标 + 能力标记」，倍率来自 /api/models 的 credits 字段。
+ * 倍率配色按档位分三档（免费/低/高），一眼能看出哪个贵。 */
+.mfield{display:flex;flex-direction:column;gap:9px}
+.mtags{display:flex;flex-wrap:wrap;gap:6px;min-height:0}
+.mtags:empty{display:none}
+.mtag{display:inline-flex;align-items:center;gap:7px;padding:4px 6px 4px 10px;border-radius:var(--r3);
+  background:var(--sunken);border:1px solid var(--line);font:12px/1.4 var(--mono);color:var(--ink)}
+.mtag .mtag-x{display:grid;place-items:center;width:16px;height:16px;border:0;padding:0;cursor:pointer;
+  border-radius:50%;background:transparent;color:var(--ink-3);font-size:13px;line-height:1}
+.mtag .mtag-x:hover{background:var(--err-soft);color:var(--err)}
+.mpick{position:relative;display:flex;align-items:center;gap:8px}
+.mtrigger{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  height:36px;padding:0 11px;border:1px solid var(--line-2);border-radius:var(--r2);
+  background:var(--surface);color:var(--ink-3);font-size:13px;cursor:pointer;text-align:left;
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.mtrigger:hover{border-color:var(--accent)}
+.mtrigger[aria-expanded=true]{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.mtrigger svg{flex:none;transition:transform .15s var(--ease)}
+.mtrigger[aria-expanded=true] svg{transform:rotate(180deg)}
+.mtrigger-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mpanel{position:absolute;z-index:80;top:calc(100% + 6px);left:0;right:0;max-height:290px;overflow:auto;
+  padding:5px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface);
+  box-shadow:var(--shadow-2)}
+.mpanel[hidden]{display:none}
+.mopt{display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:var(--r3);cursor:pointer;
+  transition:background .1s var(--ease)}
+.mopt:hover,.mopt.on{background:var(--sunken)}
+.mopt.dis{opacity:.45;cursor:default}
+.mopt.dis:hover{background:transparent}
+.mopt-main{flex:1;min-width:0}
+.mopt-id{font:12.5px/1.5 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.mopt-sub{font-size:11.5px;color:var(--ink-3);margin-top:2px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.mopt-check{flex:none;width:16px;color:var(--accent);font-size:13px}
+/* 倍率徽标：免费 / 低 / 高 三档配色，让「哪个贵」一眼可见 */
+.mrate{flex:none;font:11.5px/1 var(--mono);padding:3px 7px;border-radius:999px;
+  background:var(--sunken);color:var(--ink-2);white-space:nowrap}
+.mrate.free{background:var(--ok-soft);color:var(--ok)}
+.mrate.low{background:var(--info-soft);color:var(--info)}
+.mrate.high{background:var(--warn-soft);color:var(--warn)}
+.mcap{flex:none;font-size:11px;color:var(--ink-3)}
+.mempty{padding:14px 10px;text-align:center;color:var(--ink-3);font-size:12.5px}
+@media(max-width:700px){.mpanel{max-height:230px}}
 @media(max-width:900px){.key-table td:first-child{display:block}.key-table td:first-child::before{display:none}.key-table td:first-child .key-name{margin-bottom:3px}.key-note{max-width:100%}.key-actions{justify-content:flex-start}}
 @media(max-width:700px){.key-summary{display:block}.key-summary p{margin-top:10px;line-height:1.65}.key-dialog-body{padding:17px}.key-table td:last-child{padding-top:10px}}
