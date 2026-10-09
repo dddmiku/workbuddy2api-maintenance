@@ -203,5 +203,22 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertIn('colspan="8"', js)
 
 
+    def test_model_search_input_resets_the_generic_field_style(self):
+        """模型搜索框必须把通用输入框样式整个重置掉，否则出现「双层框」。
+
+        `.key-dialog .fld input`（0,2,1）会给输入框再加一层 border/height/padding；
+        只写 `.mtrigger-i`（0,1,0）压不过它，于是外层容器与内层 input 各画一个圆角框，
+        视觉上就是重叠（2026-10-09 用户实测）。重置规则必须带上同等或更高的优先级。
+        """
+        css = strip_css_comments(read_source("keys.css"))
+        scoped = [ln for ln in css.splitlines() if ".key-dialog .fld .mtrigger-i" in ln]
+        self.assertTrue(scoped, "缺少高优先级的搜索框重置规则")
+        joined = " ".join(scoped)
+        self.assertIn("border:0", joined, "内层 input 的边框必须清零")
+        self.assertIn("box-shadow:none", joined, "聚焦环只画在外层容器上，内层不能再画一个")
+        # 通用规则仍在（它服务于其它普通输入框），所以只能靠优先级压制，不能删它。
+        self.assertIn(".key-dialog .fld input{", css)
+
+
 if __name__ == "__main__":
     unittest.main()

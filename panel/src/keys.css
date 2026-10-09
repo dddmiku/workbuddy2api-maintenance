@@ -88,7 +88,15 @@
 .mtrigger:hover{border-color:var(--accent)}
 .mtrigger.on,.mtrigger:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .mtrigger-ic,.mtrigger-c{flex:none;color:var(--ink-3)}
-.mtrigger-i{flex:1;min-width:0;border:0;background:none;outline:none;font-size:13px;color:var(--ink);height:100%}
+.mtrigger-i{flex:1;min-width:0;font-size:13px;color:var(--ink);outline:none}
+/* 搜索框本体必须把通用输入框样式整个重置掉。
+ * 选择器写成 .key-dialog .fld .mtrigger-i 是为了压过 .key-dialog .fld input
+ * （0,2,1）：那条通用规则会给输入框再加一层 border/height/padding，于是外层容器
+ * 和内层 input 各画一个圆角框，视觉上就是「重叠」（2026-10-09 用户实测）。
+ * :focus 同理——聚焦环画在外层 .mtrigger 上，内层不能自己再画一个。 */
+.key-dialog .fld .mtrigger-i{width:auto;height:100%;padding:0;border:0;border-radius:0;
+  background:none;box-shadow:none}
+.key-dialog .fld .mtrigger-i:focus{border:0;box-shadow:none}
 .mtrigger-i::placeholder{color:var(--ink-3)}
 .mtrigger-n{flex:none;font:11.5px/1 var(--mono);color:var(--ink-3);padding:3px 6px;border-radius:999px;
   background:var(--sunken)}
