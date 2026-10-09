@@ -355,5 +355,72 @@ class KeyManagementDefaultTests(unittest.TestCase):
                          os.path.normpath("/opt/workbuddy2api/data/api_keys.sock"))
 
 
+class ModelsEndpointTests(unittest.TestCase):
+    """GET /api/models 必须把展示字段（倍率/名称/供应商/能力）透传给前端。
+
+    2026-10-08：该端点此前只回一串 id，密钥绑定表单因此看不到扣费倍率。改为一并回
+    items 后，这里锁定「透传什么、省略什么」——缺字段要省略而不是编造，同时旧的
+    models 纯 id 列表必须保留，否则既有前端会拿不到值。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def get_models(self, payload):
+        with patch.object(app, "gateway_get", return_value=payload):
+            connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+            try:
+                connection.request("GET", "/api/models",
+                                   headers={"Cookie": "test-session", "X-Admin-Request": "1"})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+    def test_forwards_display_fields_and_keeps_id_list(self):
+        status, body = self.get_models({"data": [
+            {"id": "cn:glm-5.3", "credits": "x0.79", "name": "GLM-5.3", "vendor": "e",
+             "tags": ["craft"], "supports_reasoning": True, "supports_tool_call": True,
+             "supports_images": False},
+            {"id": "cn:hy3", "credits": "x0.00", "name": "Hy3", "vendor": "j"},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        # 旧的纯 id 列表必须保留（既有前端读的是它）。
+        self.assertEqual(body["models"], ["cn:glm-5.3", "cn:hy3"])
+        by_id = {i["id"]: i for i in body["items"]}
+        self.assertEqual(by_id["cn:glm-5.3"]["credits"], "x0.79")
+        self.assertEqual(by_id["cn:glm-5.3"]["vendor"], "e")
+        self.assertTrue(by_id["cn:glm-5.3"]["supports_reasoning"])
+        self.assertTrue(by_id["cn:glm-5.3"]["supports_tool_call"])
+        # 上游没给的字段要省略，不能编造一个 false。
+        self.assertNotIn("supports_images", by_id["cn:glm-5.3"])
+        self.assertNotIn("supports_reasoning", by_id["cn:hy3"])
+
+    def test_skips_entries_without_id_and_tolerates_missing_payload(self):
+        status, body = self.get_models({"data": [
+            {"credits": "x1.0"},          # 没有 id：跳过
+            {"id": ""},                    # 空 id：跳过
+            {"id": "cn:ok"},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["models"], ["cn:ok"])
+        self.assertEqual(len(body["items"]), 1)
+        # 网关读不到时（None）不能炸，回空列表而不是 500。
+        status, body = self.get_models(None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["models"], [])
+        self.assertEqual(body["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
