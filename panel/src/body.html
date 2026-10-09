@@ -428,10 +428,14 @@
           <div class="mfield">
             <div class="mtags" id="keyModelTags" role="list" aria-label="已绑定的模型"></div>
             <div class="mpick">
-              <button type="button" class="mtrigger" id="keyModelPick" aria-haspopup="listbox" aria-expanded="false">
-                <span class="mtrigger-t">选择模型…</span>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
+              <div class="mtrigger" id="keyModelPick">
+                <svg class="mtrigger-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+                <input type="text" id="keyModelQuery" class="mtrigger-i" placeholder="输入关键词筛选，例如 gl"
+                       autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false"
+                       aria-controls="keyModelPanel" aria-autocomplete="list" aria-label="筛选并选择模型">
+                <span class="mtrigger-n" id="keyModelCount"></span>
+                <svg class="mtrigger-c" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
               <button type="button" class="btn sm" id="btnClearModels">清空</button>
               <div class="mpanel" id="keyModelPanel" role="listbox" hidden></div>
             </div>

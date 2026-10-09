@@ -455,5 +455,60 @@ return {
         self.assertEqual(result["cls_none"], "")
 
 
+    def test_model_picker_filters_as_you_type(self):
+        """输入关键词要实时筛出相关模型，且最相关的排最前。
+
+        纯子串匹配会把 `global:*` 和 `glm-*` 混在一起（"gl" 同时命中 global 前缀），
+        第一眼看不到想找的；所以按「去掉 realm 前缀后的模型名开头命中」优先排序。
+        """
+        result = self.run_frontend("""
+KS.modelItems=[
+  {id:'cn:glm-5.3', credits:'x0.79'},
+  {id:'cn:glm-5.3-flash', credits:'x0.06'},
+  {id:'global:deepseek-v4.1-flash', credits:'x0.00'},
+  {id:'global:hy3', credits:'x0.00'},
+  {id:'cn:hy3', credits:'x0.00'}
+];
+KS.modelQuery='gl';
+var ids = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='glm flash';
+var narrow = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='zzz';
+var none = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='';
+var all = filteredModelItems().map(function(i){return i.id;});
+return {gl:ids, narrow:narrow, none:none, allCount:all.length};
+""", extra_sources=("keys.js",))
+        # "gl" 命中 4 个（glm-* 两个 + global:* 两个），但模型名开头的排最前。
+        self.assertEqual(result["gl"][:2], ["cn:glm-5.3", "cn:glm-5.3-flash"],
+                         "去掉 realm 前缀后以关键词开头的模型必须排最前")
+        self.assertEqual(len(result["gl"]), 4, "global:* 也是相关项，不能隐藏")
+        self.assertEqual(result["narrow"], ["cn:glm-5.3-flash"], "多词全命中（顺序无关）")
+        self.assertEqual(result["none"], [], "无匹配返回空")
+        self.assertEqual(result["allCount"], 5, "空关键词不过滤")
+
+    def test_model_picker_count_badge_and_empty_state(self):
+        """过滤时显示「筛出/总数」计数，无匹配时给出可读的空态而不是空白面板。"""
+        result = self.run_frontend("""
+KS.modelItems=[{id:'cn:glm-5.3'},{id:'cn:hy3'}];
+KS.modelQuery='zzz';
+renderModelPanel();
+var empty = $('#keyModelPanel').innerHTML;
+var badgeEmpty = $('#keyModelCount').textContent;
+KS.modelQuery='glm';
+renderModelPanel();
+var badgeOne = $('#keyModelCount').textContent;
+KS.modelQuery='';
+renderModelPanel();
+var badgeAll = $('#keyModelCount').textContent;
+return {empty:empty, badgeEmpty:badgeEmpty, badgeOne:badgeOne, badgeAll:badgeAll};
+""", extra_sources=("keys.js",))
+        self.assertIn("没有匹配", result["empty"])
+        self.assertIn("zzz", result["empty"], "空态应回显用户输入的关键词")
+        self.assertEqual(result["badgeEmpty"], "0/2")
+        self.assertEqual(result["badgeOne"], "1/2")
+        self.assertEqual(result["badgeAll"], "", "不过滤时不显示计数徽标")
+
+
 if __name__ == "__main__":
     unittest.main()

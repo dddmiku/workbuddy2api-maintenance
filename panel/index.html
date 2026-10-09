@@ -499,15 +499,21 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   border-radius:50%;background:transparent;color:var(--ink-3);font-size:13px;line-height:1}
 .mtag .mtag-x:hover{background:var(--err-soft);color:var(--err)}
 .mpick{position:relative;display:flex;align-items:center;gap:8px}
-.mtrigger{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:10px;
+/* 可输入的触发框：整条是搜索框，点哪都能打字，面板随输入实时过滤。 */
+.mtrigger{flex:1;min-width:0;display:flex;align-items:center;gap:8px;
   height:36px;padding:0 11px;border:1px solid var(--line-2);border-radius:var(--r2);
-  background:var(--surface);color:var(--ink-3);font-size:13px;cursor:pointer;text-align:left;
+  background:var(--surface);color:var(--ink-3);cursor:text;
   transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
 .mtrigger:hover{border-color:var(--accent)}
-.mtrigger[aria-expanded=true]{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.mtrigger svg{flex:none;transition:transform .15s var(--ease)}
-.mtrigger[aria-expanded=true] svg{transform:rotate(180deg)}
-.mtrigger-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mtrigger.on,.mtrigger:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.mtrigger-ic,.mtrigger-c{flex:none;color:var(--ink-3)}
+.mtrigger-i{flex:1;min-width:0;border:0;background:none;outline:none;font-size:13px;color:var(--ink);height:100%}
+.mtrigger-i::placeholder{color:var(--ink-3)}
+.mtrigger-n{flex:none;font:11.5px/1 var(--mono);color:var(--ink-3);padding:3px 6px;border-radius:999px;
+  background:var(--sunken)}
+.mtrigger-n:empty{display:none}
+.mtrigger.on .mtrigger-c{transform:rotate(180deg)}
+.mtrigger-c{transition:transform .15s var(--ease)}
 .mpanel{position:absolute;z-index:80;top:calc(100% + 6px);left:0;right:0;max-height:290px;overflow:auto;
   padding:5px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface);
   box-shadow:var(--shadow-2)}
@@ -1148,10 +1154,14 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           <div class="mfield">
             <div class="mtags" id="keyModelTags" role="list" aria-label="已绑定的模型"></div>
             <div class="mpick">
-              <button type="button" class="mtrigger" id="keyModelPick" aria-haspopup="listbox" aria-expanded="false">
-                <span class="mtrigger-t">选择模型…</span>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
+              <div class="mtrigger" id="keyModelPick">
+                <svg class="mtrigger-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+                <input type="text" id="keyModelQuery" class="mtrigger-i" placeholder="输入关键词筛选，例如 gl"
+                       autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false"
+                       aria-controls="keyModelPanel" aria-autocomplete="list" aria-label="筛选并选择模型">
+                <span class="mtrigger-n" id="keyModelCount"></span>
+                <svg class="mtrigger-c" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
               <button type="button" class="btn sm" id="btnClearModels">清空</button>
               <div class="mpanel" id="keyModelPanel" role="listbox" hidden></div>
             </div>
@@ -2357,7 +2367,7 @@ if (document.readyState === 'loading'){
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
 // 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
 
-var KS = {keys:null, loading:false, error:'', query:'', models:null, modelItems:null, modelsLoading:false, guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
+var KS = {keys:null, loading:false, error:'', query:'', models:null, modelItems:null, modelsLoading:false, modelQuery:'', guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
 var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, active:false, recoverable:false, mode:'edit'};
 
 function keyGuardEnabled(key){
@@ -2459,13 +2469,54 @@ function rateBadge(item){
   return '<span class="mrate ' + rateClass(n) + '">' + esc(text) + '</span>';
 }
 
-// renderModelPanel 画下拉里的每一行：模型名 + 倍率徽标 + 能力标记 + 已选对勾。
+// modelMatches 判断条目是否命中关键词（模型名 / 显示名 / 供应商，多词全命中）。
+function modelMatches(item, query){
+  var terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  var hay = [item.id, item.name, item.vendor].filter(Boolean).join(' ').toLowerCase();
+  return terms.every(function(t){ return hay.indexOf(t) >= 0; });
+}
+
+// modelRank 给排序用的命中优先级（越小越靠前）：0 = 去掉 realm 前缀后的模型名
+// 以关键词开头（打 "gl" 时 glm-* 排最前），1 = 模型名包含，2 = 只在完整 id
+// 里命中（例如 "gl" 命中 global: 前缀）。这样既不隐藏任何相关项，又让最相关的
+// 排在最上面——纯子串匹配会把 global:* 和 glm-* 混在一起，第一眼看不到想找的。
+function modelRank(item, query){
+  var terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return 0;
+  var bare = String(item.id || '').replace(/^(cn|global):/, '').toLowerCase();
+  var name = String(item.name || '').toLowerCase();
+  if (terms.every(function(t){ return bare.indexOf(t) === 0; })) return 0;
+  if (terms.every(function(t){ return (bare + ' ' + name).indexOf(t) >= 0; })) return 1;
+  return 2;
+}
+
+// filteredModelItems 返回当前关键词下的条目，按「相关度 → 已选中」排序。
+function filteredModelItems(){
+  var items = (KS.modelItems || []).filter(function(item){ return modelMatches(item, KS.modelQuery); });
+  var chosen = currentModels();
+  return items.slice().sort(function(a, b){
+    var ra = modelRank(a, KS.modelQuery), rb = modelRank(b, KS.modelQuery);
+    if (ra !== rb) return ra - rb;
+    var ca = chosen.indexOf(a.id) >= 0 ? 0 : 1, cb = chosen.indexOf(b.id) >= 0 ? 0 : 1;
+    if (ca !== cb) return ca - cb;
+    return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+  });
+}
+
 function renderModelPanel(){
   var panel = $('#keyModelPanel');
   if (!panel) return;
-  var items = KS.modelItems || [];
-  if (!items.length){
+  var all = KS.modelItems || [];
+  if (!all.length){
     panel.innerHTML = '<div class="mempty">' + (KS.modelsLoading ? '正在读取模型列表…' : '暂时读不到模型列表') + '</div>';
+    updateModelCount(0, 0);
+    return;
+  }
+  var items = filteredModelItems();
+  updateModelCount(items.length, all.length);
+  if (!items.length){
+    panel.innerHTML = '<div class="mempty">没有匹配「' + esc(KS.modelQuery) + '」的模型</div>';
     return;
   }
   var chosen = currentModels();
@@ -2482,6 +2533,13 @@ function renderModelPanel(){
       rateBadge(item) +
       '<span class="mopt-check">' + (on ? '✓' : '') + '</span></div>';
   }).join('');
+}
+
+// updateModelCount 显示「筛出 N / 共 M」，让用户知道列表被过滤了多少。
+function updateModelCount(shown, total){
+  var el = $('#keyModelCount');
+  if (!el) return;
+  el.textContent = (shown === total) ? '' : (shown + '/' + total);
 }
 
 function renderModelTags(){
@@ -2503,11 +2561,22 @@ function currentModels(){
 }
 
 function toggleModelPanel(open){
-  var trigger = $('#keyModelPick'), panel = $('#keyModelPanel');
+  var trigger = $('#keyModelPick'), panel = $('#keyModelPanel'), query = $('#keyModelQuery');
   if (!trigger || !panel) return;
   var next = open === undefined ? panel.hidden : open;
   panel.hidden = !next;
-  trigger.setAttribute('aria-expanded', next ? 'true' : 'false');
+  trigger.classList.toggle('on', next);
+  if (query) query.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (next && query) query.focus();
+}
+
+// resetModelQuery 清空筛选词。打开编辑器/关闭下拉时调用，避免上一次的搜索词
+// 让用户以为模型列表缺东西（面板被过滤成空看起来像「没有模型」）。
+function resetModelQuery(){
+  KS.modelQuery = '';
+  var query = $('#keyModelQuery');
+  if (query) query.value = '';
+  renderModelPanel();
 }
 
 // setModelRow 就地更新下拉里某一行的选中态。
@@ -2655,6 +2724,7 @@ function openKeyEditor(key){
   $('#keyExpiryCustom').value = preset;
   $('#keyExpiryCustomField').classList.toggle('hide', !preset);
   toggleModelPanel(false);
+  resetModelQuery();
   $('#keySecret').value = '';
   $('#keyFields').classList.remove('hide'); $('#keyCreated').classList.add('hide');
   $('#keyDialogSave').classList.remove('hide'); $('#keyDialogSave').textContent = key ? '保存修改' : '创建密钥';
@@ -2689,10 +2759,26 @@ $('#keyDialogCancel').addEventListener('click', closeKeyEditor);
 $('#btnCreateKey').addEventListener('click', function(){openKeyEditor(null);});
 $('#btnKeysReload').addEventListener('click', loadKeys);
 $('#keySearch').addEventListener('input', function(){KS.query=this.value;renderKeys();});
-// 自绘选择器：trigger 开关面板；面板内点一行即添加（已选的再点一次取消）；
-// 标签上的 × 移除。点击面板外或按 Esc 关闭——原生 <select> 没有倍率，
-// 且系统下拉在暗色面板里与主题令牌不符。
-$('#keyModelPick').addEventListener('click', function(){ toggleModelPanel(); });
+// 可输入筛选的模型选择器：整条是搜索框，输入即过滤（打 "gl" 只剩 glm-*），
+// 点一行加入绑定（再点取消），标签上的 × 移除。点击面板外或按 Esc 关闭。
+$('#keyModelPick').addEventListener('click', function(){ toggleModelPanel(true); });
+$('#keyModelQuery').addEventListener('input', function(){
+  KS.modelQuery = this.value;
+  toggleModelPanel(true);
+  renderModelPanel();
+});
+$('#keyModelQuery').addEventListener('focus', function(){ toggleModelPanel(true); });
+// 键盘：下箭头进列表，Esc 关面板（不冒泡给对话框）。
+$('#keyModelQuery').addEventListener('keydown', function(event){
+  if (event.key === 'ArrowDown'){
+    event.preventDefault();
+    var first = $('#keyModelPanel').querySelector('.mopt');
+    if (first) first.scrollIntoView({block:'nearest'});
+  } else if (event.key === 'Escape'){
+    event.stopPropagation();
+    toggleModelPanel(false);
+  }
+});
 $('#keyModelPanel').addEventListener('click', function(event){
   var row = event.target.closest('[data-model]');
   if (!row || row.classList.contains('dis')) return;
@@ -2703,6 +2789,7 @@ $('#keyModelPanel').addEventListener('click', function(event){
   else { models.push(id); setModelRow(id, true); }
   $('#keyModels').value = models.join(', ');
   renderModelTags();
+  $('#keyModelQuery').focus();
 });
 $('#keyModelTags').addEventListener('click', function(event){
   var btn = event.target.closest('[data-drop-model]');

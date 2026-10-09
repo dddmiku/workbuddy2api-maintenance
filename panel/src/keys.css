@@ -76,15 +76,21 @@
   border-radius:50%;background:transparent;color:var(--ink-3);font-size:13px;line-height:1}
 .mtag .mtag-x:hover{background:var(--err-soft);color:var(--err)}
 .mpick{position:relative;display:flex;align-items:center;gap:8px}
-.mtrigger{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:10px;
+/* 可输入的触发框：整条是搜索框，点哪都能打字，面板随输入实时过滤。 */
+.mtrigger{flex:1;min-width:0;display:flex;align-items:center;gap:8px;
   height:36px;padding:0 11px;border:1px solid var(--line-2);border-radius:var(--r2);
-  background:var(--surface);color:var(--ink-3);font-size:13px;cursor:pointer;text-align:left;
+  background:var(--surface);color:var(--ink-3);cursor:text;
   transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
 .mtrigger:hover{border-color:var(--accent)}
-.mtrigger[aria-expanded=true]{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.mtrigger svg{flex:none;transition:transform .15s var(--ease)}
-.mtrigger[aria-expanded=true] svg{transform:rotate(180deg)}
-.mtrigger-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mtrigger.on,.mtrigger:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.mtrigger-ic,.mtrigger-c{flex:none;color:var(--ink-3)}
+.mtrigger-i{flex:1;min-width:0;border:0;background:none;outline:none;font-size:13px;color:var(--ink);height:100%}
+.mtrigger-i::placeholder{color:var(--ink-3)}
+.mtrigger-n{flex:none;font:11.5px/1 var(--mono);color:var(--ink-3);padding:3px 6px;border-radius:999px;
+  background:var(--sunken)}
+.mtrigger-n:empty{display:none}
+.mtrigger.on .mtrigger-c{transform:rotate(180deg)}
+.mtrigger-c{transition:transform .15s var(--ease)}
 .mpanel{position:absolute;z-index:80;top:calc(100% + 6px);left:0;right:0;max-height:290px;overflow:auto;
   padding:5px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface);
   box-shadow:var(--shadow-2)}
