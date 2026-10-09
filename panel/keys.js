@@ -449,6 +449,28 @@ document.addEventListener('keydown', function(event){
   if (event.key === 'Escape') toggleModelPanel(false);
 });
 $('#btnClearModels').addEventListener('click', function(){ fillModelInput([]); });
+// 「刷新」：强制网关回源拉一次模型目录。倍率缓存 1h（刻意的，避免把展示端点变成
+// 高频上游调用），这个按钮给运维一个按需刷新入口。刷新期间禁用按钮防连点，
+// 失败如实提示——不把「没刷到」显示成「已刷新」。
+$('#btnRefreshModels').addEventListener('click', async function(){
+  var btn = this;
+  if (btn.disabled) return;
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = '刷新中…';
+  try{
+    // api(path, body)：传 body（哪怕空对象）即按 POST 发出并带上管理标记。
+    var result = await api('api/models/refresh', {});
+    if (result && result.ok === false) throw new Error(result.message || '刷新失败');
+    KS.models = (result && Array.isArray(result.models)) ? result.models : KS.models;
+    KS.modelItems = (result && Array.isArray(result.items)) ? result.items : KS.modelItems;
+    renderModelPanel(); renderModelTags();
+    toast('模型列表已刷新（' + ((KS.modelItems || []).length) + ' 个）', 'ok');
+  }catch(error){
+    toast(error.message || '刷新失败，仍显示缓存中的模型列表', 'err');
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
+});
 $('#keyExpiry').addEventListener('change', function(){
   $('#keyExpiryCustomField').classList.toggle('hide', this.value !== 'custom');
   if (this.value === 'custom') $('#keyExpiryCustom').focus();

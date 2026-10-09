@@ -97,6 +97,18 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	return infos
 }
 
+// InvalidateGlobalModels 作废 global 模型探测缓存，让下一次探测真的回源
+// （管理台「刷新模型」用）。置零 fetched 即失效——读取侧判的是
+// time.Since(fetched) < globalModelsTTL；同时清掉 lastFail，否则刚失败过会让
+// 刷新请求撞上 5 分钟负缓存，用户点了刷新却看不到新数据。
+// 只动缓存时间戳，不清 names/infos：探测失败时旧快照仍可继续服务（不因刷新而丢失）。
+func (c *Client) InvalidateGlobalModels() {
+	c.globalModels.Lock()
+	c.globalModels.fetched = time.Time{}
+	c.globalModels.lastFail = time.Time{}
+	c.globalModels.Unlock()
+}
+
 // fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
 // 纯动态：成功 = 探测结果去重（不与任何静态名单合并）；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。

@@ -258,6 +258,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1beta/interactions", h.withGeminiProtocol(h.unsupportedGeminiTransport, false))
 	h.mux.HandleFunc("POST /v1/interactions", h.withGeminiProtocol(h.unsupportedGeminiTransport, false))
 	h.mux.HandleFunc("GET /v1/models", h.modelProtocolDiscovery(h.models))
+	// 管理台「刷新模型」：强制绕过 1h 缓存回源拉一次（仅本机管理通道可达）。
+	h.mux.HandleFunc("POST /models/refresh", h.requireInternal(h.modelsRefresh))
 	h.mux.HandleFunc("GET /v1/models/{model}", h.modelProtocolDiscovery(h.model))
 	h.mux.HandleFunc("GET /v1/capabilities", h.withDiscoveryAuth(h.capabilities))
 	h.mux.HandleFunc("GET /status", h.withAccountAdmin(h.status))
@@ -699,6 +701,46 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   h.visibleModels(r),
 	})
+}
+
+// modelsRefresh 强制绕过模型列表缓存重新拉取一次（管理台「刷新模型」按钮）。
+//
+// 模型列表（含 credits 倍率）缓存 1 小时，是刻意的：/v1/models 是展示端点，
+// 每次都打上游会把展示变成高频调用，失败时还会反复重试。代价是上游调整倍率后
+// 面板最多滞后 1 小时。这个端点给运维一个按需刷新入口——不缩短常态 TTL，
+// 只在有人主动点的时候真拉一次。
+//
+// 只作废缓存并重新拉取，不改动任何模型/密钥绑定状态。拉取失败时如实回错，
+// 不把「没刷新成功」伪装成成功（面板据此提示，而不是显示旧数据说已刷新）。
+func (h *Handler) modelsRefresh(w http.ResponseWriter, _ *http.Request) {
+	before := h.fetchDynamicModels()
+	h.invalidateModelCaches()
+	after := h.fetchDynamicModels()
+	if len(after) == 0 {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "models_unavailable",
+			"could not refresh the model list from the upstream; the previous snapshot is unchanged")
+		return
+	}
+	// 两域都刷：global 名单有独立缓存，只刷 CN 会让面板上的 global 倍率仍滞后。
+	globalNames, _ := h.fetchGlobalModels()
+	_ = writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"before":    len(before),
+		"after":     len(after),
+		"global":    len(globalNames),
+		"refreshed": true,
+	})
+}
+
+// invalidateModelCaches 作废两域模型缓存，让下一次读取真的回源。
+// 置零 fetched 即失效（读取侧判的是 time.Since(fetched) < TTL）；同时清掉
+// lastFail，否则刚失败过会让刷新请求撞上 5 分钟负缓存而看不到新数据。
+func (h *Handler) invalidateModelCaches() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	h.cfg.Upstream.InvalidateGlobalModels()
 }
 
 // globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录 21 名）——已删。

@@ -421,6 +421,66 @@ class ModelsEndpointTests(unittest.TestCase):
         self.assertEqual(body["models"], [])
         self.assertEqual(body["items"], [])
 
+    def post_models_refresh(self, gateway_result, models_payload):
+        """gateway_result 为 (code, payload) 时按该码返回，否则视为 (200, payload)。"""
+        """触发面板的「刷新模型」，返回 (面板响应, 是否真的调了网关刷新)。"""
+        called = {"refresh": 0}
+
+        def fake_request(socket, method, endpoint, body=None, **kw):
+            if endpoint == "/models/refresh":
+                called["refresh"] += 1
+                if isinstance(gateway_result, tuple):
+                    return gateway_result
+                return 200, gateway_result
+            return 200, models_payload
+
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \
+             patch.object(app.key_management, "request", side_effect=fake_request):
+            connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+            try:
+                connection.request("POST", "/api/models/refresh", body="{}",
+                                   headers={"Cookie": "test-session", "Content-Type": "application/json",
+                                            "X-Admin-Request": "1"})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read()), called
+            finally:
+                connection.close()
+
+    def test_refresh_returns_the_fresh_list(self):
+        """刷新成功时要把新列表一并回给前端（省一次往返），并带上 refreshed 标记。"""
+        status, body, called = self.post_models_refresh(
+            {"ok": True, "before": 2, "after": 3},
+            {"data": [{"id": "cn:new", "credits": "x0.42"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(called["refresh"], 1, "必须真的调用网关的强制刷新")
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["refreshed"])
+        self.assertEqual(body["models"], ["cn:new"])
+        self.assertEqual(body["items"][0]["credits"], "x0.42")
+
+    def test_refresh_failure_is_reported_not_hidden(self):
+        """刷新失败必须如实回错，不能让「没刷到」看起来像「已刷新」。"""
+        status, body, called = self.post_models_refresh(
+            (503, {"error": {"code": "models_unavailable", "message": "upstream refused"}}), {"data": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(called["refresh"], 1)
+        self.assertFalse(body["ok"], "失败时 ok 必须为 false")
+        self.assertNotIn("refreshed", body, "失败不得带 refreshed 标记")
+        self.assertIn("upstream refused", body["message"])
+
+    def test_refresh_requires_admin_session(self):
+        """刷新走管理写路径，未登录必须被挡。"""
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+        try:
+            connection.request("POST", "/api/models/refresh", body="{}",
+                               headers={"Cookie": "", "Content-Type": "application/json",
+                                        "X-Admin-Request": "1"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 401)
+            response.read()
+        finally:
+            connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

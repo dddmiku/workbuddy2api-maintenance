@@ -1269,22 +1269,12 @@ class Handler(BaseHTTPRequestHandler):
             # 而不是只给一串 id——密钥绑定表单要用倍率把「这个模型扣费多少」直接显示出来，
             # 只给 id 的话用户只能靠记忆或去别处查。字段全部来自 /v1/models，原样透传，
             # 缺字段就省略（不编造）。旧的 "models" 纯 id 列表保留，兼容既有前端。
-            payload = gateway_get("/v1/models")
-            ids, items = [], []
-            if isinstance(payload, dict):
-                for item in payload.get("data") or []:
-                    if not isinstance(item, dict) or not item.get("id"):
-                        continue
-                    ids.append(item["id"])
-                    entry = {"id": item["id"]}
-                    for key in ("credits", "name", "vendor", "tags", "description"):
-                        if item.get(key):
-                            entry[key] = item[key]
-                    for key in ("supports_images", "supports_reasoning", "supports_tool_call"):
-                        if item.get(key):
-                            entry[key] = True
-                    items.append(entry)
-            return self._json(200, {"ok": True, "models": sorted(set(ids)), "items": items})
+            return self._json(200, self._models_payload(gateway_get("/v1/models")))
+
+        if path == "/api/models/refresh":
+            # 「刷新模型」：强制网关绕过 1h 缓存回源拉一次，随后把新列表一并回给前端
+            # （少一次往返，前端拿到就能直接重画）。只作废缓存，不动任何绑定状态。
+            return self._models_refresh()
 
         if path == "/api/tasks":
             payload = gateway_get("/tasks")
@@ -1365,6 +1355,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.reasoning_loop_toggle(body))
             if path in ("/api/update/check", "/api/update/apply"):
                 return self.update_post(path, body)
+            if path == "/api/models/refresh":
+                return self._models_refresh()
             if path == "/api/credit":
                 return self._json(200, {"credit": get_credits(force=True)})
         except RequestBodyError as ex:
@@ -1383,6 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
             "/api/service/restart": set(), "/api/credit": set(),
+            "/api/models/refresh": set(),
             "/api/features/reasoning-loop": {"stop_only"},
         }
         allowed = shapes.get(path)
@@ -1502,6 +1495,56 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": False,
                                     "message": message or "网关未响应（旧版本网关请先升级）"})
         return self._json(200, result)
+
+    def _models_payload(self, payload):
+        """把 /v1/models 的原始响应整理成面板要的形状。
+
+        models 是纯 id 列表（兼容旧前端），items 带展示字段（倍率/名称/供应商/
+        能力旗标），全部原样透传，缺字段就省略——不编造。
+        """
+        ids, items = [], []
+        if isinstance(payload, dict):
+            for item in payload.get("data") or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                ids.append(item["id"])
+                entry = {"id": item["id"]}
+                for key in ("credits", "name", "vendor", "tags", "description"):
+                    if item.get(key):
+                        entry[key] = item[key]
+                for key in ("supports_images", "supports_reasoning", "supports_tool_call"):
+                    if item.get(key):
+                        entry[key] = True
+                items.append(entry)
+        return {"ok": True, "models": sorted(set(ids)), "items": items}
+
+    def _models_refresh(self):
+        """强制网关回源刷新模型列表，成功后连同新列表一起返回。
+
+        网关侧模型列表缓存 1h（刻意的：展示端点不该每次都打上游）。这里给运维一个
+        按需刷新入口，不缩短常态 TTL。刷新失败如实回错——不能让「没刷到」看起来像
+        「已刷新」。
+        """
+        try:
+            socket = key_management.socket_path(CONFIG_PATH, BASE)
+        except (OSError, ValueError):
+            return self._json(200, {"ok": False, "message": "无法读取网关配置"})
+        code, result = key_management.request(socket, "POST", "/models/refresh", None)
+        # 两道判据都要看：HTTP 码（网关直接报错时是 503）与 ok 字段（信封里明确说不成功）。
+        # 只看码会漏掉「200 但 ok=false」这种形态，把没刷到显示成已刷新。
+        if code != 200 or not isinstance(result, dict) or result.get("ok") is not True:
+            message = ""
+            if isinstance(result, dict):
+                error = result.get("error")
+                # 网关失败走 OpenAI 错误信封：{"error":{"code":…,"message":…}}。
+                message = result.get("message") or (error.get("message") if isinstance(error, dict) else "")
+            return self._json(200, {"ok": False,
+                                    "message": message or "刷新失败：网关未响应（旧版本网关请先升级）"})
+        payload = gateway_get("/v1/models")
+        body = self._models_payload(payload)
+        body["ok"] = True
+        body["refreshed"] = True
+        return self._json(200, body)
 
     def update_post(self, path, body):
         """热更新操作：登录后由同源管理页面触发，闸门与密钥写操作一致。"""

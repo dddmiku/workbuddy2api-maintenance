@@ -18,6 +18,7 @@ import (
 
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -264,5 +265,55 @@ func TestKeyWithoutBindingKeepsFullAccess(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("unbound key restricted: %d %s", recorder.Code, recorder.Body)
+	}
+}
+
+// TestModelsRefreshInvalidatesTheSnapshotCache 管理台的「刷新模型」必须真的让缓存失效。
+//
+// 模型列表（含 credits 倍率）缓存 1h 是刻意的：展示端点不该每次都打上游。代价是
+// 上游调倍率后面板最多滞后 1h，所以给了这个按需刷新入口。测试要证明的是：
+// 刷新确实作废了缓存（下一次读取不再命中旧快照），而不只是返回了一个 200。
+func TestModelsRefreshInvalidatesTheSnapshotCache(t *testing.T) {
+	resetModelsCache()
+	t.Cleanup(resetModelsCache)
+
+	// 种一份「新鲜」快照：TTL 内命中缓存，fetchDynamicModels 不会再回源。
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "cached-model"}}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.Unlock()
+
+	handler := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New()})
+	handler.invalidateModelCaches()
+
+	dynamicModelsCache.RLock()
+	fetched := dynamicModelsCache.fetched
+	lastFail := dynamicModelsCache.lastFail
+	dynamicModelsCache.RUnlock()
+	if !fetched.IsZero() {
+		t.Fatalf("refresh must clear the fetch timestamp so the next read goes upstream, got %v", fetched)
+	}
+	if !lastFail.IsZero() {
+		t.Fatalf("refresh must clear the failure cooldown, else a recent failure blocks the refresh")
+	}
+	// 旧快照保留：刷新失败时面板还能显示上一份数据，不该被清空成空列表。
+	dynamicModelsCache.RLock()
+	kept := len(dynamicModelsCache.ids)
+	dynamicModelsCache.RUnlock()
+	if kept != 1 {
+		t.Fatalf("refresh must keep the previous snapshot as a fallback, got %d entries", kept)
+	}
+}
+
+// TestModelsRefreshEndpointIsInternalOnly 刷新端点只对本机管理通道开放，
+// 普通调用密钥不得触发上游回源（否则等于把展示端点变成可被外部刷的接口）。
+func TestModelsRefreshEndpointIsInternalOnly(t *testing.T) {
+	handler := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New(), APIKey: "secret"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/models/refresh", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh must be internal-only, got %d: %s", recorder.Code, recorder.Body)
 	}
 }
