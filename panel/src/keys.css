@@ -4,12 +4,16 @@
 /* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
 /* 2026-09-25：增加限流表单、占用摘要与固定表头，窄屏保持独立字段对应。 */
 .key-limits{line-height:1.7}.key-limit-state{margin-top:3px;white-space:normal}.key-limit-content{min-width:0}
-/* 2026-10-05：表格收进 1396px 内容区（.inner max-width 1440 - padding）。
- *   原 11 列 min-width:1660px 在任何屏幕都放不下，「有效期/创建时间」恒被截在
- *   滚动区外（用户实测 1920 宽仍看不全）。修法不是拉宽容器，而是合并低价值列：
- *   「重复推理保护」「CN 回落」两个开关并入「状态」列（它们都是每行一个小按钮，
- *   各占一列却只显示"已开启/已关闭"），11 列变 9 列后总宽需求降到约 1330px。 */
-@media(min-width:901px){.key-table{min-width:1330px}.key-table td:first-child{min-width:150px}.key-table td:nth-child(3){min-width:190px}.key-limits{min-width:200px}.key-actions{min-width:150px}.key-model-tag{overflow-wrap:normal}}
+/* 2026-10-09：8 列（有效期与创建时间合并）。此前 9 列按「1920 视口、1396px 内容区」
+ *   定的 min-width:1330px，但 1440 视口下内容区只有 1186px，表格恒溢出 113px，
+ *   右侧操作列被切在滚动区外（用户实测截图）。合并两列时间戳后自然宽度降到约 1210px，
+ *   再把内边距收到 14px，1440 视口下刚好放得下且不局促。窄屏（≤900px）走卡片态，
+ *   不受这些下限约束。 */
+@media(min-width:901px){.key-table{min-width:0}.key-table td:first-child{min-width:140px}.key-table td:nth-child(3){min-width:160px}.key-limits{min-width:170px}.key-actions{min-width:132px}.key-model-tag{overflow-wrap:normal}
+  .key-table td,.key-table th{padding-left:12px;padding-right:12px}}
+/* 有效期与创建时间：竖排，主行是有效期状态，次行是创建时间。 */
+.key-when{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.key-when .sub{white-space:nowrap}
 /* 状态列：主徽章 + 两个次级开关竖排（并入后此列内容变多，给足换行空间）。 */
 .key-state{min-width:118px}
 .key-state .bdg{display:inline-flex}

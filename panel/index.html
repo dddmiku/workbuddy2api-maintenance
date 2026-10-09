@@ -427,12 +427,16 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 /* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
 /* 2026-09-25：增加限流表单、占用摘要与固定表头，窄屏保持独立字段对应。 */
 .key-limits{line-height:1.7}.key-limit-state{margin-top:3px;white-space:normal}.key-limit-content{min-width:0}
-/* 2026-10-05：表格收进 1396px 内容区（.inner max-width 1440 - padding）。
- *   原 11 列 min-width:1660px 在任何屏幕都放不下，「有效期/创建时间」恒被截在
- *   滚动区外（用户实测 1920 宽仍看不全）。修法不是拉宽容器，而是合并低价值列：
- *   「重复推理保护」「CN 回落」两个开关并入「状态」列（它们都是每行一个小按钮，
- *   各占一列却只显示"已开启/已关闭"），11 列变 9 列后总宽需求降到约 1330px。 */
-@media(min-width:901px){.key-table{min-width:1330px}.key-table td:first-child{min-width:150px}.key-table td:nth-child(3){min-width:190px}.key-limits{min-width:200px}.key-actions{min-width:150px}.key-model-tag{overflow-wrap:normal}}
+/* 2026-10-09：8 列（有效期与创建时间合并）。此前 9 列按「1920 视口、1396px 内容区」
+ *   定的 min-width:1330px，但 1440 视口下内容区只有 1186px，表格恒溢出 113px，
+ *   右侧操作列被切在滚动区外（用户实测截图）。合并两列时间戳后自然宽度降到约 1210px，
+ *   再把内边距收到 14px，1440 视口下刚好放得下且不局促。窄屏（≤900px）走卡片态，
+ *   不受这些下限约束。 */
+@media(min-width:901px){.key-table{min-width:0}.key-table td:first-child{min-width:140px}.key-table td:nth-child(3){min-width:160px}.key-limits{min-width:170px}.key-actions{min-width:132px}.key-model-tag{overflow-wrap:normal}
+  .key-table td,.key-table th{padding-left:12px;padding-right:12px}}
+/* 有效期与创建时间：竖排，主行是有效期状态，次行是创建时间。 */
+.key-when{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.key-when .sub{white-space:nowrap}
 /* 状态列：主徽章 + 两个次级开关竖排（并入后此列内容变多，给足换行空间）。 */
 .key-state{min-width:118px}
 .key-state .bdg{display:inline-flex}
@@ -855,8 +859,8 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           </div>
           <div class="tblwrap">
             <table class="tbl key-table" data-sticky-head="keys">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>限流与占用</th><th>状态与保护</th><th>有效期</th><th>创建时间</th><th class="r">操作</th></tr></thead>
-              <tbody id="keyRows"><tr><td colspan="9"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>限流与占用</th><th>状态与保护</th><th>有效期与创建</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="8"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -2667,7 +2671,7 @@ function renderKeys(){
   var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
   if (!filtered.length){
     var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
-    $('#keyRows').innerHTML = '<tr><td colspan="9">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    $('#keyRows').innerHTML = '<tr><td colspan="8">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
     return;
   }
   $('#keyRows').innerHTML = filtered.map(function(key){
@@ -2692,8 +2696,10 @@ function renderKeys(){
       '" aria-label="' + esc(key.name) + '的 CN 回落" data-key-action="fallback" data-id="' + esc(key.id) +
       '" title="global 号全部被限流时，改用同名 CN 模型继续；只影响此密钥后续请求">CN 回落 ' + (keyGlobalFallbackEnabled(key) ? '开' : '关') + '</button>' +
       '</div></td>' +
-      '<td data-l="有效期"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span></td>' +
-      '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
+      // 有效期与创建时间合成一列：两者都是时间戳，语义连贯，竖排后可省下一整列的
+      // 横向空间（2026-10-09：9 列在 1440 视口下仍溢出 113px，用户实测右侧操作列被切）。
+      '<td data-l="有效期与创建"><div class="key-when"><span class="' + expiry.cls + '"' + (expiry.title ? ' title="' + esc(expiry.title) + '"' : '') + '>' + esc(expiry.text) + '</span>' +
+      '<span class="sub mono">创建 ' + esc(fmtTime(key.created_at)) + '</span></div></td>' +
       '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="requests" data-id="' + esc(key.id) + '">请求明细</button><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
       '<button class="btn sm" data-key-action="toggle" data-id="' + esc(key.id) + '">' + (key.enabled ? '停用' : '启用') + '</button>' +
       '<button class="btn sm danger" data-key-action="delete" data-id="' + esc(key.id) + '">删除</button></div></td></tr>';

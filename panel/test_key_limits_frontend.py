@@ -143,7 +143,7 @@ Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',c)).then(v=
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def test_nine_columns_and_merged_controls(self):
+    def test_eight_columns_and_merged_controls(self):
         result = self.evaluate(r"""
 KS.keys=[{id:'k1',name:'甲',note:'',enabled:true,total_tokens:5,created_at:'2026-10-05T01:02:03Z'}];
 renderKeys();
@@ -155,11 +155,12 @@ return {
   guard: (row.match(/data-key-action="guard"/g)||[]).length,
   fallback: (row.match(/data-key-action="fallback"/g)||[]).length,
   badge: row.indexOf('启用</span>')>=0,
-  colspan9: row.indexOf('colspan="9"')<0  // 正常行没有 colspan；空态行才有
+  colspan8: row.indexOf('colspan="8"')<0  // 正常行没有 colspan；空态行才有
 };
 """)
-        # 9 列：名称/密钥/模型绑定/总用量/限流与占用/状态与保护/有效期/创建时间/操作
-        self.assertEqual(result["cells"], 9)
+        # 8 列：名称/密钥/模型绑定/总用量/限流与占用/状态与保护/有效期与创建/操作
+        # 2026-10-09：「有效期」与「创建时间」合并成一列，否则 1440 视口下表格溢出。
+        self.assertEqual(result["cells"], 8)
         self.assertTrue(result["state"], "合并列必须存在")
         # 两个开关都搬进了合并列，一个都不能少
         self.assertEqual(result["guard"], 1)
@@ -171,13 +172,17 @@ return {
 KS.keys=[];KS.error='';renderKeys();var row=$('#keyRows').innerHTML;
 return {colspan: (row.match(/colspan="(\d+)"/)||[])[1]||''};
 """)
-        self.assertEqual(result["colspan"], "9", "空态行的 colspan 必须与 9 列表头一致")
+        self.assertEqual(result["colspan"], "8", "空态行的 colspan 必须与 8 列表头一致")
 
-    def test_min_width_fits_content_area(self):
-        """min-width 必须能放进 .inner 的 1396px（1440 - padding）。"""
+    def test_no_hard_min_width_that_overflows(self):
+        """表格不得再有硬编码 min-width 下限。
+
+        2026-10-05 设过 min-width:1330px，是按「1920 视口、1396px 内容区」算的；
+        但 1440 视口下内容区只有 1186px，表格恒溢出 113px，右侧操作列被切在滚动区外
+        （2026-10-09 用户实测截图）。现在靠收窄内边距与合并时间戳列控制自然宽度，
+        min-width 归零，宽度跟随内容区自适应。
+        """
         css = (PANEL / "index.html").read_text(encoding="utf-8")
         import re
         m = re.search(r"\.key-table\{min-width:(\d+)px\}", css)
-        self.assertIsNotNone(m, "key-table min-width 规则必须存在")
-        self.assertLessEqual(int(m.group(1)), 1396,
-                             "表格 min-width %.0fpx 超出内容区 1396px，右列会被截断" % int(m.group(1)))
+        self.assertIsNone(m, "key-table 不应再有硬编码 min-width（会在窄内容区溢出）")

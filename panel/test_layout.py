@@ -173,5 +173,35 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertIn(".table-scroll .tbl .row-acts{display:flex", headers)
 
 
+    def test_key_table_fits_the_content_area(self):
+        """密钥表必须在常见视口下完整可见，右侧操作列不能被切在滚动区外。
+
+        2026-10-05 定的是 min-width:1330px（按 1920 视口、1396px 内容区算），但 1440
+        视口下内容区只有 1186px，表格恒溢出 113px——用户实测右侧操作列被切。
+        2026-10-09 把「有效期」与「创建时间」合并成一列（两个时间戳，语义连贯），
+        内边距收到 12px，1280 视口以上都放得下。
+        """
+        css = strip_css_comments(read_source("keys.css"))
+        # 硬下限必须去掉：它比 1440 视口的内容区还宽，任何屏幕都会溢出。
+        self.assertNotIn(".key-table{min-width:1330px}", css)
+        self.assertIn(".key-table{min-width:0}", css)
+        body = read_source("body.html")
+        # 两列时间戳必须合并：分列会让表宽需求超出 1440 视口的内容区。
+        self.assertIn("有效期与创建", body)
+        self.assertNotIn("<th>有效期</th>", body)
+        self.assertNotIn("<th>创建时间</th>", body)
+        # 渲染侧同样只输出一个时间戳单元格。
+        with open(os.path.join(HERE, "keys.js"), "r", encoding="utf-8") as fh:
+            js = fh.read()
+        self.assertIn('data-l="有效期与创建"', js)
+        self.assertNotIn('data-l="创建时间"', js)
+        # colspan 必须与表头列数一致——首屏占位行（body.html）与空态行（keys.js）
+        # 都要改，只改一处会让占位行横跨错列数（2026-10-09 漏掉了首屏那处）。
+        self.assertNotIn('colspan="9"', body, "首屏占位行的 colspan 仍是 9")
+        self.assertNotIn('colspan="9"', js, "空态行的 colspan 仍是 9")
+        self.assertIn('colspan="8"', body)
+        self.assertIn('colspan="8"', js)
+
+
 if __name__ == "__main__":
     unittest.main()
