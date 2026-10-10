@@ -706,6 +706,45 @@ return {m:m, rows:$('#acctRows').innerHTML};
         self.assertIn("120", result["m"], "无分档时应回落到标量 expiring")
         self.assertIn("其中 120 即将过期", result["rows"])
 
+    def test_real_production_state_renders(self):
+        """用生产 /api/state 的真实快照渲染一遍（脱敏后存 testdata_state_production.json）。
+
+        2026-10-10 抓的线上快照：28 个账号、7 个池级停用、全池 7 天内到期 12264 分。
+        单测的合成数据容易与真实形状脱节（v2.6.13 就是这么漏掉「面板什么都看不到」
+        的——fixture 用了不存在的字段名），这条用例锁住「真实形状能渲染出内容」。
+        """
+        fixture = json.loads(
+            (PANEL / "testdata_state_production.json").read_text(encoding="utf-8"))
+        result = self.run_frontend("""
+S.data = FIXTURE;
+renderMetrics();
+var m = $('#metrics').innerHTML;
+renderCreditsPage();
+var head = $('#creditsHead').innerHTML, bars = $('#creditsBars').innerHTML;
+renderCreditsTab();
+var tab = $('#tabCredits').textContent;
+renderAccounts();
+var rows = $('#acctRows').innerHTML;
+return {m:m, head:head, bars:bars, tab:tab,
+        rowsLen:rows.length,
+        offBadges:(rows.match(/已停用/g) || []).length,
+        revive:(rows.match(/data-revive/g) || []).length,
+        expiring:(rows.match(/即将过期/g) || []).length};
+""".replace("FIXTURE", json.dumps(fixture, ensure_ascii=False)))
+        # 总览卡片：7 个池级停用要算进「账号」卡（此前恒显示 0，用户截图反馈过）。
+        self.assertIn("7 个停用", result["m"], "账号卡必须把池级停用算进来")
+        self.assertIn("12,264", result["m"], "总览应显示 7 天内到期的合计（带千分位）")
+        # 积分有效期页：头部汇总 + 分档条都要有内容。
+        self.assertIn("12,264", result["head"])
+        self.assertIn("7 天内", result["bars"])
+        self.assertIn("30 天内", result["bars"])
+        self.assertEqual(result["tab"], "5", "侧栏计数 = 有快过期积分的账号数")
+        # 账号页：7 个停用徽标、7 个复活按钮、5 行快过期提示。
+        self.assertEqual(result["offBadges"], 7)
+        self.assertEqual(result["revive"], 7)
+        self.assertEqual(result["expiring"], 5)
+        self.assertGreater(result["rowsLen"], 10000, "账号表应真的渲染出行")
+
 
 if __name__ == "__main__":
     unittest.main()
