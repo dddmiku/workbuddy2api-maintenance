@@ -1,6 +1,7 @@
 // Pool 账号池核心：结构定义、构造（New/Set* 注入）、在途租约（Acquire/Release）
 // 与账号增删（Add/SyncToDir/upsertLocked）。选号/冷却/状态/持久化见同包其他文件。
 // ═══ 更新日志 ═══
+// 2026-10-10：新增 SetPaidModels/paidModels：付费模型（倍率>0）的快过期优先硬过滤。
 // 2026-09-19：按模型和区域保存有界探索游标，避免免费观测让其他可用账号永久饿死。
 // 2026-09-18：记录后台落盘退出信号，确保 Close 返回后不会再有旧进程的后台写入。
 // 2026-09-18：显式 Add 观察当前删除代次，既阻止陈旧创建意图，也允许删除后的合法重新添加。
@@ -76,6 +77,15 @@ type Pool struct {
 	// Release 是最热的路径（每个请求结束都走），不能为此付出固定开销。
 	slotWaitMu sync.Mutex
 	slotWaitCh chan struct{}
+
+	// paidModels 有积分倍率的模型集合（倍率 > 0 = 会扣积分，见 SetPaidModels）。
+	// 付费模型上启用「快过期优先」硬过滤：积分到期即作废，付费用掉比留着强。
+	// nil = 未注入（启动早期 / 测试）→ 该特性整体不生效，退化为既有行为。
+	//
+	// 为什么不直接复用 modelCost 实测账本：实测账本要跑过几次才有观测，新模型上线
+	// 的头几个请求拿不到偏好；而倍率是上游目录里的声明，冷启动即有。两者语义也不同
+	// （倍率=官方定价，实测=真实扣费，后者还受限免活动影响）。
+	paidModels map[string]bool
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
@@ -95,6 +105,49 @@ func New(stateFp string) *Pool {
 		p.startFlusher()
 	}
 	return p
+}
+
+// SetPaidModels 注入「有积分倍率（倍率 > 0）」的模型集合，供付费模型的快过期优先
+// 硬过滤使用（见 paidModels 字段注释）。传空切片即关闭该特性。
+//
+// 模型名按裸名（不带 realm 前缀）匹配：handler 剥前缀后传给 pick 的正是裸名，
+// 而上游两域同名模型的倍率可能不同（实测 cn:deepseek-v4.1-flash=x0.11、
+// global:deepseek-v4.1-flash=x0.00），所以键用「realm + 裸名」，避免 CN 的付费
+// 判定把 global 的免费模型也当成付费。
+func (p *Pool) SetPaidModels(models map[string]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(models) == 0 {
+		p.paidModels = nil
+		return
+	}
+	copied := make(map[string]bool, len(models))
+	for k, v := range models {
+		copied[k] = v
+	}
+	p.paidModels = copied
+}
+
+// paidModelKey 付费判定用的键：realm + 裸模型名。空 realm（未分池调用）时退化为
+// 只看裸名——那种调用不区分域，用任一域的判定都比完全不判更接近意图。
+func paidModelKey(realm, model string) string {
+	if realm == "" {
+		return model
+	}
+	return realm + "\x00" + model
+}
+
+// modelIsPaid 报告该 (realm, 模型) 是否为付费模型（有正倍率）。
+// 未注入集合时恒 false——特性整体关闭，行为与引入前一致。
+func (p *Pool) modelIsPaid(realm, model string) bool {
+	if model == "" || p.paidModels == nil {
+		return false
+	}
+	if p.paidModels[paidModelKey(realm, model)] {
+		return true
+	}
+	// realm 精确键未命中时再试裸名：SetPaidModels 的调用方可能只按裸名登记。
+	return p.paidModels[model]
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。

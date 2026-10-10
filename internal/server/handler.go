@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-10-10：同步付费模型表（倍率>0）给号池；global 号仍读余额以补齐 credits_expiring。
 // 2026-09-28：接受 Anthropic 的 `[1m]` 模型后缀（去后缀后按同一模型路由）。
 // 2026-09-28：未知 4xx 换号可选（pool.rotate_on_client_error，默认保持旧契约）。
 // 2026-09-28：换号重试上限可配（pool.max_soft_rotations）。
@@ -54,6 +55,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -921,7 +923,12 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	if acct == nil {
 		return nil, nil
 	}
-	return h.cfg.Upstream.FetchGlobalModels(acct), acct
+	names := h.cfg.Upstream.FetchGlobalModels(acct)
+	// global 目录刚刷新过：顺手同步付费表，让 global 侧的新倍率立刻参与选号
+	// （CN 侧的同步在 fetchDynamicModels 里）。放在这里是因为 global 探测的触发
+	// 时机独立于 CN 目录（/v1/models 的 global 分支、modelsRefresh 都会走到这）。
+	h.syncPaidModels()
+	return names, acct
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
@@ -983,7 +990,86 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.fetched = time.Now()
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
+	h.syncPaidModels()
 	return infos
+}
+
+// syncPaidModels 把「有正积分倍率的模型」推给号池，供付费模型的快过期优先硬过滤使用
+// （issue:积分过期；见 pool.SetPaidModels）。
+//
+// 为什么在这里推而不是启动时推一次：倍率来自上游目录，会随活动变化（限免结束、
+// 新模型上线）。模型目录每次成功刷新（含面板「刷新模型」按钮触发的强制刷新）后
+// 同步一次，池里的判定就跟着目录走，不需要重启。
+//
+// 倍率语义（2026-10-10 实测线上 6 个模型）：
+//
+//	cn:hy3 / global:hy3 / global:deepseek-v4.1-flash → x0.00（免费，不扣积分）
+//	cn:glm-5.3 x0.79 / cn:glm-5.3-flash x0.06 / cn:deepseek-v4.1-flash x0.11（付费）
+//
+// 所以判据是「解析出的倍率 > 0」而不是「credits 字段非空」——x0.00 也是非空，
+// 但那是免费模型，把它当付费会让流量无收益地压在快过期号上。
+//
+// 键用「realm + 裸名」：同名模型两域倍率可以不同（上面的 deepseek 就是），
+// 只用裸名会让 CN 的付费判定误伤 global 的免费模型。
+func (h *Handler) syncPaidModels() {
+	if h.cfg.Pool == nil {
+		return
+	}
+	paid := map[string]bool{}
+	// CN 域：动态目录（fetchDynamicModels 的缓存），模型 id 已是裸名。
+	dynamicModelsCache.RLock()
+	for _, mi := range dynamicModelsCache.ids {
+		if creditMultiplierPositive(mi.Credits) {
+			paid[paidModelKeyForRealm("cn", mi.ID)] = true
+			paid[paidModelKeyForRealm("cn", stripModelAlias(mi.ID))] = true
+		}
+	}
+	dynamicModelsCache.RUnlock()
+	// global 域：探测目录（FetchGlobalModels 的缓存，带倍率）。
+	if infos := h.cfg.Upstream.CachedGlobalModelInfos(); len(infos) > 0 {
+		for _, mi := range infos {
+			if creditMultiplierPositive(mi.Credits) {
+				paid[paidModelKeyForRealm("global", mi.ID)] = true
+				paid[paidModelKeyForRealm("global", stripModelAlias(mi.ID))] = true
+			}
+		}
+	}
+	h.cfg.Pool.SetPaidModels(paid)
+}
+
+// paidModelKeyForRealm 付费表的键：realm + 裸名（与 pool.paidModelKey 同构）。
+// 两处必须一致——池侧查表用的是同一个拼法，改了这里要同步改那边。
+func paidModelKeyForRealm(realm, model string) string {
+	if realm == "" {
+		return model
+	}
+	return realm + "\x00" + model
+}
+
+// stripModelAlias 去掉模型名的 "[1m]"/"[1M]" 别名后缀，让带别名的请求也能命中
+// 付费表（客户端可能发 `deepseek-v4.1-flash[1m]`，而目录里登记的是裸名）。
+func stripModelAlias(model string) string {
+	if i := strings.IndexByte(model, '['); i > 0 {
+		return model[:i]
+	}
+	return model
+}
+
+// creditMultiplierPositive 解析上游 credits 原文，报告倍率是否 > 0。
+// 形态： "x0.79" / "x0.05 credits" / "x0.00" / 空。解析不出数字时返回 false
+// （宁可不判为付费——误判为付费会把流量无收益地压在快过期号上）。
+func creditMultiplierPositive(raw string) bool {
+	s := normalizeCredits(raw)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "x"), "X")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return false
+	}
+	return v > 0
 }
 
 // rejectUnsupportedChoiceCount 拒绝 n>1：上游只返回一个选择，静默降级会让客户端

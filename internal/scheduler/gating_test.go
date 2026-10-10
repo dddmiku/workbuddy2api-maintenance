@@ -3,6 +3,7 @@ package scheduler
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -46,14 +47,29 @@ func TestGlobalAccountsSkipCheckinTravel(t *testing.T) {
 
 // TestGlobalAccountSkippedListedWithStatus 门控跳过的 global 账号在 CheckinAll
 // 回执里以 skipped(global) 呈现——手动触发时结果可读，不再是"未覆盖"的空白。
+//
+// 2026-10-10 调整：global 号现在**仍会读一次余额**（只跳过签到调用，不再整个跳过），
+// 因为「付费模型优先消耗快过期积分」依赖 credits_expiring，而该字段原先只由签到写、
+// 签到又跳过 global → 28 个号里 23 个永远拿不到这个数据。断言随之从「零上游调用」
+// 改为「不调用签到端点、但仍会查余额」。
 func TestGlobalAccountSkippedListedWithStatus(t *testing.T) {
 	fastTravel(t)
 	fastActivity(t)
 
-	var calls atomic.Int32
+	var checkinCalls atomic.Int32
+	var resourceCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		http.Error(w, "no upstream call expected for global", 404)
+		switch {
+		case strings.Contains(r.URL.Path, "daily-checkin"):
+			checkinCalls.Add(1)
+			http.Error(w, "global has no checkin", 404)
+		case strings.Contains(r.URL.Path, "get-user-resource"):
+			resourceCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"TotalDosage":100,"Accounts":[` +
+				`{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":100}]}}}}`))
+		default:
+			http.Error(w, "unexpected path "+r.URL.Path, 404)
+		}
 	}))
 	defer srv.Close()
 
@@ -73,11 +89,15 @@ func TestGlobalAccountSkippedListedWithStatus(t *testing.T) {
 	if out[0].Status != CheckinSkipped {
 		t.Errorf("status=%q want skipped（global 门控回执）", out[0].Status)
 	}
-	if out[0].Detail != "global" {
-		t.Errorf("detail=%q want global", out[0].Detail)
+	if checkinCalls.Load() != 0 {
+		t.Errorf("checkin calls=%d want 0（global 无签到体系，不该打签到端点）", checkinCalls.Load())
 	}
-	if calls.Load() != 0 {
-		t.Errorf("upstream calls=%d want 0", calls.Load())
+	if resourceCalls.Load() == 0 {
+		t.Error("global 号应读一次余额（credits_expiring 的数据来源）")
+	}
+	// 余额确实写进了池（否则「优先快过期」对 global 号仍然失效）。
+	if st, ok := p.Status("g1"); !ok || st.Credits != 100 {
+		t.Errorf("池内 credits=%d ok=%v want 100/true（余额查询结果应写入池）", st.Credits, ok)
 	}
 }
 

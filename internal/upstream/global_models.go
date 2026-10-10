@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-10-10：新增 CachedGlobalModelInfos（纯读缓存，供付费表同步，不触发探测）。
 // 2026-09-26：global 探测同时缓存模型目录上限，供出站补齐输出预算。
 // 2026-09-17：保留动态目录并集及完整模型字段，在并发探测前固定凭据快照以避免跨代混用。
 // global 模型目录探测：同时返回模型名与上游实际下发的完整模型字段。
@@ -97,8 +98,26 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	return infos
 }
 
-// InvalidateGlobalModels 作废 global 模型探测缓存，让下一次探测真的回源
-// （管理台「刷新模型」用）。置零 fetched 即失效——读取侧判的是
+// CachedGlobalModelInfos 返回 global 模型目录缓存的**只读副本**，不发任何上游请求。
+//
+// 与 FetchGlobalModelInfos 的区别：那个要传账号、缓存未命中时会触发一次探测；
+// 这个纯读缓存（未探测/已过期返回 nil），供「按目录派生状态」的调用方使用——
+// 例如 handler 同步付费模型表（见 syncPaidModels）：那条路径由模型列表刷新驱动，
+// 不该反过来触发一次上游探测（刷新流程自己会先探测，顺序反了会多打一轮上游）。
+// 缓存过期时返回 nil 而不是旧快照：调用方据此跳过本次同步，等下轮刷新带上新倍率，
+// 好过用过期倍率做选号决策。
+func (c *Client) CachedGlobalModelInfos() []ModelInfo {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.infos) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
+		return nil
+	}
+	out := make([]ModelInfo, len(c.globalModels.infos))
+	copy(out, c.globalModels.infos)
+	return out
+}
+
+// InvalidateGlobalModels 作废 global 模型探测缓存，让下一次探测真的回源// （管理台「刷新模型」用）。置零 fetched 即失效——读取侧判的是
 // time.Since(fetched) < globalModelsTTL；同时清掉 lastFail，否则刚失败过会让
 // 刷新请求撞上 5 分钟负缓存，用户点了刷新却看不到新数据。
 // 只动缓存时间戳，不清 names/infos：探测失败时旧快照仍可继续服务（不因刷新而丢失）。

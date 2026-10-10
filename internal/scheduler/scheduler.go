@@ -2,6 +2,7 @@
 // 连登兑换 / 成长抽奖 / 补签 —— 多类独立排程，各自独立开关与独立时点。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 // ═══ 更新日志 ═══
+// 2026-10-10：签到跳过 global 号时仍查余额，使 credits_expiring 对全部账号可用。
 // 2026-09-28：保活对停用号探活，refresh 成功即自动复活（避免误停用后永远靠人工）。
 // 2026-09-24：签到预刷新成功清除旧会话失效计数，避免间断 12153 累积成永久禁用。
 // 2026-09-17：保留较新调度上下文及奖励幂等，统一凭据快照读取。
@@ -445,14 +446,19 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
+		// D4 门控：realm=global 账号无签到体系/任务中心，**不发起签到调用**（避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			oc.Status, oc.Detail = CheckinSkipped, "global"
-			skipN++
-			out = append(out, oc)
-			continue
+		//
+		// 2026-10-10 修正：跳过签到调用，但**仍要读余额**（isGlobal 标记后继续往下走，
+		// 只是不发 DailyCheckin）。原先这里直接 continue，导致 global 账号的
+		// credits_expiring 永远为空——而「付费模型优先消耗快过期积分」正依赖这个字段，
+		// 于是该特性对 global 号（28 个里 23 个）完全失效。
+		// 余额查询是纯读接口，与签到是两件事：面板的 ./credit 一直对全部 28 个号查余额
+		// 且工作正常，说明 global 号读余额不触发风控；被跳过的是签到（写操作）。
+		isGlobal := a.IsGlobal()
+		if isGlobal {
+			oc.Detail = "global (no checkin)"
 		}
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
@@ -485,18 +491,25 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			if upstream.IsAlreadyCheckin(err) {
-				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
-				// 出现一整段 400 报文、被误读成签到失败。
-				oc.Status = CheckinAlready
+		// global 号没有签到体系：跳过签到调用（写操作，会触发风控），但下面的余额查询照做。
+		if !isGlobal {
+			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+				if upstream.IsAlreadyCheckin(err) {
+					// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
+					// 出现一整段 400 报文、被误读成签到失败。
+					oc.Status = CheckinAlready
+				} else {
+					oc.Status = CheckinFail
+					oc.Detail = err.Error()
+					log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+				}
 			} else {
-				oc.Status = CheckinFail
-				oc.Detail = err.Error()
-				log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+				oc.Status = CheckinOK
 			}
 		} else {
-			oc.Status = CheckinOK
+			// global 号：本次只做余额查询，签到状态如实记为「跳过」。
+			oc.Status = CheckinSkipped
+			skipN++
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
@@ -520,6 +533,8 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			okN++
 		case CheckinAlready:
 			alreadyN++
+		case CheckinSkipped:
+			// global 号：签到跳过但余额已更新（skipN 已在上面计过，这里不重复计）。
 		default:
 			failN++
 		}

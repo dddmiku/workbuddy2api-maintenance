@@ -97,7 +97,10 @@ func TestExpiryBreakdownExpiringWithin(t *testing.T) {
 // TestScheduleSortsAndMerges 日程必须升序且同刻合并：上游返回的套餐顺序不保证有序，
 // 同一批赠送包的时间戳还会差几秒（12:00:03 / 12:00:08），不合并会列出几十条同刻条目。
 func TestScheduleSortsAndMerges(t *testing.T) {
-	now := time.Now()
+	// 基准时刻先截到整分：本用例靠「相差 5 秒应合并」验证同刻合并，而合并粒度是
+	// 分钟。若直接用 time.Now()，当基准秒数 >= :55 时 +5s 会跨过分钟边界，
+	// 两条就不再同刻、合并断言随机失败（2026-10-10 在整套测试里复现过一次）。
+	now := time.Now().Truncate(time.Minute)
 	mk := func(d time.Duration) string { return now.Add(d).Format(packageEndLayout) }
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		// 故意乱序，且前两条相差 5 秒（应合并）。

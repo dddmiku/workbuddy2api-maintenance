@@ -1,5 +1,6 @@
 // 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
 // ═══ 更新日志 ═══
+// 2026-10-10：付费模型（倍率>0）上快过期积分硬优先（issue:积分过期）。
 // 2026-09-25：删除已无调用的旧私有包装，选择与抽签继续复用同一实现，避免静态检查遗留。
 // 2026-09-25：在实际选号锁内记录阶段、排除、权重与成本事实；旧 API 复用同一算法且不增加抽签。
 // 2026-09-19：免费优先保留，每四次普通分配给未知可用账号一次轮询机会；粘性和跨模型流量不干扰探索。
@@ -91,6 +92,45 @@ func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d
 	for _, e := range cands {
 		if e.credits > maxCredits {
 			maxCredits = e.credits
+		}
+	}
+	// 付费模型的「快过期优先」硬过滤（issue:积分过期，2026-10-10）。
+	//
+	// 语义：付费模型（有正积分倍率）上，只要有候选在到期窗口内有快过期积分，
+	// 就**只从这些号里选**——压过下面的成本分层与三因子权重。
+	//
+	// 为什么是硬过滤而不是再加权重：积分到期即作废，花掉的每一分都省下了真金白银，
+	// 而"优先"若只是权重，抽签仍会经常落到没有快过期积分的号上，等于没优先。
+	// 用户明确要的是「只要快过期就压过一切」。
+	//
+	// 为什么只在付费模型上做：免费模型（倍率 x0.00）不扣积分，把流量硬压到快过期号
+	// 上没有收益，反而白白消耗这些号的并发名额。
+	//
+	// 安全边界（三条都必须成立，否则退回原有行为）：
+	//   - 池内注入了倍率表（p.paidModels != nil），且该模型倍率 > 0；
+	//   - 至少有一个候选的快过期积分 > 0（creditsExpiring 由签到/余额任务按
+	//     expiring_soon 窗口写入，见 entry.creditsExpiring）；
+	//   - 过滤后候选非空——若全部快过期号都被 tried/在途占满排除，本过滤不会
+	//     造成"无号可选"，直接退回全体候选（宁可花长期积分，也不能让请求失败）。
+	//
+	// 不做的事：不改动 costTier/weightOf 的既有口径，也不写 lastUsed/usedSeq——
+	// 过滤只是把候选集换成一个子集，后续排序/抽签/防撞号逻辑逐字不变。
+	if p.modelIsPaid(realm, reqModel) {
+		expiring := make([]*entry, 0, len(cands))
+		for _, e := range cands {
+			if e.creditsExpiring > 0 {
+				expiring = append(expiring, e)
+			}
+		}
+		if len(expiring) > 0 && len(expiring) < len(cands) {
+			if d != nil {
+				d.increment("paid_expiring_preferred")
+				d.exclude("paid_expiring_deferred")
+			}
+			cands = expiring
+		} else if len(expiring) > 0 && d != nil {
+			// 全员都有快过期积分：过滤无差别，仍记一笔，便于运维确认该特性在生效。
+			d.increment("paid_expiring_all")
 		}
 	}
 	// 权重与成本分层**各算一次、全程复用**（weighted 结构体定义见包级注释）：
