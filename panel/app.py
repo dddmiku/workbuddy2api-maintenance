@@ -144,12 +144,17 @@ CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
 PANEL_VERSION = "2.4.17"
 
 # 网关请求行（logging.go 的表格日志）：
-# | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
-# in=/hit= 是 2026-09-18 新增列（输入 tokens 与其中缓存命中数）；旧行没有这两列，正则按可选取。
+# | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | cache=prev=305900 | tok=110 | 34.3tok/s | total=3.4s |
+# 各列都是渐进加入的，正则按**可选取**匹配，保证旧行仍能解析：
+#   - in=/hit=：2026-09-18 加入（输入 tokens 与其中缓存命中数）；
+#   - cache=：2026-10-10 加入（cold / prev=N，判定 hit=0 是冷启动还是会话内丢失）。
+# 注意 cache= 夹在 hit= 与 tok= 之间：正则必须把它写成可选段，否则整行匹配失败、
+# 请求日志页会显示「还没有请求记录」（2026-10-10 真踩过）。
 REQUEST_ROW = re.compile(
     r"^\|\s*#(?P<seq>\d+)\s*\|\s*(?P<time>[^|]*?)\s*\|\s*(?P<model>[^|]*?)\s*\|\s*(?P<mode>[^|]*?)\s*\|\s*"
     r"(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*TTFB=(?P<ttfb>[^|]*?)\s*\|\s*"
     r"(?:in=(?P<in>[^|]*?)\s*\|\s*hit=(?P<hit>[^|]*?)\s*\|\s*)?"
+    r"(?:cache=(?P<cache>[^|]*?)\s*\|\s*)?"
     r"tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*(?:rid=(?P<request_id>[A-Za-z0-9_]+)\s*\|\s*)?$"
 )
 
@@ -165,7 +170,7 @@ def parse_request_log(text):
             continue
         item = match.groupdict()
         item["key"] = (item["key"] or "").strip() or "-"
-        for field in ("in", "hit"):
+        for field in ("in", "hit", "cache"):
             item[field] = (item.get(field) or "").strip() or "-"
         rows.append(item)
     return rows, other[-60:]
@@ -1045,6 +1050,12 @@ def credits_by_uid(force=False):
 def build_state(force_credit=False):
     pool = gateway_get("/status") or {}
     pool_by_uid = {a.get("uid"): a for a in (pool.get("accounts") or [])}
+    # 网关版本从 /healthz 取，而不是复用面板自己的 PANEL_VERSION：面板是随网关一起
+    # 打包的，但两个版本号各自维护，长期不动的那个必然漂移（2026-10-10 实测：网关已
+    # 到 v2.6.19，面板仍显示 v2.4.17，用户以为没更新成功）。这里报网关的真实版本，
+    # 面板自身版本另用 panelVersion 字段，两者不一致时前端可同时显示。
+    health = gateway_get("/healthz") or {}
+    gateway_version = health.get("version") if isinstance(health, dict) else None
     cred_by_uid, credit_raw = credits_by_uid(force=force_credit)
     # 积分还在后台查（或首次加载尚未拿到）时告诉前端：稍后自己重取一次，
     # 而不是让首屏一直等 `./credit`（冷跑 8 秒）。
@@ -1098,7 +1109,10 @@ def build_state(force_credit=False):
 
     return {
         "service": "wb2api-admin",
-        "version": PANEL_VERSION,
+        # version 报**网关**版本（面板随网关打包，用户看到的就是网关版本）；
+        # panelVersion 是面板自身版本，保留以便区分「面板没跟着更新」这类问题。
+        "version": gateway_version or PANEL_VERSION,
+        "panelVersion": PANEL_VERSION,
         "containerRunning": container_running(),
         "accounts": accounts,
         "pool": {

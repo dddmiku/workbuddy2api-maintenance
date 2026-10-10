@@ -1119,9 +1119,10 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
               <thead><tr>
                 <th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>调用密钥</th>
                 <th>账号</th><th class="r">TTFB</th><th class="r">输入</th><th class="r">缓存命中</th>
+                <th>缓存参照</th>
                 <th class="r">输出</th><th class="r">tok/s</th><th class="r">total</th>
               </tr></thead>
-              <tbody id="logRows"><tr><td colspan="13"><div class="empty">正在加载日志…</div></td></tr></tbody>
+              <tbody id="logRows"><tr><td colspan="14"><div class="empty">正在加载日志…</div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1374,6 +1375,33 @@ function compactNum(v){
   if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
   return String(n);
+}
+// cacheLabel / cacheHint 渲染网关请求行的 cache= 列（v2.6.19）。
+// 这一列回答「这次该不该命中」：hit= 只说命中了多少，不说该不该有命中。
+//   cold       本会话首次请求，hit=0 属正常（前缀本来就没写过）
+//   prev=N     该会话上一轮输入 N token，与 hit= 直接比较即可判定是否丢失
+//   -          输入未知（上游没报 usage），无法判断
+function cacheLabel(it){
+  var c = (it && it.cache) || '-';
+  if (c === 'cold') return '冷启动';
+  if (c === '-') return '-';
+  var m = /^prev=(\d+)$/.exec(c);
+  if (m) return '上轮 ' + compactNum(m[1]);
+  return c;
+}
+function cacheHint(it){
+  var c = (it && it.cache) || '-';
+  if (c === 'cold') return '本会话首次请求：前缀还没写过，hit=0 属正常';
+  var m = /^prev=(\d+)$/.exec(c);
+  if (m) {
+    var prev = Number(m[1]);
+    var hit = Number(String((it && it.hit) || '').replace(/[, ]/g, ''));
+    if (!isNaN(hit) && hit > 0 && hit < prev * 0.5) {
+      return '上一轮输入 ' + prev + ' tokens，本轮只命中 ' + hit + ' —— 同会话内前缀丢失（异常）';
+    }
+    return '上一轮输入 ' + prev + ' tokens，与本轮「缓存命中」对比即可判断是否丢失';
+  }
+  return '输入未知（上游未返回 usage），无法判断是否该命中';
 }
 // debounce 让高频输入（搜索框）只在停顿后触发一次渲染。
 function debounce(fn, wait){
@@ -2563,7 +2591,7 @@ async function loadLogs(){
     if (sig !== LOG.sig){
       LOG.sig = sig;
       if (!rows.length){
-        $('#logRows').innerHTML = '<tr><td colspan="13"><div class="empty">还没有请求记录。</div></td></tr>';
+        $('#logRows').innerHTML = '<tr><td colspan="14"><div class="empty">还没有请求记录。</div></td></tr>';
       } else {
         $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
           var cls = statusClass(it.status);
@@ -2578,6 +2606,7 @@ async function loadLogs(){
           '<td class="mono num">' + esc(it.ttfb) + '</td>' +
           '<td class="mono num" title="输入 tokens（每轮重发整段上下文）">' + esc(compactNum(it.in)) + '</td>' +
           '<td class="mono num" title="输入里命中提示缓存的 tokens">' + esc(compactNum(it.hit)) + '</td>' +
+          '<td class="mono" title="' + esc(cacheHint(it)) + '">' + esc(cacheLabel(it)) + '</td>' +
           '<td class="mono num">' + esc(it.tok) + '</td>' +
           '<td class="mono num">' + esc(it.rate) + '</td>' +
           '<td class="mono num">' + esc(it.total) + '</td>' +

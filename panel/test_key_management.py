@@ -258,6 +258,34 @@ class KeyManagementTests(unittest.TestCase):
         self.assertEqual(rows[0]["key"], "-")
         self.assertEqual(other, [])
 
+    def test_parse_request_log_reads_cache_column(self):
+        """v2.6.19 在 hit= 与 tok= 之间插了 cache= 列。
+
+        回归背景（2026-10-10 真踩过）：正则原先把 hit= 与 tok= 写成紧邻，
+        插入 cache= 后整行匹配失败，请求日志页直接显示「还没有请求记录」——
+        网关日志本身是好的，是面板解析挂了。cache= 必须是可选取，且旧行
+        （无该列）仍要能解析。
+        """
+        rows, _ = app.parse_request_log("\n".join([
+            # 新格式：cache=prev=N
+            "| #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | "
+            "TTFB=3414ms | in=306401 | hit=298112 | cache=prev=305900 | tok=110 | 34.3tok/s | total=3.4s | rid=req_ABC |",
+            # 新格式：cache=cold
+            "| #013 | 22:04:31 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | "
+            "TTFB=8734ms | in=399973 | hit=1408 | cache=cold | tok=365 | 36.5tok/s | total=10.0s |",
+            # 旧格式：无 cache= 列
+            "| #098 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | "
+            "TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |",
+        ]))
+        self.assertEqual(len(rows), 3, "cache= 列不应让任何一行解析失败")
+        self.assertEqual(rows[0]["cache"], "prev=305900")
+        self.assertEqual(rows[0]["hit"], "298112")
+        self.assertEqual(rows[0]["tok"], "110")
+        self.assertEqual(rows[1]["cache"], "cold")
+        # 旧行没有该列 → 归一化成 "-"（与 key= 同一约定），而不是丢掉整行。
+        self.assertEqual(rows[2]["cache"], "-")
+        self.assertEqual(rows[2]["tok"], "110")
+
 
 class LogWindowTests(unittest.TestCase):
     """日志页的 60/120/300/600 是「请求条数」语义，不是 docker --tail 的原始行数。
