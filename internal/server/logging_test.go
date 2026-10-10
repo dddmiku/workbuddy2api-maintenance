@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -199,11 +200,11 @@ func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK,
-			306401, 298112, 1234, "团队 A")
+			306401, 298112, 1234, "团队 A", "prev=305900")
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "TTFB=412ms",
-		"in=306401", "hit=298112", "tok=1234", "tok/s |", "total=",
+		"in=306401", "hit=298112", "cache=prev=305900", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -217,9 +218,9 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-")
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-", "-")
 	})
-	for _, want := range []string{"key=-", "TTFB=-", "in=-", "hit=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"key=-", "TTFB=-", "in=-", "hit=-", "cache=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
@@ -229,8 +230,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-")
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold")
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -338,5 +339,62 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestSessionPrefixTrackerColdThenPrev 锁定 cache= 列的诊断语义：同一会话第一次
+// 是 cold（前缀本来就没写过，hit=0 正常），第二次起给出上一轮输入量做参照。
+// 这正是排查「同会话后续请求 hit 归零」时唯一缺的信息——没有 prev= 就只能人工
+// 翻上一条请求比对。
+func TestSessionPrefixTrackerColdThenPrev(t *testing.T) {
+	key := "test-cachecol-" + t.Name()
+	if got := sessionPrefixes.last(key); got != 0 {
+		t.Fatalf("unseen session must report 0, got %d", got)
+	}
+	sessionPrefixes.record(key, 546167)
+	if got := sessionPrefixes.last(key); got != 546167 {
+		t.Fatalf("last=%d want 546167", got)
+	}
+
+	// cold：本会话无上一轮。
+	cold := &chatStat{prompt: 546167}
+	if got := cold.cacheField(); got != "cold" {
+		t.Errorf("first request should be cold, got %q", got)
+	}
+	// 有上一轮：给出参照值，供与 hit= 直接比较。
+	next := &chatStat{prompt: 546634, cachePrev: 546167}
+	if got := next.cacheField(); got != "prev=546167" {
+		t.Errorf("subsequent request should carry prev=, got %q", got)
+	}
+	// 输入未知时不编造参照。
+	if got := (&chatStat{prompt: -1}).cacheField(); got != "-" {
+		t.Errorf("unknown input must render -, got %q", got)
+	}
+}
+
+// TestSessionPrefixTrackerBounded 键来自客户端，必须有上限，否则随机会话 ID
+// 能把内存推成无上限（与 session.Router 的 maxEntries 同一类风险）。
+func TestSessionPrefixTrackerBounded(t *testing.T) {
+	tracker := &sessionPrefixTracker{prev: make(map[string]int)}
+	for i := 0; i < sessionPrefixMax+50; i++ {
+		tracker.record("k"+strconv.Itoa(i), i+1)
+	}
+	if len(tracker.prev) > sessionPrefixMax {
+		t.Fatalf("tracker grew past the cap: %d", len(tracker.prev))
+	}
+	if len(tracker.order) > sessionPrefixMax {
+		t.Fatalf("order slice grew past the cap: %d", len(tracker.order))
+	}
+	// 空键不占位。
+	tracker.record("", 1)
+	if _, ok := tracker.prev[""]; ok {
+		t.Error("empty key must not be tracked")
+	}
+	// 未知输入不覆盖已有值（用一个仍在窗口内的键）。
+	tracker.record("k"+(strconv.Itoa(sessionPrefixMax-1)), 42)
+	tracker.record("k"+(strconv.Itoa(sessionPrefixMax-1)), 0)
+	tracker.record("k"+(strconv.Itoa(sessionPrefixMax-1)), -5)
+	if got := tracker.last("k" + strconv.Itoa(sessionPrefixMax-1)); got != 42 {
+		t.Errorf("non-positive input must not overwrite: got %d", got)
 	}
 }

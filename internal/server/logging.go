@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-10-10：请求行加 cache= 列，区分「会话首次冷启动」与「同会话内前缀丢失」。
 // 2026-09-26：单独记录最后一次尝试的上游输入 token，供输出预算按会话推算（累计值会因重试偏大）。
 // 2026-09-25：重试失败保留当次真实消费与错误，循环截断用量明确标记未完整上报。
 // 2026-09-25：仅从实际 HTTP 尝试起点标记上游消费，发送前本地失败不再误入账本。
@@ -22,7 +23,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,12 +52,18 @@ type chatStat struct {
 	status    int
 
 	// 调用方密钥身份（鉴权命中时填，单密钥模式留空 → 显示 "-"）。
-	keyID           string
-	keyName         string
-	keyMask         string
-	prompt          int
-	lastPrompt      int // 最后一次上报用量的尝试的输入 token（多次尝试不累加；0 = 未知）
-	cached          int // 输入里命中提示缓存的 token 数（<0 表示未知）
+	keyID      string
+	keyName    string
+	keyMask    string
+	prompt     int
+	lastPrompt int // 最后一次上报用量的尝试的输入 token（多次尝试不累加；0 = 未知）
+	cached     int // 输入里命中提示缓存的 token 数（<0 表示未知）
+	// sessKey 会话粘性键（已按调用方隔离）；cachePrev 是同一会话上**上一次**请求的
+	// 输入 token（0 = 本进程没见过该会话 → 首次冷启动）。两者只用于日志行的 cache=
+	// 列：`hit=0` 本身分不清「首次冷启动（正常）」与「同会话内前缀丢失（异常）」，
+	// 有上一轮输入量做参照才能一眼判定（见 cacheField）。
+	sessKey         string
+	cachePrev       int
 	hasUsage        bool
 	credit          float64
 	hasCred         bool
@@ -79,6 +88,70 @@ func (s *chatStat) keyLabel() string {
 		return s.keyMask
 	}
 	return "-"
+}
+
+// sessionPrefixTracker 记录每个会话上一次请求的输入 token 数。
+//
+// 为什么需要：日志行的 `hit=` 只说「命中了多少」，**不说这次该不该命中**。排查
+// 「同一会话后续请求突然不命中」时，`hit=0` 有两个完全不同的成因——首次冷启动
+// （正常，前缀本来就没写过）与同会话内前缀丢失（异常，上一轮明明刚写过）。两者
+// 在日志里长得一模一样，只能靠人工翻上一条请求去比。有了上一轮输入量做参照，
+// `hit=0` 配上 `prev=546k` 一眼就是异常，配上 `cold` 就是正常。
+//
+// 有界：键来自客户端（会话标识），必须设上限，否则随机会话 ID 能把内存推成无上限。
+// 超限按插入顺序淘汰最旧的（近似 LRU，精度够用——这里只为日志标注服务，不参与
+// 任何路由或计费决策）。
+type sessionPrefixTracker struct {
+	mu    sync.Mutex
+	prev  map[string]int
+	order []string
+}
+
+const sessionPrefixMax = 4096
+
+var sessionPrefixes = &sessionPrefixTracker{prev: make(map[string]int, sessionPrefixMax)}
+
+// last 返回该会话上一次请求的输入 token；从未见过返回 0。
+func (t *sessionPrefixTracker) last(key string) int {
+	if key == "" {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.prev[key]
+}
+
+// record 记下该会话本次的输入 token（<=0 视为未知，不覆盖已有值）。
+func (t *sessionPrefixTracker) record(key string, prompt int) {
+	if key == "" || prompt <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, seen := t.prev[key]; !seen {
+		if len(t.order) >= sessionPrefixMax {
+			// 淘汰最旧的一条，避免无界增长。
+			oldest := t.order[0]
+			t.order = t.order[1:]
+			delete(t.prev, oldest)
+		}
+		t.order = append(t.order, key)
+	}
+	t.prev[key] = prompt
+}
+
+// cacheField 生成日志行的 cache= 列：把「本次命中」放到「上一轮输入」的参照系里。
+//   - `-`            输入未知（上游没报 usage），无法判断
+//   - `cold`         本会话首次请求（没有上一轮可复用），hit=0 属正常
+//   - `prev=<n>`     上一轮输入 n token；与 hit= 直接比较即可判定是否丢失
+func (s *chatStat) cacheField() string {
+	if s == nil || s.prompt < 0 {
+		return "-"
+	}
+	if s.cachePrev <= 0 {
+		return "cold"
+	}
+	return "prev=" + strconv.Itoa(s.cachePrev)
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -157,8 +230,11 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
+	// 先取上一轮的参照值，再记录本轮——顺序反了就会把自己当成「上一轮」。
+	s.cachePrev = sessionPrefixes.last(s.sessKey)
+	sessionPrefixes.record(s.sessKey, s.prompt)
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status,
-		s.prompt, s.cached, s.toks, s.keyLabel(), s.requestID)
+		s.prompt, s.cached, s.toks, s.keyLabel(), s.cacheField(), s.requestID)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -447,7 +523,8 @@ func uidPrefix(uid string) string {
 //
 // 三个 token 列都是「上游 usage 原值」：in= 输入、hit= 输入里命中缓存的、
 // tok= 输出（含思考 token）。负值表示上游没给 usage，显示 "-"（缺失≠0）。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key string, requestIDs ...string) {
+// cache= 列给出「本次该不该命中」的参照（cold / prev=N），见 chatStat.cacheField。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key, cache string, requestIDs ...string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -475,6 +552,9 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 	if cached >= 0 {
 		cachedField = fmt.Sprintf("%d", cached)
 	}
+	if cache == "" {
+		cache = "-"
+	}
 	suffix := ""
 	if len(requestIDs) > 0 && requestIDs[0] != "" {
 		suffix = " rid=" + strings.Map(func(r rune) rune {
@@ -484,7 +564,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 			return -1
 		}, requestIDs[0]) + " |"
 	}
-	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
+	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | cache=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -495,6 +575,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		ttfbMS,
 		promptField,
 		cachedField,
+		cache,
 		tokField,
 		tokpsField,
 		total.Seconds(),

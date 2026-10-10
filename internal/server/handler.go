@@ -1323,6 +1323,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if stickyKey == "" {
 		stickyKey = session.ScopeKey(st.keyID, session.ContentKey(body))
 	}
+	// 日志行的 cache= 列要用**最终**粘性键（含无标识客户端的正文回退键），
+	// 否则 narrafork 这类请求会被全部标成 cold，看不出会话内的前缀丢失。
+	st.sessKey = stickyKey
 	stickyUID := ""
 	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
