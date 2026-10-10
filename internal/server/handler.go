@@ -669,6 +669,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// paid_models：当前判定为付费（积分倍率 > 0）的模型数，以及其中本域可服务的
+		// 模型名（供运维确认「付费模型优先消耗快过期积分」是否真的生效）。
+		// 只读展示，不影响任何选号状态；未注入倍率表时为 0。
+		"paid_models": h.cfg.Pool.PaidModelSummary(),
 	})
 }
 

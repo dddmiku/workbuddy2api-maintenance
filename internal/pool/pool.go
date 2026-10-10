@@ -8,6 +8,8 @@
 package pool
 
 import (
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +128,23 @@ func (p *Pool) SetPaidModels(models map[string]bool) {
 		copied[k] = v
 	}
 	p.paidModels = copied
+}
+
+// PaidModelSummary 报告已登记的付费模型（倍率 > 0）摘要，供 /status 展示——
+// 运维据此确认「付费模型优先消耗快过期积分」是否真的生效（看不到就会怀疑特性没跑）。
+//
+// 返回总数与排序后的键。键里的 realm 前缀**保留**（展示为 "cn:m" 而不是内部拼法）：
+// 同名模型两域倍率可能不同（cn:deepseek-v4.1-flash 付费 / global 同名免费），
+// 只报裸名会让运维以为 global 也被判成付费了。
+func (p *Pool) PaidModelSummary() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	keys := make([]string, 0, len(p.paidModels))
+	for k := range p.paidModels {
+		keys = append(keys, strings.Replace(k, "\x00", ":", 1))
+	}
+	sort.Strings(keys)
+	return map[string]any{"count": len(keys), "models": keys}
 }
 
 // paidModelKey 付费判定用的键：realm + 裸模型名。空 realm（未分池调用）时退化为

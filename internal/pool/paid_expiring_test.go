@@ -4,6 +4,7 @@ package pool
 //             免费模型不受影响、无快过期号时退回全体候选。
 
 import (
+	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -219,5 +220,36 @@ func TestPaidModelKeyRoundTrip(t *testing.T) {
 	}
 	if got := paidModelKey("", "m"); got != "m" {
 		t.Errorf("空 realm 应退化为裸名，got %q", got)
+	}
+}
+
+// TestPaidModelSummary 摘要用于 /status 展示：数量对、键可读（realm 前缀保留），
+// 未注入时为空（不是 nil map 崩）。
+func TestPaidModelSummary(t *testing.T) {
+	p := New("")
+	if got := p.PaidModelSummary(); got["count"] != 0 {
+		t.Errorf("未注入时 count=%v want 0", got["count"])
+	}
+	p.SetPaidModels(map[string]bool{
+		paidModelKey("cn", "glm-5.3"):                 true,
+		paidModelKey("global", "deepseek-v4.1-flash"): true,
+	})
+	got := p.PaidModelSummary()
+	if got["count"] != 2 {
+		t.Fatalf("count=%v want 2", got["count"])
+	}
+	models, _ := got["models"].([]string)
+	if len(models) != 2 {
+		t.Fatalf("models=%v want 2 项", models)
+	}
+	// 可读形态：不含内部 \x00 分隔符，且保留 realm 前缀。
+	for _, m := range models {
+		if strings.ContainsRune(m, '\x00') {
+			t.Errorf("摘要不该暴露内部分隔符: %q", m)
+		}
+	}
+	joined := strings.Join(models, ",")
+	if !strings.Contains(joined, "cn:glm-5.3") || !strings.Contains(joined, "global:deepseek-v4.1-flash") {
+		t.Errorf("摘要应保留 realm 前缀，got %q", joined)
 	}
 }
