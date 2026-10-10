@@ -749,11 +749,24 @@ func (h *Handler) invalidateModelCaches() {
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
 // 上游格式不统一："x0.05 credits" / "x0.29" / "x0.00 credits" 等，
 // 统一提取 x数字 部分，去 "credits" 后缀。
-func fmtCreditsPrefix(raw string) string {
+// normalizeCredits 把上游 credits 原文规整成纯倍率写法（"x0.34"）。
+//
+// 上游同一字段有两种形态：`x0.34` 与 `x0.34 credits`（2026-10-10 线上实测：
+// 73 个模型里 4 个带后缀，全是 global 侧）。原样透传会让 `credits` 出现两种形状，
+// 下游按它做解析或比较时很容易踩坑——这里统一，同时保留「上游没给」与
+// 「给了空值」的区别（都返回 ""，调用方按空值省略字段，不编造）。
+func normalizeCredits(raw string) string {
 	s := strings.TrimSpace(raw)
-	// 去掉 "credits" 后缀
-	s = strings.TrimSuffix(s, "credits")
-	s = strings.TrimSpace(s)
+	// 去掉 "credits" 后缀（大小写不敏感），再清一次空白。
+	if len(s) >= len("credits") && strings.EqualFold(s[len(s)-len("credits"):], "credits") {
+		s = strings.TrimSpace(s[:len(s)-len("credits")])
+	}
+	return s
+}
+
+// fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
+func fmtCreditsPrefix(raw string) string {
+	s := normalizeCredits(raw)
 	if s == "" {
 		return ""
 	}
@@ -780,7 +793,10 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 		}
 	}
 	if mi.Credits != "" {
-		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+		// 规整成纯倍率写法（去掉上游偶发的 " credits" 后缀），仅展示用。
+		if c := normalizeCredits(mi.Credits); c != "" {
+			entry["credits"] = c
+		}
 	}
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags

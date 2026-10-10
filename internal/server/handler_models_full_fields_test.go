@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // fullFieldsModelsBody CN /console 动态目录全字段样本（任务书 hy3 抓取样本逐字，
@@ -216,5 +217,38 @@ func TestFetchGlobalModelsReturnsAccount(t *testing.T) {
 	// nil 账号路径（无 global 号）：FetchGlobalModelInfos(nil) 安稳返回 nil。
 	if got := h.cfg.Upstream.FetchGlobalModelInfos(nil); got != nil {
 		t.Errorf("FetchGlobalModelInfos(nil)=%v want nil", got)
+	}
+}
+
+// TestCreditsSuffixNormalized 上游同一字段有两种形态："x0.34" 与 "x0.34 credits"。
+// 原样透传会让下游拿到两种形状（2026-10-10 线上实测 73 个模型里 4 个带后缀），
+// 必须统一成纯倍率写法；同时「上游没给」仍要省略字段，不编造。
+func TestCreditsSuffixNormalized(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"x0.34", "x0.34"},
+		{"x0.34 credits", "x0.34"},
+		{"x3.31 CREDITS", "x3.31"},
+		{"  x0.05  credits ", "x0.05"},
+		{"x0.00 credits", "x0.00"},
+		{"credits", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := normalizeCredits(tc.raw); got != tc.want {
+				t.Fatalf("normalizeCredits(%q)=%q want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+	// 空倍率不得写出字段（空值省略，不编造）。
+	entry := map[string]any{}
+	entry = applyModelInfoFields(entry, upstream.ModelInfo{ID: "m", Credits: "credits"})
+	if _, ok := entry["credits"]; ok {
+		t.Fatalf("empty credits must be omitted, got %v", entry["credits"])
+	}
+	// 带后缀的倍率要落成规整形态。
+	entry = applyModelInfoFields(map[string]any{}, upstream.ModelInfo{ID: "m", Credits: "x0.34 credits"})
+	if entry["credits"] != "x0.34" {
+		t.Fatalf("credits=%v want x0.34 (suffix stripped)", entry["credits"])
 	}
 }
