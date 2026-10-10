@@ -68,15 +68,34 @@ type expiryView struct {
 	Later     int64  `json:"later"`
 	Unlimited int64  `json:"unlimited"`
 	NextEnd   string `json:"next_end,omitempty"` // RFC3339（本地墙钟），空 = 无到期时间
+	// Schedule 逐笔到期日程（升序）：某时刻会作废多少。面板据此显示具体过期时间。
+	// 与分档互补——分档回答"有多少快过期"，日程回答"具体什么时候过期多少"。
+	Schedule []scheduleView `json:"schedule,omitempty"`
+	// ScheduleTruncated 日程是否被截断（超 maxScheduleEntries 条时余额聚成尾巴）。
+	// 面板据此在末尾加一句说明，避免用户以为"就这些"。
+	ScheduleTruncated bool `json:"schedule_truncated,omitempty"`
 }
 
-func newExpiryView(b upstream.ExpiryBreakdown) expiryView {
+// scheduleView 日程单条：到期时刻 + 该时刻作废的余额。
+type scheduleView struct {
+	End      string `json:"end"` // RFC3339（上游 UTC+8 墙钟）
+	Amount   int64  `json:"amount"`
+	Packages int    `json:"packages,omitempty"`
+}
+
+func newExpiryView(b upstream.ExpiryBreakdown, schedule []upstream.ExpiryEntry, truncated bool) expiryView {
 	v := expiryView{
 		Within1d: b.Within1d, Within3d: b.Within3d, Within7d: b.Within7d,
 		Within30d: b.Within30d, Later: b.Later, Unlimited: b.Unlimited,
+		ScheduleTruncated: truncated,
 	}
 	if !b.NextEnd.IsZero() {
 		v.NextEnd = b.NextEnd.Format(time.RFC3339)
+	}
+	for _, e := range schedule {
+		v.Schedule = append(v.Schedule, scheduleView{
+			End: e.End.Format(time.RFC3339), Amount: e.Amount, Packages: e.Packages,
+		})
 	}
 	return v
 }
@@ -212,7 +231,7 @@ func collectWithWindow(authDir string, up *upstream.Client, workers int, soon ti
 					res.Packages = usage.Packages
 					res.Expiring = usage.Expiring
 					res.ExpiringWindowHours = int(soon.Hours())
-					res.Expiry = newExpiryView(usage.Expiry)
+					res.Expiry = newExpiryView(usage.Expiry, usage.Schedule, usage.ScheduleTruncated)
 					res.OK = true
 				}
 				slots[item.index] = res

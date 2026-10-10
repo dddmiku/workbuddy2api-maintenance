@@ -1,7 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
-// 2026-10-10：到期字段改为 CycleEndTime（PackageEndTime 上游从不发，导致快过期分桶恒为 0），并新增 ResourceUsage/ExpiryBreakdown 供面板分档。
+// 2026-10-10：到期字段改为 CycleEndTime（PackageEndTime 上游从不发，导致快过期分桶恒为 0），并新增 ResourceUsage/ExpiryBreakdown 分档与 Schedule 逐笔日程。
 // 2026-09-28：11140 的内容审核拒绝（displayMsg）先于账号故障判定，不再误禁健康号。
 // 2026-09-26：重置时间同时认中英文写法（code 6004 英文文案不再被当成无重置限流）。
 // 2026-09-26：明确的参数错误（invalid_request_error/11101/11133）先于限流关键词分类，"too many images" 等不再冷却健康账号。
@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1799,6 +1800,72 @@ type ResourceUsage struct {
 	// Expiry 到期分布（按固定档位累计的余额），供面板画「有效期」视图。
 	// 各档位的余额互不重叠，且都在 Remain 之内；无到期时间的余额只计入 Unlimited。
 	Expiry ExpiryBreakdown
+	// Schedule 逐笔到期日程（每笔 = 一个到期时刻 + 该时刻作废的余额）。
+	// 面板据此显示「什么时候具体过期、过期多少」——只有分档看不出"哪天到期"。
+	Schedule []ExpiryEntry
+	// ScheduleTruncated 日程是否超过 maxScheduleEntries 被截断（多余余额已聚进最后一笔）。
+	// 面板据此在末尾加一句说明，免得用户以为"就这些"。
+	ScheduleTruncated bool
+}
+
+// ExpiryEntry 一笔到期：某个时刻会作废的余额（同一时刻的多套餐已合并）。
+type ExpiryEntry struct {
+	// End 到期时刻（上游 UTC+8 墙钟解析后的时间点）。
+	End time.Time
+	// Amount 该时刻到期的余额。
+	Amount int64
+	// Packages 合并进这一笔的套餐数（同一时刻常有多个赠送包，合并后计数）。
+	Packages int
+}
+
+// maxScheduleEntries 单账号日程条数上限。真实数据里一个号可有上百个套餐、
+// 上百个不同到期时刻（实测 4e183777：119 个套餐 / 119 个时刻），全量透出会让
+// /status 与面板表格膨胀。按时间升序保留最近 maxScheduleEntries 条，其余聚成
+// 一条"更远"的尾巴（见 finalizeSchedule），保证"合计仍等于 remain"不被悄悄破坏。
+const maxScheduleEntries = 40
+
+// addSchedule 记录一笔到期（原始条目，不做合并）。
+// 上游返回的套餐顺序不保证有序，合并/截断统一放到 finalizeSchedule 里做，
+// 否则"同刻合并"与"超限累到最后一笔"都会因输入无序而错位。
+func (u *ResourceUsage) addSchedule(end time.Time, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	u.Schedule = append(u.Schedule, ExpiryEntry{End: end.Truncate(time.Minute), Amount: amount, Packages: 1})
+}
+
+// finalizeSchedule 排序 → 同刻合并 → 按上限截断（多余余额聚成尾巴）。
+//
+// 三步的顺序不能换：先排序才能让同刻条目相邻；先合并才能让截断的粒度是
+// "到期时刻"而不是"套餐"（一个时刻可能对应几十个赠送包）。
+// 截断后尾巴把剩余余额全收进来，因此 Schedule 合计恒等于有到期时间的余额。
+func (u *ResourceUsage) finalizeSchedule() {
+	if len(u.Schedule) == 0 {
+		return
+	}
+	sort.Slice(u.Schedule, func(i, j int) bool { return u.Schedule[i].End.Before(u.Schedule[j].End) })
+	merged := u.Schedule[:1]
+	for _, e := range u.Schedule[1:] {
+		if last := &merged[len(merged)-1]; last.End.Equal(e.End) {
+			last.Amount += e.Amount
+			last.Packages += e.Packages
+			continue
+		}
+		merged = append(merged, e)
+	}
+	if len(merged) > maxScheduleEntries {
+		// 尾巴：把超出的条目余额合并到最后保留的一条上（该条已是保留区里最远的），
+		// 这样调用方看到的是"第 N 条之后还有这么多，一起在那一刻前后作废"。
+		tail := merged[maxScheduleEntries-1]
+		for _, e := range merged[maxScheduleEntries:] {
+			tail.Amount += e.Amount
+			tail.Packages += e.Packages
+		}
+		merged = merged[:maxScheduleEntries]
+		merged[len(merged)-1] = tail
+		u.ScheduleTruncated = true
+	}
+	u.Schedule = merged
 }
 
 // ExpiryBreakdown 余额按到期紧迫度的固定分档（各档互斥，单位：积分）。
@@ -1947,10 +2014,16 @@ func (c *Client) ResourceUsage(a *auth.Auth, soon time.Duration) (ResourceUsage,
 		// 免得面板展示与选号权重用两套算法得出两个数。
 		end, hasEnd := packageEndTime(acct.CycleEndTime, acct.PackageEndTime)
 		out.Expiry.add(r, end, hasEnd, now)
+		if hasEnd {
+			// 日程只收"还有余额、且确实有到期时间"的套餐：无到期时间的积分不会作废，
+			// 列进日程会让"什么时候过期多少"变成误导。
+			out.addSchedule(end, r)
+		}
 		if soon > 0 && r > 0 && hasEnd && !end.After(now.Add(soon)) {
 			out.Expiring += r
 		}
 	}
+	out.finalizeSchedule()
 	out.Packages = len(resp.Response.Data.Accounts)
 	// TotalDosage 作 size 下限（历史口径：已消耗的不该比总剂量小）。
 	if out.Size > 0 {

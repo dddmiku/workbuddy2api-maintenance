@@ -189,6 +189,30 @@
           </div>
         </div>
         <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。</p>
+
+        <div class="panel" style="margin-top:18px">
+          <div class="ph">
+            <h2>到期日程</h2>
+            <span class="sp"></span>
+            <div class="seg" id="schedScope">
+              <button data-s="all" aria-pressed="true">全部账号</button>
+              <button data-s="soon">窗口内</button>
+            </div>
+            <div class="seg" id="schedAccount" style="margin-left:8px"></div>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr>
+                <th>到期时间</th>
+                <th>距今</th>
+                <th class="r">作废积分</th>
+                <th>涉及账号</th>
+              </tr></thead>
+              <tbody id="schedRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">每一行是「某个时刻会作废的积分」。同一时刻的多个赠送包已合并；单账号最多列 40 笔，更远的余额聚在最后一笔里（末尾会标注）。</p>
       </section>
 
       <section class="view hide" data-view="keys">

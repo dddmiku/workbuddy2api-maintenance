@@ -830,6 +830,115 @@ function renderCreditsPage(){
       '<td data-l="最近到期"><span class="sub">' + esc(fmtEnd(e.next_end)) + '</span></td></tr>';
   }).join('');
   $('#creditsMeta').textContent = have.length + ' 个账号 · 分档互斥，合计 = 剩余';
+  renderSchedule();
+}
+
+/* ── 到期日程 ─────────────────────────────────────────
+ * 分档回答「有多少快过期」，日程回答「具体几号几点过期多少」。
+ * 把各账号的 schedule 按到期时刻聚合：同一时刻多个号一起作废的合成一行，
+ * 这样运维能一眼看到"下一波什么时候来、一共多少"。
+ */
+// SCHED_STATE 日程视图状态（范围 + 选中账号）。放在模块级而不是 S 里：
+// 它只影响这一个区块，且切换筛选不该触发整页重绘。
+var SCHED_STATE = { scope:'all', account:'' };
+// schedEntries 把账号列表的 schedule 聚合成「时刻 → {amount, accounts[]}」。
+function schedEntries(list){
+  var byTime = {}, order = [];
+  list.forEach(function(x){
+    var sch = ((x.credits || {}).expiry || {}).schedule || [];
+    sch.forEach(function(e){
+      var t = e.end; if (!t) return;
+      if (!byTime[t]){ byTime[t] = { end:t, amount:0, accounts:[] }; order.push(t); }
+      byTime[t].amount += Number(e.amount) || 0;
+      byTime[t].accounts.push(x.nickname || shortUid(x.uid));
+    });
+  });
+  return order.sort(function(p, q){ return new Date(p) - new Date(q); })
+    .map(function(t){ return byTime[t]; });
+}
+// schedRel 把到期时刻写成「N 天后 / 明天 / 今天 HH:MM / 已到期」。
+function schedRel(iso){
+  var t = new Date(iso); if (isNaN(t.getTime())) return '';
+  var ms = t.getTime() - Date.now();
+  var days = Math.floor(ms / 86400000);
+  if (ms < 0) return '已到期';
+  if (days === 0) return '今天';
+  if (days === 1) return '明天';
+  if (days < 30) return days + ' 天后';
+  return Math.floor(days / 30) + ' 个月后';
+}
+// schedCls 按紧迫度给行上色：3 天内 err、7 天内 warn、30 天内 info、更远中性。
+function schedCls(iso){
+  var ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 3 * 86400000) return 'e';
+  if (ms <= 7 * 86400000) return 'w';
+  if (ms <= 30 * 86400000) return 'a';
+  return '';
+}
+function renderSchedule(){
+  var rowsEl = $('#schedRows'); if (!rowsEl) return;
+  var d = S.data || {}, a = d.accounts || [];
+  var have = a.filter(function(x){
+    return x.credits && typeof x.credits.remain === 'number' &&
+           ((x.credits.expiry || {}).schedule || []).length;
+  });
+  // 账号选择器：只列真的有日程的号（几十个号全列出来没人用）。
+  var picker = $('#schedAccount');
+  if (picker){
+    picker.innerHTML = '<button data-a="" aria-pressed="' + (!SCHED_STATE.account) + '">全部</button>' +
+      have.map(function(x){
+        return '<button data-a="' + esc(x.uid) + '" aria-pressed="' +
+          (SCHED_STATE.account === x.uid) + '">' + esc(x.nickname || shortUid(x.uid)) + '</button>';
+      }).join('');
+  }
+  var scope = have;
+  if (SCHED_STATE.account){
+    scope = have.filter(function(x){ return x.uid === SCHED_STATE.account; });
+  }
+  var entries = schedEntries(scope);
+  if (SCHED_STATE.scope === 'soon'){
+    // 「窗口内」= 与分档同口径：7 天内（窗口由 pool.expiring_soon 决定，
+    // 面板拿到的小时数在这里换算，避免两处各写死一个天数）。
+    var wh = Number((d.creditTotals || {}).expiring_window_hours) || 168;
+    var cutoff = Date.now() + wh * 3600000;
+    entries = entries.filter(function(e){ return new Date(e.end).getTime() <= cutoff; });
+  }
+  if (!entries.length){
+    rowsEl.innerHTML = '<tr><td colspan="4" data-l="">' +
+      emptyBox(IC.clock, '没有到期日程',
+        have.length ? '换个筛选条件' : '取到的账号都没有带到期时间的积分') + '</td></tr>';
+    return;
+  }
+  // 截断说明：任一账号标了 truncated 就提示一次（余额已聚进最后一笔，不是丢了）。
+  var truncated = scope.some(function(x){
+    return ((x.credits.expiry || {}).schedule_truncated);
+  });
+  var html = entries.map(function(e){
+    var cls = schedCls(e.end);
+    var names = e.accounts;
+    var label = names.length <= 3 ? names.join('、')
+      : (names.slice(0, 3).join('、') + ' 等 ' + names.length + ' 个号');
+    return '<tr>' +
+      '<td data-l="到期时间"><span class="sched-t ' + cls + '">' + esc(fmtStamp(e.end)) + '</span></td>' +
+      '<td data-l="距今"><span class="sub">' + esc(schedRel(e.end)) + '</span></td>' +
+      '<td class="r" data-l="作废积分"><b class="' + (cls === 'e' ? 'exp-urgent' : '') + '">' +
+        num(e.amount) + '</b></td>' +
+      '<td data-l="涉及账号"><span class="sub">' + esc(label) + '</span></td></tr>';
+  }).join('');
+  if (truncated){
+    html += '<tr><td colspan="4" data-l=""><div class="sub sched-trunc">' +
+      '部分账号的日程超过 40 笔，更远的余额已合并到最后一笔——合计仍等于剩余积分。</div></td></tr>';
+  }
+  rowsEl.innerHTML = html;
+}
+// fmtStamp 绝对时刻：M/D HH:MM（跨年时补年份，避免"1/5"看不出是哪年）。
+function fmtStamp(iso){
+  var t = new Date(iso); if (isNaN(t.getTime())) return '—';
+  var now = new Date();
+  var s = (t.getMonth() + 1) + '/' + t.getDate() + ' ' +
+    ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2);
+  if (t.getFullYear() !== now.getFullYear()) s = t.getFullYear() + '/' + s;
+  return s;
 }
 // 侧栏计数：有积分将在窗口内到期的账号数（0 时显示 —，避免长期占一个数字）。
 function renderCreditsTab(){
@@ -849,6 +958,21 @@ $('#acctFilter').addEventListener('click', function(e){
     x.setAttribute('aria-pressed', String(x === b));
   });
   renderAccounts();
+});
+// 到期日程的两个筛选：范围（全部/窗口内）与账号。只重绘日程表，不动整页。
+$('#schedScope').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-s]'); if (!b) return;
+  SCHED_STATE.scope = b.getAttribute('data-s');
+  $$('#schedScope button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderSchedule();
+});
+// 账号选择器是动态重建的（只列有日程的号），用事件委托挂在容器上。
+$('#schedAccount').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-a]'); if (!b) return;
+  SCHED_STATE.account = b.getAttribute('data-a');
+  renderSchedule();  // 重绘会顺带刷新选择器的 aria-pressed
 });
 $('#acctRows').addEventListener('click', function(e){
   var rv = e.target.closest('[data-revive]');

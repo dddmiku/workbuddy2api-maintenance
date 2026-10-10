@@ -17,7 +17,15 @@ NODE = shutil.which("node")
 
 @unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
 class FrontendBehaviorTests(unittest.TestCase):
-    def run_frontend(self, expression, extra_sources=()):
+    def run_frontend(self, expression, extra_sources=(), fixtures=()):
+        """在 Node 里跑前端表达式。
+
+        fixtures：要预加载的 JSON 文件名列表，在表达式里以同名的全局变量访问
+        （如 fixtures=("testdata_state_production.json",) → 表达式里用
+        testdata_state_production）。走文件而不是把 JSON 拼进表达式：生产快照
+        有近百 KB，作为 argv 传会被 Windows 的 32K 命令行上限截断
+        （FileNotFoundError: [WinError 206]）。
+        """
         program = r"""
 const vm = require('vm'), fs = require('fs'), path = require('path');
 const nodes = new Map();
@@ -51,12 +59,18 @@ const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON,
 vm.createContext(context);
 for (const source of ['app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
   vm.runInContext(fs.readFileSync(path.join(process.argv[1],source),'utf8'),context);
+// 预加载 fixture：变量名 = 去掉 .json 的文件名，表达式里直接引用。
+for (const name of String(process.argv[4]||'').split(',').filter(Boolean)) {
+  const raw = fs.readFileSync(path.join(process.argv[1], name), 'utf8');
+  context[name.replace(/\.json$/, '')] = JSON.parse(raw);
+}
 Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',context))
   .then(result=>console.log(JSON.stringify(result)))
   .catch(error=>{console.error(error);process.exitCode=1});
 """
         env = dict(os.environ, TZ="Asia/Shanghai")
-        result = subprocess.run([NODE, "-e", program, str(PANEL), expression, ",".join(extra_sources)],
+        result = subprocess.run([NODE, "-e", program, str(PANEL), expression,
+                                 ",".join(extra_sources), ",".join(fixtures)],
                                 capture_output=True, text=True, encoding="utf-8", env=env, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -713,10 +727,8 @@ return {m:m, rows:$('#acctRows').innerHTML};
         单测的合成数据容易与真实形状脱节（v2.6.13 就是这么漏掉「面板什么都看不到」
         的——fixture 用了不存在的字段名），这条用例锁住「真实形状能渲染出内容」。
         """
-        fixture = json.loads(
-            (PANEL / "testdata_state_production.json").read_text(encoding="utf-8"))
         result = self.run_frontend("""
-S.data = FIXTURE;
+S.data = testdata_state_production;
 renderMetrics();
 var m = $('#metrics').innerHTML;
 renderCreditsPage();
@@ -730,7 +742,7 @@ return {m:m, head:head, bars:bars, tab:tab,
         offBadges:(rows.match(/已停用/g) || []).length,
         revive:(rows.match(/data-revive/g) || []).length,
         expiring:(rows.match(/即将过期/g) || []).length};
-""".replace("FIXTURE", json.dumps(fixture, ensure_ascii=False)))
+""", fixtures=("testdata_state_production.json",))
         # 总览卡片：7 个池级停用要算进「账号」卡（此前恒显示 0，用户截图反馈过）。
         self.assertIn("7 个停用", result["m"], "账号卡必须把池级停用算进来")
         self.assertIn("12,264", result["m"], "总览应显示 7 天内到期的合计（带千分位）")
@@ -744,6 +756,102 @@ return {m:m, head:head, bars:bars, tab:tab,
         self.assertEqual(result["revive"], 7)
         self.assertEqual(result["expiring"], 5)
         self.assertGreater(result["rowsLen"], 10000, "账号表应真的渲染出行")
+
+    def test_schedule_shows_absolute_times(self):
+        """到期日程要给出具体时刻与金额，不只是「N 天内」的分档。"""
+        result = self.run_frontend("""
+function acct(uid, sch){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+S.data={accounts:[
+  acct('a',[{end:'2026-10-15T10:41:23+08:00',amount:1560,packages:3},
+            {end:'2026-10-16T09:00:07+08:00',amount:385}]),
+  acct('b',[{end:'2026-10-15T10:41:23+08:00',amount:100}])
+],pool:{},creditTotals:{expiring_window_hours:168}};
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, picker:$('#schedAccount').innerHTML};
+""")
+        rows = result["rows"]
+        self.assertIn("10/15", rows, "应显示具体日期")
+        self.assertIn("10:41", rows, "应显示具体时刻")
+        self.assertIn("1,660", rows, "同一时刻的两个号应合并（1560+100）")
+        self.assertIn("385", rows)
+        # 时刻升序：10/15 那行在 10/16 之前。
+        self.assertLess(rows.index("10/15"), rows.index("10/16"))
+        # 账号选择器列出有日程的号。
+        self.assertIn('data-a="a"', result["picker"])
+        self.assertIn('data-a="b"', result["picker"])
+
+    def test_schedule_scope_and_account_filters(self):
+        """范围（窗口内）与账号筛选都要生效。"""
+        result = self.run_frontend("""
+function acct(uid, sch){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+var soon = new Date(Date.now()+2*86400000).toISOString();
+var far  = new Date(Date.now()+60*86400000).toISOString();
+S.data={accounts:[
+  acct('a',[{end:soon,amount:50},{end:far,amount:70}]),
+  acct('b',[{end:far,amount:30}])
+],pool:{},creditTotals:{expiring_window_hours:168}};
+SCHED_STATE.scope='all'; SCHED_STATE.account='';
+renderSchedule(); var all=$('#schedRows').innerHTML;
+SCHED_STATE.scope='soon'; renderSchedule(); var soonOnly=$('#schedRows').innerHTML;
+SCHED_STATE.scope='all'; SCHED_STATE.account='a'; renderSchedule(); var oneAcct=$('#schedRows').innerHTML;
+SCHED_STATE.account='';
+return {all:all, soon:soonOnly, one:oneAcct};
+""")
+        self.assertIn("50", result["all"])
+        # a 的 70 与 b 的 30 是同一时刻 → 合并成 100（这正是"同一波一起作废"的读法）。
+        self.assertIn("100", result["all"])
+        self.assertIn("a、b", result["all"], "合并行应列出两个号")
+        # 窗口内（7 天）只剩 soon 那笔。
+        self.assertIn("50", result["soon"])
+        self.assertNotIn("100", result["soon"], "60 天后的不该出现在窗口内")
+        # 只看账号 a：只剩 a 的两笔，b 不再出现在涉及账号里。
+        self.assertIn("50", result["one"])
+        self.assertIn("70", result["one"])
+        self.assertNotIn("a、b", result["one"], "筛选账号后不该出现别的号")
+
+    def test_schedule_marks_truncation(self):
+        """日程被截断时要说明，免得用户以为"就这些"。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,
+      schedule:[{end:'2026-10-15T10:00:00+08:00',amount:10}],schedule_truncated:true}}}
+],pool:{},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn("40 笔", result, "应说明截断与合并口径")
+        self.assertIn("合计仍等于剩余积分", result)
+
+    def test_schedule_empty_state(self):
+        """没有日程时给空态，而不是空白表。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100,schedule:[]}}}
+],pool:{},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn("没有到期日程", result)
+
+    def test_production_schedule_renders(self):
+        """生产快照里的日程也要能渲染（真实数据：CN 号 119 套餐 / 119 时刻）。"""
+        result = self.run_frontend("""
+S.data = testdata_state_production;
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, picker:$('#schedAccount').innerHTML};
+""", fixtures=("testdata_state_production.json",))
+        self.assertIn("/", result["rows"], "应渲染出具体到期时刻")
+        self.assertIn('data-a="', result["picker"])
+        # 真实数据里最近一批在 10 月中旬（快照抓取时全池最早到期 10/15）。
+        self.assertIn("10/", result["rows"])
 
 
 if __name__ == "__main__":

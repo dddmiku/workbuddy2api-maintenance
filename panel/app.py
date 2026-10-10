@@ -1087,7 +1087,8 @@ def build_state(force_credit=False):
             # 取较大者：两者口径同源（同一上游字段、同一窗口），差异只来自数据新鲜度；
             # 取大不会漏报"要作废了"，符合这个提示的用途（宁可多提醒，不可漏）。
             "expiring": max(int(c.get("expiring") or 0), int(p.get("credits_expiring") or 0)),
-            # 到期分布（固定档位，互斥，合计 = remain）：积分有效期页用。
+            # 到期分布（固定档位，互斥，合计 = remain）+ 逐笔日程（具体几号几点过期多少）：
+            # 积分有效期页用。两者是同一份数据的两种粒度，故同放 expiry 一层。
             "expiry": c.get("expiry") or {},
             "expiringWindowHours": int(c.get("expiring_window_hours") or 0),
         }

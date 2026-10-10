@@ -39,3 +39,16 @@
 @media (max-width:640px){
   .exp-bars{grid-template-columns:minmax(0,1fr)}
 }
+
+/* ══ 到期日程表 ════════════════════════════════════════════════════
+ * 绝对时刻用等宽字体（一列时刻能对齐扫读），并按紧迫度上色：
+ * 3 天内 err、7 天内 warn、30 天内 info、更远保持中性。
+ */
+.sched-t{font:12.5px/1 var(--mono);font-variant-numeric:tabular-nums}
+.sched-t.e{color:var(--err);font-weight:600}
+.sched-t.w{color:var(--warn);font-weight:500}
+.sched-t.a{color:var(--info)}
+.sched-trunc{padding:10px 0;line-height:1.6}
+/* 账号选择器可能有很多号：横向滚动而不是撑破面板。 */
+#schedAccount{max-width:100%;overflow-x:auto}
+#schedAccount button{max-width:150px;overflow:hidden;text-overflow:ellipsis}
