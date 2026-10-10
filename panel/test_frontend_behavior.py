@@ -510,5 +510,63 @@ return {empty:empty, badgeEmpty:badgeEmpty, badgeOne:badgeOne, badgeAll:badgeAll
         self.assertEqual(result["badgeAll"], "", "不过滤时不显示计数徽标")
 
 
+    def test_expiring_credits_are_surfaced(self):
+        """快过期积分必须显示出来——到期即作废，运维得知道有积分要浪费了。
+
+        数据来自网关 /status 的 credits_expiring（签到/积分任务按 expiring_soon
+        窗口判定），面板经 /api/state 透传成 credits.expiring。三处都要显示：
+        总览卡片、积分卡片合计、账号行。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}},
+  {uid:'u2',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,used:100,expiring:0}}
+],pool:{total:2,healthy:2}};
+renderMetrics();
+var metrics=$('#metrics').innerHTML;
+renderCredit();
+var credit=$('#creditPanel').innerHTML;
+renderAccounts();
+var rows=$('#acctRows').innerHTML;
+return {metrics:metrics, credit:credit, rows:rows};
+""")
+        self.assertIn("即将过期", result["metrics"], "总览卡片应提示有积分快过期")
+        self.assertIn("120", result["metrics"])
+        self.assertIn("快过期", result["credit"], "积分卡片应显示快过期合计")
+        self.assertIn("120", result["credit"])
+        self.assertIn("即将作废", result["credit"])
+        self.assertIn("其中 120 即将过期", result["rows"], "账号行应标出该号的快过期积分")
+
+    def test_no_expiring_credits_shows_nothing(self):
+        """没有快过期积分时不显示任何相关文案（大多数时候如此，不该占位）。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:0}}
+],pool:{total:1,healthy:1}};
+renderMetrics(); var m=$('#metrics').innerHTML;
+renderCredit();   var c=$('#creditPanel').innerHTML;
+renderAccounts(); var r=$('#acctRows').innerHTML;
+return {m:m,c:c,r:r};
+""")
+        for part, name in ((result["m"], "总览"), (result["c"], "积分卡"), (result["r"], "账号行")):
+            self.assertNotIn("过期", part, "%s 不该在无快过期积分时出现提示" % name)
+
+    def test_expiring_rows_are_escaped_not_html(self):
+        """mrow 会转义值（防 XSS），所以快过期提示必须用它的 cls 上色，不能塞 HTML。
+
+        2026-10-10 实测踩到：直接传 <span> 会把标签当字面文本显示出来。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}}
+],pool:{total:1,healthy:1}};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertNotIn("&lt;span", result, "快过期提示不该把 HTML 当文本输出")
+        self.assertNotIn("<span class=\"expiring\">", result, "mrow 会转义，不能塞 HTML")
+        self.assertIn('class="v w"', result, "应改用 mrow 的 cls 参数上警示色")
+
+
 if __name__ == "__main__":
     unittest.main()

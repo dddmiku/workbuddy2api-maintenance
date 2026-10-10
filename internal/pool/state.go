@@ -554,18 +554,21 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
-		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:            reason,
-		Disabled:          e.disabled,
-		SuccessCount:      e.successCount,
-		ErrTotal:          e.errTotal,
-		LastSuccessTime:   e.lastSuccess,
-		LastErrTime:       e.lastErr,
-		Until:             e.until,
-		SoftStreak:        e.softStreak,
-		InFlight:          int(e.inFlight.Load()),
-		BreakerFails:      e.fails,
-		BreakerUntil:      e.breakerUntil,
+		// 快过架子集（Credits 的一部分）。写入口 SetCreditsDetailed 已钳到 [0,credits]，
+		// 这里再钳一次，防止持久化恢复或扣减竞态让它短暂超过总量。
+		CreditsExpiring: min(e.creditsExpiring, e.credits),
+		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:          reason,
+		Disabled:        e.disabled,
+		SuccessCount:    e.successCount,
+		ErrTotal:        e.errTotal,
+		LastSuccessTime: e.lastSuccess,
+		LastErrTime:     e.lastErr,
+		Until:           e.until,
+		SoftStreak:      e.softStreak,
+		InFlight:        int(e.inFlight.Load()),
+		BreakerFails:    e.fails,
+		BreakerUntil:    e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

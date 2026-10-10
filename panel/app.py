@@ -1026,6 +1026,9 @@ def build_state(force_credit=False):
             "used": c.get("used"),
             "packages": c.get("packages"),
             "ok": c.get("ok"),
+            # 快过期积分子集（remain 的一部分）：由网关签到/积分任务按 expiring_soon
+            # 窗口判定，面板据此提示「其中 N 即将过期」。缺失按 0（旧网关无此字段）。
+            "expiring": p.get("credits_expiring") or 0,
         }
         accounts.append(s)
 

@@ -36,16 +36,20 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Realm         string    `json:"realm,omitempty"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID      string `json:"uid"`
+	Realm    string `json:"realm,omitempty"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsExpiring 即将过期的积分子集（Credits 的一部分），由签到/积分任务按
+	// expiring_soon 窗口判定。选号权重对它额外加成以优先消耗——面板据此提示
+	// 「其中 N 即将过期」，让运维知道有积分要作废（issue:积分过期）。
+	CreditsExpiring int64     `json:"credits_expiring,omitempty"`
+	Cooling         bool      `json:"cooling"`
+	CoolKind        string    `json:"cool_kind,omitempty"`
+	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
+	Until           time.Time `json:"until,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。

@@ -398,6 +398,8 @@ function renderMetrics(){
     return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
   var pct = size ? Math.round(remain / size * 100) : 0;
   var hpct = total ? Math.round(healthy / total * 100) : 0;
+  // 快过期积分合计：到期即作废，总览页给一个汇总，免得逐行去找。
+  var expiring = have.reduce(function(s, x){ return s + (Number(x.credits.expiring) || 0); }, 0);
 
   $('#metrics').innerHTML = [
     metric('账号', a.length, on + ' 启用', (a.length - on) + ' 个停用',
@@ -406,8 +408,8 @@ function renderMetrics(){
       cooling ? (cooling + ' 个冷却中') : (dis ? (dis + ' 个停用') : '全部可用'),
       cooling ? 'w' : (dis ? 'e' : 'ok'), hpct, IC.pulse),
     metric('可用积分', num(remain), '剩余',
-      have.length + ' / ' + a.length + ' 个账号取到',
-      pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok'), pct, IC.coins),
+      expiring > 0 ? (num(expiring) + ' 即将过期') : (have.length + ' / ' + a.length + ' 个账号取到'),
+      expiring > 0 ? 'w' : (pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok')), pct, IC.coins),
     metric('排程', taskList().length ? String(taskList().length) : '—', '个任务',
       runs ? (runs + ' 个执行中') : '全部空闲', runs ? 'w' : '', null, IC.clock)
   ].join('');
@@ -513,7 +515,9 @@ function renderCredit(){
     var remain = list.reduce(function(s, x){ return s + x.credits.remain; }, 0);
     var size = list.reduce(function(s, x){
       return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
-    return {remain: remain, size: size, used: Math.max(0, size - remain), count: list.length};
+    var expiring = list.reduce(function(s, x){ return s + (Number(x.credits.expiring) || 0); }, 0);
+    return {remain: remain, size: size, used: Math.max(0, size - remain),
+            count: list.length, expiring: expiring};
   }
   var total = sumOf(have);
   var remain = total.remain, size = total.size, used = total.used;
@@ -525,6 +529,12 @@ function renderCredit(){
     '</div>' +
     mrow('已用', num(used)) +
     mrow('总额度', num(size)) +
+    // 快过期积分：到期即作废。有才显示，并在分域小计里也各自标出来。
+    // mrow 会对值做转义（防止 XSS），所以只能用它的 cls 参数上色，不能塞 HTML。
+    (total.expiring > 0
+      ? mrow('其中快过期', num(total.expiring) + '（' +
+          Math.round(total.expiring / Math.max(1, remain) * 100) + '% 即将作废）', 'w')
+      : '') +
     mrow('取到积分', have.length + ' / ' + a.length);
   // 分域小计：只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
   [['global', '国际'], ['cn', '国内']].forEach(function(pair){
@@ -533,7 +543,9 @@ function renderCredit(){
     if (!subset.length) return;
     var part = sumOf(subset);
     var share = remain ? Math.round(part.remain / remain * 100) : 0;
-    html += mrow(label + '剩余', num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）');
+    html += mrow(label + '剩余', num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）' +
+      (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : ''),
+      part.expiring > 0 ? 'w' : '');
   });
   if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
   else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
@@ -601,12 +613,20 @@ function renderAccounts(){
     var coolEnd = (S.loadedAt || Date.now()) + (Number(p.coolRemaining) || 0) * 1000;
     p.coolRemaining = Math.max(0, Math.ceil((coolEnd - Date.now()) / 1000));
     var left = daysLeft(a.expiresAt);
+    // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
+    // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
+    // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
+    var expiring = Number(c.expiring) || 0;
+    var expiringLine = (expiring > 0 && typeof c.remain === 'number')
+      ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
+        num(expiring) + ' 即将过期</span>'
+      : '';
     var creditCell = (typeof c.remain === 'number')
       ? '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
         '<span class="m">已用 ' + num(c.used) + ' / ' + num(c.size) + '</span>' +
         (typeof c.size === 'number' && c.size > 0
           ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
-          : '') + '</div>'
+          : '') + expiringLine + '</div>'
       : '<span style="color:var(--ink-3)">—</span>';
     // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
     // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
