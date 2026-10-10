@@ -47,11 +47,11 @@ def run(args, timeout=60, check=False):
             except FileNotFoundError:
                 continue
         return 0, ''.join(rows), ''
-    if len(args) >= 3 and args[:2] == ['exec', container]:
-        command = args[2:]
-        # 允许 docker 的 -e KEY=VALUE 前缀（面板给 ./credit 透传 WB2A_EXPIRING_SOON
-        # 时用）：剥掉它们后按原规则校验，并把键值注入子进程环境。不接受其它 docker
-        # 旗标——原生部署没有容器边界，白名单必须保持窄。
+    if len(args) >= 3 and args[0] == 'exec':
+        # 面板可能带 docker 的 -e KEY=VALUE 前缀（给 ./credit 透传
+        # WB2A_EXPIRING_SOON 时用）。必须先剥掉再校验容器名：native 模式下没有
+        # docker，args 是面板自己拼的，容器名固定是第二个位置参数。
+        command = list(args[1:])
         exec_env = {}
         while len(command) >= 2 and command[0] == '-e':
             pair = command[1]
@@ -60,6 +60,11 @@ def run(args, timeout=60, check=False):
                 return 1, '', '不支持此运行操作'
             exec_env[key] = value
             command = command[2:]
+        # 剥完旗标后第一个位置参数必须是容器名；不接受其它 docker 旗标——原生
+        # 部署没有容器边界，白名单必须保持窄。
+        if not command or command[0] != container:
+            return 1, '', '不支持此运行操作'
+        command = command[1:]
         allowed = command == ['./credit']
         if command and command[0] == './login':
             allowed = len(command) in (3, 4) and command[1] in ('--realm=cn', '--realm=global') and command[-1] in ('url', 'poll')
