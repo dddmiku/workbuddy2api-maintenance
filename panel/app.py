@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-10-10：新增积分有效期页的数据透传与账号复活转发（/api/account/revive）；
+#             credits.expiry 改由 ./credit 现算，expiring 与 /status 取较大者。
 # 2026-09-26：登录限流按 IPv6 /64 分桶、新增全站失败节流与可选管理入口 CIDR 白名单。
 # 2026-09-26：面板版本同步为 2.4.2（输出预算与全项目审查修复）。
 # 2026-09-25：无筛选条件直接使用空参数列表，兼容Python3.8严格解析空查询串的差异。
@@ -687,6 +689,36 @@ def gateway_post(path, timeout=30):
         return False, {"error": {"message": "连不上网关：%s" % ex}}
 
 
+def gateway_post_json(path, payload, timeout=30):
+    """带 JSON 请求体向网关发 POST。返回 (ok, payload)。
+
+    与 gateway_post 分开（而不是给它加个可选 body）：那条路径的既有调用点
+    （tasks/run、service/restart、update/*）都是空体，改动签名会波及全部调用点，
+    而空体与带体在 socket 与 urlopen 两条路径上的写法并不一样。
+    """
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        management_socket = key_management.socket_path(CONFIG_PATH, BASE)
+        if management_socket:
+            code, result = key_management.request(management_socket, "POST", path, body=payload, timeout=timeout)
+            return code < 400, result
+    except (OSError, ValueError):
+        return False, {"ok": False, "message": "无法读取网关配置"}
+    key = api_key()
+    req = Request(GATEWAY + path, data=raw, method="POST",
+                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            return True, json.loads(r.read().decode("utf-8"))
+    except HTTPError as e:
+        try:
+            return False, json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return False, {"error": {"message": "网关返回 %d" % e.code}}
+    except (URLError, OSError, ValueError) as ex:
+        return False, {"error": {"message": "连不上网关：%s" % ex}}
+
+
 def set_task_enabled(key, enabled):
     """改 config.json 的 schedule.<key>_enabled。返回 (ok, message)。
 
@@ -964,11 +996,33 @@ def _start_credit_refresh_locked():
     return refresh
 
 
+def _expiring_soon_env():
+    """把网关 pool.expiring_soon 透传给 ./credit，让面板的「N 天内」与选号权重同口径。
+
+    读不到/非法 → 返回空（credit 自己回落默认 7 天）。配置是管理员可控的
+    （pool.expiring_soon），面板文案必须跟着它走，否则会出现「面板说 3 天内
+    要过期、实际网关按 7 天在加权」的错位。
+    """
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = (json.load(f).get("pool") or {}).get("expiring_soon")
+    except (OSError, ValueError):
+        return ""
+    value = str(raw or "").strip()
+    # 只接受 Go duration 形状（数字 + 单位），避免把任意配置值塞进 env。
+    return value if re.fullmatch(r"\d+(\.\d+)?(ns|us|µs|ms|s|m|h)", value) else ""
+
+
 def _query_credits():
     """只执行及校验查询；缓存统一由刷新协调器提交，错误不覆盖成功数据。"""
     if not container_running():
         return {"error": "容器未运行"}
-    rc, out, err = docker(["exec", CONTAINER, "./credit"], timeout=90)
+    env = {}
+    soon = _expiring_soon_env()
+    if soon:
+        env["WB2A_EXPIRING_SOON"] = soon
+    rc, out, err = docker(["exec"] + [a for pair in sorted(env.items()) for a in ("-e", "%s=%s" % pair)]
+                          + [CONTAINER, "./credit"], timeout=90)
     if rc != 0:
         return {"error": err or out or "credit 执行失败"}
     try:
@@ -1026,9 +1080,16 @@ def build_state(force_credit=False):
             "used": c.get("used"),
             "packages": c.get("packages"),
             "ok": c.get("ok"),
-            # 快过期积分子集（remain 的一部分）：由网关签到/积分任务按 expiring_soon
-            # 窗口判定，面板据此提示「其中 N 即将过期」。缺失按 0（旧网关无此字段）。
-            "expiring": p.get("credits_expiring") or 0,
+            # 快过期积分子集（remain 的一部分）。来源优先级：
+            #   1) ./credit 的 expiring（本次查询时按 WB2A_EXPIRING_SOON 现算，全账号都有，
+            #      包括不签到的 global 号）；
+            #   2) 网关 /status 的 credits_expiring（签到任务写的，只覆盖 CN 号且最长滞后 12h）。
+            # 取较大者：两者口径同源（同一上游字段、同一窗口），差异只来自数据新鲜度；
+            # 取大不会漏报"要作废了"，符合这个提示的用途（宁可多提醒，不可漏）。
+            "expiring": max(int(c.get("expiring") or 0), int(p.get("credits_expiring") or 0)),
+            # 到期分布（固定档位，互斥，合计 = remain）：积分有效期页用。
+            "expiry": c.get("expiry") or {},
+            "expiringWindowHours": int(c.get("expiring_window_hours") or 0),
         }
         accounts.append(s)
 
@@ -1346,6 +1407,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.login_poll(body))
             if path == "/api/account/toggle":
                 return self._json(200, self.account_toggle(body))
+            if path == "/api/account/revive":
+                return self._json(200, self.account_revive(body))
             if path == "/api/account/delete":
                 return self._json(200, self.account_delete(body))
             if path == "/api/task/run":
@@ -1376,6 +1439,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/password": {"current", "username", "password", "confirm"},
             "/api/login/start": {"realm"}, "/api/login/poll": {"realm", "login_id"},
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
+            "/api/account/revive": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
             "/api/service/restart": set(), "/api/credit": set(),
             "/api/models/refresh": set(),
@@ -1849,6 +1913,24 @@ class Handler(BaseHTTPRequestHandler):
                 "trashed": os.path.basename(dst),
                 "message": "已删除 %s(回收件 %s)，%s" % (
                     entry["uid"][:8], os.path.basename(dst), msg)}
+
+    def account_revive(self, body):
+        """复活被网关停用的账号（清 disabled + reason，账号回到可选池）。
+
+        只走网关的管理通道 POST /accounts/revive；不改 auth 文件——池级停用是
+        网关自己记的状态（被上游封禁/内容审核标记），文件层面的启停是另一回事
+        （见 account_toggle）。两者独立，运维可能都需要用。
+        """
+        uid = body.get("uid") or ""
+        ok, payload = gateway_post_json("/accounts/revive", {"uid": uid})
+        if not ok:
+            msg = (payload.get("error") or {}).get("message") or payload.get("message") or "复活失败"
+            return {"ok": False, "message": msg}
+        if not payload.get("ok"):
+            return {"ok": False, "message": payload.get("message") or "复活失败"}
+        if not payload.get("was_disabled"):
+            return {"ok": True, "message": "该账号未被停用，无需复活"}
+        return {"ok": True, "message": "已复活 %s" % uid[:8]}
 
     def task_run(self, body):
         key = (body.get("key") or "").strip()

@@ -693,6 +693,47 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 @media(max-width:900px){.requests-table-wrap .requests-table thead{display:table-header-group}.requests-table-wrap .requests-table tbody tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.requests-table-wrap .requests-table td{display:table-cell;padding:11px 14px;border-bottom:1px solid var(--line)}.requests-table-wrap .requests-table td::before{display:none}.requests-table-wrap .requests-table tbody tr:hover{background:var(--surface-2)}}
 @media(max-width:650px){.requests-detail-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.requests-attempt-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.requests-dialog-body{padding:13px}.requests-dialog-head,.requests-dialog-foot{padding:12px 14px}.requests-attempt{padding:12px}.requests-pagination .sp{display:none}.requests-pagination>span:first-child{width:100%;margin-bottom:2px}.requests-filters{gap:9px}}
 @media(max-width:420px){.requests-filters{grid-template-columns:minmax(0,1fr)}.requests-attempt-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+/* ══ 积分有效期页 ═══════════════════════════════════════════════════
+ * 参照总览的 .metrics 卡片与 .comp 进度条：
+ *   · 顶部三张卡复用 .metric 的排版（标题 / 大数字 / 说明三行）；
+ *   · 分档条沿用「色块 + 宽度百分比 + 百分比文字」的既有语言，
+ *     颜色按紧迫度递进（err 最急 → info → 中性 → ok 不会过期）。
+ * 2026-10-10 新建：积分按套餐分批到期，原先只在总览卡上做了一行条件提示
+ *           （窗口内无积分时整块不出现），运维看不到「哪天、哪个号、多少分要作废」。
+ */
+
+.exp-hd{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:16px}
+.exp-hd .metric{margin:0}
+
+/* 分档条：每档一行（标签 + 数值 / 进度条 / 百分比）。
+   用 grid 让三列对齐，条宽按占剩余的比例；极小值给 1% 下限以免完全看不见。 */
+.exp-bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:18px}
+.exp-bar{padding:12px 14px;border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);min-width:0}
+.exp-bar-h{display:flex;align-items:baseline;gap:8px;font-size:12.5px;color:var(--ink-2)}
+.exp-bar-h b{margin-left:auto;font:600 15px/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
+.exp-bar-t{height:5px;margin-top:9px;background:var(--sunken);border-radius:3px;overflow:hidden}
+.exp-bar-t i{display:block;height:100%;background:var(--ink-3);border-radius:3px;
+  transition:width .3s var(--ease)}
+.exp-bar-s{margin-top:6px;font-size:11.5px;color:var(--ink-3);font-family:var(--mono)}
+/* 紧迫度配色：1/3 天用 err，7 天用 warn，30 天用 info，之后中性，不会过期用 ok。 */
+.exp-bar.e .exp-bar-t i{background:var(--err)}
+.exp-bar.w .exp-bar-t i{background:var(--warn)}
+.exp-bar.a .exp-bar-t i{background:var(--info)}
+.exp-bar.ok .exp-bar-t i{background:var(--ok)}
+.exp-bar.e .exp-bar-h b{color:var(--err)}
+.exp-bar.w .exp-bar-h b{color:var(--warn)}
+
+/* 表格里的数字：1 天内到期的用警示色标出来，其余保持普通字重；
+   零值用极浅色「—」，避免一排 0 抢注意力。 */
+.exp-urgent{color:var(--err);font-weight:600}
+.exp-zero{color:var(--ink-3)}
+
+@media (max-width:900px){
+  .exp-hd{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:640px){
+  .exp-bars{grid-template-columns:minmax(0,1fr)}
+}
 </style>
 </head>
 <body>
@@ -736,6 +777,11 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.4"/><path d="M3.2 19.5a6.3 6.3 0 0 1 12.6 0"/><path d="M17 6.2a3.4 3.4 0 0 1 0 6.6"/><path d="M18.6 19.5a6.3 6.3 0 0 0-2.2-4.4"/></svg>
         账号
         <i id="tabAcct">0</i>
+      </button>
+      <button data-view="credits">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3 1.8"/></svg>
+        积分有效期
+        <i id="tabCredits">—</i>
       </button>
       <button data-view="keys">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="9" r="4.5"/><path d="m11.3 12.3 8 8 2-2-2-2 1.5-1.5-2-2-1.5 1.5-2.7-2.7"/></svg>
@@ -854,6 +900,34 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
             </table>
           </div>
         </div>
+      </section>
+
+      <section class="view hide" data-view="credits">
+        <div class="exp-hd" id="creditsHead"></div>
+        <div class="exp-bars" id="creditsBars"></div>
+        <div class="panel">
+          <div class="ph">
+            <h2>按账号</h2>
+            <span class="sp"></span>
+            <span class="sub" id="creditsMeta"></span>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr>
+                <th>账号</th>
+                <th class="r">剩余</th>
+                <th class="r">1 天内</th>
+                <th class="r">3 天内</th>
+                <th class="r">7 天内</th>
+                <th class="r">30 天内</th>
+                <th class="r">不会过期</th>
+                <th>最近到期</th>
+              </tr></thead>
+              <tbody id="creditsRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。</p>
       </section>
 
       <section class="view hide" data-view="keys">
@@ -1226,6 +1300,7 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 "use strict";
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-10-10：新增积分有效期页；停用口径改为「文件级 ∪ 池级」并补池级复活按钮。
 // 2026-09-25：接入请求消费明细导航与刷新，保持筛选和历史分页状态。
 // 2026-09-24：忽略过时刷新响应，日志按完整行检测更新并补取改变后的条数；修正空成功时间、凭证到期判断和当前页刷新。
 // 2026-09-24：冷却截止时间随数据快照固定，搜索或切页不再重新开始倒计时；同一到期快照仅补取一次。
@@ -1440,6 +1515,7 @@ function toast(msg, kind){
 var PAGE = {
   overview:{ t:'概览', d:'账号池与运行状态' },
   accounts:{ t:'账号', d:'凭证、积分与启停' },
+  credits: { t:'积分有效期', d:'积分到期分布与即将作废的余额' },
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
   usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
   requests:{ t:'请求明细', d:'核对每次调用、重试消费与账号调度' },
@@ -1573,6 +1649,7 @@ function render(){
   var a = d.accounts || [], tasks = taskList();
   $('#tabAcct').textContent = a.length;
   $('#tabTask').textContent = tasks.length ? tasks.length : '—';
+  renderCreditsTab();
   renderNotes();
   renderStrip();
   renderView(CURRENT_VIEW);
@@ -1583,6 +1660,7 @@ function renderView(v){
   if (!S.data) return;
   if (v === 'overview'){ renderMetrics(); renderPool(); renderCredit(); renderOvTasks(); }
   else if (v === 'accounts'){ renderAccounts(); }
+  else if (v === 'credits'){ renderCreditsPage(); }
   else if (v === 'tasks'){ renderTasks(); }
   else if (v === 'system'){ renderSystem(); }
 }
@@ -1595,6 +1673,8 @@ function renderAll(){
   renderCredit();
   renderOvTasks();
   renderAccounts();
+  renderCreditsPage();
+  renderCreditsTab();
   renderTasks();
   renderSystem();
 }
@@ -1612,9 +1692,31 @@ function metric(k, value, unit, sub, cls, pct, icon){
     '</div>';
 }
 
+// acctOff 报告账号是否处于「停用」状态——两个来源取并集：
+//   · 文件级：面板把 workbuddy-X.json 改名成 .disabled，网关下次加载时不再读它
+//     （重启后生效，见 renderNotes 的 pendingRestart）；
+//   · 池级：网关自己停用的号（被上游封禁/内容审核标记等），仍在池内但不可选。
+//
+// 为什么要并集（2026-10-10 用户反馈「卡片数字打架」）：总览的「账号」卡原先只看
+// 文件级（线上 28 个文件都没 .disabled → 恒显示「0 个停用」），而「账号池」卡读
+// 网关 /status（7 个池级停用）。两张卡并排却各说各话。运维关心的是「有几个号现在
+// 用不了」，那就是并集。
+function acctOff(a){
+  return !!a.disabled || !!((a.pool || {}).disabled);
+}
+// acctOffKind 区分停用来源，供提示文案说明处置方式（文件级要重启，池级要重登）。
+function acctOffKind(a){
+  var file = !!a.disabled, pool = !!((a.pool || {}).disabled);
+  if (file && pool) return 'both';
+  if (file) return 'file';
+  if (pool) return 'pool';
+  return '';
+}
+
 function renderMetrics(){
   var d = S.data, a = d.accounts || [], p = d.pool || {};
-  var on = a.filter(function(x){ return !x.disabled; }).length;
+  var on = a.filter(function(x){ return !acctOff(x); }).length;
+  var off = a.length - on;
   var total = Number(p.total) || 0, healthy = Number(p.healthy) || 0;
   var cooling = Number(p.cooling) || 0, dis = Number(p.disabled) || 0;
   var runs = taskList().filter(function(t){ return t.running; }).length;
@@ -1625,11 +1727,12 @@ function renderMetrics(){
   var pct = size ? Math.round(remain / size * 100) : 0;
   var hpct = total ? Math.round(healthy / total * 100) : 0;
   // 快过期积分合计：到期即作废，总览页给一个汇总，免得逐行去找。
-  var expiring = have.reduce(function(s, x){ return s + (Number(x.credits.expiring) || 0); }, 0);
+  var expiring = have.reduce(function(s, x){
+    return s + expiringSoon(x.credits, 7); }, 0);
 
   $('#metrics').innerHTML = [
-    metric('账号', a.length, on + ' 启用', (a.length - on) + ' 个停用',
-      (a.length - on) ? 'w' : 'ok', null, IC.users),
+    metric('账号', a.length, on + ' 启用', off + ' 个停用',
+      off ? 'w' : 'ok', null, IC.users),
     metric('账号池', healthy + ' / ' + total, '健康',
       cooling ? (cooling + ' 个冷却中') : (dis ? (dis + ' 个停用') : '全部可用'),
       cooling ? 'w' : (dis ? 'e' : 'ok'), hpct, IC.pulse),
@@ -1741,7 +1844,7 @@ function renderCredit(){
     var remain = list.reduce(function(s, x){ return s + x.credits.remain; }, 0);
     var size = list.reduce(function(s, x){
       return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
-    var expiring = list.reduce(function(s, x){ return s + (Number(x.credits.expiring) || 0); }, 0);
+    var expiring = list.reduce(function(s, x){ return s + expiringSoon(x.credits, 7); }, 0);
     return {remain: remain, size: size, used: Math.max(0, size - remain),
             count: list.length, expiring: expiring};
   }
@@ -1811,8 +1914,12 @@ function renderOvTasks(){
 }
 
 function acctState(a){
-  if (a.disabled) return { cls:'n', text:'已停用' };
   var p = a.pool || {};
+  // 池级停用（网关自己停的，多为被上游封禁/标记）优先展示——这是真正"用不了"
+  // 且需要重登的原因；文件级停用（面板改名）在它之后。两者都用 acctOff 口径，
+  // 保证与总览卡片一致（见 acctOff 注释）。
+  if (p.disabled) return { cls:'n', text:'已停用' };
+  if (a.disabled) return { cls:'n', text:'已停用' };
   if (!p.inPool) return { cls:'w', text:'不在池中' };
   if (p.cooling) return { cls:'w', text:'冷却中' };
   if (!p.healthy) return { cls:'e', text:'异常' };
@@ -1822,8 +1929,8 @@ function renderAccounts(){
   var all = S.data.accounts || [];
   var list = all.slice();
   var q = S.q.trim().toLowerCase();
-  if (S.filter === 'on') list = list.filter(function(a){ return !a.disabled; });
-  if (S.filter === 'off') list = list.filter(function(a){ return a.disabled; });
+  if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
+  if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
   if (q) list = list.filter(function(a){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
            (a.uid || '').toLowerCase().indexOf(q) >= 0;
@@ -1842,7 +1949,7 @@ function renderAccounts(){
     // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
-    var expiring = Number(c.expiring) || 0;
+    var expiring = expiringSoon(c, 7);
     var expiringLine = (expiring > 0 && typeof c.remain === 'number')
       ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
         num(expiring) + ' 即将过期</span>'
@@ -1883,12 +1990,155 @@ function renderAccounts(){
       (lastSub ? '<span class="sub">' + esc(lastSub) + '</span>' : '') + '</span></td>' +
       // 操作列：td 保持 table-cell（`class="r"` 与其它列一致地拿到 border-collapse
       // 的底边），flex 交给内层 div——td 自己 flex 化会让折叠边框不再绘制它。
+      //
+      // 池级停用（p.disabled）的号给「复活」而不是「启用」：文件级改名对它们无效
+      // （文件本来就在池里），只有 POST /accounts/revive 能清网关侧的 disabled+reason。
+      // 两类停用都可能同时存在，故两个按钮按需分别出现。
       '<td class="r" data-l="操作"><div class="row-acts">' +
+      (p.disabled
+        ? '<button class="btn sm" data-revive="' + esc(a.uid) + '" title="' +
+          esc(p.disabledReason || '清除网关侧的停用标记') + '">复活</button>'
+        : '') +
       '<button class="btn sm" data-toggle="' + esc(a.uid) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' +
       (a.disabled ? '启用' : '停用') + '</button>' +
       '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
       '" title="删除">' + svg(IC.trash, 13) + '</button></div></td></tr>';
   }).join('');
+}
+
+/* ── 积分有效期页 ─────────────────────────────────────
+ * 数据来源：账号的 credits.expiry（cmd/credit 直查上游 billing/meter 得到的分档）。
+ * 为什么不在总览卡上只做一行提示：积分按套餐分批到期，运维需要看到「哪天、哪个号、
+ * 多少分要作废」才能决定是否优先跑掉——一行汇总数看不出这些。
+ * 分档是固定的 1/3/7/30 天，面板不再按窗口重复查上游。
+ */
+// EXPIRY_BUCKETS 与后端 upstream.ExpiryBreakdown 的档位一一对应。
+var EXPIRY_BUCKETS = [
+  { key:'within_1d',  label:'1 天内',  cls:'e' },
+  { key:'within_3d',  label:'3 天内',  cls:'e' },
+  { key:'within_7d',  label:'7 天内',  cls:'w' },
+  { key:'within_30d', label:'30 天内', cls:'a' },
+  { key:'later',      label:'30 天后', cls:'' },
+  { key:'unlimited',  label:'不会过期', cls:'ok' }
+];
+function expiryOf(c){
+  var e = (c && c.expiry) || {};
+  var out = {}, sum = 0;
+  EXPIRY_BUCKETS.forEach(function(b){
+    var v = Number(e[b.key]) || 0;
+    out[b.key] = v; sum += v;
+  });
+  out.next_end = e.next_end || '';
+  out.sum = sum;
+  return out;
+}
+// expiringSoon 返回「N 天内」的累计快过期积分（含更紧迫档位，不含不会过期的部分）。
+//
+// 两个数据来源，优先用更细的分档：
+//   · credits.expiry（分档，积分有效期页用）——存在且有任何一档非零时按天累计；
+//   · credits.expiring（标量，网关/credit 直接给的窗口内合计）——分档缺失时回落到它。
+// 回落是必要的：旧面板数据/旧网关只给标量，硬走分档会把「有积分要作废」显示成 0。
+function expiringSoon(c, days){
+  if (!c) return 0;
+  var e = c.expiry;
+  if (e && typeof e === 'object'){
+    var hasBucket = EXPIRY_BUCKETS.some(function(b){ return (Number(e[b.key]) || 0) > 0; });
+    if (hasBucket){
+      var s = 0;
+      EXPIRY_BUCKETS.forEach(function(b){
+        if (b.key === 'later' || b.key === 'unlimited') return;
+        var d = parseInt(b.label, 10);           // "1 天内" → 1
+        if (d <= days) s += Number(e[b.key]) || 0;
+      });
+      return s;
+    }
+  }
+  return Number(c.expiring) || 0;
+}
+function fmtEnd(iso){
+  if (!iso) return '—';
+  var t = new Date(iso);
+  if (isNaN(t.getTime())) return '—';
+  var days = Math.ceil((t.getTime() - Date.now()) / 86400000);
+  var rel = days <= 0 ? '已到期' : (days === 1 ? '明天' : days + ' 天后');
+  var md = (t.getMonth() + 1) + '/' + t.getDate() + ' ' +
+    ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2);
+  return md + '（' + rel + '）';
+}
+function renderCreditsPage(){
+  var d = S.data || {}, a = d.accounts || [];
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  if (!have.length){
+    $('#creditsHead').innerHTML = '';
+    $('#creditsBars').innerHTML = '';
+    $('#creditsRows').innerHTML = '<tr><td colspan="8" data-l="">' +
+      emptyBox(IC.coins, d.creditPending ? '正在统计积分' : '暂无积分数据',
+        d.creditError ? String(d.creditError) : '稍后自动刷新') + '</td></tr>';
+    $('#creditsMeta').textContent = '';
+    return;
+  }
+  var total = { within_1d:0, within_3d:0, within_7d:0, within_30d:0, later:0, unlimited:0, sum:0 };
+  var remain = 0, soon7 = 0, nextEnd = '';
+  have.forEach(function(x){
+    var e = expiryOf(x.credits);
+    EXPIRY_BUCKETS.forEach(function(b){ total[b.key] += e[b.key]; });
+    total.sum += e.sum;
+    remain += x.credits.remain;
+    soon7 += expiringSoon(x.credits, 7);
+    if (e.next_end && (!nextEnd || new Date(e.next_end) < new Date(nextEnd))) nextEnd = e.next_end;
+  });
+  var windowHours = Number((d.creditTotals || {}).expiring_window_hours) || 0;
+  var windowDays = windowHours ? Math.round(windowHours / 24) : 0;
+  var pctSoon = remain ? Math.round(soon7 / remain * 100) : 0;
+  $('#creditsHead').innerHTML =
+    '<div class="metric"><div class="k">' + (windowDays ? windowDays + ' 天内到期' : '7 天内到期') + '</div>' +
+      '<div class="v">' + svg(IC.clock, 15) + '<b>' + num(soon7) + '</b><small>积分</small></div>' +
+      '<div class="s ' + (soon7 > 0 ? 'w' : 'ok') + '">' +
+      (soon7 > 0 ? '占剩余 ' + pctSoon + '%，到期即作废' : '暂无即将作废的积分') + '</div></div>' +
+    '<div class="metric"><div class="k">剩余合计</div>' +
+      '<div class="v">' + svg(IC.coins, 15) + '<b>' + num(remain) + '</b><small>积分</small></div>' +
+      '<div class="s">' + have.length + ' / ' + a.length + ' 个账号取到</div></div>' +
+    '<div class="metric"><div class="k">最近一次到期</div>' +
+      '<div class="v">' + svg(IC.clock, 15) + '<b>' + (nextEnd ? fmtEnd(nextEnd).replace(/（.*$/, '') : '—') + '</b></div>' +
+      '<div class="s">' + (nextEnd ? fmtEnd(nextEnd).replace(/^.*（|）$/g, '') : '无到期积分') + '</div></div>';
+  // 分档条：把 remain 按到期紧迫度铺成一条，一眼看出「多少要作废」。
+  $('#creditsBars').innerHTML = EXPIRY_BUCKETS.map(function(b){
+    var v = total[b.key];
+    if (!v) return '';
+    var pct = remain ? (v / remain * 100) : 0;
+    return '<div class="exp-bar ' + b.cls + '">' +
+      '<div class="exp-bar-h"><span>' + esc(b.label) + '</span><b>' + num(v) + '</b></div>' +
+      '<div class="exp-bar-t"><i style="width:' + Math.max(1, Math.round(pct)) + '%"></i></div>' +
+      '<div class="exp-bar-s">' + pct.toFixed(pct < 10 ? 1 : 0) + '%</div></div>';
+  }).join('');
+  // 账号表：按「7 天内到期的积分」降序，有作废风险的在最上面。
+  var rows = have.slice().sort(function(x, y){
+    return expiringSoon(y.credits, 7) - expiringSoon(x.credits, 7);
+  });
+  $('#creditsRows').innerHTML = rows.map(function(x){
+    var e = expiryOf(x.credits);
+    function cell(v){
+      return '<td class="r" data-l="">' + (v ? '<span class="' +
+        (v === e.within_1d ? 'exp-urgent' : '') + '">' + num(v) + '</span>' : '<span class="exp-zero">—</span>') + '</td>';
+    }
+    return '<tr>' +
+      '<td data-l="账号"><div class="who">' + esc(x.nickname || '') + '</div>' +
+        '<div class="sub mono">' + esc(shortUid(x.uid)) + ' · ' + esc(String(x.realm || '').toUpperCase()) + '</div></td>' +
+      '<td class="r" data-l="剩余"><b>' + num(x.credits.remain) + '</b></td>' +
+      cell(e.within_1d) + cell(e.within_3d) + cell(e.within_7d) + cell(e.within_30d) +
+      '<td class="r" data-l="不会过期">' + (e.unlimited ? num(e.unlimited) : '<span class="exp-zero">—</span>') + '</td>' +
+      '<td data-l="最近到期"><span class="sub">' + esc(fmtEnd(e.next_end)) + '</span></td></tr>';
+  }).join('');
+  $('#creditsMeta').textContent = have.length + ' 个账号 · 分档互斥，合计 = 剩余';
+}
+// 侧栏计数：有积分将在窗口内到期的账号数（0 时显示 —，避免长期占一个数字）。
+function renderCreditsTab(){
+  var el = $('#tabCredits'); if (!el) return;
+  var a = (S.data && S.data.accounts) || [];
+  var n = a.filter(function(x){
+    return x.credits && typeof x.credits.remain === 'number' && expiringSoon(x.credits, 7) > 0;
+  }).length;
+  el.textContent = n ? String(n) : '—';
 }
 // 搜索输入防抖：账号表在输入过程中每敲一个字都重建 DOM，几十行时能感到迟滞。
 $('#acctSearch').addEventListener('input', debounce(function(e){ S.q = e.target.value; renderAccounts(); }, 120));
@@ -1901,6 +2151,8 @@ $('#acctFilter').addEventListener('click', function(e){
   renderAccounts();
 });
 $('#acctRows').addEventListener('click', function(e){
+  var rv = e.target.closest('[data-revive]');
+  if (rv) return actRevive(rv.getAttribute('data-revive'));
   var t = e.target.closest('[data-toggle]');
   if (t) return actToggle(t.getAttribute('data-toggle'), t.getAttribute('data-disabled') === '0');
   var d = e.target.closest('[data-del]');
@@ -2012,6 +2264,21 @@ async function actToggle(uid, nextDisabled){
     if (r.ok) await loadAll();
   }catch(err){ toast('操作失败：' + (err && err.message || err), 'err'); }
   finally{ busy(false); }
+}
+function actRevive(uid){
+  ask('复活账号',
+    '将清除网关侧对该号的停用标记，让它重新参与调度。\n\n' +
+    '注意：如果该号是被上游标记（内容审核/封禁）的，复活后第一次请求会被再次拒绝并重新停用——' +
+    '这类号需要先用官方客户端重新登录一次。',
+    '复活', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/revive', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
 }
 function actDelete(uid, name){
   ask('删除账号', '将把「' + (name || shortUid(uid)) + '」移入 auths-trash 并重启网关，可手动从回收目录恢复。',

@@ -7,8 +7,14 @@
 // 输出结构:
 //
 //	{"service":"workbuddy","ts":N,
-//	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
-//	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
+//	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N,
+//	          "expiring":N,"expiring_window_hours":N,"expiry":{...}},
+//	 "accounts":[{"uid","nickname","remain","used","size","packages","expiring",
+//	              "expiring_window_hours","expiry":{...},"ok","error?"}]}
+//
+// expiry 为到期分布分档（within_1d/3d/7d/30d、later、unlimited、next_end），
+// 面板的「积分有效期」页据此渲染。窗口由 WB2A_EXPIRING_SOON 控制（默认 168h）。
+// 2026-10-10：新增到期分档；到期字段改用 CycleEndTime（上游不发 PackageEndTime）。
 //
 // realm 感知：复用 upstream.Client（auth.Parse + upstream.New），global 账号查积分
 // 走 workbuddy.ai /billing/meter/*（404 回落 /v2），CN 账号维持 codebuddy.cn
@@ -24,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +45,40 @@ type accountResult struct {
 	Used     *int64 `json:"used"`
 	Size     *int64 `json:"size"`
 	Packages int    `json:"packages,omitempty"`
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
+	// Expiring 是 Remain 中在到期窗口内即将作废的部分（Remain 的子集）。
+	// 面板据此在账号行/总览卡上提示「其中 N 即将过期」。窗口由 WB2A_EXPIRING_SOON
+	// 控制（默认 168h=7天，与网关 pool.expiring_soon 同口径）；查询失败或不分桶时为 0。
+	Expiring int64 `json:"expiring"`
+	// ExpiringWindowHours 本次分桶用的窗口小时数，供面板文案显示「N 天内」而不是
+	// 硬编码 7 天（窗口可配，文案跟着走）。
+	ExpiringWindowHours int `json:"expiring_window_hours,omitempty"`
+	// Expiry 到期分布（固定档位，互斥，合计 = Remain）：面板「有效期」视图用。
+	// 无到期时间的余额落在 unlimited（不会作废）。
+	Expiry expiryView `json:"expiry"`
+	OK     bool       `json:"ok"`
+	Error  string     `json:"error,omitempty"`
+}
+
+// expiryView 到期分布的 JSON 形态（前端字段名用 snake_case，与面板其余字段一致）。
+type expiryView struct {
+	Within1d  int64  `json:"within_1d"`
+	Within3d  int64  `json:"within_3d"`
+	Within7d  int64  `json:"within_7d"`
+	Within30d int64  `json:"within_30d"`
+	Later     int64  `json:"later"`
+	Unlimited int64  `json:"unlimited"`
+	NextEnd   string `json:"next_end,omitempty"` // RFC3339（本地墙钟），空 = 无到期时间
+}
+
+func newExpiryView(b upstream.ExpiryBreakdown) expiryView {
+	v := expiryView{
+		Within1d: b.Within1d, Within3d: b.Within3d, Within7d: b.Within7d,
+		Within30d: b.Within30d, Later: b.Later, Unlimited: b.Unlimited,
+	}
+	if !b.NextEnd.IsZero() {
+		v.NextEnd = b.NextEnd.Format(time.RFC3339)
+	}
+	return v
 }
 
 func main() {
@@ -52,6 +91,25 @@ func main() {
 	up.GlobalEnabled = true // 允许按 realm 路由：global 账查积分走 workbuddy.ai
 	accounts := collectWithConcurrency(authDir, up, concurrencyFromEnv())
 	printAccounts(accounts, pretty)
+}
+
+// defaultExpiringSoon 默认到期窗口（7 天），与网关 pool.expiring_soon 默认值一致。
+// 面板拿这份数据展示「其中 N 即将过期」，窗口口径必须与选号权重一致，
+// 否则会出现「提示说快过期、但权重没优先消耗」的矛盾。
+const defaultExpiringSoon = 168 * time.Hour
+
+// expiringSoonFromEnv 读 WB2A_EXPIRING_SOON（Go duration 串，如 "168h"）；
+// 空/非法/<=0 → 默认 7 天。
+func expiringSoonFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("WB2A_EXPIRING_SOON"))
+	if raw == "" {
+		return defaultExpiringSoon
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultExpiringSoon
+	}
+	return d
 }
 
 // defaultConcurrency 默认并发度：19 个账号 6 路并发，冷跑从 8.3s 降到约 1.5s，
@@ -88,6 +146,11 @@ func collect(authDir string, up *upstream.Client) []accountResult {
 // 否则每次刷新账号行都会跳位置。上游 Client 自身并发安全（内部 RWMutex + 共享
 // Transport 连接池），每个账号各自带自己的 token，互不干扰。
 func collectWithConcurrency(authDir string, up *upstream.Client, workers int) []accountResult {
+	return collectWithWindow(authDir, up, workers, expiringSoonFromEnv())
+}
+
+// collectWithWindow 是 collectWithConcurrency 的显式窗口版本（供测试注入窗口）。
+func collectWithWindow(authDir string, up *upstream.Client, workers int, soon time.Duration) []accountResult {
 	files, _ := auth.LoadAuthFiles(authDir)
 	if workers < 1 {
 		workers = 1
@@ -138,14 +201,18 @@ func collectWithConcurrency(authDir string, up *upstream.Client, workers int) []
 			defer wg.Done()
 			for item := range jobs {
 				res := accountResult{UID: item.auth.UID, Nickname: item.auth.Nickname}
-				remain, used, size, packs, err := up.ResourceSummary(item.auth)
+				usage, err := up.ResourceUsage(item.auth, soon)
 				if err != nil {
 					res.Error = err.Error()
 				} else {
+					remain, used, size := usage.Remain, usage.Used, usage.Size
 					res.Remain = &remain
 					res.Used = &used
 					res.Size = &size
-					res.Packages = packs
+					res.Packages = usage.Packages
+					res.Expiring = usage.Expiring
+					res.ExpiringWindowHours = int(soon.Hours())
+					res.Expiry = newExpiryView(usage.Expiry)
 					res.OK = true
 				}
 				slots[item.index] = res
@@ -170,8 +237,10 @@ func collectWithConcurrency(authDir string, up *upstream.Client, workers int) []
 
 // printAccounts 汇总并输出结果：-pretty 走人类可读日报，否则 JSON（与老版输出一致）。
 func printAccounts(accounts []accountResult, pretty bool) {
-	var totalRemain, totalUsed, totalSize int64
+	var totalRemain, totalUsed, totalSize, totalExpiring int64
+	var totalExpiry expiryView
 	okCount := 0
+	windowHours := 0
 	for _, a := range accounts {
 		if a.OK {
 			okCount++
@@ -183,6 +252,27 @@ func printAccounts(accounts []accountResult, pretty bool) {
 			}
 			if a.Size != nil {
 				totalSize += *a.Size
+			}
+			totalExpiring += a.Expiring
+			totalExpiry.Within1d += a.Expiry.Within1d
+			totalExpiry.Within3d += a.Expiry.Within3d
+			totalExpiry.Within7d += a.Expiry.Within7d
+			totalExpiry.Within30d += a.Expiry.Within30d
+			totalExpiry.Later += a.Expiry.Later
+			totalExpiry.Unlimited += a.Expiry.Unlimited
+			// 合计口径的最近到期：取所有账号里最早的（RFC3339 串按字典序即时间序，
+			// 但为稳妥仍做真实解析比较）。
+			if a.Expiry.NextEnd != "" {
+				if t, err := time.Parse(time.RFC3339, a.Expiry.NextEnd); err == nil {
+					if totalExpiry.NextEnd == "" {
+						totalExpiry.NextEnd = a.Expiry.NextEnd
+					} else if cur, err2 := time.Parse(time.RFC3339, totalExpiry.NextEnd); err2 == nil && t.Before(cur) {
+						totalExpiry.NextEnd = a.Expiry.NextEnd
+					}
+				}
+			}
+			if a.ExpiringWindowHours > windowHours {
+				windowHours = a.ExpiringWindowHours
 			}
 		}
 	}
@@ -200,6 +290,11 @@ func printAccounts(accounts []accountResult, pretty bool) {
 			"accounts": len(accounts),
 			"ok":       okCount,
 			"failed":   len(accounts) - okCount,
+			// expiring：全账号快过期积分合计（remain 的子集），面板总览卡用。
+			// expiring_window_hours：本次分桶窗口，面板据此写「N 天内」文案。
+			"expiring":              totalExpiring,
+			"expiring_window_hours": windowHours,
+			"expiry":                totalExpiry,
 		},
 		"accounts": accounts,
 	}

@@ -39,6 +39,11 @@
         账号
         <i id="tabAcct">0</i>
       </button>
+      <button data-view="credits">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3 1.8"/></svg>
+        积分有效期
+        <i id="tabCredits">—</i>
+      </button>
       <button data-view="keys">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="9" r="4.5"/><path d="m11.3 12.3 8 8 2-2-2-2 1.5-1.5-2-2-1.5 1.5-2.7-2.7"/></svg>
         密钥管理
@@ -156,6 +161,34 @@
             </table>
           </div>
         </div>
+      </section>
+
+      <section class="view hide" data-view="credits">
+        <div class="exp-hd" id="creditsHead"></div>
+        <div class="exp-bars" id="creditsBars"></div>
+        <div class="panel">
+          <div class="ph">
+            <h2>按账号</h2>
+            <span class="sp"></span>
+            <span class="sub" id="creditsMeta"></span>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr>
+                <th>账号</th>
+                <th class="r">剩余</th>
+                <th class="r">1 天内</th>
+                <th class="r">3 天内</th>
+                <th class="r">7 天内</th>
+                <th class="r">30 天内</th>
+                <th class="r">不会过期</th>
+                <th>最近到期</th>
+              </tr></thead>
+              <tbody id="creditsRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。</p>
       </section>
 
       <section class="view hide" data-view="keys">

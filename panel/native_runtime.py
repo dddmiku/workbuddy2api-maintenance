@@ -7,6 +7,7 @@ import collections
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 import key_management
@@ -48,16 +49,27 @@ def run(args, timeout=60, check=False):
         return 0, ''.join(rows), ''
     if len(args) >= 3 and args[:2] == ['exec', container]:
         command = args[2:]
+        # 允许 docker 的 -e KEY=VALUE 前缀（面板给 ./credit 透传 WB2A_EXPIRING_SOON
+        # 时用）：剥掉它们后按原规则校验，并把键值注入子进程环境。不接受其它 docker
+        # 旗标——原生部署没有容器边界，白名单必须保持窄。
+        exec_env = {}
+        while len(command) >= 2 and command[0] == '-e':
+            pair = command[1]
+            key, sep, value = pair.partition('=')
+            if not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+                return 1, '', '不支持此运行操作'
+            exec_env[key] = value
+            command = command[2:]
         allowed = command == ['./credit']
         if command and command[0] == './login':
             allowed = len(command) in (3, 4) and command[1] in ('--realm=cn', '--realm=global') and command[-1] in ('url', 'poll')
             if len(command) == 4:
-                import re
                 allowed = allowed and bool(re.fullmatch(r'--session=[a-f0-9]{32}', command[2]))
         if not allowed:
             return 1, '', '不支持此运行操作'
         executable = Path(os.environ['WB2API_RUNTIME_DIR']) / command[0][2:]
         env = dict(os.environ)
+        env.update(exec_env)
         env['WB2A_AUTH_DIR'] = os.environ['WB2API_AUTHS_DIR']
         env['WB2API_LOGIN_STATE_DIR'] = str(Path(os.environ['WB2API_ADMIN_DIR']) / 'login-states')
         try:

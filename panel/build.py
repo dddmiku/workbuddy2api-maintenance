@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-10-10：合入积分有效期页的样式（credits.css）。
 # 2026-09-25：合入请求明细页与样式，密钥限流和调度消费通过同一控制台访问。
 # 2026-09-19：合入两张长表格的固定表头和窄屏横向滚动支持。
 # 2026-09-16：加入密钥管理页的样式与行为源码，继续生成可直接部署的单文件控制台。
@@ -44,7 +45,8 @@ def read(name):
 
 def main():
     css = "".join(read(n) for n in ("css_a.css", "css_b.css", "css_c.css", "keys.css",
-                                    "usage.css", "logs.css", "update.css", "table_headers.css", "requests.css"))
+                                    "usage.css", "logs.css", "update.css", "table_headers.css",
+                                    "requests.css", "credits.css"))
     body = read("body.html")
     if "<!--__REQUESTS_VIEW__-->" not in body:
         sys.stderr.write("body.html 缺少请求明细占位符\n")

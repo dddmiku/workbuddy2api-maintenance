@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
@@ -213,5 +214,67 @@ func TestCollectLoadsNonHyphenAuthFile(t *testing.T) {
 	}
 	if !accounts[0].OK {
 		t.Errorf("account ok=%v error=%s（应成功查询）", accounts[0].OK, accounts[0].Error)
+	}
+}
+
+// TestCollectReportsExpiring 锁住「积分有效期」数据链路：credit 输出的每账号
+// expiring 字段必须是 remain 中在窗口内到期的部分，且窗口随 WB2A_EXPIRING_SOON 走。
+//
+// 背景（2026-10-10）：上游到期字段实际叫 CycleEndTime，而解析代码读的是
+// PackageEndTime（线上 0 次出现），导致 expiring 恒为 0、面板整块提示不显示。
+// 本用例用真实字段名构造响应，防止再次静默失效。
+func TestCollectReportsExpiring(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	dir := t.TempDir()
+	writeTestAuth(t, dir, "cnuid-00000003", "at-cn", "www.codebuddy.cn", "")
+
+	soon := time.Now().Add(3 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	far := time.Now().Add(45 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	up := fakeUpstreamCredit(t, func(r *http.Request) (*http.Response, error) {
+		return creditResp(`{"code":0,"data":{"Response":{"Data":{"TotalDosage":1500,"Accounts":[
+			{"PackageName":"运营费包","CycleEndTime":"` + soon + `","CycleCapacitySize":1000,"CycleCapacityRemain":700,"CycleCapacityUsed":300},
+			{"PackageName":"订阅包","CycleEndTime":"` + far + `","CycleCapacitySize":500,"CycleCapacityRemain":500,"CycleCapacityUsed":0}
+		]}}}}`), nil
+	})
+	accounts := collectWithWindow(dir, up, 1, 7*24*time.Hour)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts=%d want 1", len(accounts))
+	}
+	a := accounts[0]
+	if !a.OK {
+		t.Fatalf("account not ok: %s", a.Error)
+	}
+	if a.Remain == nil || *a.Remain != 1200 {
+		t.Errorf("remain=%v want 1200", a.Remain)
+	}
+	if a.Expiring != 700 {
+		t.Errorf("expiring=%d want 700（运营费包 3 天内到期）", a.Expiring)
+	}
+	if a.ExpiringWindowHours != 168 {
+		t.Errorf("expiring_window_hours=%d want 168", a.ExpiringWindowHours)
+	}
+}
+
+// TestExpiringSoonFromEnv 窗口解析：空/非法/<=0 回落 7 天，合法值按原样。
+func TestExpiringSoonFromEnv(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 168 * time.Hour},
+		{"  ", 168 * time.Hour},
+		{"nonsense", 168 * time.Hour},
+		{"0s", 168 * time.Hour},
+		{"-5h", 168 * time.Hour},
+		{"24h", 24 * time.Hour},
+		{"72h", 72 * time.Hour},
+	}
+	for _, c := range cases {
+		t.Setenv("WB2A_EXPIRING_SOON", c.raw)
+		if got := expiringSoonFromEnv(); got != c.want {
+			t.Errorf("WB2A_EXPIRING_SOON=%q → %v want %v", c.raw, got, c.want)
+		}
 	}
 }

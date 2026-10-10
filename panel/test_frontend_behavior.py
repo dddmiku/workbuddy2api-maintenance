@@ -567,6 +567,145 @@ return $('#creditPanel').innerHTML;
         self.assertNotIn("<span class=\"expiring\">", result, "mrow 会转义，不能塞 HTML")
         self.assertIn('class="v w"', result, "应改用 mrow 的 cls 参数上警示色")
 
+    def test_disabled_count_uses_pool_state_too(self):
+        """总览「账号」卡的停用数必须把池级停用算进去。
+
+        2026-10-10 用户反馈「卡片数字打架」：账号卡读文件级停用（.disabled 后缀，
+        线上 28 个文件一个都没有 → 恒显示 0 个停用），而账号池卡读网关 /status
+        （7 个池级停用）。两卡并排却各说各话。运维关心「有几个号现在用不了」，
+        所以取并集。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true}},
+  {uid:'b',disabled:true, pool:{inPool:false}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+renderMetrics();
+var m=$('#metrics').innerHTML;
+renderAccounts();
+return {m:m, rows:$('#acctRows').innerHTML};
+""")
+        # 3 个号里 2 个用不了（1 个池级 + 1 个文件级）。
+        self.assertIn("1 启用", result["m"], "并集口径：只有 c 是启用的")
+        self.assertIn("2 个停用", result["m"])
+        # 账号行也按同一口径标停用。
+        self.assertEqual(result["rows"].count("已停用"), 2)
+
+    def test_account_off_filter_matches_metric_card(self):
+        """「停用」筛选与总览卡片同口径（否则筛选出的行数对不上卡片数字）。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true}},
+  {uid:'b',disabled:true, pool:{inPool:false}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+S.filter='off'; renderAccounts();
+var off=$('#acctRows').innerHTML;
+S.filter='on'; renderAccounts();
+var on=$('#acctRows').innerHTML;
+S.filter='all'; return {off:off, on:on};
+""")
+        self.assertIn("a", result["off"])
+        self.assertIn("b", result["off"])
+        self.assertNotIn(">c<", result["off"].replace("<td", "<td"), "启用的号不该出现在停用筛选里")
+        self.assertIn("c", result["on"])
+
+    def test_pool_disabled_account_offers_revive(self):
+        """池级停用的号给「复活」按钮，不是「启用」。
+
+        文件级改名对池级停用无效（文件本来就在池里），只有 /accounts/revive
+        能清网关侧的 disabled+reason。混用会让运维点了没反应。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true,disabledReason:'12153 session dead'}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn('data-revive="a"', result, "池级停用应提供复活按钮")
+        self.assertIn("12153 session dead", result, "悬停应显示停用原因")
+        self.assertEqual(result.count("data-revive"), 1, "正常号不该有复活按钮")
+
+    def test_credits_page_renders_breakdown(self):
+        """积分有效期页按分档渲染，并标出最近到期。
+
+        分档来自 cmd/credit 直查上游 billing/meter（含 global 号，不受签到跳过影响）。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',nickname:'n1',realm:'cn',pool:{inPool:true},
+   credits:{remain:1000,size:2000,used:1000,expiring:300,
+     expiry:{within_1d:100,within_3d:200,within_7d:300,within_30d:400,later:0,
+             unlimited:0,next_end:'2026-10-11T09:00:00+08:00'}}},
+  {uid:'u2',nickname:'n2',realm:'global',pool:{inPool:true},
+   credits:{remain:500,size:500,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:500}}}
+],pool:{total:2,healthy:2},creditTotals:{expiring:300,expiring_window_hours:168}};
+renderCreditsPage();
+return {head:$('#creditsHead').innerHTML, bars:$('#creditsBars').innerHTML,
+        rows:$('#creditsRows').innerHTML, meta:$('#creditsMeta').textContent};
+""")
+        # 7 天内 = 100+200+300 = 600。
+        self.assertIn("600", result["head"], "头部应显示 7 天内到期的累计值")
+        self.assertIn("占剩余", result["head"])
+        # 分档条：只渲染非零档位。
+        self.assertIn("1 天内", result["bars"])
+        self.assertIn("30 天内", result["bars"])
+        self.assertIn("不会过期", result["bars"])
+        self.assertNotIn("30 天后", result["bars"], "零值档位不渲染")
+        # 账号行：两个号都在，且最近到期有值。
+        self.assertIn("n1", result["rows"])
+        self.assertIn("n2", result["rows"])
+        self.assertIn("2 个账号", result["meta"])
+
+    def test_credits_page_orders_by_urgency(self):
+        """积分有效期页按「7 天内到期」降序：有作废风险的号排最上面。"""
+        result = self.run_frontend("""
+function acct(uid,soon){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('low',1),acct('high',99),acct('mid',50)],
+  pool:{total:3,healthy:3},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        self.assertLess(result.index("high"), result.index("mid"), "到期多的应排前面")
+        self.assertLess(result.index("mid"), result.index("low"))
+
+    def test_credits_tab_counts_accounts_with_expiring(self):
+        """侧栏计数 = 有积分将在窗口内到期的账号数；为 0 时显示 —（不占位）。"""
+        result = self.run_frontend("""
+function acct(uid,soon){return {uid:uid,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('a',5),acct('b',0)],pool:{}};
+renderCreditsTab();
+var one=$('#tabCredits').textContent;
+S.data={accounts:[acct('a',0)],pool:{}};
+renderCreditsTab();
+var none=$('#tabCredits').textContent;
+return {one:one, none:none};
+""")
+        self.assertEqual(result["one"], "1")
+        self.assertEqual(result["none"], "—")
+
+    def test_expiring_scalar_falls_back_when_no_breakdown(self):
+        """只有标量 expiring（旧网关/旧数据）时仍要显示提示，不能被分档分支吞掉。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}}
+],pool:{total:1,healthy:1}};
+renderMetrics();
+var m=$('#metrics').innerHTML;
+renderAccounts();
+return {m:m, rows:$('#acctRows').innerHTML};
+""")
+        self.assertIn("120", result["m"], "无分档时应回落到标量 expiring")
+        self.assertIn("其中 120 即将过期", result["rows"])
+
 
 if __name__ == "__main__":
     unittest.main()
