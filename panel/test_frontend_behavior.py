@@ -939,3 +939,57 @@ class UndefinedFunctionReferenceTest(unittest.TestCase):
             with self.subTest(fn=fn):
                 self.assertIn("function " + fn, index,
                               "%s 被调用但未定义" % fn)
+
+
+class SelectorTargetExistsTest(unittest.TestCase):
+    """禁止「解引用了不存在的元素 id」。
+
+    2026-10-11 实测两连：先是 `readClipboardIntoCallback is not defined`（函数被删），
+    再是 `var btn = $('#drSubmit')` —— 按钮已改名 `drSubmit2`，旧 id 取不到，
+    `$()` 返回 null，下一行 `.disabled` 直接抛异常，**整个函数静默失败**，
+    用户看到的就是「点了没反应」。
+
+    这类错误 node --check 抓不到（语法合法），只能靠「id 是否存在」的静态核对。
+    """
+
+    def _blobs(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        js = {}
+        for name in ("app.js", "keys.js", "usage.js", "requests.js", "update.js", "logs.js"):
+            path = os.path.join(here, name)
+            if os.path.exists(path):
+                js[name] = open(path, encoding="utf-8").read()
+        index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+        return js, index
+
+    def test_dollar_selectors_target_known_ids(self):
+        js, index = self._blobs()
+        # 所有会被创建的 id：HTML 静态的 + JS 里动态拼的（两种引号）。
+        known = set(re.findall(r'\bid="([\w-]+)"', index))
+        for body in js.values():
+            known |= set(re.findall(r'''id=["']([\w-]+)["']''', body))
+        missing = set()
+        for name, body in js.items():
+            for m in re.finditer(r"\$\(['\"]#([\w-]+)['\"]\)\s*\.\s*([\w]+)", body):
+                if m.group(1) not in known:
+                    missing.add("%s: #%s .%s" % (name, m.group(1), m.group(2)))
+        self.assertEqual(sorted(missing), [],
+                         "这些选择器指向不存在的 id：%s" % sorted(missing))
+
+    def test_trae_buttons_use_current_ids(self):
+        """Trae 授权页的按钮 id 与 submitTraeCallback 里取的要一致。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        body = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        start = body.index("function renderTraeAuth()")
+        block = body[start:body.index("function renderWait()", start)]
+        # 渲染出的按钮 id
+        rendered = set(re.findall(r'''id=["']([\w-]+)["']''', block))
+        self.assertIn("drSubmit2", rendered)
+        self.assertIn("drPaste", rendered)
+        self.assertIn("drReopen", rendered)
+        # submitTraeCallback 必须取 drSubmit2，不能取已废弃的 drSubmit
+        sub = body[body.index("async function submitTraeCallback()"):]
+        sub = sub[:sub.index("\n}")]
+        self.assertIn("$('#drSubmit2')", sub)
+        self.assertNotIn("$('#drSubmit')", sub,
+                         "drSubmit 是扫码流程的按钮，Trae 流程用 drSubmit2")

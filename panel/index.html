@@ -2911,18 +2911,22 @@ async function submitTraeCallback(){
     if (msg) msg.textContent = '这是授权页的链接，不是回调链接。请在 Trae 完成登录后，复制跳转到的 127.0.0.1 那条地址。';
     return;
   }
-  var btn = $('#drSubmit'); btn.disabled = true; btn.textContent = '正在添加…';
+  // 按钮 id 是 drSubmit2（drSubmit 是扫码流程用的，两者不能混）。
+  // 取不到时不能直接解引用：$() 返回 null 会在这里抛异常，整个函数静默失败，
+  // 用户看到的就是「点了没反应」（2026-10-11 实测踩到）。
+  var btn = $('#drSubmit2');
+  if (btn){ btn.disabled = true; btn.textContent = '正在添加…'; }
   try{
     var r = await api('api/trae/login/finish', { callback: value });
     if (!r.ok){
       if (msg) msg.textContent = r.message || '添加失败';
-      btn.disabled = false; btn.textContent = '完成添加';
+      if (btn){ btn.disabled = false; btn.textContent = '完成添加'; }
       return;
     }
     renderDone(r);
   }catch(err){
     if (msg) msg.textContent = '添加失败：' + (err && err.message || err);
-    btn.disabled = false; btn.textContent = '完成添加';
+    if (btn){ btn.disabled = false; btn.textContent = '完成添加'; }
   }
 }
 
