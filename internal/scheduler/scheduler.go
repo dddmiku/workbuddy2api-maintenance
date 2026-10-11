@@ -100,6 +100,14 @@ type Scheduler struct {
 	// 换新派生的设备号即可绕过（实测第 0 代 9074、第 1 代立刻成功）。命中后
 	// 代数 +1 并重试一次，成功后记住新代数。进程重启即清零，不持久化。
 	traeDeviceGen map[string]int
+	// traeBackoff Trae 签到的 9074 有界退避：uid → {下次可试时刻, 连续次数}。
+	//
+	// 轮换设备号能绕过大多数 9074，但**绕不过上游的高峰期**：实测 2026-10-12
+	// 00:00（新的一天、跨天边界）两个号连 gen0→gen1 都吃 9074。参考实现
+	// （autumnsentiment/Trae2api-cn）同样保留一层有界退避兜住这种情况。
+	// 基数 60s、每次翻倍、指数封顶 3（最多 8 分钟），而不是线性重试——上游的
+	// 限流是「人多」这种容量信号，短时间猛重试只会让窗口更长。
+	traeBackoff map[string]traeBackoffEntry
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
@@ -492,6 +500,14 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			out = append(out, oc)
 			continue
 		}
+		// 仍在 9074 退避窗口内：本轮跳过，别去撞上游（撞了只会延长窗口）。
+		if d, waiting := s.traeInBackoff(st.UID); waiting {
+			oc.Status, oc.Detail = CheckinSkipped,
+				fmt.Sprintf("trae: 9074 退避中，还需 %s", d.Round(time.Second))
+			skipN++
+			out = append(out, oc)
+			continue
+		}
 		// 本账号当前用的设备号代数（9074 后递增，见下）。
 		gen := s.traeDeviceGeneration(st.UID)
 		// 与通用签到一致：停机跨过 token 有效期时先补一次刷新。
@@ -530,14 +546,20 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 				log.Printf("trae checkin %s: 9074 on device gen %d, rotating to gen %d",
 					logfmt.UID8(st.UID), gen-1, gen)
 				claimed, claimErr = trae.ClaimCheckin(ctx, a, gen)
-				if claimErr == nil {
-					// 新设备号有效：记下代数，后续轮次直接用新的。
-					s.noteTraeDeviceGeneration(st.UID, gen)
-				}
+				// 无论新设备号成没成，都把代数记下来：旧代数已经确认被限流，
+				// 下次还从它开始只会白撞一次（实测 2026-10-12 00:00 那两个号
+				// 连 gen0→gen1 都吃 9074，若只在成功时记住，每轮都要重走一遍 gen0）。
+				s.noteTraeDeviceGeneration(st.UID, gen)
 			}
 			if claimErr != nil {
 				oc.Status, oc.Detail = CheckinFail, "trae: "+claimErr.Error()
 				failN++
+				// 轮换后仍 9074（上游高峰期的容量信号，换设备号也绕不过）：
+				// 记一层有界退避，避免本进程后续轮次继续撞。
+				if trae.IsRateLimited(claimErr) {
+					d := s.noteTraeBackoff(st.UID)
+					oc.Detail += fmt.Sprintf("（退避 %s）", d.Round(time.Second))
+				}
 				log.Printf("trae checkin %s: claim: %v", logfmt.UID8(st.UID), claimErr)
 			} else {
 				oc.Status = CheckinOK
@@ -545,6 +567,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 				if gained > 0 {
 					oc.Detail = fmt.Sprintf("trae: +%.0f credits", gained)
 				}
+				s.clearTraeBackoff(st.UID)
 				okN++
 			}
 		}
@@ -562,6 +585,60 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 	log.Printf("trae checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(out), okN, alreadyN, failN, skipN)
 	return out, nil
+}
+
+// traeBackoffEntry 单账号的 9074 退避状态。
+type traeBackoffEntry struct {
+	until  time.Time // 下次允许尝试的时刻
+	streak int       // 连续命中次数（决定退避翻几倍）
+}
+
+const (
+	// traeBackoffBase 首次 9074 后的冷却基数。
+	traeBackoffBase = 60 * time.Second
+	// traeBackoffExpCap 退避指数上限：60s × 2^3 = 8 分钟就够——
+	// 上游限流是短窗口的，退避太久会白白错过当天可签的时机。
+	traeBackoffExpCap = 3
+)
+
+// traeInBackoff 报告该账号是否仍在 9074 退避窗口内。
+func (s *Scheduler) traeInBackoff(uid string) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.traeBackoff[uid]
+	if !ok {
+		return 0, false
+	}
+	if d := time.Until(e.until); d > 0 {
+		return d, true
+	}
+	return 0, false
+}
+
+// noteTraeBackoff 记一次 9074，返回本轮应冷却多久。
+func (s *Scheduler) noteTraeBackoff(uid string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.traeBackoff == nil {
+		s.traeBackoff = map[string]traeBackoffEntry{}
+	}
+	e := s.traeBackoff[uid]
+	e.streak++
+	exp := e.streak - 1
+	if exp > traeBackoffExpCap {
+		exp = traeBackoffExpCap
+	}
+	d := traeBackoffBase << exp
+	e.until = time.Now().Add(d)
+	s.traeBackoff[uid] = e
+	return d
+}
+
+// clearTraeBackoff 签到成功后清退避（下一次从基数重新开始）。
+func (s *Scheduler) clearTraeBackoff(uid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.traeBackoff, uid)
 }
 
 // traeDeviceGeneration / noteTraeDeviceGeneration：Trae 签到的设备号代数。

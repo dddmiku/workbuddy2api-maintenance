@@ -152,3 +152,44 @@ func TestTaskLogKeepsLastRunWhileIdle(t *testing.T) {
 		t.Fatalf("未知 key 应报 ErrUnknownTask，实际 %v", err)
 	}
 }
+
+// TestTraeBackoffEscalatesAndCaps 9074 的退避要有界：60s 起、翻倍、封顶 8 分钟。
+//
+// 轮换设备号能绕过大多数 9074，但绕不过上游高峰期（实测 2026-10-12 00:00 跨天
+// 边界，两个号 gen0→gen1 都吃 9074）。这层退避就是为那种情况兜底：短时间猛重试
+// 只会让「人多」的窗口更长，所以要退，但退太久会白白错过当天可签的时机。
+func TestTraeBackoffEscalatesAndCaps(t *testing.T) {
+	s := New(Config{})
+	if _, waiting := s.traeInBackoff("u1"); waiting {
+		t.Fatal("初始不该在退避中")
+	}
+	// 前四次：60s / 120s / 240s / 480s。
+	want := []time.Duration{60 * time.Second, 120 * time.Second, 240 * time.Second, 480 * time.Second}
+	for i, w := range want {
+		if got := s.noteTraeBackoff("u1"); got != w {
+			t.Fatalf("第 %d 次退避应为 %s，实际 %s", i+1, w, got)
+		}
+	}
+	// 第五次起封顶在 8 分钟，不再翻倍。
+	for i := 0; i < 3; i++ {
+		if got := s.noteTraeBackoff("u1"); got != 8*time.Minute {
+			t.Fatalf("封顶后应为 8m，实际 %s", got)
+		}
+	}
+	// 退避窗口内应被判定为等待中。
+	if d, waiting := s.traeInBackoff("u1"); !waiting || d <= 0 {
+		t.Fatalf("应处于退避中，实际 waiting=%v d=%s", waiting, d)
+	}
+	// 别的账号不受影响。
+	if _, waiting := s.traeInBackoff("u2"); waiting {
+		t.Fatal("退避按账号维度，不该波及其它号")
+	}
+	// 成功后清零，下次从基数重来。
+	s.clearTraeBackoff("u1")
+	if _, waiting := s.traeInBackoff("u1"); waiting {
+		t.Fatal("清退避后不该再判为等待中")
+	}
+	if got := s.noteTraeBackoff("u1"); got != 60*time.Second {
+		t.Fatalf("清零后应回到基数 60s，实际 %s", got)
+	}
+}
