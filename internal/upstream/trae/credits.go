@@ -1,0 +1,279 @@
+// credits.go — Trae 域的签到与积分查询。
+//
+// 与 WorkBuddy 完全不同的一套端点（都在 api.trae.cn 的 UG / pay API 上）：
+//
+//	签到状态  POST /trae/api/v2/ug/checkin_credits/status
+//	签到领取  POST /trae/api/v2/ug/checkin_credits/claim
+//	账号积分  POST /trae/api/v2/pay/ide_user_ent_usage
+//
+// 鉴权用同一枚 Cloud-IDE-JWT，但头族是签到专用的一套（x-device-id 必须存在，
+// 上游按设备维度做每日签到去重）。
+//
+// ═══ 更新日志 ═══
+// 2026-10-11：初版——签到状态/领取与账号积分，端点来自 Trae2api-cn 实测。
+package trae
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"workbuddy2api/internal/auth"
+)
+
+// Trae API host（签到与积分都在这台，不是模型网关）。
+const TraeAPIHost = "https://api.trae.cn"
+
+const (
+	checkinStatusPath = "/trae/api/v2/ug/checkin_credits/status"
+	checkinClaimPath  = "/trae/api/v2/ug/checkin_credits/claim"
+	entUsagePath      = "/trae/api/v2/pay/ide_user_ent_usage"
+)
+
+// checkinDeviceBrand/Type 签到头里的设备描述（对齐 Trae 桌面端形态）。
+const (
+	checkinDeviceBrand = "ASUS TUF Gaming A15 FA507RM_FA507RM"
+	checkinDeviceType  = "windows"
+)
+
+// CheckinStatus 是签到状态。
+type CheckinStatus struct {
+	// Enabled 上游是否开放签到。
+	Enabled bool
+	// CheckedIn 今天是否已签到。
+	CheckedIn bool
+	// Credits 本次可领/已领的积分。
+	Credits float64
+	// ExtraCredits 额外奖励积分。
+	ExtraCredits float64
+	// Message 上游文案。
+	Message string
+}
+
+// Credits 是账号积分概览。
+type Credits struct {
+	// Total 总额度。
+	Total float64
+	// Consumed 已消费。
+	Consumed float64
+	// Remaining 剩余（Total - Consumed，上游没给时由两者算出）。
+	Remaining float64
+	// Packs 逐包明细（到期时间 + 额度），供面板显示有效期。
+	Packs []CreditPack
+}
+
+// CreditPack 一个积分包。
+type CreditPack struct {
+	Name      string
+	Limit     float64
+	Remaining float64
+	// EndTime Unix 秒；0 表示无到期时间。
+	EndTime int64
+}
+
+// checkinHeaders 构造签到/积分接口的头族。
+//
+// 与 llm_utils_chat 的头族不同：这里只需要 JWT + 设备标识（上游按设备维度做
+// 每日签到去重，x-device-id 缺失会被判成新设备）。设备指纹按 UID 派生，跨请求稳定。
+func checkinHeaders(a *auth.Auth) http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "application/json")
+	h.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
+	h.Set("x-device-id", checkinDeviceID(a.UID))
+	h.Set("x-device-brand", checkinDeviceBrand)
+	h.Set("x-device-type", checkinDeviceType)
+	return h
+}
+
+// checkinDeviceID 派生 16 位数字设备号（对齐上游对设备 ID 的形态要求）。
+func checkinDeviceID(uid string) string {
+	sum := deviceID(uid, "checkin")
+	// 取十六进制前缀转十进制并截到 16 位：形态与真实客户端一致（纯数字）。
+	var value uint64
+	for i := 0; i < 16 && i < len(sum); i++ {
+		digit := sum[i]
+		if digit >= 'a' {
+			value = value*16 + uint64(digit-'a'+10)
+		} else {
+			value = value*16 + uint64(digit-'0')
+		}
+	}
+	return fmt.Sprintf("%016d", value%10000000000000000)
+}
+
+// postTraeAPI 向 Trae API 发一个 POST，返回解析后的对象。
+func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	body := []byte("{}")
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = encoded
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		TraeAPIHost+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range checkinHeaders(a) {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("trae api %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("trae api %s read: %w", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("trae api %s: HTTP %d: %s", path, resp.StatusCode, truncate(string(data), 300))
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("trae api %s parse: %w", path, err)
+	}
+	return out, nil
+}
+
+// CheckinStatusOf 查询签到状态。
+func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
+	data, err := postTraeAPI(ctx, a, checkinStatusPath, nil)
+	if err != nil {
+		return CheckinStatus{}, err
+	}
+	if code, ok := asFloat(data["code"]); ok && code != 0 {
+		message, _ := data["message"].(string)
+		return CheckinStatus{}, fmt.Errorf("trae checkin status: code %g: %s", code, message)
+	}
+	status := CheckinStatus{}
+	status.Enabled, _ = data["enable"].(bool)
+	status.CheckedIn, _ = data["checked_in"].(bool)
+	status.Message, _ = data["message"].(string)
+	if v, ok := asFloat(data["credits"]); ok {
+		status.Credits = v
+	}
+	if v, ok := asFloat(data["extra_credits"]); ok {
+		status.ExtraCredits = v
+	}
+	return status, nil
+}
+
+// ClaimCheckin 领取今天的签到积分。
+//
+// 上游用业务码表达结果，不都是 HTTP 错误：
+//   - code 0     成功；
+//   - code 9074  风控（同一设备短时间内重复领取），**不要立刻重试**——
+//     第二次请求会延长上游的限流窗口（参考实现踩过这个坑）；
+//   - 其它非 0   如实上报，不做"当成已签到"的猜测。
+func ClaimCheckin(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
+	data, err := postTraeAPI(ctx, a, checkinClaimPath, nil)
+	if err != nil {
+		return CheckinStatus{}, err
+	}
+	message, _ := data["message"].(string)
+	if code, ok := asFloat(data["code"]); ok && code != 0 {
+		if code == 9074 {
+			return CheckinStatus{}, fmt.Errorf("trae checkin: rate limited by upstream (9074): %s", message)
+		}
+		return CheckinStatus{}, fmt.Errorf("trae checkin: code %g: %s", code, message)
+	}
+	status := CheckinStatus{CheckedIn: true, Message: message}
+	if v, ok := asFloat(data["credits"]); ok {
+		status.Credits = v
+	}
+	if v, ok := asFloat(data["extra_credits"]); ok {
+		status.ExtraCredits = v
+	}
+	return status, nil
+}
+
+// FetchCredits 查询账号积分与逐包明细。
+//
+// req_source=1 是通用 IDE 额度（客户端显示的那个总数）。
+func FetchCredits(ctx context.Context, a *auth.Auth) (Credits, error) {
+	data, err := postTraeAPI(ctx, a, entUsagePath,
+		map[string]any{"require_usage": true, "req_source": 1})
+	if err != nil {
+		return Credits{}, err
+	}
+	if code, ok := asFloat(data["code"]); ok && code != 0 {
+		message, _ := data["message"].(string)
+		return Credits{}, fmt.Errorf("trae credits: code %g: %s", code, message)
+	}
+	out := Credits{}
+	if summary, ok := data["usage_summary"].(map[string]any); ok {
+		if v, ok := asFloat(summary["total_amount"]); ok {
+			out.Total = v
+		}
+		if v, ok := asFloat(summary["consumed_amount"]); ok {
+			out.Consumed = v
+		}
+	}
+	out.Remaining = out.Total - out.Consumed
+	if out.Remaining < 0 {
+		out.Remaining = 0
+	}
+	if packs, ok := data["user_entitlement_pack_list"].([]any); ok {
+		for _, raw := range packs {
+			pack, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			out.Packs = append(out.Packs, parseCreditPack(pack))
+		}
+	}
+	return out, nil
+}
+
+// parseCreditPack 解析一个积分包（层级较深，逐层容错）。
+func parseCreditPack(pack map[string]any) CreditPack {
+	out := CreditPack{}
+	base, _ := pack["entitlement_base_info"].(map[string]any)
+	if base != nil {
+		if v, ok := asFloat(base["end_time"]); ok && v > 0 {
+			out.EndTime = int64(v)
+		}
+		if extra, ok := base["product_extra"].(map[string]any); ok {
+			if pe, ok := extra["package_extra"].(map[string]any); ok {
+				if name, ok := pe["package_name"].(string); ok {
+					out.Name = name
+				}
+				if quota, ok := pe["quota"].(map[string]any); ok {
+					if v, ok := asFloat(quota["credits_limit"]); ok {
+						out.Limit = v
+					}
+				}
+			}
+		}
+	}
+	if v, ok := asFloat(pack["remaining_amount"]); ok {
+		out.Remaining = v
+	} else if v, ok := asFloat(pack["available_amount"]); ok {
+		out.Remaining = v
+	}
+	if out.Name == "" {
+		out.Name, _ = pack["display_desc"].(string)
+	}
+	return out
+}
+
+// IsTraeRealm 报告账号是否属于 Trae 域（供上层按域分流）。
+func IsTraeRealm(a *auth.Auth) bool {
+	return a != nil && strings.EqualFold(strings.TrimSpace(a.RealmStored()), Realm)
+}

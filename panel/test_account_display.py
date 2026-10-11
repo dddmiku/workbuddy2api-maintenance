@@ -94,16 +94,17 @@ class RealmCapabilityTest(unittest.TestCase):
              mock.patch.object(panel_app, "_expiring_soon_env", return_value=""):
             return panel_app.build_state()
 
-    def test_trae_account_credit_is_not_applicable(self):
-        acct = self._state("trae")["accounts"][0]
-        self.assertIs(acct["credits"]["supported"], False)
-        for key in ("remain", "size", "used", "packages", "ok"):
-            self.assertIsNone(acct["credits"][key], key)
-        self.assertEqual(acct["credits"]["expiring"], 0)
-        self.assertEqual(acct["credits"]["expiry"], {})
+    def test_trae_account_reports_its_own_credits(self):
+        """trae 有**自己的**积分接口（pay API），不再显示为「不适用」。
 
-    def test_workbuddy_accounts_still_report_credits(self):
-        for realm in ("cn", "global"):
+        2026-10-11 实测 /trae/api/v2/pay/ide_user_ent_usage 可用，额度换算成整数
+        走同一套字段。单位与 WorkBuddy 积分不同，前端按 realm 标注、不做跨域合计。
+        """
+        acct = self._state("trae")["accounts"][0]
+        self.assertIs(acct["credits"]["supported"], True)
+
+    def test_all_realms_report_credits(self):
+        for realm in ("cn", "global", "trae"):
             acct = self._state(realm)["accounts"][0]
             self.assertIs(acct["credits"]["supported"], True, realm)
 

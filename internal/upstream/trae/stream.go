@@ -59,6 +59,14 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		ctx = context.Background()
 	}
 	requestID := newRequestID()
+	// 用实时目录把客户端模型名解析成 config_name（含显示名匹配，如
+	// "DeepSeek-V4.1-Flash" → "deepseek-v4.1-flash"）；目录不可用时
+	// BuildChatBody 内部回落静态别名表。
+	if models, cerr := FetchCatalog(ctx, a); cerr == nil && len(models) > 0 {
+		if resolved := ResolveFromCatalog(models, modelFromPrepared(prepared)); resolved != "" {
+			prepared = withModel(prepared, resolved)
+		}
+	}
 	body, err := BuildChatBody(prepared, requestID)
 	if err != nil {
 		return nil, 0, nil, err
@@ -154,6 +162,24 @@ func chatTransport() http.RoundTripper {
 func newRequestID() string {
 	n := atomic.AddUint64(&chunkSeq, 1)
 	return fmt.Sprintf("trae-%d-%d", time.Now().UnixNano(), n)
+}
+
+// withModel 把出站请求体的 model 字段换成解析后的 config_name。
+// 解析失败或 body 不可解析时原样返回（不二次错误化）。
+func withModel(prepared []byte, model string) []byte {
+	var src map[string]any
+	if json.Unmarshal(prepared, &src) != nil || src == nil {
+		return prepared
+	}
+	if current, _ := src["model"].(string); current == model {
+		return prepared
+	}
+	src["model"] = model
+	out, err := json.Marshal(src)
+	if err != nil {
+		return prepared
+	}
+	return out
 }
 
 func modelFromPrepared(prepared []byte) string {

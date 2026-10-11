@@ -17,6 +17,65 @@
 
 历史说明：`v2.4.1`–`v2.4.27` 期间补丁号被当作计数器使用，其中多数是修复、少数是新能力，未按本规则区分。规则自 `v2.5.0` 起生效。
 
+## v2.6.25 — 2026-10-11
+
+Trae 模型目录改为**动态拉取**（含真实消费倍率），并补上 Trae 自己的签到与积分。
+
+### 一、模型目录：静态表漏了用户真在用的模型
+
+原先照参考项目的别名表写了一张静态清单，用户一看就发现**少了 `DeepSeek-V4.1-Flash`**
+（上游配置名 `deepseek-v4.1-flash`，静态表里只有旧的 `DeepSeek-V4-Flash`）。
+根因是思路错了：模型清单是**账号/时段相关**的，静态表一定滞后。
+
+改为拉上游真实目录：`POST {gateway}/api/ide/v1/get_detail_param` →
+`config_info_list`（46 项），按同一套规则过滤：
+
+- `usage != chat_completion` 的（`summary`）不是可选对话模型；
+- `custom_model_*` 是路由配置不是模型；
+- `is_invisible_to_user=true` 的内部子代理（`browser_use_subagent`、
+  `explore_sub_agent_v2` 等）不对外公布。
+
+过滤后 19 个真实模型。目录缓存 30 分钟；拉取失败时保留上一次成功的快照，
+不因为一次网络抖动就把列表变空。
+
+### 二、消费倍率
+
+倍率藏在 `display_contact_config`——一个 **JSON 字符串**字段里：
+
+```json
+{"consumption_rate":{"enable":true,"data":{"rate":0.78}},
+ "discount":{"enable":true,"data":{"original_consumption_rate":0.78,
+             "consumption_rate":0.39,"member_discount":50}}}
+```
+
+取折后价（`discount.consumption_rate`）优先于原价，因为计费用的是折后价。
+实测与客户端显示**逐项一致**：GLM-5.3-FlashX 0.31 / GLM-5.3-Flash 0.06 /
+GLM-5.3 0.39 / GLM-5.2 0.78 / DeepSeek-V4.1-Flash 0.15 / DeepSeek-V4-Flash 0.20 /
+DeepSeek-V4-Pro 0.72。倍率以 `credits: "x0.39"` 透出（与 CN/global 同口径）；
+上游没给倍率时**不写该字段**——缺失≠0，写成 0 会被当成免费模型。
+
+模型名解析优先用实时目录（客户端按显示名 `DeepSeek-V4.1-Flash` 请求也能匹配到
+配置名 `deepseek-v4.1-flash`），目录不可用时回落静态别名表。
+
+### 三、Trae 的签到与积分
+
+Trae 有自己的一套（都在 `api.trae.cn`，与 WorkBuddy 无关），实测可用：
+
+```
+POST /trae/api/v2/ug/checkin_credits/status  → {"checked_in":false,"credits":100,"enable":true}
+POST /trae/api/v2/ug/checkin_credits/claim   → 领取
+POST /trae/api/v2/pay/ide_user_ent_usage     → {"usage_summary":{"consumed_amount":0.64,"total_amount":5000}}
+```
+
+签到接进定时任务（原先 trae 账号是被整条跳过的）；`code 9074`（风控）如实上报
+**不立刻重试**——参考实现踩过这个坑：几秒内重复领取会延长上游限流窗口。
+积分换算成整数记入池，逐包到期时间折成面板同一套到期档位（1/3/7/30 天 + 不过期），
+两域在面板上呈现同一个概念。
+
+### 实测
+
+真实上游拉取目录 → 19 个模型 + 倍率逐项与客户端一致；签到状态与积分接口均 200。
+
 ## v2.6.24 — 2026-10-11
 
 Trae 域实测修复（真实上游验证）+ 账号页/排程页的域感知。

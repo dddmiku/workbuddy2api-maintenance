@@ -693,7 +693,9 @@ function renderAccounts(){
     var coolEnd = (S.loadedAt || Date.now()) + (Number(p.coolRemaining) || 0) * 1000;
     p.coolRemaining = Math.max(0, Math.ceil((coolEnd - Date.now()) / 1000));
     var left = daysLeft(a.expiresAt);
-    var workbuddy = c.supported !== false;
+    // 每个域都有自己的积分接口（WorkBuddy billing/meter、Trae pay API），都能查。
+    // trae 的额度单位与 WorkBuddy 的积分不同，用悬停说明区分，不做跨域合计。
+    var isTrae = String(a.realm || '') === 'trae';
     // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
@@ -705,14 +707,14 @@ function renderAccounts(){
     // 非 WorkBuddy 域（trae）没有这套积分接口：显示「不适用」而不是「—」或错误，
     // 否则运维会以为是查询失败。
     var creditCell;
-    if (!workbuddy){
-      creditCell = '<span class="na" title="Trae 域不使用 WorkBuddy 的积分接口">不适用</span>';
-    } else if (typeof c.remain === 'number'){
+    if (typeof c.remain === 'number'){
+      var creditTitle = isTrae ? 'Trae 额度（与 WorkBuddy 积分口径不同，不参与跨域合计）' : '';
       creditCell = '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
         '<span class="m">已用 ' + num(c.used) + ' / ' + num(c.size) + '</span>' +
         (typeof c.size === 'number' && c.size > 0
           ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
           : '') + expiringLine + '</div>';
+      if (creditTitle) creditCell = '<span title="' + esc(creditTitle) + '" style="display:block">' + creditCell + '</span>';
     } else if (c.error){
       creditCell = '<span class="na err" title="' + esc(String(c.error)) + '">查询失败</span>';
     } else {
@@ -724,7 +726,7 @@ function renderAccounts(){
     // 那种像是出过错的措辞。
     var errAt = activityTime(p.lastErr), successAt = activityTime(p.lastSuccess);
     var lastTxt, lastSub;
-    if (!workbuddy && !successAt && !errAt){
+    if (isTrae && !successAt && !errAt){
       lastTxt = '尚未使用';
       lastSub = '';
     } else {
@@ -946,7 +948,7 @@ function renderSchedule(){
   // 积分到期日程是 WorkBuddy 端点族的概念（cmd/credit 查 billing/meter 得到）。
   // 非 WorkBuddy 域（trae）没有这项，必须排除——否则它会被算进「取到的账号」里，
   // 让「没有到期日程」的空态看起来像是数据缺失，而实际是这个域压根没有这个概念。
-  var billable = a.filter(function(x){ return (x.credits || {}).supported !== false; });
+  var billable = a;
   var have = billable.filter(function(x){
     return x.credits && typeof x.credits.remain === 'number' &&
            ((x.credits.expiry || {}).schedule || []).length;

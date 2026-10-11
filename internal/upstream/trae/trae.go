@@ -99,6 +99,9 @@ type exchangeResponse struct {
 // 基础 IDE 头（Cloud-IDE-JWT 鉴权 + x-uid + 设备指纹）之上叠加 SOLO 路由头。
 // 网关只认这一族版本头——用账号 OAuth host 的旧 IDE 版本头会得到
 // "param is invalid"（Trae2api-cn 实测结论）。
+// BuildHeaders 导出出站头族（排障与目录探测共用；生产走 ChatStream 内部调用）。
+func BuildHeaders(a *auth.Auth) http.Header { return buildHeaders(a) }
+
 func buildHeaders(a *auth.Auth) http.Header {
 	h := http.Header{}
 	token := a.AccessToken
@@ -161,7 +164,9 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 	}
 	// 上游按 config_name 精确匹配（大小写敏感），必须先把客户端写的宽松名
 	// （gpt-4o / claude-sonnet-4-5 之类）映射到 Trae 的真实模型名，否则会被拒。
-	// 查不到的模型名原样透传——上游的报错比网关自己猜一个替代模型更可用。
+	// 优先用**实时目录**匹配（客户端可能按显示名请求，如 "DeepSeek-V4.1-Flash"）；
+	// 目录不可用时回落静态别名表。都查不到则原样透传——上游的报错比网关自己
+	// 猜一个替代模型更可用。
 	name := ResolveModelName(modelFromSource(src))
 	if name == "" {
 		name = "glm-5.2"

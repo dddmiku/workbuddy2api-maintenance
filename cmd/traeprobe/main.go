@@ -29,6 +29,18 @@ func main() {
 		os.Exit(2)
 	}
 	authPath, model := os.Args[1], os.Args[2]
+	if model == "models" {
+		modelsMain(authPath)
+		return
+	}
+	if model == "rawmodel" {
+		want := "glm-5.3"
+		if len(os.Args) > 3 {
+			want = os.Args[3]
+		}
+		rawModelsMain(authPath, want)
+		return
+	}
 	prompt := "Say exactly: PONG"
 	if len(os.Args) > 3 {
 		prompt = os.Args[3]

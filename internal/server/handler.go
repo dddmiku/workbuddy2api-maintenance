@@ -914,20 +914,50 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
-	// Trae 域：静态目录（Trae 没有公开的模型列表端点可查，llm_utils_chat 这条路径
-	// 一直用静态表）。只在池里真有 trae 账号时公布——没有号却列出模型，客户端会选到
-	// 一个永远选不到号的模型名，不如不列。
+	// Trae 域：**动态目录**（get_detail_param），带消费倍率。
+	//
+	// 曾经写成静态表，结果漏了客户端真实在用的 deepseek-v4.1-flash——模型清单是
+	// 账号/时段相关的，静态表一定滞后。拉不到时回落静态别名表，至少不空。
+	// 只在池里真有 trae 账号时公布（没有号却列模型，客户端会选到一个选不中的名字）。
 	if h.cfg.Pool != nil && h.cfg.Pool.ServableForRealm(trae.Realm) {
-		for _, id := range trae.ModelIDs() {
-			out = append(out, map[string]any{
-				"id":       trae.Realm + ":" + id,
+		models, _ := h.traeCatalog()
+		if len(models) == 0 {
+			for _, id := range trae.ModelIDs() {
+				out = append(out, map[string]any{
+					"id": trae.Realm + ":" + id, "object": "model",
+					"created": 1753600000, "owned_by": "trae",
+				})
+			}
+			return out
+		}
+		for _, m := range models {
+			entry := map[string]any{
+				"id":       trae.Realm + ":" + m.ConfigName,
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "trae",
-			})
+			}
+			if m.DisplayName != "" {
+				entry["name"] = m.DisplayName
+			}
+			// 倍率透出为 credits 字段（与 CN/global 同口径，面板直接读）。
+			// 上游没给倍率时**不写**这个字段——缺失≠0，写成 0 会被当成免费模型。
+			if m.HasRate {
+				entry["credits"] = fmt.Sprintf("x%.2f", m.Rate)
+			}
+			out = append(out, entry)
 		}
 	}
 	return out
+}
+
+// traeCatalog 取 trae 域的动态模型目录（取一个可服务的 trae 账号发起探测）。
+func (h *Handler) traeCatalog() ([]trae.CatalogModel, error) {
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", trae.Realm)
+	if acct == nil {
+		return nil, nil
+	}
+	return trae.FetchCatalog(context.Background(), acct)
 }
 
 // fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。

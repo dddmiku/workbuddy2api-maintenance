@@ -26,6 +26,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -36,6 +37,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/upstream/trae"
 )
 
 type accountResult struct {
@@ -211,6 +213,27 @@ func collectWithWindow(authDir string, up *upstream.Client, workers int, soon ti
 		}
 		// 余额查询打的是 WorkBuddy billing 端点。非 WorkBuddy 域（trae）没有这套
 		// 端点，拿它的 JWT 去查只会得到 401，让整个列表看起来全是失败账号。
+		// Trae 域有**自己的**积分接口（api.trae.cn 的 pay API），不是 WorkBuddy 那套。
+		// 2026-10-11 实测：POST /trae/api/v2/pay/ide_user_ent_usage 返回
+		// {"usage_summary":{"consumed_amount":0.64,"total_amount":5000}, ...}。
+		// 换算成整数记入（面板/选号用整数口径），逐包到期时间也带出来。
+		if a.Realm() == trae.Realm {
+			credits, cerr := trae.FetchCredits(context.Background(), a)
+			if cerr != nil {
+				res.Error = "trae: " + cerr.Error()
+			} else {
+				total := int64(credits.Total)
+				consumed := int64(credits.Consumed)
+				remain := int64(credits.Remaining)
+				res.Remain, res.Used, res.Size = &remain, &consumed, &total
+				res.OK = true
+				res.Packages = len(credits.Packs)
+				res.Expiry = traeExpiryView(credits)
+			}
+			slots[index] = res
+			filled[index] = true
+			continue
+		}
 		if !a.IsWorkBuddy() {
 			res.Error = a.Realm() + " 域无 WorkBuddy 余额接口（跳过）"
 			slots[index] = res
@@ -356,4 +379,40 @@ func printPretty(accounts []accountResult, totalRemain, totalUsed, totalSize int
 	for _, f := range failed {
 		fmt.Printf("⚠️ %s\n", f)
 	}
+}
+
+// traeExpiryView 把 Trae 的逐包到期时间折成面板的到期分布档位。
+//
+// 面板的「有效期」视图按固定档位聚合（1/3/7/30 天 + 不会过期），档位口径与
+// WorkBuddy 侧一致——两域在面板上呈现同一个概念，不该各写一套。
+func traeExpiryView(credits trae.Credits) expiryView {
+	var out expiryView
+	now := time.Now().Unix()
+	for _, pack := range credits.Packs {
+		amount := int64(pack.Limit)
+		if pack.Remaining > 0 {
+			amount = int64(pack.Remaining)
+		}
+		if amount <= 0 {
+			continue
+		}
+		if pack.EndTime <= 0 {
+			out.Unlimited += amount
+			continue
+		}
+		days := (pack.EndTime - now) / 86400
+		switch {
+		case days <= 1:
+			out.Within1d += amount
+		case days <= 3:
+			out.Within3d += amount
+		case days <= 7:
+			out.Within7d += amount
+		case days <= 30:
+			out.Within30d += amount
+		default:
+			out.Later += amount
+		}
+	}
+	return out
 }

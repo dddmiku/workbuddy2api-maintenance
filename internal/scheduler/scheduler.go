@@ -26,6 +26,7 @@ import (
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/upstream/trae"
 )
 
 // Config 调度器依赖。
@@ -512,9 +513,51 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 				oc.Status = CheckinOK
 			}
 		} else if !isWorkBuddy {
-			// trae 号：签到与余额都不适用（端点族不同），直接如实记为「跳过」。
-			oc.Status = CheckinSkipped
-			skipN++
+			// Trae 域：有**自己的**签到与积分体系（api.trae.cn 的 UG / pay API），
+			// 与 WorkBuddy 那套完全无关。2026-10-11 实测端点可用：
+			//   status → {"checked_in":false,"credits":100,"enable":true}
+			//   usage  → {"usage_summary":{"consumed_amount":0.64,"total_amount":5000}}
+			// 积分换算成整数记入池（面板/选号用的是整数口径；Trae 的额度本身是
+			// 大数值的 credit，直接取整不丢有效信息）。
+			traeStatus, traeErr := trae.CheckinStatusOf(ctx, a)
+			switch {
+			case traeErr != nil:
+				oc.Status = CheckinFail
+				oc.Detail = "trae: " + traeErr.Error()
+				failN++
+				log.Printf("checkin %s: trae status: %v", logfmt.UID8(st.UID), traeErr)
+			case !traeStatus.Enabled:
+				oc.Status = CheckinSkipped
+				oc.Detail = "trae: checkin disabled"
+				skipN++
+			case traeStatus.CheckedIn:
+				oc.Status = CheckinAlready
+				alreadyN++
+			default:
+				claimed, claimErr := trae.ClaimCheckin(ctx, a)
+				if claimErr != nil {
+					oc.Status = CheckinFail
+					oc.Detail = "trae: " + claimErr.Error()
+					failN++
+					log.Printf("checkin %s: trae claim: %v", logfmt.UID8(st.UID), claimErr)
+				} else {
+					oc.Status = CheckinOK
+					gained := claimed.Credits + claimed.ExtraCredits
+					if gained > 0 {
+						oc.Detail = fmt.Sprintf("trae: +%.0f credits", gained)
+					}
+					okN++
+				}
+			}
+			// 顺手读余额（纯读接口，与签到是两件事）。
+			if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
+				remain := int64(credits.Remaining)
+				s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+				s.cfg.Pool.SetCredits(st.UID, remain)
+				oc.Credits = &remain
+			} else {
+				log.Printf("user-resource %s: trae: %v", logfmt.UID8(st.UID), cerr)
+			}
 			out = append(out, oc)
 			continue
 		} else {
