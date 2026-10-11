@@ -34,9 +34,13 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即各类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
-	CheckinHours   []int // 默认 [9, 21]
+	Pool         *pool.Pool
+	Upstream     *upstream.Client
+	CheckinHours []int // 默认 [9, 21]
+	// TraeCheckHours 是 Trae 域签到的独立排程。Trae 与 WorkBuddy 是**两个不同的
+	// 站点**（不同端点、不同风控），签到必须分开：混在一个任务里无法单独开关，
+	// 面板也会把 trae 归到 WorkBuddy 的「签到」下。
+	TraeCheckHours []int // 默认 [10]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
@@ -57,6 +61,8 @@ type Config struct {
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
 	CheckinDisabled bool
+	// TraeCheckDisabled 显式关闭 Trae 签到排程（schedule.trae_check_enabled=false）。
+	TraeCheckDisabled bool
 	// TravelDisabled 显式关闭猫猫旅行排程（schedule.travel_enabled=false）。
 	TravelDisabled bool
 	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
@@ -90,6 +96,12 @@ type Scheduler struct {
 	// （服务端幂等兜底：重启后当日重复 redeem 会拿 409 正常态，无副作用）。
 	rewardClaimed map[string]string
 
+	// traeRateLimited Trae 签到的当日限流去重：uid → CST 自然日。上游对 claim 有
+	// 账号维度限流（code 9074），旧实现每次调度都无差别重打，限流窗口被一轮轮
+	// 延长（2026-10-11 实测一天四轮全吃 9074）。命中一次即记下，当天不再重试。
+	// 与 adoptTried / rewardClaimed 同口径：进程重启即清零，不持久化。
+	traeRateLimited map[string]string
+
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
 
@@ -114,6 +126,9 @@ type Scheduler struct {
 func New(cfg Config) *Scheduler {
 	if len(cfg.CheckinHours) == 0 {
 		cfg.CheckinHours = []int{9, 21}
+	}
+	if len(cfg.TraeCheckHours) == 0 {
+		cfg.TraeCheckHours = []int{10}
 	}
 	if len(cfg.TravelHours) == 0 {
 		cfg.TravelHours = []int{9, 21}
@@ -202,6 +217,7 @@ type taskKind int
 
 const (
 	taskCheckin taskKind = iota
+	taskTraeCheck
 	taskTravel
 	taskActivity
 	taskKeepalive
@@ -223,6 +239,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	var slots []slot
 	if !s.cfg.CheckinDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+	}
+	if !s.cfg.TraeCheckDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.TraeCheckHours), taskTraeCheck})
 	}
 	if !s.cfg.TravelDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
@@ -380,6 +399,8 @@ func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
 		s.runCheckin(ctx)
+	case taskTraeCheck:
+		s.runTraeCheck(ctx)
 	case taskTravel:
 		s.runTravel(ctx)
 	case taskActivity:
@@ -408,6 +429,157 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 	if _, err := s.checkinAll(ctx); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
+}
+
+// ── Trae 签到（独立站点，独立排程）────────────────────────────────────────
+//
+// Trae 与 WorkBuddy 是**两个不同的站点**：Trae 的签到与积分走 api.trae.cn 的
+// UG / pay API，WorkBuddy 走 codebuddy.cn 的 billing/meter。端点、鉴权头族、
+// 风控规则都不同，所以拆成两个任务、两套排程，各自可开关。
+//
+// 关键教训（2026-10-11）：上游对 claim 有**账号维度**的限流（code 9074
+// "当前参与用户太多"）。旧实现把 trae 塞在通用签到里，每次调度都无差别重打
+// claim，于是限流窗口被一轮轮延长——实测同一对号在 17:34 / 19:31 / 21:00 /
+// 21:23 四轮里每次都吃 9074，一天下来一个都没签上。
+//
+// 对策是**本地按天去重**：9074 一旦出现，当天不再对该账号重试（与 adoptTried /
+// rewardClaimed 同款语义，进程重启即清零）。上游的限流是短窗口的，明天再来即可；
+// 反复重试只会让窗口更长。
+
+// runTraeCheck 定时入口：撞车时记日志跳过，不重复打上游。
+func (s *Scheduler) runTraeCheck(ctx context.Context) {
+	if _, err := s.traeCheckAll(ctx); err != nil {
+		log.Printf("scheduled trae checkin skipped: %v", err)
+	}
+}
+
+// TraeCheckAll 供管理面板手动触发：逐账号结果由 traeCheckAll 记日志。
+func (s *Scheduler) TraeCheckAll() ([]CheckinOutcome, error) {
+	return s.traeCheckAll(context.Background())
+}
+
+// traeCheckAll 只处理 trae 域的账号：签到 → 查余额 → 解冻。
+//
+// 与 checkinAll 共用 checkinMu：两个任务虽然站点不同，但都是「签到类」写操作，
+// 手动同时触发两个不该并发打上游（各自打各自的站点，但日志与节流口径一致更简单）。
+func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) {
+	if !s.checkinMu.TryLock() {
+		return nil, ErrBusy
+	}
+	defer s.checkinMu.Unlock()
+
+	statuses := s.cfg.Pool.List()
+	out := make([]CheckinOutcome, 0, len(statuses))
+	var okN, alreadyN, failN, skipN int
+	today := travelDay(time.Now())
+	for _, st := range statuses {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		// 只处理 trae 域；其它域的账号本任务不碰（它们归 TaskKeyCheckin）。
+		if a == nil || a.Realm() != trae.Realm {
+			continue
+		}
+		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
+		if st.Disabled {
+			oc.Status, oc.Detail = CheckinSkipped, "disabled"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		if a.Snapshot().RefreshToken == "" {
+			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		// 本地按天去重：今天已经因 9074 放弃过的号不再重试。
+		// 上游限流是短窗口的，明天自然可以再试；反复重试只会延长窗口。
+		if s.traeRateLimitedToday(st.UID, today) {
+			oc.Status, oc.Detail = CheckinSkipped, "trae: rate limited earlier today"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		// 与通用签到一致：停机跨过 token 有效期时先补一次刷新。
+		if a.NeedsRefresh(checkinRefreshSkew) {
+			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				log.Printf("trae checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				if a.NeedsRefresh(0) {
+					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
+					failN++
+					out = append(out, oc)
+					continue
+				}
+			} else if err := a.SaveAtomic(); err != nil {
+				log.Printf("trae checkin %s save: %v", logfmt.UID8(st.UID), err)
+			}
+		}
+
+		traeStatus, traeErr := trae.CheckinStatusOf(ctx, a)
+		switch {
+		case traeErr != nil:
+			oc.Status, oc.Detail = CheckinFail, "trae: "+traeErr.Error()
+			failN++
+			log.Printf("trae checkin %s: status: %v", logfmt.UID8(st.UID), traeErr)
+		case !traeStatus.Enabled:
+			oc.Status, oc.Detail = CheckinSkipped, "trae: checkin disabled"
+			skipN++
+		case traeStatus.CheckedIn:
+			oc.Status = CheckinAlready
+			alreadyN++
+		default:
+			claimed, claimErr := trae.ClaimCheckin(ctx, a)
+			if claimErr != nil {
+				oc.Status, oc.Detail = CheckinFail, "trae: "+claimErr.Error()
+				failN++
+				// 9074 = 上游限流：记进「今天不再试」的表，避免本轮与后续轮次
+				// 反复重打把窗口越推越长。这是本轮修复的核心。
+				if trae.IsRateLimited(claimErr) {
+					s.noteTraeRateLimited(st.UID, today)
+				}
+				log.Printf("trae checkin %s: claim: %v", logfmt.UID8(st.UID), claimErr)
+			} else {
+				oc.Status = CheckinOK
+				gained := claimed.Credits + claimed.ExtraCredits
+				if gained > 0 {
+					oc.Detail = fmt.Sprintf("trae: +%.0f credits", gained)
+				}
+				okN++
+			}
+		}
+		// 顺手读余额（纯读接口，与签到是两件事）。
+		if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
+			remain := int64(credits.Remaining)
+			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+			s.cfg.Pool.SetCredits(st.UID, remain)
+			oc.Credits = &remain
+		} else {
+			log.Printf("user-resource %s: trae: %v", logfmt.UID8(st.UID), cerr)
+		}
+		out = append(out, oc)
+	}
+	log.Printf("trae checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
+		len(out), okN, alreadyN, failN, skipN)
+	return out, nil
+}
+
+// traeRateLimitedToday / noteTraeRateLimited：Trae 签到的当日限流去重表。
+// 语义与 adoptTried / rewardClaimed 一致：uid → CST 自然日，进程重启即清零。
+func (s *Scheduler) traeRateLimitedToday(uid, day string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.traeRateLimited[uid] == day
+}
+
+func (s *Scheduler) noteTraeRateLimited(uid, day string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.traeRateLimited == nil {
+		s.traeRateLimited = map[string]string{}
+	}
+	s.traeRateLimited[uid] = day
 }
 
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
@@ -462,8 +634,14 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		// isWorkBuddy 为 false 时两件事都不做——它不是「国际版不签到但读余额」
 		// 那种语义，而是「根本不是这套端点」。
 		isWorkBuddy := a.IsWorkBuddy()
+		// Trae 号整条跳过，**在刷新之前**：它不是 WorkBuddy 的端点族，签到与余额
+		// 都不适用，而且 Trae 的 refreshToken 是一次性轮换的——为了一个不存在的
+		// 签到去刷它，只会白白消耗凭据。它们归独立的 TaskKeyTraeCheck。
 		if !isWorkBuddy {
-			oc.Detail = a.Realm() + " (no checkin)"
+			oc.Status, oc.Detail = CheckinSkipped, a.Realm()+" (separate task)"
+			skipN++
+			out = append(out, oc)
+			continue
 		}
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
@@ -512,54 +690,6 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			} else {
 				oc.Status = CheckinOK
 			}
-		} else if !isWorkBuddy {
-			// Trae 域：有**自己的**签到与积分体系（api.trae.cn 的 UG / pay API），
-			// 与 WorkBuddy 那套完全无关。2026-10-11 实测端点可用：
-			//   status → {"checked_in":false,"credits":100,"enable":true}
-			//   usage  → {"usage_summary":{"consumed_amount":0.64,"total_amount":5000}}
-			// 积分换算成整数记入池（面板/选号用的是整数口径；Trae 的额度本身是
-			// 大数值的 credit，直接取整不丢有效信息）。
-			traeStatus, traeErr := trae.CheckinStatusOf(ctx, a)
-			switch {
-			case traeErr != nil:
-				oc.Status = CheckinFail
-				oc.Detail = "trae: " + traeErr.Error()
-				failN++
-				log.Printf("checkin %s: trae status: %v", logfmt.UID8(st.UID), traeErr)
-			case !traeStatus.Enabled:
-				oc.Status = CheckinSkipped
-				oc.Detail = "trae: checkin disabled"
-				skipN++
-			case traeStatus.CheckedIn:
-				oc.Status = CheckinAlready
-				alreadyN++
-			default:
-				claimed, claimErr := trae.ClaimCheckin(ctx, a)
-				if claimErr != nil {
-					oc.Status = CheckinFail
-					oc.Detail = "trae: " + claimErr.Error()
-					failN++
-					log.Printf("checkin %s: trae claim: %v", logfmt.UID8(st.UID), claimErr)
-				} else {
-					oc.Status = CheckinOK
-					gained := claimed.Credits + claimed.ExtraCredits
-					if gained > 0 {
-						oc.Detail = fmt.Sprintf("trae: +%.0f credits", gained)
-					}
-					okN++
-				}
-			}
-			// 顺手读余额（纯读接口，与签到是两件事）。
-			if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
-				remain := int64(credits.Remaining)
-				s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-				s.cfg.Pool.SetCredits(st.UID, remain)
-				oc.Credits = &remain
-			} else {
-				log.Printf("user-resource %s: trae: %v", logfmt.UID8(st.UID), cerr)
-			}
-			out = append(out, oc)
-			continue
 		} else {
 			// global 号：本次只做余额查询，签到状态如实记为「跳过」。
 			oc.Status = CheckinSkipped

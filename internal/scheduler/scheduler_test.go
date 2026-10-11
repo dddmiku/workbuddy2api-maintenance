@@ -133,6 +133,7 @@ func TestNextWakeKeepaliveDisabled(t *testing.T) {
 func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
+		TraeCheckDisabled: true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
@@ -171,6 +172,7 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 		Pool:              p,
 		Upstream:          up,
 		CheckinDisabled:   true,
+		TraeCheckDisabled: true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,

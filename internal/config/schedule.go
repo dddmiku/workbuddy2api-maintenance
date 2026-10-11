@@ -15,15 +15,18 @@ import "fmt"
 // cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
 // 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
 type Schedule struct {
-	CheckinHours   []int `json:"checkin_hours"`   // [9,21]
-	TravelHours    []int `json:"travel_hours"`    // [9,21]
-	ActivityHours  []int `json:"activity_hours"`  // [10]
-	KeepaliveHours []int `json:"keepalive_hours"` // [22]
-	SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
-	CatHours       []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
-	RedeemHours    []int `json:"redeem_hours"`    // [9] 连登档位兑换（7d/14d/28d，需签到后跑）
-	LotteryHours   []int `json:"lottery_hours"`   // [21] 成长中心抽奖（清空当日抽奖次数）
-	MakeupHours    []int `json:"makeup_hours"`    // [9] 补签（只补最近一次漏签，需补签卡余量）
+	CheckinHours []int `json:"checkin_hours"` // [9,21]（WorkBuddy 两域）
+	// TraeCheckHours 是 Trae 站点的独立签到排程。Trae 与 WorkBuddy 不是同一个
+	// 站点（api.trae.cn vs codebuddy.cn），签到必须分开排程、分开开关。
+	TraeCheckHours []int `json:"trae_check_hours"` // [10]
+	TravelHours    []int `json:"travel_hours"`     // [9,21]
+	ActivityHours  []int `json:"activity_hours"`   // [10]
+	KeepaliveHours []int `json:"keepalive_hours"`  // [22]
+	SchoolHours    []int `json:"school_hours"`     // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
+	CatHours       []int `json:"cat_hours"`        // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
+	RedeemHours    []int `json:"redeem_hours"`     // [9] 连登档位兑换（7d/14d/28d，需签到后跑）
+	LotteryHours   []int `json:"lottery_hours"`    // [21] 成长中心抽奖（清空当日抽奖次数）
+	MakeupHours    []int `json:"makeup_hours"`     // [9] 补签（只补最近一次漏签，需补签卡余量）
 	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
 	// 显式禁用开关（缺省 true）。
 	//
@@ -33,15 +36,16 @@ type Schedule struct {
 	//     则对老配置零影响，向后完全兼容。
 	//   - 开关与取值解耦：禁用时仍保留用户显式配的小时，重新启用无需补配。
 	//   - 无需猜测哨兵（[-1] 之类），非法小时一律报错并提示改用本开关。
-	CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到
-	TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
-	ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
-	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
-	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
-	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
-	RedeemEnabled    bool `json:"redeem_enabled"`    // 缺省 true；false = 停连登兑换
-	LotteryEnabled   bool `json:"lottery_enabled"`   // 缺省 true；false = 停成长抽奖
-	MakeupEnabled    bool `json:"makeup_enabled"`    // 缺省 true；false = 停补签
+	CheckinEnabled   bool `json:"checkin_enabled"`    // 缺省 true；false = 关 WorkBuddy 签到
+	TraeCheckEnabled bool `json:"trae_check_enabled"` // 缺省 true；false = 关 Trae 签到
+	TravelEnabled    bool `json:"travel_enabled"`     // 缺省 true；false = 完全停猫猫旅行
+	ActivityEnabled  bool `json:"activity_enabled"`   // 缺省 true；false = 停活跃上报
+	KeepaliveEnabled bool `json:"keepalive_enabled"`  // 缺省 true；false = 关 token 保活
+	SchoolEnabled    bool `json:"school_enabled"`     // 缺省 true；false = 停开学季任务
+	CatEnabled       bool `json:"cat_enabled"`        // 缺省 true；false = 停夜猫子任务
+	RedeemEnabled    bool `json:"redeem_enabled"`     // 缺省 true；false = 停连登兑换
+	LotteryEnabled   bool `json:"lottery_enabled"`    // 缺省 true；false = 停成长抽奖
+	MakeupEnabled    bool `json:"makeup_enabled"`     // 缺省 true；false = 停补签
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -57,6 +61,7 @@ type Schedule struct {
 func DefaultSchedule() Schedule {
 	return Schedule{
 		CheckinHours:        []int{9, 21},
+		TraeCheckHours:      []int{10},
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
 		KeepaliveHours:      []int{22},
@@ -66,6 +71,7 @@ func DefaultSchedule() Schedule {
 		LotteryHours:        []int{21},
 		MakeupHours:         []int{9},
 		CheckinEnabled:      true,
+		TraeCheckEnabled:    true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,
 		KeepaliveEnabled:    true,
@@ -89,6 +95,9 @@ func DefaultSchedule() Schedule {
 func (s *Schedule) Normalize() error {
 	if len(s.CheckinHours) == 0 {
 		s.CheckinHours = []int{9, 21}
+	}
+	if len(s.TraeCheckHours) == 0 {
+		s.TraeCheckHours = []int{10}
 	}
 	if len(s.TravelHours) == 0 {
 		s.TravelHours = []int{9, 21}
@@ -128,6 +137,9 @@ func (s *Schedule) Normalize() error {
 // （checkin_enabled / keepalive_enabled），避免用户靠猜哨兵值来配。
 func (s *Schedule) validateHours() error {
 	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", s.CheckinHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.trae_check_hours", "trae_check_enabled", s.TraeCheckHours); err != nil {
 		return err
 	}
 	if err := checkHourRange("schedule.travel_hours", "travel_enabled", s.TravelHours); err != nil {

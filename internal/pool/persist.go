@@ -177,6 +177,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		e := &entry{
+			p:                 p,
 			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:           s.Credits,
 			disabled:          s.Disabled,

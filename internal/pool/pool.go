@@ -351,7 +351,7 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		}
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	p.byUID[a.UID] = &entry{a: a, p: p}
 	if p.stateFp != "" {
 		if p.persistBase.Accounts == nil {
 			p.persistBase.Accounts = make(map[string]stateAccount)
@@ -360,4 +360,31 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		change := p.stateIntentLocked(a.UID)
 		change.created, change.deleted, change.createdEpoch = true, false, epoch
 	}
+}
+
+// hardCreditBlocksModel 报告「余额不足」的硬冷却是否应当拦住该模型。
+//
+// 余额耗尽的账号只是调不了**扣积分**的模型；免费模型（倍率 x0.00）不消耗积分，
+// 照样能正常出结果。旧行为把整个账号摘出候选池，于是这些号在免费模型上也完全
+// 闲置（2026-10-11 用户反馈：「积分不足的号是可以用免费模型的」）。
+//
+// 安全边界（与付费模型快过期过滤同一张倍率表，三条缺一即退回旧行为）：
+//   - model 为空（未指定模型的调用路径）→ 拦截，保持旧语义；
+//   - 倍率表未注入（p.paidModels == nil）→ 拦截，特性整体关闭；
+//   - 该 (realm, model) 在表里标记为付费 → 拦截。
+//
+// 其余情况（免费模型）放行。
+//
+// 注意放行的只是「账号级余额冷却」这一条：熔断、模型级 6004 冷却、禁用仍然照常
+// 拦截（unavailableReason 里本条 return "" 之后会继续判它们）。
+func (p *Pool) hardCreditBlocksModel(realm, model string) bool {
+	if model == "" {
+		return true
+	}
+	// 倍率表未注入时无从判断「这个模型免不免费」，一律按旧行为拦截——
+	// 宁可少放行，也不能因为拿不到倍率就把余额不足的号放到扣积分的模型上白撞 402。
+	if p.paidModels == nil {
+		return true
+	}
+	return p.modelIsPaid(realm, model)
 }

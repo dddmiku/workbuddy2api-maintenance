@@ -1004,6 +1004,51 @@ class SelectorTargetExistsTest(unittest.TestCase):
                          "drSubmit 是扫码流程的按钮，Trae 流程用 drSubmit2")
 
 
+class TraeCheckTaskGroupingTest(FrontendHarness, unittest.TestCase):
+    """Trae 签到是独立任务，必须单独成组、单独可触发。
+
+    用户要求：「trae 的签到走 trae 的定时，workbuddy 的走 workbuddy 的，他们不是
+    同一个站点」。后端已把 trae 拆成 TaskKeyTraeCheck（realms=['trae']），
+    面板按 t.realms 分组，所以这里锁的是「分组真的把两个签到分到不同域下」。
+    """
+
+    def test_two_checkin_tasks_land_in_different_realm_groups(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c1',realm:'cn'},{uid:'g1',realm:'global'},{uid:'t1',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9,21],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+renderTasks();
+return $('#taskList').innerHTML;
+""")
+        # 两个签到任务必须都在，且各自挂在正确的域组下。
+        self.assertIn("签到（WorkBuddy）", result)
+        self.assertIn("签到（Trae）", result)
+        cn = result.index("国内版 CN")
+        gl = result.index("国际版 Global")
+        tr = result.index("Trae CN")
+        self.assertLess(cn, gl, "域组顺序应为 cn → global → trae")
+        self.assertLess(gl, tr)
+        # WorkBuddy 签到落在 CN 组内（cn 与 trae 之间），Trae 签到落在 Trae 组内。
+        self.assertLess(cn, result.index("签到（WorkBuddy）"))
+        self.assertLess(result.index("签到（WorkBuddy）"), tr)
+        self.assertGreater(result.index("签到（Trae）"), tr)
+
+    def test_trae_task_can_be_triggered_independently(self):
+        """独立任务意味着它有独立的「跑一次」按钮，key 是 trae_check。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'t1',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+renderTasks();
+return $('#taskList').innerHTML;
+""")
+        self.assertIn('data-run="trae_check"', result,
+                      "Trae 签到应有自己的手动触发按钮")
+
+
 class RealmBreakdownCompletenessTest(unittest.TestCase):
     """概览里的分域小计必须覆盖**全部域**，顺序与文案统一。
 

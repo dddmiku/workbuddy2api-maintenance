@@ -99,6 +99,9 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
 		RedeemDisabled:    true,
 		LotteryDisabled:   true,
 		MakeupDisabled:    true,
+		// Trae 签到默认 10:00；这条用例验证「school/cat 禁用后只剩签到」，
+		// 不关掉 trae 的话 10:00 会冒出一个时点。
+		TraeCheckDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 14, 21, 0, 0, 0, time.Local); !at.Equal(want) {

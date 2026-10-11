@@ -80,7 +80,11 @@ type RateLimitedModel struct {
 }
 
 type entry struct {
-	a       *auth.Auth
+	a *auth.Auth
+	// p 是所属池的反向引用：unavailableReason 需要判断「该模型是否付费」
+	// （余额不足只拦付费模型，免费模型照常可用），而倍率表在池上。
+	// 只在池内创建 entry，恒非 nil。
+	p       *Pool
 	credits int64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其

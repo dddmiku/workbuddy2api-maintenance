@@ -502,6 +502,9 @@ func TestNextWakeActivityIndependent(t *testing.T) {
 		TravelHours:    []int{9},
 		ActivityHours:  []int{10},
 		KeepaliveHours: []int{22},
+		// Trae 签到默认也在 10:00；这条用例验证的是「活跃有独立时点」，
+		// 关掉它才能让 10:00 只剩 activity 一个任务（否则 kinds 有两个）。
+		TraeCheckDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -542,6 +545,8 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		SchoolDisabled:   true,
 		CatDisabled:      true,
+		// Trae 签到默认也在 10:00，不关掉的话「活跃禁用」之后 10:00 仍是时点。
+		TraeCheckDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -577,6 +582,7 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
 func TestAllFourDisabledNoSpin(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
+		TraeCheckDisabled: true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,

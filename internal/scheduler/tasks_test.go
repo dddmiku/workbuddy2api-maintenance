@@ -12,7 +12,7 @@ import (
 func TestTaskSnapshotOrderAndSwitches(t *testing.T) {
 	s := New(Config{}) // 零值 Config = 六类全启用、小时回落默认
 	snap := s.TaskSnapshot()
-	wantKeys := []string{"checkin", "travel", "activity", "keepalive", "school", "cat",
+	wantKeys := []string{"checkin", "trae_check", "travel", "activity", "keepalive", "school", "cat",
 		"redeem", "lottery", "makeup"}
 	if len(snap) != len(wantKeys) {
 		t.Fatalf("应返回 %d 类任务，实际 %d", len(wantKeys), len(snap))
@@ -38,9 +38,16 @@ func TestTaskSnapshotOrderAndSwitches(t *testing.T) {
 
 	// 显式禁用后：Enabled=false 且不再给下次时点（与 nextWake 跳过零时点同口径）。
 	s2 := New(Config{CatDisabled: true})
-	cat := s2.TaskSnapshot()[5]
+	// 按 key 取而不是写死下标：任务表增删时下标会整体后移，
+	// 写死下标会让这条断言去检查另一个任务（2026-10-11 新增 trae_check 时踩到）。
+	var cat TaskInfo
+	for _, info := range s2.TaskSnapshot() {
+		if info.Key == "cat" {
+			cat = info
+		}
+	}
 	if cat.Key != "cat" {
-		t.Fatalf("第 6 项应为 cat，实际 %s", cat.Key)
+		t.Fatal("快照里应有 cat 任务")
 	}
 	if cat.Enabled {
 		t.Fatal("CatDisabled=true 时 cat 应为停用")

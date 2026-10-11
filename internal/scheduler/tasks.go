@@ -17,15 +17,16 @@ import (
 type TaskKey string
 
 const (
-	TaskKeyCheckin   TaskKey = "checkin"   // 签到 + 余额查询解冻
-	TaskKeyTravel    TaskKey = "travel"    // 猫猫旅行：领养 / 派出 / 领奖
-	TaskKeyActivity  TaskKey = "activity"  // 活跃上报：连登天数 + 领猫前置
-	TaskKeyKeepalive TaskKey = "keepalive" // token 保活
-	TaskKeySchool    TaskKey = "school"    // 开学季任务
-	TaskKeyCat       TaskKey = "cat"       // 夜猫子任务
-	TaskKeyRedeem    TaskKey = "redeem"    // 连登档位兑换
-	TaskKeyLottery   TaskKey = "lottery"   // 成长中心抽奖
-	TaskKeyMakeup    TaskKey = "makeup"    // 补签（补最近一次漏签）
+	TaskKeyCheckin   TaskKey = "checkin"    // 签到 + 余额查询解冻
+	TaskKeyTraeCheck TaskKey = "trae_check" // Trae 域签到（独立站点，独立排程）
+	TaskKeyTravel    TaskKey = "travel"     // 猫猫旅行：领养 / 派出 / 领奖
+	TaskKeyActivity  TaskKey = "activity"   // 活跃上报：连登天数 + 领猫前置
+	TaskKeyKeepalive TaskKey = "keepalive"  // token 保活
+	TaskKeySchool    TaskKey = "school"     // 开学季任务
+	TaskKeyCat       TaskKey = "cat"        // 夜猫子任务
+	TaskKeyRedeem    TaskKey = "redeem"     // 连登档位兑换
+	TaskKeyLottery   TaskKey = "lottery"    // 成长中心抽奖
+	TaskKeyMakeup    TaskKey = "makeup"     // 补签（补最近一次漏签）
 )
 
 // ErrUnknownTask 未知任务 key；ErrTaskBusy 该任务当前正在执行。
@@ -61,6 +62,8 @@ func (k taskKind) key() TaskKey {
 	switch k {
 	case taskCheckin:
 		return TaskKeyCheckin
+	case taskTraeCheck:
+		return TaskKeyTraeCheck
 	case taskTravel:
 		return TaskKeyTravel
 	case taskActivity:
@@ -86,6 +89,8 @@ func kindOf(key string) (taskKind, bool) {
 	switch TaskKey(key) {
 	case TaskKeyCheckin:
 		return taskCheckin, true
+	case TaskKeyTraeCheck:
+		return taskTraeCheck, true
 	case TaskKeyTravel:
 		return taskTravel, true
 	case TaskKeyActivity:
@@ -111,7 +116,9 @@ func kindOf(key string) (taskKind, bool) {
 func describe(k TaskKey) (string, string) {
 	switch k {
 	case TaskKeyCheckin:
-		return "签到", "每日签到 + 余额查询；余额恢复后自动解冻冷却中的账号"
+		return "签到（WorkBuddy）", "WorkBuddy 两域每日签到 + 余额查询；余额恢复后自动解冻冷却中的账号"
+	case TaskKeyTraeCheck:
+		return "签到（Trae）", "Trae 站点独立签到；上游 9074 限流时按天跳过，不重试"
 	case TaskKeyActivity:
 		return "活跃上报", "对话事件连发上报，点亮连登天数、解锁领养前置"
 	case TaskKeyTravel:
@@ -142,7 +149,12 @@ func describe(k TaskKey) (string, string) {
 func realmsOf(k TaskKey) []string {
 	switch k {
 	case TaskKeyCheckin:
-		return []string{"cn", "global", "trae"}
+		// WorkBuddy 两域。trae 已剥离为独立任务（TaskKeyTraeCheck）——两个站点
+		// 端点、风控、排程都不同，混在一个任务里会让面板把 trae 归到「签到」下，
+		// 也让人无法单独关掉其中一个。
+		return []string{"cn", "global"}
+	case TaskKeyTraeCheck:
+		return []string{"trae"}
 	}
 	// 其余任务只服务 WorkBuddy 两域。
 	return []string{"cn", "global"}
@@ -153,6 +165,8 @@ func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 	switch k {
 	case TaskKeyCheckin:
 		return s.cfg.CheckinHours, !s.cfg.CheckinDisabled
+	case TaskKeyTraeCheck:
+		return s.cfg.TraeCheckHours, !s.cfg.TraeCheckDisabled
 	case TaskKeyTravel:
 		return s.cfg.TravelHours, !s.cfg.TravelDisabled
 	case TaskKeyActivity:
@@ -179,7 +193,7 @@ func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 func (s *Scheduler) TaskSnapshot() []TaskInfo {
 	now := time.Now()
 	keys := []TaskKey{
-		TaskKeyCheckin, TaskKeyTravel, TaskKeyActivity,
+		TaskKeyCheckin, TaskKeyTraeCheck, TaskKeyTravel, TaskKeyActivity,
 		TaskKeyKeepalive, TaskKeySchool, TaskKeyCat,
 		TaskKeyRedeem, TaskKeyLottery, TaskKeyMakeup,
 	}

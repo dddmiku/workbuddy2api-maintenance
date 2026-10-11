@@ -149,12 +149,21 @@ func (d *Decision) unavailableSticky(reason string) {
 // This is the shared first-failure predicate for health and selection.
 // It preserves the existing priority: disabled, account cooldown, breaker,
 // model cooldown. No raw state reason (which could contain secrets) is copied.
+//
+// model 非空时，「余额不足」这类账号级硬冷却对**免费模型**豁免：余额耗尽的账号
+// 只是调不了扣积分的模型，免费模型（倍率 x0.00）照常可用——把整个账号从池里摘掉
+// 会让 7 个号白白闲置（2026-10-11 用户反馈：余额不足的号仍能用免费模型）。
+// 判定用的是注入的倍率表（见 modelIsPaid），未注入时该特性整体关闭、行为不变。
 func (e *entry) unavailableReason(now time.Time, model string) string {
 	if e.disabled {
 		return "disabled"
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
 		if e.coolKind == CoolHard {
+			// 余额不足：仅对扣积分的模型拦截；免费模型放行（见 hardCreditBlocksModel）。
+			if !e.p.hardCreditBlocksModel(e.a.Realm(), model) {
+				return "" // 免费模型：余额不足不影响可用性，继续往下判熔断/模型冷却
+			}
 			return "account_limit"
 		}
 		return "account_cooldown"

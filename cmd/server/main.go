@@ -211,6 +211,7 @@ func main() {
 		Pool:                p,
 		Upstream:            up,
 		CheckinHours:        cfg.Schedule.CheckinHours,
+		TraeCheckHours:      cfg.Schedule.TraeCheckHours,
 		TravelHours:         cfg.Schedule.TravelHours,
 		ActivityHours:       cfg.Schedule.ActivityHours,
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
@@ -222,6 +223,7 @@ func main() {
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TraeCheckDisabled:   !cfg.Schedule.TraeCheckEnabled,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
@@ -233,9 +235,16 @@ func main() {
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
-		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
+		log.Printf("WorkBuddy 签到已禁用（schedule.checkin_enabled=false）")
 	default:
-		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+		log.Printf("WorkBuddy 签到已启用：%v 点（cn/global 签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+	}
+	// Trae 是另一个站点，独立排程、独立开关（见 scheduler 的 traeCheckAll）。
+	switch {
+	case !cfg.Schedule.TraeCheckEnabled:
+		log.Printf("Trae 签到已禁用（schedule.trae_check_enabled=false）")
+	default:
+		log.Printf("Trae 签到已启用：%v 点（独立站点，上游 9074 限流时当天不再重试）", cfg.Schedule.TraeCheckHours)
 	}
 	switch {
 	case !cfg.Schedule.TravelEnabled:

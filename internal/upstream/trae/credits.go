@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -174,12 +175,36 @@ func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 	return status, nil
 }
 
+// RateLimitCode 是上游对签到 claim 的限流业务码（"当前参与用户太多，请稍后再试"）。
+//
+// 它是**账号维度**的短窗口限流，不是设备维度：2026-10-11 实测同一账号换两个
+// 完全不同的 x-device-id 都返回 9074。也正因如此，反复重试只会把窗口越推越长
+// ——调用方拿到它之后应当**当天不再重试**，而不是立刻换参数重打。
+const RateLimitCode = 9074
+
+// RateLimitError 是 9074 的具名错误：调用方用 errors.As 判定，不必匹配字符串
+// （上游 message 是中文文案，会随上游改版漂移，拿它做分支判断是脆的）。
+type RateLimitError struct {
+	Message string
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("trae checkin: rate limited by upstream (%d): %s", RateLimitCode, e.Message)
+}
+
+// IsRateLimited 报告错误是否为上游签到限流（9074）。
+func IsRateLimited(err error) bool {
+	var target *RateLimitError
+	return errors.As(err, &target)
+}
+
 // ClaimCheckin 领取今天的签到积分。
 //
 // 上游用业务码表达结果，不都是 HTTP 错误：
 //   - code 0     成功；
-//   - code 9074  风控（同一设备短时间内重复领取），**不要立刻重试**——
-//     第二次请求会延长上游的限流窗口（参考实现踩过这个坑）；
+//   - code 9074  风控（账号维度的短窗口限流），**不要立刻重试**——
+//     第二次请求会延长上游的限流窗口（参考实现踩过这个坑，2026-10-11 本网关
+//     也踩了：一天四轮调度全吃 9074）。调用方应据 IsRateLimited 当天放弃；
 //   - 其它非 0   如实上报，不做"当成已签到"的猜测。
 func ClaimCheckin(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 	data, err := postTraeAPI(ctx, a, checkinClaimPath, nil)
@@ -188,8 +213,8 @@ func ClaimCheckin(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 	}
 	message, _ := data["message"].(string)
 	if code, ok := asFloat(data["code"]); ok && code != 0 {
-		if code == 9074 {
-			return CheckinStatus{}, fmt.Errorf("trae checkin: rate limited by upstream (9074): %s", message)
+		if code == RateLimitCode {
+			return CheckinStatus{}, &RateLimitError{Message: message}
 		}
 		return CheckinStatus{}, fmt.Errorf("trae checkin: code %g: %s", code, message)
 	}
