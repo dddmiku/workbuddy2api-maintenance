@@ -856,3 +856,37 @@ return {rows:$('#schedRows').innerHTML, picker:$('#schedAccount').innerHTML};
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VersionAndModelRefreshTest(unittest.TestCase):
+    """锁定两处用户实测反馈的修复。
+
+    1) 顶栏版本号渲染成 "wv2.6.26"：网关版本号自带 "v" 前缀（VERSION 文件是
+       "v2.6.26"），前端又补了一个，于是出现两个 v。
+    2) 打开密钥编辑时要自动回源刷新模型列表（含倍率）——上游会调价、会员折扣会变，
+       原先每次都得手点「刷新模型」才看得到当前值。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.keys_js = (PANEL / "keys.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+
+    def test_version_prefix_is_not_duplicated(self):
+        # 不能无条件拼 'v'：要先看版本号是不是已经带了。
+        self.assertNotIn("' · v' + d.version", self.app_js)
+        self.assertIn("charAt(0) !== 'v'", self.app_js)
+        # 打包产物同样生效。
+        self.assertIn("charAt(0) !== 'v'", self.index)
+
+    def test_editor_open_triggers_silent_refresh(self):
+        self.assertIn("refreshKeyModels({toast:false})", self.keys_js)
+        self.assertIn("refreshKeyModels({toast:false})", self.index)
+        # 静默：自动刷新失败不该弹错误打断编辑。
+        self.assertIn("opts.toast !== false", self.keys_js)
+
+    def test_manual_refresh_still_toasts(self):
+        """手动点刷新仍要有反馈（不能因为抽函数把提示弄丢）。"""
+        self.assertIn("toast('模型列表已刷新", self.keys_js)
+        self.assertIn("btnRefreshModels", self.keys_js)
+

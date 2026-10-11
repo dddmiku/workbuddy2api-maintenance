@@ -1733,7 +1733,13 @@ function emptyBox(icon, title, sub){
 // 侧栏计数与提示条是全局信息，每次刷新都更新。
 function render(){
   var d = S.data; if (!d) return;
-  if (d.service) $('#brandVer').textContent = d.service + (d.version ? ' · v' + d.version : '');
+  // 网关版本号**自带** "v" 前缀（VERSION 文件是 "v2.6.26"，/healthz 原样透出），
+  // 这里再补一个就渲染成 "wv2.6.26"（2026-10-11 用户实测看到）。补前缀前先看有没有。
+  if (d.service){
+    var ver = String(d.version || '');
+    if (ver && ver.charAt(0) !== 'v') ver = 'v' + ver;
+    $('#brandVer').textContent = d.service + (ver ? ' · ' + ver : '');
+  }
   var a = d.accounts || [], tasks = taskList();
   $('#tabAcct').textContent = a.length;
   $('#tabTask').textContent = tasks.length ? tasks.length : '—';
@@ -3424,6 +3430,10 @@ function openKeyEditor(key){
   $('#keyExpiryCustomField').classList.toggle('hide', !preset);
   toggleModelPanel(false);
   resetModelQuery();
+  // 打开编辑器就回源刷一次模型列表，让倍率/模型清单是最新的——用户不必再手点
+  // 「刷新模型」。静默执行：用户没主动要求刷新，成功失败都不弹提示打断编辑；
+  // 刷新完成后重绘标签，正在编辑的选择不受影响（selectedModels 按 id 保留）。
+  refreshKeyModels({toast:false}).then(function(){ renderModelTags(); });
   $('#keySecret').value = '';
   $('#keyFields').classList.remove('hide'); $('#keyCreated').classList.add('hide');
   $('#keyDialogSave').classList.remove('hide'); $('#keyDialogSave').textContent = key ? '保存修改' : '创建密钥';
@@ -3507,11 +3517,15 @@ $('#btnClearModels').addEventListener('click', function(){ fillModelInput([]); }
 // 「刷新」：强制网关回源拉一次模型目录。倍率缓存 1h（刻意的，避免把展示端点变成
 // 高频上游调用），这个按钮给运维一个按需刷新入口。刷新期间禁用按钮防连点，
 // 失败如实提示——不把「没刷到」显示成「已刷新」。
-$('#btnRefreshModels').addEventListener('click', async function(){
-  var btn = this;
-  if (btn.disabled) return;
-  var old = btn.textContent;
-  btn.disabled = true; btn.textContent = '刷新中…';
+// refreshKeyModels 强制回源刷新模型列表（含倍率），返回是否成功。
+//
+// 抽成函数是因为两处都要用：手动点「刷新模型」，以及**打开密钥编辑时自动刷一次**。
+// 后者是用户实测反馈：倍率会变（上游调价/会员折扣），每次编辑都要先手点一下刷新
+// 才能看到当前值，太别扭。
+async function refreshKeyModels(options){
+  var opts = options || {};
+  if (KS.refreshing) return false;
+  KS.refreshing = true;
   try{
     // api(path, body)：传 body（哪怕空对象）即按 POST 发出并带上管理标记。
     var result = await api('api/models/refresh', {});
@@ -3519,12 +3533,28 @@ $('#btnRefreshModels').addEventListener('click', async function(){
     KS.models = (result && Array.isArray(result.models)) ? result.models : KS.models;
     KS.modelItems = (result && Array.isArray(result.items)) ? result.items : KS.modelItems;
     renderModelPanel(); renderModelTags();
-    toast('模型列表已刷新（' + ((KS.modelItems || []).length) + ' 个）', 'ok');
+    if (opts.toast !== false){
+      toast('模型列表已刷新（' + ((KS.modelItems || []).length) + ' 个）', 'ok');
+    }
+    return true;
   }catch(error){
-    toast(error.message || '刷新失败，仍显示缓存中的模型列表', 'err');
+    // 自动刷新失败时不弹错误打断编辑——用户没主动要求，缓存里的列表仍然可用。
+    if (opts.toast !== false){
+      toast(error.message || '刷新失败，仍显示缓存中的模型列表', 'err');
+    }
+    return false;
   }finally{
-    btn.disabled = false; btn.textContent = old;
+    KS.refreshing = false;
   }
+}
+
+$('#btnRefreshModels').addEventListener('click', async function(){
+  var btn = this;
+  if (btn.disabled) return;
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = '刷新中…';
+  await refreshKeyModels({});
+  btn.disabled = false; btn.textContent = old;
 });
 $('#keyExpiry').addEventListener('change', function(){
   $('#keyExpiryCustomField').classList.toggle('hide', this.value !== 'custom');

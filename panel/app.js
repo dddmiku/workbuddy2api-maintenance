@@ -372,7 +372,13 @@ function emptyBox(icon, title, sub){
 // 侧栏计数与提示条是全局信息，每次刷新都更新。
 function render(){
   var d = S.data; if (!d) return;
-  if (d.service) $('#brandVer').textContent = d.service + (d.version ? ' · v' + d.version : '');
+  // 网关版本号**自带** "v" 前缀（VERSION 文件是 "v2.6.26"，/healthz 原样透出），
+  // 这里再补一个就渲染成 "wv2.6.26"（2026-10-11 用户实测看到）。补前缀前先看有没有。
+  if (d.service){
+    var ver = String(d.version || '');
+    if (ver && ver.charAt(0) !== 'v') ver = 'v' + ver;
+    $('#brandVer').textContent = d.service + (ver ? ' · ' + ver : '');
+  }
   var a = d.accounts || [], tasks = taskList();
   $('#tabAcct').textContent = a.length;
   $('#tabTask').textContent = tasks.length ? tasks.length : '—';
