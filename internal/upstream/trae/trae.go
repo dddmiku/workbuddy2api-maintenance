@@ -171,7 +171,7 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 	if msgs, ok := src["messages"].([]any); ok {
 		for _, m := range msgs {
 			if mm, ok := m.(map[string]any); ok {
-				body.Messages = append(body.Messages, mm)
+				body.Messages = append(body.Messages, nativeMessage(mm))
 			}
 		}
 	}
@@ -205,6 +205,176 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 	return out, nil
 }
 
+// nativeMessage 把一条 OpenAI 消息转成 Trae 原生形状。
+//
+// 2026-10-11 实测：直接透传 OpenAI 消息会被上游拒掉——
+//
+//	{"code":4001,"message":"bad request: json: cannot unmarshal string into Go struct
+//	 field LLMRawMessage.messages.content of type []*idecopilot.LLMRawMessageContent"}
+//
+// 即 `content` 必须是**内容块数组**而不是字符串。块形如
+// `{"type":"text","text":"..."}`（对齐 Trae2api-cn 的 _ide_native_content）。
+// 助手消息里的 tool_calls 要转成上游的 `function_call` 形状。
+func nativeMessage(message map[string]any) map[string]any {
+	out := map[string]any{}
+	role, _ := message["role"].(string)
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "developer" {
+		role = "system"
+	}
+	switch role {
+	case "system", "user", "assistant", "tool", "function":
+	default:
+		role = "user"
+	}
+	out["role"] = role
+
+	if content, present := message["content"]; present {
+		out["content"] = nativeContent(content)
+	}
+
+	if role == "assistant" {
+		if calls := nativeAssistantToolCalls(message["tool_calls"]); len(calls) > 0 {
+			out["tool_calls"] = calls
+		}
+		if legacy, ok := message["function_call"].(map[string]any); ok {
+			if converted := nativeFunctionCall(legacy); converted != nil {
+				out["function_call"] = converted
+			}
+		}
+	}
+	if role == "tool" || role == "function" {
+		for _, key := range []string{"tool_call_id", "name"} {
+			if value, ok := message[key]; ok && value != nil {
+				out[key] = fmt.Sprint(value)
+			}
+		}
+	}
+	return out
+}
+
+// nativeContent 把 content 归一成 Trae 要的内容块数组。
+//
+// 字符串 → 单个 text 块；已经是块数组 → 逐块归一（text/input_text 统一成 text，
+// 并把文本提到 text 字段）；其它标量 → 转字符串后包成 text 块。
+func nativeContent(content any) any {
+	switch value := content.(type) {
+	case nil:
+		return nil
+	case string:
+		return []any{map[string]any{"type": "text", "text": value}}
+	case []any:
+		blocks := make([]any, 0, len(value))
+		for _, raw := range value {
+			switch block := raw.(type) {
+			case string:
+				blocks = append(blocks, map[string]any{"type": "text", "text": block})
+			case map[string]any:
+				blocks = append(blocks, nativeContentBlock(block))
+			default:
+				blocks = append(blocks, raw)
+			}
+		}
+		return blocks
+	case map[string]any:
+		return []any{nativeContentBlock(value)}
+	default:
+		return []any{map[string]any{"type": "text", "text": fmt.Sprint(value)}}
+	}
+}
+
+// nativeContentBlock 归一单个内容块：文本类统一成 {"type":"text","text":...}。
+func nativeContentBlock(block map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range block {
+		out[key] = value
+	}
+	kind, _ := out["type"].(string)
+	switch strings.ToLower(kind) {
+	case "text", "input_text":
+		out["type"] = "text"
+		text, _ := out["text"].(string)
+		if text == "" {
+			text, _ = out["content"].(string)
+		}
+		if text == "" {
+			text, _ = out["value"].(string)
+		}
+		out["text"] = text
+		delete(out, "value")
+	}
+	return out
+}
+
+// nativeAssistantToolCalls 把 OpenAI 的 tool_calls 转成 Trae 的 function_call 形状。
+//
+// 上游助手消息用的是 `{"id","type","function_call":{"name","arguments"}}`，
+// 不是 OpenAI 的 `{"function":{"name","arguments"}}`（对齐 Trae2api-cn
+// 的 _native_assistant_tool_calls）。arguments 必须是 JSON 字符串。
+func nativeAssistantToolCalls(value any) []map[string]any {
+	calls, ok := value.([]any)
+	if !ok || len(calls) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(calls))
+	for _, raw := range calls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn := call["function"]
+		if fn == nil {
+			fn = call["function_call"]
+		}
+		converted := nativeFunctionCall(fn)
+		if converted == nil {
+			continue
+		}
+		id, _ := call["id"].(string)
+		if id == "" {
+			id, _ = call["tool_call_id"].(string)
+		}
+		typ, _ := call["type"].(string)
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, map[string]any{"id": id, "type": typ, "function_call": converted})
+	}
+	return out
+}
+
+// nativeFunctionCall 归一成 {"name","arguments"}，arguments 保证是 JSON 字符串。
+
+func nativeFunctionCall(value any) map[string]any {
+	fn, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	name, _ := fn["name"].(string)
+	if name == "" {
+		return nil
+	}
+	arguments := fn["arguments"]
+	if arguments == nil {
+		arguments = fn["input"]
+	}
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
+	encoded, ok := arguments.(string)
+	if !ok {
+		raw, err := json.Marshal(arguments)
+		if err != nil {
+			raw = []byte("{}")
+		}
+		encoded = string(raw)
+	}
+	return map[string]any{"name": name, "arguments": encoded}
+}
+
+// 唯一实质差异：Trae 的 FunctionDefinition.parameters 是 **JSON 字符串**，
+// 不是对象（上游的 protobuf/JSON 适配层要求）。其余字段（name/description/strict）
+// 原样保留。
 // nativeToolDefinitions 把 OpenAI tools 声明转成 Trae 原生形态。
 //
 // 唯一实质差异：Trae 的 FunctionDefinition.parameters 是 **JSON 字符串**，

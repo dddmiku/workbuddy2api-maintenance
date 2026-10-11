@@ -89,6 +89,45 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	return TranslateStream(resp.Body, modelFromPrepared(prepared)), resp.StatusCode, nil, nil
 }
 
+// RawChatStream 与 ChatStream 相同，但**不做转译**，直接返回上游原始 SSE。
+//
+// 只用于排障：工具调用的 name/arguments 具体落在哪个事件、哪个字段，只有看原始
+// 事件才能确定（2026-10-11 实测发现上游把工具身份与参数拆在多个事件里）。
+func RawChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestID := newRequestID()
+	body, err := BuildChatBody(prepared, requestID)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBase+ChatPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	headers := buildHeaders(a)
+	for k, vs := range headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+	client := &http.Client{Transport: chatTransport()}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, resp.StatusCode, raw, nil
+	}
+	return resp.Body, resp.StatusCode, nil, nil
+}
+
 // TranslateStream 把 Trae 上游事件流（llm_utils_chat 的 SSE）转成 OpenAI SSE 流。
 //
 // ChatStream 内部走这里；单独导出是因为跨包的契约测试需要喂**合成**事件流来验证
@@ -326,6 +365,24 @@ func (t *toolAccumulator) absorb(items []any) []map[string]any {
 		if fn == nil {
 			// 紧凑形态：name/arguments 直接放在调用对象上。
 			fn = call
+		}
+		// 上游原生形态：name/arguments 在 `function_call` 里（不是 OpenAI 的
+		// `function`）。2026-10-11 实测原始事件确认：
+		//   {"index":0,"id":"call_...","type":"function",
+		//    "function_call":{"name":"read_file","arguments":"{\""}}
+		//   {"index":0,"id":"","type":"function",
+		//    "function_call":{"name":"","arguments":"path\":\"/etc/hostname\"}"}}
+		// 即工具身份与参数**拆在两个事件**里，且 arguments 是增量拼接。
+		// 只认 `function` 会让 name 与参数全部丢失。
+		if native, ok := call["function_call"].(map[string]any); ok {
+			merged := map[string]any{}
+			for k, v := range fn {
+				merged[k] = v
+			}
+			for k, v := range native {
+				merged[k] = v
+			}
+			fn = merged
 		}
 		fnDelta := map[string]any{}
 		if name, _ := fn["name"].(string); name != "" && state.name == "" {
@@ -634,6 +691,11 @@ func mapUsage(usage map[string]any) map[string]any {
 	}
 	if cached, ok := number("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"); ok {
 		out["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
+	}
+	// reasoning_tokens 下游按 completion_tokens_details.reasoning_tokens 读取
+	// （见 server/responses.go 的 usageObject），归一过去思考量才不会丢。
+	if reasoning, ok := number("reasoning_tokens", "completion_thinking_tokens"); ok {
+		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoning}
 	}
 	if len(out) == 0 {
 		return nil

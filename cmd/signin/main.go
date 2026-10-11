@@ -65,6 +65,15 @@ func main() {
 		a.FilePath = f
 		r.uid, r.nick = a.UID, a.Nickname
 
+		// 签到与余额查询都是 WorkBuddy 端点族。非 WorkBuddy 域（trae）整条跳过：
+		// 否则每个 trae 账号都会在列表里显示为失败（拿 Trae 的 JWT 打 codebuddy.cn）。
+		if !a.IsWorkBuddy() {
+			r.status = "SKIP"
+			r.detail = a.Realm() + " 域无 WorkBuddy 签到接口"
+			rows = append(rows, r)
+			continue
+		}
+
 		// refresh 过期 token
 		if a.NeedsRefresh(2 * 3600) {
 			if err := up.RefreshToken(a); err != nil {

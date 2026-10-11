@@ -114,11 +114,17 @@ func (p *Pool) SourceRateGate(realm string) (bool, time.Duration) {
 	return true, gate.until.Sub(now)
 }
 
-// realmKeyOr 归一 realm 键：空串与未知值都归到 cn（裸模型名的默认域）。
+// realmKeyOr 归一 realm 键：空串归到 cn（裸模型名的默认域），已知域原样返回。
+//
+// 原先「未知值一律归 cn」把 trae 也算成未知值：trae 上游的来源级限流会被记进
+// **cn** 闸门，于是 trae 限流能暂停 CN 选号、CN 限流也能把 trae 请求提前拦下——
+// 两个完全不同的上游互相污染。闸门必须按真实域分桶（2026-10-11 接入 trae 时发现）。
 func realmKeyOr(realm string) string {
 	switch realm {
 	case "global":
 		return "global"
+	case "trae":
+		return "trae"
 	default:
 		return "cn"
 	}

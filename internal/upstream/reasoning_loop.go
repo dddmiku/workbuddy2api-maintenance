@@ -185,7 +185,14 @@ func reasoningLoopModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if realm, bare, found := strings.Cut(model, ":"); found {
 		switch realm {
-		case "cn", "global", "sg":
+		// 已知域都剥前缀后比裸名。trae 必须在内：它的目录里 deepseek 系经
+		// ResolveModelName 原样透传，trae:deepseek-v4.1-flash 会命中这个模型——
+		// 原先 default: return false 让该域**静默失去**推理循环保护。
+		case "cn", "global", "trae":
+			model = bare
+		case "sg":
+			// "sg" 不是网关的域（历史遗留的别名匹配），剥掉前缀按裸名判定，
+			// 保持既有行为不变。
 			model = bare
 		default:
 			return false

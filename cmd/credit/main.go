@@ -209,6 +209,14 @@ func collectWithWindow(authDir string, up *upstream.Client, workers int, soon ti
 			filled[index] = true
 			continue
 		}
+		// 余额查询打的是 WorkBuddy billing 端点。非 WorkBuddy 域（trae）没有这套
+		// 端点，拿它的 JWT 去查只会得到 401，让整个列表看起来全是失败账号。
+		if !a.IsWorkBuddy() {
+			res.Error = a.Realm() + " 域无 WorkBuddy 余额接口（跳过）"
+			slots[index] = res
+			filled[index] = true
+			continue
+		}
 		tasks = append(tasks, task{index: index, auth: a})
 	}
 

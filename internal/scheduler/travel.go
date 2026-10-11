@@ -84,8 +84,8 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 		if a == nil || a.Snapshot().RefreshToken == "" {
 			continue
 		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
+		if !a.IsWorkBuddy() {
+			continue // D4 门控：非 WorkBuddy 域（global/trae）无猫猫旅行体系，不发起任何上游调用
 		}
 		if !first {
 			if !sleepCtx(ctx, travelAccountDelay) {

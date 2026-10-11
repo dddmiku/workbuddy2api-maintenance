@@ -456,9 +456,13 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		// 于是该特性对 global 号（28 个里 23 个）完全失效。
 		// 余额查询是纯读接口，与签到是两件事：面板的 ./credit 一直对全部 28 个号查余额
 		// 且工作正常，说明 global 号读余额不触发风控；被跳过的是签到（写操作）。
-		isGlobal := a.IsGlobal()
-		if isGlobal {
-			oc.Detail = "global (no checkin)"
+		// trae 域走完全不同的端点族：签到与余额查询都必须跳过（拿 Trae 的
+		// Cloud-IDE-JWT 打 codebuddy.cn 只会 401，且每轮刷一遍日志）。
+		// isWorkBuddy 为 false 时两件事都不做——它不是「国际版不签到但读余额」
+		// 那种语义，而是「根本不是这套端点」。
+		isWorkBuddy := a.IsWorkBuddy()
+		if !isWorkBuddy {
+			oc.Detail = a.Realm() + " (no checkin)"
 		}
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
@@ -492,7 +496,8 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			return out, err
 		}
 		// global 号没有签到体系：跳过签到调用（写操作，会触发风控），但下面的余额查询照做。
-		if !isGlobal {
+		// trae 号在更上面已整条 continue（端点族不同，签到与余额都不适用）。
+		if isWorkBuddy && a.Realm() != auth.RealmGlobal {
 			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 				if upstream.IsAlreadyCheckin(err) {
 					// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
@@ -506,6 +511,12 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			} else {
 				oc.Status = CheckinOK
 			}
+		} else if !isWorkBuddy {
+			// trae 号：签到与余额都不适用（端点族不同），直接如实记为「跳过」。
+			oc.Status = CheckinSkipped
+			skipN++
+			out = append(out, oc)
+			continue
 		} else {
 			// global 号：本次只做余额查询，签到状态如实记为「跳过」。
 			oc.Status = CheckinSkipped
@@ -589,6 +600,12 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.Snapshot().AccessToken == "" {
+			continue
+		}
+		// 活动上报走 WorkBuddy 的 billing 端点。非 WorkBuddy 域（trae）没有这套端点，
+		// 拿它的 JWT 去打只会 401 并刷日志——原先这里没有任何域判断，trae 账号会被
+		// 逐条送去撞墙（2026-10-11 接入 trae 时发现）。
+		if !a.IsWorkBuddy() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -686,7 +703,7 @@ func (s *Scheduler) claimGrowthRewardsContext(ctx context.Context, a *auth.Auth)
 	// global 新账号 GET /activity/growth/streak 返回 500（实测 sliverkiss）——链上第一步就
 	// 拿不到 days，无法挑档；且 streak 500 会每趟刷 WARN 污染日志。结论：证据不足，跳过
 	// global（不发起任何领取类调用）。CN 账号无此问题（CN streak 200 days=N）。
-	if a.IsGlobal() {
+	if !a.IsWorkBuddy() {
 		return
 	}
 	if s.rewardClaimedToday(a.UID) {
@@ -850,7 +867,7 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 		// 14017（trial not activated）永久拒绝。这里每天顺手补一次（幂等：已登记号
 		// 只多一次 register 调用，无副作用），让存量坏号不必等到被轮转选中才自愈。
 		// 失败只记 WARN，不影响 token 刷新结果。
-		if a.IsGlobal() {
+		if a.Realm() == auth.RealmGlobal {
 			area, rerr := s.cfg.Upstream.CompleteRegion(a)
 			switch {
 			case rerr != nil:

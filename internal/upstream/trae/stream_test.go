@@ -389,3 +389,229 @@ func TestModelIDsSortedAndComplete(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeMessageContentIsBlockArray 锁定 Trae 要求的内容块数组形态。
+//
+// 2026-10-11 真实上游实测：直接透传 OpenAI 消息被拒——
+//
+//	{"code":4001,"message":"bad request: json: cannot unmarshal string into Go struct
+//	 field LLMRawMessage.messages.content of type []*idecopilot.LLMRawMessageContent"}
+//
+// 也就是说 content 必须是数组。这条测试钉住它，避免以后有人"顺手简化"回字符串。
+func TestNativeMessageContentIsBlockArray(t *testing.T) {
+	msg := nativeMessage(map[string]any{"role": "user", "content": "hello"})
+	blocks, ok := msg["content"].([]any)
+	if !ok {
+		t.Fatalf("content must be an array, got %T: %v", msg["content"], msg["content"])
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("blocks=%v want one", blocks)
+	}
+	block, _ := blocks[0].(map[string]any)
+	if block["type"] != "text" || block["text"] != "hello" {
+		t.Errorf("block=%v want {type:text text:hello}", block)
+	}
+}
+
+func TestNativeMessageRoleNormalization(t *testing.T) {
+	cases := map[string]string{
+		"user":      "user",
+		"USER":      "user",
+		"assistant": "assistant",
+		"system":    "system",
+		"developer": "system", // developer 是 system 的新名字
+		"tool":      "tool",
+		"weird":     "user", // 未知角色回落 user
+	}
+	for in, want := range cases {
+		got, _ := nativeMessage(map[string]any{"role": in, "content": "x"})["role"].(string)
+		if got != want {
+			t.Errorf("role %q -> %q want %q", in, got, want)
+		}
+	}
+}
+
+// TestNativeAssistantToolCallsShape 锁定助手工具调用转成上游的 function_call 形状。
+func TestNativeAssistantToolCallsShape(t *testing.T) {
+	msg := nativeMessage(map[string]any{
+		"role":    "assistant",
+		"content": "",
+		"tool_calls": []any{map[string]any{
+			"id":   "call_1",
+			"type": "function",
+			"function": map[string]any{
+				"name":      "read",
+				"arguments": `{"path":"a.txt"}`,
+			},
+		}},
+	})
+	calls, _ := msg["tool_calls"].([]map[string]any)
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls=%v want one", msg["tool_calls"])
+	}
+	call := calls[0]
+	if call["id"] != "call_1" || call["type"] != "function" {
+		t.Errorf("call identity wrong: %v", call)
+	}
+	// 关键：上游要 function_call，不是 function。
+	fn, ok := call["function_call"].(map[string]any)
+	if !ok {
+		t.Fatalf("must carry function_call, got keys %v", call)
+	}
+	if fn["name"] != "read" || fn["arguments"] != `{"path":"a.txt"}` {
+		t.Errorf("function_call=%v", fn)
+	}
+}
+
+// TestNativeToolResultKeepsCorrelation 锁定 tool 消息保留关联字段。
+func TestNativeToolResultKeepsCorrelation(t *testing.T) {
+	msg := nativeMessage(map[string]any{
+		"role": "tool", "tool_call_id": "call_1", "name": "read", "content": "file body",
+	})
+	if msg["tool_call_id"] != "call_1" || msg["name"] != "read" {
+		t.Errorf("tool correlation lost: %v", msg)
+	}
+	if _, ok := msg["content"].([]any); !ok {
+		t.Errorf("tool content must also be a block array: %v", msg["content"])
+	}
+}
+
+// TestNativeContentAcceptsBlockArray 覆盖已是块数组的输入（Anthropic 风格）。
+func TestNativeContentAcceptsBlockArray(t *testing.T) {
+	msg := nativeMessage(map[string]any{
+		"role": "user",
+		"content": []any{
+			map[string]any{"type": "text", "text": "hi"},
+			map[string]any{"type": "input_text", "content": "there"},
+		},
+	})
+	blocks, _ := msg["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%v", blocks)
+	}
+	first, _ := blocks[0].(map[string]any)
+	second, _ := blocks[1].(map[string]any)
+	if first["type"] != "text" || first["text"] != "hi" {
+		t.Errorf("block0=%v", first)
+	}
+	// input_text 归一为 text，文本从 content 提到 text。
+	if second["type"] != "text" || second["text"] != "there" {
+		t.Errorf("block1=%v", second)
+	}
+}
+
+// TestBuildChatBodyMessagesAreNative 端到端确认出站体里的 content 是数组。
+func TestBuildChatBodyMessagesAreNative(t *testing.T) {
+	prepared := []byte(`{"model":"glm-5.3","messages":[
+		{"role":"system","content":"be brief"},
+		{"role":"user","content":"hi"}]}`)
+	body, err := BuildChatBody(prepared, "req-1")
+	if err != nil {
+		t.Fatalf("BuildChatBody: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	msgs, _ := parsed["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages=%v", parsed["messages"])
+	}
+	for i, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		blocks, ok := m["content"].([]any)
+		if !ok {
+			t.Fatalf("message %d content is %T, must be an array (upstream rejects strings)",
+				i, m["content"])
+		}
+		if len(blocks) == 0 {
+			t.Fatalf("message %d has empty content array", i)
+		}
+	}
+}
+
+// TestTranslateNativeFunctionCallShape 锁定 2026-10-11 真实上游的工具调用形态。
+//
+// 原始事件实测（read_file 调用）：
+//
+//	{"index":0,"id":"call_97917b0d...","type":"function",
+//	 "function_call":{"name":"read_file","arguments":"{\""}}
+//	{"index":0,"id":"","type":"function",
+//	 "function_call":{"name":"","arguments":"path\":\"/etc/hostname\"}"}}
+//
+// 三个必须同时成立的点，缺一个工具调用就废：
+//  1. name/arguments 在 **function_call** 里（不是 OpenAI 的 function）——
+//     只认 function 会让名字与参数全丢，下游报 invalid tool arguments；
+//  2. 身份与参数**拆在两个事件**里，第二帧的 id/name 是空串，不能覆盖第一帧；
+//  3. arguments 是**增量拼接**（"{\"" + "path\":...}"），不是累计快照。
+func TestTranslateNativeFunctionCallShape(t *testing.T) {
+	upstream := "event: output\ndata: {\"response\":\"\",\"reasoning_content\":null," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\"," +
+		"\"function_call\":{\"name\":\"read_file\",\"arguments\":\"{\\\"\"}}]}\n\n" +
+		"event: output\ndata: {\"response\":\"\",\"reasoning_content\":null," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\"," +
+		"\"function_call\":{\"name\":\"\",\"arguments\":\"path\\\":\\\"/etc/hostname\\\"}\"}}]}\n\n" +
+		"event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n"
+
+	sse, err := collect(t, upstream)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+
+	// 首片必须带 id/name/type 各一次。
+	if n := strings.Count(sse, `"id":"call_abc"`); n != 1 {
+		t.Errorf("tool id delivered %d times want 1: %q", n, sse)
+	}
+	if n := strings.Count(sse, `"name":"read_file"`); n != 1 {
+		t.Errorf("tool name delivered %d times want 1: %q", n, sse)
+	}
+	if n := strings.Count(sse, `"type":"function"`); n != 1 {
+		t.Errorf("tool type delivered %d times want 1: %q", n, sse)
+	}
+	// 参数按增量交付（首片 "{\""，次片 "path\":...}"）。
+	if !strings.Contains(sse, `"arguments":"{\""`) {
+		t.Errorf("first argument fragment missing: %q", sse)
+	}
+	if !strings.Contains(sse, `path\":\"/etc/hostname\"}`) {
+		t.Errorf("second argument fragment missing: %q", sse)
+	}
+	// 终态归一为 tool_calls。
+	if !strings.Contains(sse, `"finish_reason":"tool_calls"`) {
+		t.Errorf("finish_reason should be tool_calls: %q", sse)
+	}
+	// 空 id/name 的后续帧不得再交付身份字段。
+	if strings.Contains(sse, `"name":""`) || strings.Contains(sse, `"id":""`) {
+		t.Errorf("empty identity fields leaked into the stream: %q", sse)
+	}
+}
+
+// TestTranslateNativeToolUsageMapping 锁定上游 usage 字段名（token_usage 事件）。
+//
+// 真实事件：{"prompt_tokens":189,"completion_tokens":43,"total_tokens":232,
+//
+//	"cache_read_input_tokens":128,"reasoning_tokens":29}
+//
+// 网关下游按 prompt_tokens_details.cached_tokens / completion_tokens_details.
+// reasoning_tokens 读缓存与思考量，不归一就会静默丢字段。
+func TestTranslateNativeToolUsageMapping(t *testing.T) {
+	upstream := "event: output\ndata: {\"response\":\"hi\"}\n\n" +
+		"event: token_usage\ndata: {\"prompt_tokens\":189,\"completion_tokens\":43," +
+		"\"total_tokens\":232,\"cache_read_input_tokens\":128,\"reasoning_tokens\":29}\n\n" +
+		"event: done\ndata: {}\n\n"
+
+	sse, err := collect(t, upstream)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	for _, want := range []string{
+		`"prompt_tokens":189`,
+		`"completion_tokens":43`,
+		`"total_tokens":232`,
+		`"cached_tokens":128`,
+		`"reasoning_tokens":29`,
+	} {
+		if !strings.Contains(sse, want) {
+			t.Errorf("usage field %s missing from %q", want, sse)
+		}
+	}
+}

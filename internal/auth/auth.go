@@ -153,6 +153,34 @@ func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
 // GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
 func GlobalEnabled() bool { return globalEnabled.Load() }
 
+// 网关认识的 realm 名。集中定义在最底层（auth 不依赖任何 internal 包），
+// 供各包共用——2026-10-11 接入 trae 时发现域集合散落在十余处（resolveModel、
+// splitRealm、reasoningLoopModel、sourcerate、healthz 展示、面板 REALMS…），
+// 每处各写一遍「cn/global」就会漏。新增域时改这里 + 下面两个谓词。
+const (
+	RealmCN     = "cn"
+	RealmGlobal = "global"
+	RealmTrae   = "trae"
+)
+
+// normalizeRealm 把显式 realm 值归一成小写已知域。
+//
+// 大小写不敏感很重要：手写 auth 文件里写 "Trae"/"TRAE" 时，若按字面比较会落到
+// global/cn 判定 → 静默判 cn → 拿 Trae 的 JWT 去打 codebuddy.cn，必然 401
+// 且没有任何告警。归一后这类文件按预期工作。
+// 未知值原样返回（由调用方决定，通常回落 cn）。
+func normalizeRealm(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// IsWorkBuddy 报告账号是否走 WorkBuddy 端点族（cn/global）。
+//
+// trae 域走完全不同的端点与协议（internal/upstream/trae 的 llm_utils_chat）。
+// 所有「对 WorkBuddy 端点发请求」的运维动作——签到、余额查询、连登奖励、猫猫旅行、
+// 活动上报、注册地补全——都必须先问这个谓词：拿 Trae 的 Cloud-IDE-JWT 去打
+// codebuddy.cn 只会得到 401，而且每轮定时任务都会刷一遍日志。
+func (a *Auth) IsWorkBuddy() bool { return a.Realm() != RealmTrae }
+
 // Realm 返回账号的归一化域：显式 realm=="trae" → "trae"；显式 Realm=="global"
 // 或 domain 后缀 .workbuddy.ai → "global"，否则 "cn"。显式 global 优先于 domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
@@ -163,16 +191,16 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 func (a *Auth) Realm() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if strings.TrimSpace(a.realm) == "trae" {
-		return "trae"
+	if normalizeRealm(a.realm) == RealmTrae {
+		return RealmTrae
 	}
 	if !globalEnabled.Load() {
-		return "cn"
+		return RealmCN
 	}
-	if strings.TrimSpace(a.realm) == "global" || isGlobalDomain(a.Domain) {
-		return "global"
+	if normalizeRealm(a.realm) == RealmGlobal || isGlobalDomain(a.Domain) {
+		return RealmGlobal
 	}
-	return "cn"
+	return RealmCN
 }
 
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
