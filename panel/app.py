@@ -1137,23 +1137,32 @@ def build_state(force_credit=False):
             "successCount": p.get("success_count") or 0,
             "errTotal": p.get("err_total") or 0,
         }
+        # 域能力：积分/签到/连登等是 WorkBuddy 端点族的概念，trae 域没有。
+        # 面板据此显示「不适用」而不是把 ./credit 的跳过说明当成查询失败——
+        # 2026-10-11 接入 trae 时发现，非 WorkBuddy 账号在这一页只会显示一堆错误。
+        realm = s.get("realm") or ""
+        workbuddy = realm != "trae"
+        credit_error = c.get("error")
         s["credits"] = {
-            "remain": c.get("remain"),
-            "size": c.get("size"),
-            "used": c.get("used"),
-            "packages": c.get("packages"),
-            "ok": c.get("ok"),
+            "supported": workbuddy,
+            "remain": c.get("remain") if workbuddy else None,
+            "size": c.get("size") if workbuddy else None,
+            "used": c.get("used") if workbuddy else None,
+            "packages": c.get("packages") if workbuddy else None,
+            "ok": c.get("ok") if workbuddy else None,
+            "error": credit_error if workbuddy else None,
             # 快过期积分子集（remain 的一部分）。来源优先级：
             #   1) ./credit 的 expiring（本次查询时按 WB2A_EXPIRING_SOON 现算，全账号都有，
             #      包括不签到的 global 号）；
             #   2) 网关 /status 的 credits_expiring（签到任务写的，只覆盖 CN 号且最长滞后 12h）。
             # 取较大者：两者口径同源（同一上游字段、同一窗口），差异只来自数据新鲜度；
             # 取大不会漏报"要作废了"，符合这个提示的用途（宁可多提醒，不可漏）。
-            "expiring": max(int(c.get("expiring") or 0), int(p.get("credits_expiring") or 0)),
+            "expiring": (max(int(c.get("expiring") or 0), int(p.get("credits_expiring") or 0))
+                         if workbuddy else 0),
             # 到期分布（固定档位，互斥，合计 = remain）+ 逐笔日程（具体几号几点过期多少）：
             # 积分有效期页用。两者是同一份数据的两种粒度，故同放 expiry 一层。
-            "expiry": c.get("expiry") or {},
-            "expiringWindowHours": int(c.get("expiring_window_hours") or 0),
+            "expiry": (c.get("expiry") or {}) if workbuddy else {},
+            "expiringWindowHours": int(c.get("expiring_window_hours") or 0) if workbuddy else 0,
         }
         accounts.append(s)
 

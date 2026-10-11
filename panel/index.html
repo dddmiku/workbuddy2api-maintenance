@@ -426,6 +426,21 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   .chip{padding:0 9px}
   .wm b{font-size:12.5px}
 }
+
+/* ── 域标签（接入 trae 后账号表出现三种来源）─────────────
+ * 纯大写文字 CN/GLOBAL/TRAE 在几十行里扫不出来，用带色胶囊区分：
+ * 一眼能定位「哪个域的号出问题了」。配色只做区分，不表示好坏。
+ */
+.rtag{display:inline-block;padding:1px 6px;border-radius:5px;font-size:10.5px;
+  font-weight:600;letter-spacing:.04em;line-height:1.5;vertical-align:middle;
+  border:1px solid transparent}
+.rtag.cn{background:var(--info-soft);color:var(--info);border-color:var(--info-soft)}
+.rtag.global{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
+.rtag.trae{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-soft)}
+/* 「不适用」：该域没有这项能力（如 trae 没有 WorkBuddy 的积分接口）。
+ * 与「—」（暂无数据）区别开，否则运维会以为是查询失败。 */
+.na{color:var(--ink-3);font-size:12px}
+.na.err{color:var(--err);cursor:help}
 /* 2026-09-20：对齐 new-api 规范——标签改软色药丸、弹窗 14px 圆角、输入框 34px。
  * 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
 /* 2026-09-20：列表复制入口和逐密钥重复推理保护开关，兼容移动端卡片。 */
@@ -900,7 +915,14 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
               <button data-f="on">启用</button>
               <button data-f="off">停用</button>
             </div>
+            <div class="seg" id="acctRealm" title="按域筛选">
+              <button data-r="" aria-pressed="true">全区域</button>
+              <button data-r="cn">CN</button>
+              <button data-r="global">Global</button>
+              <button data-r="trae">Trae</button>
+            </div>
             <span class="sp"></span>
+            <span class="sub" id="acctCount"></span>
             <button class="btn sm pri" id="btnAdd">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
               添加账号
@@ -952,6 +974,7 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
             </div>
             <div class="seg" id="schedAccount" style="margin-left:8px"></div>
           </div>
+          <div class="sub" id="schedCount" style="padding:0 2px 10px"></div>
           <div class="tblwrap">
             <table class="tbl">
               <thead><tr>
@@ -1524,7 +1547,7 @@ var IC = {
 };
 
 /* ── 状态 ─────────────────────────────────────────── */
-var S = { data:null, tasks:null, filter:'all', q:'', logLines:120, loadRevision:0, loadedAt:0 };
+var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
 var modalCb = null;
 var logKey = null, logName = '';
@@ -1978,6 +2001,16 @@ function renderOvTasks(){
   }).join('');
 }
 
+// realmTag 渲染域标签。
+//
+// 接入 trae 后池子里有三种来源（CN / Global / Trae），纯大写文字（CN/GLOBAL/TRAE）
+// 在几十行里扫不出来。用带色的胶囊标签区分：一眼能看出「哪个域的号出问题了」。
+function realmTag(realm){
+  var r = String(realm || '').toLowerCase();
+  var label = r === 'trae' ? 'TRAE' : (r === 'global' ? 'GLOBAL' : 'CN');
+  return '<span class="rtag ' + esc(r) + '">' + esc(label) + '</span>';
+}
+
 function acctState(a){
   var p = a.pool || {};
   // 池级停用（网关自己停的，多为被上游封禁/标记）优先展示——这是真正"用不了"
@@ -1996,13 +2029,23 @@ function renderAccounts(){
   var q = S.q.trim().toLowerCase();
   if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
   if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
+  // 按域筛选：接入 trae 后池子里有三种来源，全混在一张表里看不出「哪个域的号出问题了」。
+  if (S.realm) list = list.filter(function(a){ return String(a.realm || '') === S.realm; });
   if (q) list = list.filter(function(a){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
            (a.uid || '').toLowerCase().indexOf(q) >= 0;
   });
+  // 计数按当前域口径给出：筛选到 CN 时，「共 N 个」应当指 CN 的号，不是全池。
+  var scoped = S.realm ? all.filter(function(a){ return String(a.realm || '') === S.realm; }) : all;
+  var countEl = $('#acctCount');
+  if (countEl){
+    countEl.textContent = (list.length === scoped.length)
+      ? ('共 ' + scoped.length + ' 个账号')
+      : ('显示 ' + list.length + ' / ' + scoped.length + ' 个账号');
+  }
   if (!list.length){
     $('#acctRows').innerHTML = '<tr><td colspan="5" data-l="">' +
-      emptyBox(IC.users, '没有匹配的账号', all.length ? '换个关键词或筛选条件' : '用右上角添加账号') +
+      emptyBox(IC.users, '没有匹配的账号', scoped.length ? '换个关键词或筛选条件' : '用右上角添加账号') +
       '</td></tr>';
     return;
   }
@@ -2011,6 +2054,7 @@ function renderAccounts(){
     var coolEnd = (S.loadedAt || Date.now()) + (Number(p.coolRemaining) || 0) * 1000;
     p.coolRemaining = Math.max(0, Math.ceil((coolEnd - Date.now()) / 1000));
     var left = daysLeft(a.expiresAt);
+    var workbuddy = c.supported !== false;
     // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
@@ -2019,19 +2063,36 @@ function renderAccounts(){
       ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
         num(expiring) + ' 即将过期</span>'
       : '';
-    var creditCell = (typeof c.remain === 'number')
-      ? '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
+    // 非 WorkBuddy 域（trae）没有这套积分接口：显示「不适用」而不是「—」或错误，
+    // 否则运维会以为是查询失败。
+    var creditCell;
+    if (!workbuddy){
+      creditCell = '<span class="na" title="Trae 域不使用 WorkBuddy 的积分接口">不适用</span>';
+    } else if (typeof c.remain === 'number'){
+      creditCell = '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
         '<span class="m">已用 ' + num(c.used) + ' / ' + num(c.size) + '</span>' +
         (typeof c.size === 'number' && c.size > 0
           ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
-          : '') + expiringLine + '</div>'
-      : '<span style="color:var(--ink-3)">—</span>';
+          : '') + expiringLine + '</div>';
+    } else if (c.error){
+      creditCell = '<span class="na err" title="' + esc(String(c.error)) + '">查询失败</span>';
+    } else {
+      creditCell = '<span style="color:var(--ink-3)">—</span>';
+    }
     // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
     // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
+    // trae 号从没成功过也属正常（刚加进来还没用过），不该显示成「无成功记录」
+    // 那种像是出过错的措辞。
     var errAt = activityTime(p.lastErr), successAt = activityTime(p.lastSuccess);
-    var lastTxt = successAt ? relTime(successAt) : (errAt ? '无成功记录' : '无记录');
-    var lastSub = errAt ? ('最近错误 ' + relTime(errAt))
-      : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
+    var lastTxt, lastSub;
+    if (!workbuddy && !successAt && !errAt){
+      lastTxt = '尚未使用';
+      lastSub = '';
+    } else {
+      lastTxt = successAt ? relTime(successAt) : (errAt ? '无成功记录' : '无记录');
+      lastSub = errAt ? ('最近错误 ' + relTime(errAt))
+        : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
+    }
     // 状态列：冷却中显示冷却剩余与原因；正常号才显示凭证有效期（两者混在一起会把
     // 「冷却中」误读成要等 363 天，见 coolLeft 注释）。
     // 冷却中的行带 data-cool-end（截止毫秒时间戳），交给 tickCooldowns 每秒就地刷新，
@@ -2046,7 +2107,7 @@ function renderAccounts(){
         : '');
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
-      '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + esc(String(a.realm || '').toUpperCase()) + '</div></td>' +
+      '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + realmTag(a.realm) + '</div></td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
       coolSub +
       '</span></td>' +
@@ -2243,7 +2304,11 @@ function schedCls(iso){
 function renderSchedule(){
   var rowsEl = $('#schedRows'); if (!rowsEl) return;
   var d = S.data || {}, a = d.accounts || [];
-  var have = a.filter(function(x){
+  // 积分到期日程是 WorkBuddy 端点族的概念（cmd/credit 查 billing/meter 得到）。
+  // 非 WorkBuddy 域（trae）没有这项，必须排除——否则它会被算进「取到的账号」里，
+  // 让「没有到期日程」的空态看起来像是数据缺失，而实际是这个域压根没有这个概念。
+  var billable = a.filter(function(x){ return (x.credits || {}).supported !== false; });
+  var have = billable.filter(function(x){
     return x.credits && typeof x.credits.remain === 'number' &&
            ((x.credits.expiry || {}).schedule || []).length;
   });
@@ -2268,10 +2333,21 @@ function renderSchedule(){
     var cutoff = Date.now() + wh * 3600000;
     entries = entries.filter(function(e){ return new Date(e.end).getTime() <= cutoff; });
   }
+  // 顶部计数：让「有日程的号 / 参与统计的号」可见，而不是只给一张表。
+  var countEl = $('#schedCount');
+  if (countEl){
+    var skipped = a.length - billable.length;
+    countEl.textContent = have.length
+      ? ('共 ' + entries.length + ' 笔 · 涉及 ' + scope.length + ' 个账号' +
+         (skipped ? '（' + skipped + ' 个非 WorkBuddy 账号不参与）' : ''))
+      : '';
+  }
   if (!entries.length){
+    var why = have.length ? '换个筛选条件'
+      : (billable.length ? '取到的账号都没有带到期时间的积分'
+        : '没有适用积分到期的账号');
     rowsEl.innerHTML = '<tr><td colspan="4" data-l="">' +
-      emptyBox(IC.clock, '没有到期日程',
-        have.length ? '换个筛选条件' : '取到的账号都没有带到期时间的积分') + '</td></tr>';
+      emptyBox(IC.clock, '没有到期日程', why) + '</td></tr>';
     return;
   }
   // 截断说明：任一账号标了 truncated 就提示一次（余额已聚进最后一笔，不是丢了）。
@@ -2320,6 +2396,15 @@ $('#acctFilter').addEventListener('click', function(e){
   var b = e.target.closest('button[data-f]'); if (!b) return;
   S.filter = b.getAttribute('data-f');
   $$('#acctFilter button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderAccounts();
+});
+// 域筛选：与状态筛选相互独立（两个维度同时生效），只重绘表格不动整页。
+$('#acctRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.realm = b.getAttribute('data-r');
+  $$('#acctRealm button').forEach(function(x){
     x.setAttribute('aria-pressed', String(x === b));
   });
   renderAccounts();

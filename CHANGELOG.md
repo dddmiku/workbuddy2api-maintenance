@@ -17,6 +17,71 @@
 
 历史说明：`v2.4.1`–`v2.4.27` 期间补丁号被当作计数器使用，其中多数是修复、少数是新能力，未按本规则区分。规则自 `v2.5.0` 起生效。
 
+## v2.6.24 — 2026-10-11
+
+Trae 域实测修复（真实上游验证）+ 账号页/排程页的域感知。
+
+### 一、Trae 域：三个只有跑真实上游才会暴露的缺陷
+
+单测全绿但第一次真实调用就 400。三个缺陷都不是读代码能发现的——测试里写的是和
+代码同一套（错误的）假设。
+
+**消息必须是内容块数组。** 真实上游第一句就拒了：
+
+```
+{"code":4001,"message":"bad request: json: cannot unmarshal string into Go struct
+ field LLMRawMessage.messages.content of type []*idecopilot.LLMRawMessageContent"}
+```
+
+`content` 要是 `[{"type":"text","text":...}]`，不是 OpenAI 的字符串；助手消息的工具
+调用放在 `function_call` 而不是 `function`。
+
+**工具身份与参数分在两个事件里。** 真实事件：
+
+```
+{"index":0,"id":"call_...","function_call":{"name":"read_file","arguments":"{\""}}
+{"index":0,"id":"","function_call":{"name":"","arguments":"path\":\"/etc/hostname\"}"}}
+```
+
+name/arguments 在 `function_call` 下（只认 `function` 会让两者全丢，网关随即以
+"incomplete tool arguments" 失败整条流）；第二帧的空 id/name 不能覆盖第一帧；
+arguments 是**增量拼接**。
+
+**usage 字段名不同。** 上游发 `cache_read_input_tokens` 与 `reasoning_tokens`，
+下游读 `prompt_tokens_details.cached_tokens` 与
+`completion_tokens_details.reasoning_tokens`，不归一就会静默丢字段。
+
+### 二、realm 假设的全面清理
+
+一次针对「代码里哪些地方假定域集合恰为 {cn, global}」的审计找出十余处残留：
+
+- trae 账号被送去 WorkBuddy 的**签到、余额、连登奖励、猫猫旅行、活动上报**端点
+  （必然 401，且每轮定时任务刷一遍日志）；
+- 来源级限流闸门把 trae 归并进 **cn** 桶——一个上游的限流能暂停另一个上游的选号；
+- `trae:deepseek-*` 的**推理循环保护被静默关闭**；
+- `/healthz` 与 `/status` **完全看不到 trae 域**（trae 全挂时仍报 200）。
+
+域名现在集中在一处（`auth.RealmCN/RealmGlobal/RealmTrae`），展示层走 `realmNames()`。
+另修：手写 auth 文件里 realm 写 `"Trae"`/`"TRAE"` 会静默判成 cn（现在大小写不敏感）。
+
+### 三、账号页与排程页
+
+- 账号页新增**域筛选**（全区域 / CN / Global / Trae）与**域标签胶囊**——三种来源混在
+  一张表里，纯大写文字扫不出「哪个域的号出问题了」；筛选后计数按当前域口径显示。
+- 积分列对 trae 显示「**不适用**」（而不是 `—` 或查询失败），因为 trae 没有 WorkBuddy
+  的积分接口；查询失败单独显示为「查询失败」并带悬停原因，两者不再混为一谈。
+- trae 账号的「最近活动」显示「**尚未使用**」而不是「无成功记录」——后者像是出过错。
+- 排程页排除非 WorkBuddy 账号（它们不参与积分到期统计），并显示「N 个非 WorkBuddy
+  账号不参与」，避免把「没有日程」误读成数据缺失。
+
+### 实测验证
+
+对着真实 Trae 上游跑通：文本+思考（PONG，reasoning 正确拆出）、工具调用
+（`read_file` + `{"path":"/etc/hostname"}` 聚合成合法 OpenAI tool_calls），
+均经网关自己的 `upstream.Stream`/`Aggregate` 消费，零错误。
+续期也已实测：用账号里的 refreshToken 打 ExchangeToken 换出新 JWT（HTTP 200），
+新 exp 顺延 14 天。
+
 ## v2.6.23 — 2026-10-11
 
 修 Trae 授权登录的引导：用户实测时把回调地址**打开**了，而不是复制。

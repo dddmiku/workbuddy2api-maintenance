@@ -148,7 +148,14 @@
               <button data-f="on">启用</button>
               <button data-f="off">停用</button>
             </div>
+            <div class="seg" id="acctRealm" title="按域筛选">
+              <button data-r="" aria-pressed="true">全区域</button>
+              <button data-r="cn">CN</button>
+              <button data-r="global">Global</button>
+              <button data-r="trae">Trae</button>
+            </div>
             <span class="sp"></span>
+            <span class="sub" id="acctCount"></span>
             <button class="btn sm pri" id="btnAdd">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
               添加账号
@@ -200,6 +207,7 @@
             </div>
             <div class="seg" id="schedAccount" style="margin-left:8px"></div>
           </div>
+          <div class="sub" id="schedCount" style="padding:0 2px 10px"></div>
           <div class="tblwrap">
             <table class="tbl">
               <thead><tr>

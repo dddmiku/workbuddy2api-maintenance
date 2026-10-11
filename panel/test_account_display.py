@@ -70,5 +70,43 @@ class AccountDisplayTests(unittest.TestCase):
         self.assertIn("if (document.hidden) return;", self.app_js)
 
 
+class RealmCapabilityTest(unittest.TestCase):
+    """锁定「域能力」字段：trae 域没有 WorkBuddy 的积分接口。
+
+    2026-10-11 接入 trae 时发现，面板把 ./credit 对非 WorkBuddy 账号的「跳过」
+    说明当成查询结果展示，于是 trae 账号在账号页与积分页显示成一片错误。
+    后端现在显式给出 credits.supported，前端据此显示「不适用」。
+    """
+
+    def _state(self, realm):
+        import app as panel_app
+        from unittest import mock
+        summary = {"uid": "u1", "realm": realm, "nickname": "n", "disabled": False,
+                   "expiresAt": 0, "domain": "", "enterpriseId": "", "parsable": True}
+        with mock.patch.object(panel_app, "list_auth_files",
+                               return_value=[{"uid": "u1", "file": "f.json",
+                                              "disabled": False, "path": "p"}]), \
+             mock.patch.object(panel_app, "auth_summary", return_value=summary), \
+             mock.patch.object(panel_app, "gateway_get", return_value={}), \
+             mock.patch.object(panel_app, "credits_by_uid",
+                               return_value=({}, {"accounts": []})), \
+             mock.patch.object(panel_app, "container_running", return_value=True), \
+             mock.patch.object(panel_app, "_expiring_soon_env", return_value=""):
+            return panel_app.build_state()
+
+    def test_trae_account_credit_is_not_applicable(self):
+        acct = self._state("trae")["accounts"][0]
+        self.assertIs(acct["credits"]["supported"], False)
+        for key in ("remain", "size", "used", "packages", "ok"):
+            self.assertIsNone(acct["credits"][key], key)
+        self.assertEqual(acct["credits"]["expiring"], 0)
+        self.assertEqual(acct["credits"]["expiry"], {})
+
+    def test_workbuddy_accounts_still_report_credits(self):
+        for realm in ("cn", "global"):
+            acct = self._state(realm)["accounts"][0]
+            self.assertIs(acct["credits"]["supported"], True, realm)
+
+
 if __name__ == "__main__":
     unittest.main()

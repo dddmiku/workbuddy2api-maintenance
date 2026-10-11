@@ -217,3 +217,18 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   .chip{padding:0 9px}
   .wm b{font-size:12.5px}
 }
+
+/* ── 域标签（接入 trae 后账号表出现三种来源）─────────────
+ * 纯大写文字 CN/GLOBAL/TRAE 在几十行里扫不出来，用带色胶囊区分：
+ * 一眼能定位「哪个域的号出问题了」。配色只做区分，不表示好坏。
+ */
+.rtag{display:inline-block;padding:1px 6px;border-radius:5px;font-size:10.5px;
+  font-weight:600;letter-spacing:.04em;line-height:1.5;vertical-align:middle;
+  border:1px solid transparent}
+.rtag.cn{background:var(--info-soft);color:var(--info);border-color:var(--info-soft)}
+.rtag.global{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
+.rtag.trae{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-soft)}
+/* 「不适用」：该域没有这项能力（如 trae 没有 WorkBuddy 的积分接口）。
+ * 与「—」（暂无数据）区别开，否则运维会以为是查询失败。 */
+.na{color:var(--ink-3);font-size:12px}
+.na.err{color:var(--err);cursor:help}
