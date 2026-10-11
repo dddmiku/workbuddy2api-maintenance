@@ -188,6 +188,21 @@ var IC = {
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
+
+// REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
+//
+// 接入 trae 后有三处要列域（账号池、积分分域、任务分组），此前各写各的：
+// 账号池用「国内/国际/trae」，积分用「国际/国内」且顺序相反，trae 干脆被漏掉
+// （2026-10-11 用户实测：积分合计 63,125，但分域只列了 33,501 + 10,673，
+// 差额就是没显示的 trae）。顺序与文案集中在这里，新增域只改一处。
+var REALM_ORDER = ['cn', 'global', 'trae'];
+var REALM_LABEL = { cn: '国内版 CN', global: '国际版 Global', trae: 'Trae CN' };
+// REALM_SHORT 用于「XX 可用 / XX 剩余」这类紧凑行。
+var REALM_SHORT = { cn: '国内', global: '国际', trae: 'Trae' };
+
+function realmName(realm){ return REALM_LABEL[realm] || realm; }
+function realmShort(realm){ return REALM_SHORT[realm] || realm; }
+
 var modalCb = null;
 var logKey = null, logName = '';
 
@@ -540,13 +555,17 @@ function renderPool(){
     mrow('并发占满', String(p.inFlightFull || 0)) +
     mrow('粘性会话', String(p.stickySessions || 0));
   var rt = p.realmTotals || {};
-  Object.keys(rt).forEach(function(k){
-    var v = rt[k], label = (k === 'cn' ? '国内' : (k === 'global' ? '国际' : k));
+  // 固定顺序（cn → global → trae），不跟对象键的插入顺序走：域多了以后顺序乱跳
+  // 会让运维每次刷新都要重新找那一行。只列真的有账号的域。
+  REALM_ORDER.forEach(function(k){
+    var v = rt[k];
+    if (v === undefined) return;
     if (v && typeof v === 'object'){
       var tot = Number(v.total) || 0, ok = Number(v.healthy) || 0;
-      html += mrow(label + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
+      if (!tot) return;
+      html += mrow(realmShort(k) + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
     } else {
-      html += mrow(label + '可用', String(v));
+      html += mrow(realmShort(k) + '可用', String(v));
     }
   });
   $('#poolPanel').innerHTML = html;
@@ -596,14 +615,15 @@ function renderCredit(){
           Math.round(total.expiring / Math.max(1, remain) * 100) + '% 即将作废）', 'w')
       : '') +
     mrow('取到积分', have.length + ' / ' + a.length);
-  // 分域小计：只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
-  [['global', '国际'], ['cn', '国内']].forEach(function(pair){
-    var realm = pair[0], label = pair[1];
+  // 分域小计：按 REALM_ORDER 固定顺序，**包含全部域**（含 trae）。
+  // 只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
+  REALM_ORDER.forEach(function(realm){
     var subset = have.filter(function(x){ return String(x.realm || '') === realm; });
     if (!subset.length) return;
     var part = sumOf(subset);
     var share = remain ? Math.round(part.remain / remain * 100) : 0;
-    html += mrow(label + '剩余', num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）' +
+    html += mrow(realmShort(realm) + '剩余',
+      num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）' +
       (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : ''),
       part.expiring > 0 ? 'w' : '');
   });
@@ -1079,16 +1099,15 @@ function renderTasks(){
     var r = String(a.realm || 'cn').toLowerCase();
     present[r] = true;
   });
-  var ORDER = ['cn', 'global', 'trae'];
-  var LABEL = { cn:'CN 国内版', global:'Global 国际版', trae:'Trae CN' };
-  var groups = ORDER.filter(function(r){ return present[r]; });
+  // 域顺序与文案用全局那一份（REALM_ORDER / REALM_LABEL），不再各写一套。
+  var groups = REALM_ORDER.filter(function(r){ return present[r]; });
   // 兜底：池里没有账号（或数据未到）时，用任务自己声明的域，至少不显示空白。
   if (!groups.length){
     var seen = {};
     list.forEach(function(t){
       (t.realms || ['cn']).forEach(function(r){ seen[r] = true; });
     });
-    groups = ORDER.filter(function(r){ return seen[r]; });
+    groups = REALM_ORDER.filter(function(r){ return seen[r]; });
   }
   var html = groups.map(function(realm){
     var mine = list.filter(function(t){
@@ -1097,7 +1116,7 @@ function renderTasks(){
     if (!mine.length) return '';
     return '<div class="vhead sec" style="margin-top:18px">' +
         '<h2 style="font-size:14px">' + realmTag(realm) +
-        '<span style="margin-left:8px">' + esc(LABEL[realm] || realm) + '</span></h2>' +
+        '<span style="margin-left:8px">' + esc(realmName(realm)) + '</span></h2>' +
         '<span class="sp"></span>' +
         '<span class="sub">' + mine.length + ' 个任务</span>' +
       '</div>' +

@@ -993,3 +993,61 @@ class SelectorTargetExistsTest(unittest.TestCase):
         self.assertIn("$('#drSubmit2')", sub)
         self.assertNotIn("$('#drSubmit')", sub,
                          "drSubmit 是扫码流程的按钮，Trae 流程用 drSubmit2")
+
+
+class RealmBreakdownCompletenessTest(unittest.TestCase):
+    """概览里的分域小计必须覆盖**全部域**，顺序与文案统一。
+
+    2026-10-11 用户实测：接入 trae 后积分分域仍只写死 `[['global','国际'],['cn','国内']]`，
+    trae 被漏掉——合计 63,125，但分域只列了 33,501 + 10,673，差额正是没显示的 trae。
+    同时两处文案不一致（账号池「国内/国际」，积分「国际/国内」且顺序相反）。
+
+    现在域顺序与文案集中在 REALM_ORDER / REALM_LABEL / REALM_SHORT，三处共用。
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+
+    def test_single_source_for_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("var REALM_ORDER = ['cn', 'global', 'trae']", body)
+                self.assertIn("REALM_SHORT", body)
+
+    def test_no_hardcoded_realm_pairs(self):
+        """禁止再出现写死的域列表——那正是 trae 被漏掉的原因。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertNotIn("[['global', '国际'], ['cn', '国内']]", body)
+                self.assertNotIn("k === 'cn' ? '国内'", body)
+
+    def test_credit_breakdown_iterates_all_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function renderCredit()")
+                block = body[start:body.index("function taskState(", start)]
+                self.assertIn("REALM_ORDER.forEach", block,
+                              "积分分域必须遍历 REALM_ORDER，不能写死两域")
+
+    def test_pool_breakdown_iterates_all_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function renderPool()")
+                block = body[start:body.index("function renderCredit()", start)]
+                self.assertIn("REALM_ORDER.forEach", block)
+                self.assertIn("realmShort(k)", block)
+
+    def test_realm_defs_precede_first_use(self):
+        """REALM_ORDER 必须在任何 render 调用之前赋值。
+
+        var 声明会提升但赋值不会：定义在文件后半段时，前面的 renderPool() 读到的
+        是 undefined，`REALM_ORDER.forEach` 直接抛异常、整块面板空白。
+        """
+        body = self.index
+        def_line = body.index("var REALM_ORDER = ")
+        # init() 里会调用 go() → renderPool()
+        init_line = body.index("  go(v);\n  loadAll();")
+        self.assertLess(def_line, init_line,
+                        "REALM_ORDER 必须先于 init 里的首次渲染赋值")
