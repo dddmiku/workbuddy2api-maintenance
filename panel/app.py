@@ -131,6 +131,8 @@ LOGIN_GLOBAL_MAX_FAILS = 20
 # 留空 = 不限制（默认，行为不变）。
 ADMIN_ALLOW_CIDRS = os.environ.get("WB2API_ADMIN_ALLOW_CIDRS", "")
 COOKIE_NAME = "wb2a_admin"
+# Trae 授权回调路径（经 nginx 暴露为 https://<host>/admin/trae/callback）。
+TRAE_CALLBACK_PATH = "/trae/callback"
 
 # 可信反向代理网段（CIDR，逗号分隔）。只有直连对端落在这些网段内，才采信
 # X-Real-IP / CF-Connecting-IP / X-Forwarded-For —— 这些头客户端能自己伪造，
@@ -961,6 +963,34 @@ def write_trae_auth_file(creds, uid, expires_at):
     }
 
 
+def trae_callback_page(ok, message, nickname=""):
+    """Trae 授权回调的结果页（自包含，不需要面板会话与静态资源）。"""
+    title = "授权成功" if ok else "授权失败"
+    color = "#1a8c5c" if ok else "#c0392b"
+    extra = ("<p>账号：%s</p>" % escape_html(nickname)) if nickname else ""
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trae %s</title>
+<style>
+body{font:15px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+background:#0f1117;color:#e8eaed;display:flex;align-items:center;
+justify-content:center;min-height:100vh;margin:0;padding:20px}
+.p{background:#1a1d28;border:1px solid #2d3140;border-radius:10px;
+max-width:460px;width:100%%;padding:26px 24px}
+h1{font-size:17px;margin:0 0 12px;color:%s}
+p{margin:8px 0;color:#9aa0b0;font-size:13px;line-height:1.6;word-break:break-all}
+</style></head><body><div class="p">
+<h1>%s</h1>%s<p>%s</p>
+<p>这个页面可以关闭了。</p>
+</div></body></html>""" % (title, color, title, extra, escape_html(message))
+
+
+def escape_html(text):
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def find_entry(uid):
     if not UID_RE.match(uid or ""):
         return None
@@ -1338,6 +1368,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "version": PANEL_VERSION})
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
         session = self._session()
+
+        # Trae 授权回调。必须**在会话检查之前**：浏览器从 Trae 授权页跳回来时
+        # 没有管理台会话 cookie，走到下面会被重定向到登录页、把凭据参数丢掉。
+        # 这里只负责把凭据收下并落盘，不做任何需要鉴权的操作。
+        if path == TRAE_CALLBACK_PATH:
+            return self.trae_callback(query)
 
         if path == "/login":
             if session:
@@ -1961,6 +1997,37 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "account": summary,
                 "message": "账号已添加(%s)，重启耗时 %ss" % (summary["nickname"], secs)}
 
+    def trae_callback(self, query):
+        """接收 Trae 授权回调（浏览器直接跳到这里，无管理会话）。
+
+        成功：解析凭据 → 落盘成 trae 账号 → 重启网关加载 → 返回一个自动关闭的提示页。
+        失败：返回可读的原因，并把原始参数留在页面上便于排查。
+
+        这条路径经 nginx 暴露在公网（Trae 只能回调到公网地址），因此**不返回任何
+        凭据内容**，页面只说成功或失败原因。
+        """
+        try:
+            creds = trae_login.parse_callback("?" + query if query else "")
+        except RuntimeError as error:
+            return self._html(400, trae_callback_page(False, str(error)))
+        uid = creds.get("uid") or ""
+        if not UID_RE.match(uid):
+            return self._html(400, trae_callback_page(False, "授权结果里没有拿到有效的用户 ID"))
+        expires_at = trae_login.normalize_expire(creds.get("token_expire_at"))
+        if expires_at <= 0:
+            expires_at = int(time.time()) + 3600
+        try:
+            with _lock:
+                summary = write_trae_auth_file(creds, uid, expires_at)
+                ok, msg, _ = restart_container()
+        except Exception as ex:  # noqa: BLE001 - 回调页必须给出可读原因
+            return self._html(500, trae_callback_page(False, "保存失败：%s" % ex))
+        if not ok:
+            return self._html(200, trae_callback_page(True, "凭据已保存，但 %s" % msg,
+                                                      summary.get("nickname", "")))
+        return self._html(200, trae_callback_page(True, "账号已添加并加载",
+                                                  summary.get("nickname", "")))
+
     def trae_login_start(self, body):
         """生成 Trae 授权链接。
 
@@ -1971,8 +2038,30 @@ class Handler(BaseHTTPRequestHandler):
         login_trace_id = str(uuid.uuid4())
         machine_id = secrets.token_hex(32)
         device_id = "".join(secrets.choice("0123456789") for _ in range(19))
-        url = trae_login.build_auth_url(login_trace_id, machine_id, device_id)
-        return {"ok": True, "url": url, "login_id": login_trace_id}
+        # 优先给**公网回调**地址：Trae 授权完成后直接跳回本服务，凭据自动落盘，
+        # 用户只需要在 Trae 页面点一下登录。回调页在 /trae/callback（nginx 下是
+        # /admin/trae/callback），不经管理会话——浏览器从 Trae 跳回来时没有 cookie。
+        callback = self._trae_public_callback()
+        url = trae_login.build_auth_url(login_trace_id, machine_id, device_id, callback)
+        # 同时给一条本机回调的链接作为兜底：万一 Trae 侧不接受这个回调地址，
+        # 用户仍可用它走「授权后把地址栏粘回来」的老路。
+        fallback = trae_login.build_auth_url(login_trace_id, machine_id, device_id)
+        return {"ok": True, "url": url, "login_id": login_trace_id,
+                "fallback_url": fallback, "auto": bool(callback),
+                "callback": callback}
+
+    def _trae_public_callback(self):
+        """本次请求的对外回调地址；取不到 Host 时返回空（回落手工回传）。"""
+        host = (self.headers.get("X-Forwarded-Host")
+                or self.headers.get("Host") or "").strip()
+        # Host 头来自客户端，必须挡住路径分隔符与控制字符：它会被拼进回调 URL，
+        # 不做检查就是一个注入点（回调地址是我们要发给 Trae 的）。
+        if not host or any(ch in host for ch in " \t\r\n/\\") or len(host) > 255:
+            return ""
+        proto = (self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "https"
+        return "%s://%s/admin/trae/callback" % (proto, host)
 
     def trae_login_finish(self, body):
         """接收用户粘贴的回调 URL，解析凭据并落盘成 Trae 账号。"""

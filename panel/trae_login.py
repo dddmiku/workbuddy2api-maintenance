@@ -46,8 +46,14 @@ def _json_loads_safe(value):
     return parsed if isinstance(parsed, dict) else {}
 
 
-def build_auth_url(login_trace_id, machine_id, device_id):
-    """拼出 Trae 网页授权 URL（参数与 Trae 官网一致）。"""
+def build_auth_url(login_trace_id, machine_id, device_id, callback_url=""):
+    """拼出 Trae 网页授权 URL（参数与 Trae 官网一致）。
+
+    callback_url 为空时用默认的本机地址（需要用户手工回传）；
+    传入公网回调地址时，Trae 授权完成后会**直接跳回服务器**，凭据自动落盘，
+    用户全程只需要在 Trae 页面点一下登录（2026-10-11 加，目标是与 WorkBuddy
+    扫码同等的操作量）。
+    """
     params = {
         "login_version": "1",
         "auth_from": "solo",
@@ -57,7 +63,7 @@ def build_auth_url(login_trace_id, machine_id, device_id):
         "client_id": TRAE_CLIENT_ID,
         "redirect": "0",
         "login_trace_id": login_trace_id,
-        "auth_callback_url": TRAE_CALLBACK_URL,
+        "auth_callback_url": callback_url or TRAE_CALLBACK_URL,
         "machine_id": machine_id,
         "device_id": device_id,
         "x_device_id": device_id,

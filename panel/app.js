@@ -187,7 +187,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeAuto:false, traeFallback:'' };
 var modalCb = null;
 var logKey = null, logName = '';
 
@@ -1447,7 +1447,11 @@ async function startLogin(){
       var t = await api('api/trae/login/start', {});
       if (!t.ok){ toast(t.message || '获取 Trae 授权链接失败', 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
       DT.url = t.url; DT.loginId = t.login_id || '';
+      DT.traeAuto = !!t.auto; DT.traeFallback = t.fallback_url || '';
       renderTraeWait();
+      // 自动模式：直接开授权页，用户点一下登录即可，回调会自动落盘。
+      // 手工模式（回调地址取不到）：仍需用户回传地址栏链接。
+      if (DT.traeAuto) window.open(DT.url, '_blank', 'noopener');
       return;
     }
     var r = await api('api/login/start', { realm:DT.realm });
@@ -1462,6 +1466,59 @@ async function startLogin(){
   }
 }
 
+// renderTraeAuto 是「一键授权」页：Trae 授权完成后会直接跳回本服务，
+// 凭据自动落盘。用户全程只需要在 Trae 页面点一下登录——与 WorkBuddy 扫码同等操作量。
+//
+// 面板每 2 秒轮询一次账号列表：回调落盘并重启网关后，新账号会自己出现，
+// 不需要用户回面板确认。
+function renderTraeAuto(){
+  $('#drTitle').textContent = 'Trae 授权';
+  $('#drBody').innerHTML =
+    '<div class="mtext">已打开 Trae 授权页。在那边点一下登录就行，' +
+      '完成后这里会<b>自动检测到新账号</b>，不用再复制粘贴任何东西。</div>' +
+    '<div style="margin-top:12px"><button class="btn" id="drReopen">没打开？再点一次</button></div>' +
+    '<div class="wait" style="margin-top:14px"><span class="spin"></span>' +
+      '<span id="waitMsg">等待授权完成…</span></div>' +
+    '<div class="sub" id="traeMsg" style="margin-top:10px;line-height:1.6"></div>' +
+    '<div class="sub" style="margin-top:14px;line-height:1.6">' +
+      '如果 Trae 拒绝了这个回调地址，可以用<b>手工方式</b>：' +
+    '</div>' +
+    '<div style="margin-top:8px"><button class="btn" id="drManual">改用手工粘贴</button></div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>';
+  $('#drCancel').addEventListener('click', renderPick);
+  $('#drReopen').addEventListener('click', function(){ window.open(DT.url, '_blank', 'noopener'); });
+  $('#drManual').addEventListener('click', function(){ DT.traeManual = true; renderTraeWait(); });
+  startTraeWatch();
+}
+
+// startTraeWatch 轮询账号列表，等 trae 账号出现。
+// 计数基线取打开时的 trae 账号数：只要多了一个就说明回调成功。
+function startTraeWatch(){
+  stopPoll(); DT.tries = 0;
+  var baseline = ((S.data && S.data.accounts) || []).filter(function(a){
+    return String(a.realm || '') === 'trae';
+  }).length;
+  DT.timer = setInterval(async function(){
+    if (DT.polling) return;
+    if (DT.tries++ > 60){ stopPoll(); setWait('等待超时。可以改用手工粘贴，或重新生成链接。'); return; }
+    try{
+      DT.polling = true;
+      await loadAll(true);
+      var now = ((S.data && S.data.accounts) || []).filter(function(a){
+        return String(a.realm || '') === 'trae';
+      });
+      if (now.length > baseline){
+        stopPoll();
+        var added = now[now.length - 1];
+        renderDone({ok:true, account:{uid:added.uid, nickname:added.nickname,
+                                     realm:'trae', expiresInDays:daysLeft(added.expiresAt)},
+                    message:'Trae 账号已添加'});
+      }
+    }catch(err){ /* 单次失败继续等 */ }
+    finally { DT.polling = false; }
+  }, 2000);
+}
+
 // renderTraeWait：Trae 的等待页不是「等扫码」，而是「等你把回调链接拿回来」。
 //
 // 这一步是整个流程唯一容易走错的地方：Trae 授权完成后浏览器会跳到一个
@@ -1471,6 +1528,10 @@ async function startLogin(){
 // 并给一个「从剪贴板读取」按钮——点按钮是用户手势，浏览器允许读剪贴板，
 // 于是整个回传动作变成一次点击而不是 全选→复制→切回来→粘贴。
 function renderTraeWait(){
+  if (DT.traeAuto && !DT.traeManual){ renderTraeAuto(); return; }
+  // 手工模式必须用**本机回调**那条链接：自动模式那条的回调指向公网，
+  // 手工粘贴时浏览器会跳到公网、拿不到地址栏里的参数。
+  if (DT.traeFallback) DT.url = DT.traeFallback;
   $('#drTitle').textContent = 'Trae 授权';
   $('#drBody').innerHTML =
     '<div class="mtext"><b>第 1 步</b>：点下面的「打开 Trae 授权页」，在 Trae 页面完成登录。</div>' +

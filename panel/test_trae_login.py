@@ -217,3 +217,63 @@ class RealCallbackShapeTest(unittest.TestCase):
         """明显不是 token 的文本必须报错，不能被当成裸 token 送去兑换。"""
         with self.assertRaises(RuntimeError):
             trae_login.parse_callback("我登录好了，你看看")
+
+
+class CallbackRouteTest(unittest.TestCase):
+    """锁定公网回调这条「一键授权」路径。
+
+    Trae 授权完成后浏览器直接跳到本服务，**没有管理台会话 cookie**——回调路由
+    必须在会话检查之前处理，否则会被重定向到登录页、把凭据参数丢掉。
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "app.py"), "r", encoding="utf-8") as fh:
+            self.app_py = fh.read()
+
+    def test_callback_handled_before_session_check(self):
+        body = self.app_py
+        cb = body.index("if path == TRAE_CALLBACK_PATH:")
+        # 会话拒绝分支（session 为空 → 401/重定向）必须在回调之后。
+        guard = body.index("if not session:", cb)
+        self.assertLess(cb, guard,
+                        "callback must be routed before the session gate")
+
+    def test_callback_page_never_echoes_credentials(self):
+        """回调页经公网暴露，绝不能把 token 回显到页面上。"""
+        body = self.app_py
+        start = body.index("def trae_callback_page(")
+        end = body.index("def escape_html(", start)
+        page = body[start:end]
+        for secret in ("access_token", "refresh_token", "accessToken", "token"):
+            self.assertNotIn(secret, page,
+                             "callback page must not render %s" % secret)
+
+    def test_public_callback_requires_https_and_safe_host(self):
+        body = self.app_py
+        start = body.index("def _trae_public_callback(")
+        end = body.index("def trae_login_finish(", start)
+        fn = body[start:end]
+        # Host 头来自客户端：必须挡控制字符与路径分隔符（会被拼进发给 Trae 的 URL）。
+        # 源码里写的是转义序列，断言按源码文本比对。
+        self.assertIn(r'" \t\r\n/\\"', fn)
+        self.assertIn("X-Forwarded-Proto", fn)
+        self.assertIn("len(host) > 255", fn)
+
+    def test_login_start_offers_fallback(self):
+        """自动模式失败时仍要能手工粘贴——两条链接都给。"""
+        body = self.app_py
+        self.assertIn("fallback_url", body)
+        self.assertIn("build_auth_url(login_trace_id, machine_id, device_id)", body)
+
+
+class TraeAuthUrlCallbackTest(unittest.TestCase):
+
+    def test_custom_callback_is_used(self):
+        url = trae_login.build_auth_url("t", "m", "1",
+                                        "https://example.com/admin/trae/callback")
+        self.assertIn("auth_callback_url=https%3A%2F%2Fexample.com%2Fadmin%2Ftrae%2Fcallback", url)
+
+    def test_default_callback_is_localhost(self):
+        url = trae_login.build_auth_url("t", "m", "1")
+        self.assertIn("auth_callback_url=http%3A%2F%2F127.0.0.1%3A8765%2Fauthorize", url)
