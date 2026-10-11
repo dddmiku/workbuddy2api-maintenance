@@ -325,16 +325,17 @@ def trae_login_app():
     return app
 
 
-class TraeUIBothPathsTest(unittest.TestCase):
-    """Trae 授权页必须**同屏**给出两条路。
+class TraeUIPrimaryPathTest(unittest.TestCase):
+    """Trae 授权页以**手工路为主路径**，自动回调折叠为可选项。
 
-    实测：Trae 的授权页由字节 Passport SDK 驱动，我们用官方客户端的 client_id，
-    其回调白名单很可能只含 localhost——把回调指向本服务公网地址时，Trae 侧报
-    「网络错误」，请求根本没到服务器。所以自动回调可能不可用，但值得先试。
+    实测依据（2026-10-11）：授权页由字节 Passport SDK 驱动，我们用官方客户端的
+    client_id，其回调白名单只认 localhost——把 auth_callback_url 指向本服务公网
+    地址时 Trae 报「网络错误」，服务器上**一条回调请求都收不到**（nginx 访问日志
+    里只有我自己的 curl 探测）。
 
-    关键是别让用户「先试一条、失败了再找另一条」：两条路要同时可见。
-    另一个易错点：手工路必须用**本机回调**那条链接重新授权——用自动那条授权后，
-    浏览器不会停在带凭据的 127.0.0.1 地址上，用户无从复制。
+    所以不能把走不通的那条摆在主路径上：让用户先点一条、失败了再回头找另一条，
+    比一开始就给能走通的那条更糟。自动回调保留为折叠选项——自建 client_id 且登记了
+    回调地址的部署可以用它一步完成。
     """
 
     def setUp(self):
@@ -342,21 +343,38 @@ class TraeUIBothPathsTest(unittest.TestCase):
         self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
         self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
 
-    def test_both_paths_visible_on_one_screen(self):
+    def test_manual_path_is_primary(self):
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertIn("drReopen", body, "自动路按钮")
-                self.assertIn("drPaste", body, "手工路按钮")
-                # 两条路在同一个函数里渲染，不需要切页面。
-                start = body.index("function renderTraeAuto()")
+                start = body.index("function renderTraeAuth()")
                 end = body.index("function startTraeWatch()", start)
                 block = body[start:end]
+                # 主路径：打开授权页 + 剪贴板读取，两者都在折叠区之外。
                 self.assertIn("drReopen", block)
                 self.assertIn("drPaste", block)
+                self.assertIn("127.0.0.1", block, "必须说清报错页是正常的")
 
-    def test_manual_path_uses_localhost_callback(self):
-        """手工路必须用本机回调链接重新授权，否则浏览器不会停在 127.0.0.1。"""
+    def test_manual_uses_localhost_link(self):
+        """手工路必须用本机回调链接，否则浏览器不会停在带凭据的 127.0.0.1。"""
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertIn("drReopenLocal", body)
-                self.assertIn("DT.traeFallback", body)
+                self.assertIn("DT.traeFallback || DT.url", body)
+
+    def test_auto_callback_is_secondary(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("drAutoTry", body)
+                start = body.index("function renderTraeAuth()")
+                end = body.index("function startTraeWatch()", start)
+                block = body[start:end]
+                # 自动回调必须出现在 <details> 折叠块里，不能与主路径并列。
+                self.assertIn("<details", block)
+                self.assertLess(block.index("drPaste"), block.index("<details"),
+                                "手工路要排在折叠区之前")
+
+    def test_no_dead_render_function(self):
+        """上一版留下的废弃函数要清掉，否则改一处漏一处。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertNotIn("renderTraeWaitUnused", body)
+                self.assertNotIn("renderTraeAuto", body)

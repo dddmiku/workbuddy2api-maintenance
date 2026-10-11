@@ -187,7 +187,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeAuto:false, traeFallback:'' };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeAuto:false, traeFallback:'', traeCallback:'' };
 var modalCb = null;
 var logKey = null, logName = '';
 
@@ -1447,8 +1447,8 @@ async function startLogin(){
       var t = await api('api/trae/login/start', {});
       if (!t.ok){ toast(t.message || '获取 Trae 授权链接失败', 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
       DT.url = t.url; DT.loginId = t.login_id || '';
-      DT.traeAuto = !!t.auto; DT.traeFallback = t.fallback_url || '';
-      renderTraeWait();
+      DT.traeAuto = !!t.auto; DT.traeFallback = t.fallback_url || ''; DT.traeCallback = t.callback || '';
+      renderTraeAuth();
       // 自动模式：直接开授权页，用户点一下登录即可，回调会自动落盘。
       // 手工模式（回调地址取不到）：仍需用户回传地址栏链接。
       if (DT.traeAuto) window.open(DT.url, '_blank', 'noopener');
@@ -1466,51 +1466,60 @@ async function startLogin(){
   }
 }
 
-// renderTraeAuto 是 Trae 授权页：**同屏给出两条路**，不再让用户先试一条、失败了再找另一条。
+// renderTraeAuth 是 Trae 授权页。
 //
-// 背景：Trae 的授权页由字节 Passport SDK 驱动，我们用的是官方客户端的 client_id，
-// 其注册的回调白名单很可能只含 localhost——实测把回调指向本服务的公网地址时，
-// Trae 侧报「网络错误」，请求根本没到服务器。所以自动回调**可能**不可用，但值得先试：
-// 能用就一步完成，不能用就当场粘贴，不用切页面。
-function renderTraeAuto(){
+// **默认走手工路**（本机回调 + 粘贴），因为实测公网回调被 Trae 拒绝：
+// 授权页由字节 Passport SDK 驱动，我们用的是官方客户端的 client_id，其注册的回调
+// 白名单只认 localhost——把 auth_callback_url 指向本服务公网地址时，Trae 侧报
+// 「网络错误」，服务器上**一条回调请求都收不到**（nginx 访问日志可证）。
+//
+// 所以不把自动回调摆在主路径上：让用户先点一条走不通的路，再回头找另一条，
+// 比一开始就给他能走通的那条更糟。自动回调保留为折叠选项——万一某个部署形态下
+// Trae 接受了（例如自建 client_id），它一步就能完成。
+function renderTraeAuth(){
   $('#drTitle').textContent = 'Trae 授权';
   $('#drBody').innerHTML =
-    '<div class="mtext"><b>第 1 步</b>：在 Trae 授权页完成登录。</div>' +
-    '<div style="margin-top:8px"><button class="btn pri" id="drReopen">打开 Trae 授权页</button></div>' +
-    '<div class="wait" style="margin-top:12px"><span class="spin"></span>' +
-      '<span id="waitMsg">若回调地址被接受，这里会自动检测到新账号…</span></div>' +
+    '<div class="mtext"><b>第 1 步</b>：点下面的按钮打开 Trae 授权页并完成登录。</div>' +
+    '<div style="margin-top:8px"><button class="btn pri" id="drReopen" style="width:100%">打开 Trae 授权页</button></div>' +
     '<div class="note w" style="margin-top:14px;line-height:1.65">' +
       svg(IC.warn, 16) +
-      '<div class="g"><b>第 2 步：Trae 报「网络错误」时走这条。</b>' +
-      '用下面这个按钮<b>重新授权一次</b>（这次回调到本机），授权后浏览器会跳到' +
-      ' <code>127.0.0.1</code> 并显示打不开——<b>这是正常的，别关那个标签页</b>，' +
-      '按 <code>Ctrl+L</code>、<code>Ctrl+C</code> 复制它的地址：</div>' +
+      '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1</code> 并显示' +
+      '「无法访问此网站」。<b>这是正常的，别关那个标签页</b>——凭据就在它的地址栏里。' +
+      '在那个报错页按 <code>Ctrl+L</code>、<code>Ctrl+C</code> 复制地址，然后回来点下面：</div>' +
     '</div>' +
-    '<div style="display:flex;gap:8px;margin-top:10px">' +
-      '<button class="btn" id="drReopenLocal" style="flex:1">① 用本机回调重新授权</button>' +
-      '<button class="btn pri" id="drPaste" style="flex:1">② 从剪贴板读取并添加</button>' +
-    '</div>' +
+    '<div style="margin-top:10px"><button class="btn pri" id="drPaste" style="width:100%">' +
+      '从剪贴板读取并添加</button></div>' +
     '<textarea id="traeCallback" rows="3" spellcheck="false" ' +
       'style="width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
       'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
       'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
-    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
-  $('#drFoot').innerHTML =
-    '<button class="btn" id="drCancel">重新选择区域</button>' +
-    '<button class="btn" id="drSubmit">完成添加</button>';
+    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>' +
+    (DT.traeAuto
+      ? '<details style="margin-top:16px"><summary class="sub" style="cursor:pointer">' +
+        '试试自动回调（多数部署下 Trae 不接受）</summary>' +
+        '<div class="sub" style="margin-top:8px;line-height:1.6">' +
+        '若你的部署有自建 client_id 且已登记本服务的回调地址，可用这条一步完成。' +
+        '回调地址：<code>' + esc(DT.traeCallback || '') + '</code></div>' +
+        '<div style="margin-top:8px"><button class="btn" id="drAutoTry">用公网回调授权</button></div>' +
+        '</details>'
+      : '');
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>';
   $('#drCancel').addEventListener('click', renderPick);
-  $('#drReopen').addEventListener('click', function(){ window.open(DT.url, '_blank', 'noopener'); });
-  // 手工路必须用**本机回调**那条链接重新授权：自动那条的回调指向公网，
-  // 用它授权后浏览器不会停在带凭据的 127.0.0.1 地址上，用户无从复制。
-  $('#drReopenLocal').addEventListener('click', function(){
-    var link = DT.traeFallback || DT.url;
-    window.open(link, '_blank', 'noopener');
+  $('#drReopen').addEventListener('click', function(){
+    window.open(DT.traeFallback || DT.url, '_blank', 'noopener');
   });
-  $('#drSubmit').addEventListener('click', submitTraeCallback);
   $('#drPaste').addEventListener('click', readClipboardIntoCallback);
-  startTraeWatch();
-  // 自动打开授权页：省掉用户再点一次。
-  window.open(DT.url, '_blank', 'noopener');
+  var autoBtn = $('#drAutoTry');
+  if (autoBtn){
+    autoBtn.addEventListener('click', function(){
+      window.open(DT.url, '_blank', 'noopener');
+      startTraeWatch();
+      var m = $('#traeMsg');
+      if (m) m.textContent = '已用公网回调打开授权页；若 Trae 报「网络错误」，请改走上面第 2 步。';
+    });
+  }
+  $('#drFoot').innerHTML += '<button class="btn pri" id="drSubmit2">完成添加</button>';
+  $('#drSubmit2').addEventListener('click', submitTraeCallback);
 }
 
 // startTraeWatch 轮询账号列表，等 trae 账号出现（自动回调成功后自己弹出来）。
@@ -1549,66 +1558,6 @@ function startTraeWatch(){
 // ERR_CONNECTION_REFUSED 以为失败了。所以这里把「报错是正常的」写在最显眼处，
 // 并给一个「从剪贴板读取」按钮——点按钮是用户手势，浏览器允许读剪贴板，
 // 于是整个回传动作变成一次点击而不是 全选→复制→切回来→粘贴。
-function renderTraeWait(){
-  if (DT.traeAuto && !DT.traeManual){ renderTraeAuto(); return; }
-  // 手工模式必须用**本机回调**那条链接：自动模式那条的回调指向公网，
-  // 手工粘贴时浏览器会跳到公网、拿不到地址栏里的参数。
-  if (DT.traeFallback) DT.url = DT.traeFallback;
-  $('#drTitle').textContent = 'Trae 授权';
-  $('#drBody').innerHTML =
-    '<div class="mtext"><b>第 1 步</b>：点下面的「打开 Trae 授权页」，在 Trae 页面完成登录。</div>' +
-    '<div class="url-box" id="urlText" style="margin-top:8px">' + esc(DT.url) + '</div>' +
-    '<div class="note w" style="margin-top:14px;line-height:1.65">' +
-      svg(IC.warn, 16) +
-      '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1:8765</code> 并显示' +
-      '「无法访问此网站」。<b>这是正常的，不要关掉那个标签页</b>——' +
-      '凭据就在它的地址栏里，我们需要的是那条链接本身。</div>' +
-    '</div>' +
-    '<div class="mtext" style="margin-top:12px">' +
-      '在<b>那个报错页</b>上按 <code>Ctrl+L</code> 全选地址栏 → <code>Ctrl+C</code> 复制，' +
-      '然后回到这里点下面的按钮：' +
-    '</div>' +
-    '<div style="display:flex;gap:8px;margin-top:10px">' +
-      '<button class="btn pri" id="drPaste" style="flex:1">从剪贴板读取</button>' +
-    '</div>' +
-    '<textarea id="traeCallback" rows="3" spellcheck="false" ' +
-      'style="width:100%;margin-top:10px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
-      'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
-      'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
-    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
-  $('#drFoot').innerHTML =
-    '<button class="btn" id="drCancel">重新选择区域</button>' +
-    '<button class="btn" id="drOpen">打开 Trae 授权页</button>' +
-    '<button class="btn pri" id="drSubmit">完成添加</button>';
-  $('#drCancel').addEventListener('click', renderPick);
-  $('#drOpen').addEventListener('click', function(){ window.open(DT.url, '_blank', 'noopener'); });
-  $('#drSubmit').addEventListener('click', submitTraeCallback);
-  $('#drPaste').addEventListener('click', readClipboardIntoCallback);
-}
-
-// readClipboardIntoCallback 读剪贴板并直接提交。
-// 按钮点击是用户手势，浏览器允许 clipboard.readText；不支持或拒绝时退回手动粘贴，
-// 不把"读不到剪贴板"变成死路。
-async function readClipboardIntoCallback(){
-  var msg = $('#traeMsg');
-  try{
-    if (!navigator.clipboard || !navigator.clipboard.readText){
-      if (msg) msg.textContent = '这个浏览器不支持读取剪贴板，请在下面手动 Ctrl+V';
-      return;
-    }
-    var text = await navigator.clipboard.readText();
-    if (!text || !text.trim()){
-      if (msg) msg.textContent = '剪贴板是空的，请先在报错页按 Ctrl+L、Ctrl+C';
-      return;
-    }
-    var box = $('#traeCallback');
-    if (box) box.value = text.trim();
-    submitTraeCallback();
-  }catch(err){
-    if (msg) msg.textContent = '读剪贴板被拒绝，请在下面手动 Ctrl+V';
-  }
-}
-
 async function submitTraeCallback(){
   var box = $('#traeCallback'); if (!box) return;
   var value = (box.value || '').trim();
