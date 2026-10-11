@@ -376,12 +376,21 @@ class TaskRealmGroupingTest(unittest.TestCase):
                 self.assertIn("realmTag(realm)", block, "分组标题用域标签")
 
     def test_only_renders_realms_with_accounts(self):
-        """只渲染池里真有账号的域：没有 trae 号时列「Trae」分组会让人以为漏了配置。"""
+        """只渲染池里真有账号的域：没有 trae 号时列「Trae」分组会让人以为漏了配置。
+
+        该判据在 v2.10.1 挪进了 taskRealms()——顶部区域切换要用同一份域列表，
+        所以把它从 renderTasks 里抽出来共用（两处各写一份必然漂移）。
+        """
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                start = body.index("function renderTasks(){")
-                block = body[start:body.index("function taskTile(", start)]
+                self.assertIn("function taskRealms(", body)
+                start = body.index("function taskRealms(")
+                block = body[start:body.index("\n}", start)]
                 self.assertIn("present[r]", block)
+                # renderTasks 必须复用那一份，不能自己再算一遍。
+                rt = body[body.index("function renderTasks(){"):]
+                rt = rt[:rt.index("function taskTile(")]
+                self.assertIn("taskRealms(list)", rt)
 
     def test_overview_no_longer_shows_schedule(self):
         """概览页不再有「今日排程」卡片（用户要求去掉）。"""

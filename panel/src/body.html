@@ -287,6 +287,9 @@
           <div class="ph">
             <b>任务</b>
             <span class="sp"></span>
+            <!-- 区域切换：域多了以后整页要滚很久才能看到 Trae。
+                 选项由 JS 按「当前真有任务的域」动态生成（含「全部」）。 -->
+            <div class="seg" id="taskRealm" title="按账号区域筛选"></div>
             <span class="sub">按账号区域分组，按点执行，可手动触发一次</span>
             <button class="btn sm" id="btnTaskReload">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>

@@ -1421,3 +1421,104 @@ return {running:running, done:done, none:none};
                 block = body[start:body.index("\n}", start)]
                 self.assertIn("LG.lastSig", block)
                 self.assertIn("return;", block, "指纹一致应提前返回")
+
+
+class TaskRealmFilterTest(FrontendHarness, unittest.TestCase):
+    """任务页顶部要有区域切换：域多了以后整页滚太久才看得到后面的域。
+
+    2026-10-11 用户反馈：「区域从顶部加个选项，不然太长了」。选项由 JS 按
+    「当前真有任务的域」动态生成（含「全部」），不是写死的——哪些域有任务
+    随池子变化，写死会让新域无法筛选。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_header_has_realm_filter(self):
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn('id="taskRealm"', body,
+                              "任务页头部需要区域切换容器")
+
+    def test_options_are_generated_not_hardcoded(self):
+        """选项必须动态生成——写死会让新增的域无法筛选。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function renderTaskRealmSeg(", body)
+                start = body.index("function renderTaskRealmSeg(")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("groups.map", block, "选项应按域列表生成")
+                self.assertIn("realmShort", block, "按钮文案用统一的域简称")
+
+    def test_filters_rendered_groups(self):
+        """选中某域时只渲染那一组。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm='trae'; renderTasks();
+return {seg:$('#taskRealm').innerHTML, list:$('#taskList').innerHTML};
+""")
+        self.assertIn("签到（Trae）", result["list"])
+        self.assertNotIn("签到（WorkBuddy）", result["list"], "筛 trae 时不该渲染别的域")
+        # 按钮上要有 aria-pressed 标记当前选中项。
+        self.assertIn('data-r="trae" aria-pressed="true"', result["seg"])
+        self.assertIn('data-r="" aria-pressed="false"', result["seg"])
+
+    def test_all_option_shows_every_realm(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm=''; renderTasks();
+return {seg:$('#taskRealm').innerHTML, list:$('#taskList').innerHTML};
+""")
+        self.assertIn("签到（Trae）", result["list"])
+        self.assertIn("签到（WorkBuddy）", result["list"])
+        self.assertIn("全部", result["seg"])
+
+    def test_falls_back_when_selected_realm_disappears(self):
+        """选中的域从池里消失（账号被删）时回落到「全部」。
+
+        不回落的后果是卡在一个空页上：按钮还在、点「全部」也没用（选中项
+        已经不存在了），用户只能刷新页面。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm='global';   // global 已经没有账号了
+renderTasks();
+return {realm:S.taskRealm, list:$('#taskList').innerHTML};
+""")
+        self.assertEqual(result["realm"], "", "选中的域消失后应回落到「全部」")
+        self.assertIn("签到（Trae）", result["list"])
+
+    def test_filter_is_independent_of_other_pages(self):
+        """任务页的筛选只作用于本页，不动账号页/积分页的筛选。
+
+        三个页面的筛选是三个不同的使用场景；联动会导致「在账号页筛了 CN，
+        切到任务页只剩一半」这种意外。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'g',realm:'global'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true}
+]};
+S.realm='cn'; S.creditRealm='global'; S.taskRealm='';
+renderTasks();
+var taskRealmAfter=S.taskRealm;
+// 反过来：改任务页筛选不该动另外两个。
+S.taskRealm='global'; renderTasks();
+return {taskRealmAfter:taskRealmAfter, acct:S.realm, credit:S.creditRealm};
+""")
+        self.assertEqual(result["taskRealmAfter"], "", "任务页筛选不该被其它页带动")
+        self.assertEqual(result["acct"], "cn", "账号页筛选不该被任务页改动")
+        self.assertEqual(result["credit"], "global", "积分页筛选不该被任务页改动")

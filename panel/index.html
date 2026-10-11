@@ -1178,6 +1178,9 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           <div class="ph">
             <b>任务</b>
             <span class="sp"></span>
+            <!-- 区域切换：域多了以后整页要滚很久才能看到 Trae。
+                 选项由 JS 按「当前真有任务的域」动态生成（含「全部」）。 -->
+            <div class="seg" id="taskRealm" title="按账号区域筛选"></div>
             <span class="sub">按账号区域分组，按点执行，可手动触发一次</span>
             <button class="btn sm" id="btnTaskReload">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
@@ -1617,7 +1620,7 @@ var IC = {
 };
 
 /* ── 状态 ─────────────────────────────────────────── */
-var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
+var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
 
 // REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
@@ -2601,6 +2604,14 @@ $('#acctRealm').addEventListener('click', function(e){
   });
   renderAccounts();
 });
+// 任务页的域筛选：只作用于本页（S.taskRealm）。与账号页 S.realm、积分页
+// S.creditRealm 三者各自独立——它们是三个不同的使用场景，联动会让「在账号页
+// 筛了 CN，切到任务页只剩一半」这种意外发生。
+$('#taskRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.taskRealm = b.getAttribute('data-r');
+  renderTasks();  // 重绘会顺带刷新按钮的 aria-pressed
+});
 // 积分有效期页的域筛选：只作用于本页（S.creditRealm），与账号页的 S.realm 互不影响
 // ——两页的筛选是各自的使用场景，联动的结果是「在账号页筛了 CN，切到积分页只剩一半」。
 $('#creditsRealm').addEventListener('click', function(e){
@@ -2641,24 +2652,14 @@ $('#acctRows').addEventListener('click', function(e){
 // cn/global/trae 三个域，其余任务只服务 WorkBuddy 两域，猜一定会猜错。
 //
 // 只渲染池里**真有账号**的域：没有 trae 号时列出「Trae」分组只会让人以为漏了配置。
-function renderTasks(){
-  var list = taskList();
-  var host = $('#taskList');
-  if (!host) return;
-  if (!list.length){
-    host.innerHTML = emptyBox(IC.clock, '暂无定时任务',
-      (S.tasks && S.tasks.error) || '网关进程没有加载排程器');
-    return;
-  }
-  // 池里出现的域（按 cn → global → trae 固定顺序，避免分组跳动）。
+// taskRealms 返回任务页该展示哪些域（按 REALM_ORDER 固定顺序，避免分组跳动）。
+//
+// 依据是**池里出现的域**（与分组同一口径）；池子数据还没到时退回任务自己声明的域，
+// 至少不显示空白。返回的这份同时用于顶部切换按钮与分组渲染。
+function taskRealms(list){
   var present = {};
-  ((S.data && S.data.accounts) || []).forEach(function(a){
-    var r = realmOf(a);
-    present[r] = true;
-  });
-  // 域顺序与文案用全局那一份（REALM_ORDER / REALM_LABEL），不再各写一套。
+  ((S.data && S.data.accounts) || []).forEach(function(a){ present[realmOf(a)] = true; });
   var groups = REALM_ORDER.filter(function(r){ return present[r]; });
-  // 兜底：池里没有账号（或数据未到）时，用任务自己声明的域，至少不显示空白。
   if (!groups.length){
     var seen = {};
     list.forEach(function(t){
@@ -2666,7 +2667,41 @@ function renderTasks(){
     });
     groups = REALM_ORDER.filter(function(r){ return seen[r]; });
   }
-  var html = groups.map(function(realm){
+  return groups;
+}
+
+// renderTaskRealmSeg 生成顶部区域切换按钮。
+//
+// 选项是**动态**的：哪些域有任务随池子变化（今天只有 cn/global，明天加了 trae），
+// 写死会让新域无法筛选。域多了以后整页要滚很久才能看到后面的域，所以只渲染
+// 选中的那一个域（「全部」则全渲染）。
+function renderTaskRealmSeg(groups){
+  var host = $('#taskRealm');
+  if (!host) return;
+  // 选中的域已经从池里消失（账号被删）时回落到「全部」，否则会卡在一个空页上。
+  if (S.taskRealm && groups.indexOf(S.taskRealm) < 0) S.taskRealm = '';
+  var btns = [['', '全部']].concat(groups.map(function(r){ return [r, realmShort(r)]; }));
+  host.innerHTML = btns.map(function(pair){
+    return '<button data-r="' + esc(pair[0]) + '" aria-pressed="' +
+      (S.taskRealm === pair[0]) + '">' + esc(pair[1]) + '</button>';
+  }).join('');
+}
+
+function renderTasks(){
+  var list = taskList();
+  var host = $('#taskList');
+  if (!host) return;
+  if (!list.length){
+    renderTaskRealmSeg([]);
+    host.innerHTML = emptyBox(IC.clock, '暂无定时任务',
+      (S.tasks && S.tasks.error) || '网关进程没有加载排程器');
+    return;
+  }
+  var groups = taskRealms(list);
+  renderTaskRealmSeg(groups);
+  // 只渲染选中的域；「全部」时渲染全部域。
+  var shown = S.taskRealm ? groups.filter(function(r){ return r === S.taskRealm; }) : groups;
+  var html = shown.map(function(realm){
     var mine = list.filter(function(t){
       return (t.realms || ['cn']).indexOf(realm) >= 0;
     });
