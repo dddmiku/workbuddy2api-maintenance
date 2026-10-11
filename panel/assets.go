@@ -7,5 +7,5 @@ import "embed"
 // Files includes only application assets; credentials and local test data can
 // never become part of a binary even when they are next to the sources.
 //
-//go:embed app.py key_management.py native_runtime.py file_lock.py index.html login.html vendor/qrcode.js
+//go:embed app.py key_management.py trae_login.py native_runtime.py file_lock.py index.html login.html vendor/qrcode.js
 var Files embed.FS

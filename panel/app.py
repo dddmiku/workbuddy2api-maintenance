@@ -87,7 +87,9 @@ import threading
 import socketserver
 import signal
 import time
+import uuid
 import key_management
+import trae_login
 from file_lock import document_lock
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -194,7 +196,7 @@ try:
 except ValueError:
     LISTEN_PORT = 7864
 
-REALMS = ("cn", "global")
+REALMS = ("cn", "global", "trae")
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 # auth 文件命名口径的单一来源：与网关 internal/auth/auth.go 的 AuthFileGlob（`workbuddy*.json`）
 # 保持同一宽度。网关会加载不带连字符的名字（如 workbuddy_new.json，auth.go 的注释里就点了这个
@@ -909,6 +911,56 @@ def write_auth_file(poll_result):
     }
 
 
+def write_trae_auth_file(creds, uid, expires_at):
+    """把 Trae 凭据落盘成网关可读的 auth 文件。
+
+    文件名用 trae- 前缀区分域（网关按内容里的 realm 判定，前缀只是运维可读性），
+    但**必须仍匹配网关的 AuthFileGlob**（workbuddy*.json）才会被扫描到。
+    """
+    doc = {
+        "account": {
+            "uid": uid,
+            "nickname": creds.get("nickname") or uid[:8],
+        },
+        "auth": {
+            "accessToken": creds.get("access_token") or "",
+            "refreshToken": creds.get("refresh_token") or "",
+            "expiresAt": int(expires_at),
+            "domain": creds.get("host") or "api.trae.cn",
+            "realm": "trae",
+        },
+    }
+    if not doc["auth"]["accessToken"]:
+        raise RuntimeError("授权结果里没有 access_token")
+
+    os.makedirs(AUTHS_DIR, exist_ok=True)
+    final_path = os.path.join(AUTHS_DIR, "workbuddy-trae-%s.json" % uid)
+    stale = final_path + ".disabled"
+    descriptor, tmp = tempfile.mkstemp(prefix=".workbuddy-trae-", dir=AUTHS_DIR)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        # 先改属主与权限再原子替换：与 write_auth_file 同一理由（落地瞬间就要是
+        # 网关可读的形态，否则 uid 10001 读不到会被静默跳过）。
+        chown_app(tmp)
+        os.replace(tmp, final_path)
+        if os.path.exists(stale):
+            os.remove(stale)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+    return {
+        "uid": uid,
+        "nickname": doc["account"]["nickname"],
+        "realm": "trae",
+        "expiresAt": doc["auth"]["expiresAt"],
+        "expiresInDays": round(max(0, expires_at - time.time()) / 86400.0, 1),
+    }
+
+
 def find_entry(uid):
     if not UID_RE.match(uid or ""):
         return None
@@ -1420,6 +1472,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.login_start(body))
             if path == "/api/login/poll":
                 return self._json(200, self.login_poll(body))
+            if path == "/api/trae/login/start":
+                return self._json(200, self.trae_login_start(body))
+            if path == "/api/trae/login/finish":
+                return self._json(200, self.trae_login_finish(body))
             if path == "/api/account/toggle":
                 return self._json(200, self.account_toggle(body))
             if path == "/api/account/revive":
@@ -1453,6 +1509,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/logout": set(),
             "/api/auth/password": {"current", "username", "password", "confirm"},
             "/api/login/start": {"realm"}, "/api/login/poll": {"realm", "login_id"},
+            "/api/trae/login/start": set(),
+            "/api/trae/login/finish": {"callback"},
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
             "/api/account/revive": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
@@ -1464,7 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
         if allowed is not None and set(body) - allowed:
             raise RequestBodyError(400, "包含不支持的字段")
         for field, value in body.items():
-            if field in {"username", "password", "current", "confirm", "realm", "uid", "key"} and not isinstance(value, str):
+            if field in {"username", "password", "current", "confirm", "realm", "uid", "key", "callback"} and not isinstance(value, str):
                 raise RequestBodyError(400, "字段格式不正确：" + field)
         if "login_id" in body and (not isinstance(body["login_id"], str) or not re.fullmatch(r"[a-f0-9]{32}", body["login_id"])):
             raise RequestBodyError(400, "登录流程标识无效，请重新生成链接")
@@ -1856,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
     def login_start(self, body):
         realm = (body.get("realm") or "cn").strip().lower()
         if realm not in REALMS:
-            return {"ok": False, "message": "realm 只能是 cn 或 global"}
+            return {"ok": False, "message": "该区域不支持扫码登录，请用 Trae 授权" if realm == "trae" else "realm 只能是 cn 或 global"}
         if not container_running():
             return {"ok": False, "message": "容器未运行，先启动服务"}
         login_id = secrets.token_hex(16)
@@ -1872,7 +1930,7 @@ class Handler(BaseHTTPRequestHandler):
     def login_poll(self, body):
         realm = (body.get("realm") or "cn").strip().lower()
         if realm not in REALMS:
-            return {"ok": False, "message": "realm 只能是 cn 或 global"}
+            return {"ok": False, "message": "该区域不支持扫码登录，请用 Trae 授权" if realm == "trae" else "realm 只能是 cn 或 global"}
         login_id = body.get("login_id")
         if not isinstance(login_id, str) or not re.fullmatch(r"[a-f0-9]{32}", login_id):
             return {"ok": False, "message": "登录流程已失效，请重新生成链接"}
@@ -1892,6 +1950,45 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "message": "凭证已保存，但 %s" % msg, "account": summary}
         return {"ok": True, "account": summary,
                 "message": "账号已添加(%s)，重启耗时 %ss" % (summary["nickname"], secs)}
+
+    def trae_login_start(self, body):
+        """生成 Trae 授权链接。
+
+        与 cn/global 的扫码不同：Trae 授权页强制回调到 http://127.0.0.1:<port>/authorize，
+        浏览器打不开那个地址，但**地址栏里带着全部凭据**。所以这里只生成链接，
+        由用户完成授权后把地址栏整条粘回来（见 trae_login_finish）。
+        """
+        login_trace_id = str(uuid.uuid4())
+        machine_id = secrets.token_hex(32)
+        device_id = "".join(secrets.choice("0123456789") for _ in range(19))
+        url = trae_login.build_auth_url(login_trace_id, machine_id, device_id)
+        return {"ok": True, "url": url, "login_id": login_trace_id}
+
+    def trae_login_finish(self, body):
+        """接收用户粘贴的回调 URL，解析凭据并落盘成 Trae 账号。"""
+        raw = body.get("callback") or ""
+        if not isinstance(raw, str) or len(raw) > 16384:
+            return {"ok": False, "message": "回调内容格式不正确"}
+        try:
+            creds = trae_login.parse_callback(raw)
+        except RuntimeError as error:
+            return {"ok": False, "message": str(error)}
+        uid = creds.get("uid") or ""
+        if not UID_RE.match(uid):
+            return {"ok": False,
+                    "message": "授权结果里没有拿到有效的用户 ID，请重新授权"}
+        expires_at = trae_login.normalize_expire(creds.get("token_expire_at"))
+        if expires_at <= 0:
+            # Trae 的 JWT 自带过期时间但回调里不一定带；给一个保守值，
+            # 网关会按 refreshToken 自动续期（trae.Refresh）。
+            expires_at = int(time.time()) + 3600
+        with _lock:
+            summary = write_trae_auth_file(creds, uid, expires_at)
+            ok, msg, secs = restart_container()
+        if not ok:
+            return {"ok": False, "message": "凭证已保存，但 %s" % msg, "account": summary}
+        return {"ok": True, "account": summary,
+                "message": "Trae 账号已添加(%s)，重启耗时 %ss" % (summary["nickname"], secs)}
 
     def account_toggle(self, body):
         uid = body.get("uid") or ""
