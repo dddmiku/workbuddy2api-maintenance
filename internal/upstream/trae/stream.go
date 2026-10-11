@@ -86,9 +86,16 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, resp.StatusCode, raw, nil
 	}
-	model := modelFromPrepared(prepared)
-	tr := newTranslator(model)
-	return newTranslateReader(resp.Body, tr), resp.StatusCode, nil, nil
+	return TranslateStream(resp.Body, modelFromPrepared(prepared)), resp.StatusCode, nil, nil
+}
+
+// TranslateStream 把 Trae 上游事件流（llm_utils_chat 的 SSE）转成 OpenAI SSE 流。
+//
+// ChatStream 内部走这里；单独导出是因为跨包的契约测试需要喂**合成**事件流来验证
+// 转换器的输出能被网关自己的解析器消费（internal/upstream 已 import 本包，
+// 反向 import 会成环，所以那个测试只能待在 upstream 包里）。
+func TranslateStream(upstream io.ReadCloser, model string) io.ReadCloser {
+	return newTranslateReader(upstream, newTranslator(model))
 }
 
 // chatTransport 是 SSE 专用 Transport：首字节有超时、流中空闲交给上游事件心跳，
