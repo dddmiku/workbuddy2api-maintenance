@@ -1787,8 +1787,8 @@ class Handler(BaseHTTPRequestHandler):
                 for item in models) or len(set(models)) != len(models):
             return "模型绑定需为最多 64 个不重复的模型名"
         # 前缀后必须还有模型名：`cn:` / `global:` 这种只有前缀的写法同样匹配不上。
-        if any(not re.fullmatch(r"(cn|global):.+", item) for item in models):
-            return "模型绑定必须选完整模型名（cn: 或 global: 开头），请从模型列表添加"
+        if any(not re.fullmatch(r"(cn|global|trae):.+", item) for item in models):
+            return "模型绑定必须选完整模型名（cn: / global: / trae: 开头），请从模型列表添加"
         return None
 
     @staticmethod

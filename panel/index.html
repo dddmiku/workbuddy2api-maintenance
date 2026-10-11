@@ -3181,7 +3181,7 @@ function modelMatches(item, query){
 function modelRank(item, query){
   var terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (!terms.length) return 0;
-  var bare = String(item.id || '').replace(/^(cn|global):/, '').toLowerCase();
+  var bare = String(item.id || '').replace(/^(cn|global|trae):/, '').toLowerCase();
   var name = String(item.name || '').toLowerCase();
   if (terms.every(function(t){ return bare.indexOf(t) === 0; })) return 0;
   if (terms.every(function(t){ return (bare + ' ' + name).indexOf(t) >= 0; })) return 1;
@@ -3539,8 +3539,8 @@ $('#keyForm').addEventListener('submit', async function(event){
   if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
   // 绑定按完整模型名逐字比对，裸名一条也匹配不上（模型列表里没有裸名）。
   // 手填时先在这里拦住，免得保存成功却调用全 403。
-  if (body.models.some(function(item){return !/^(cn|global):.+/.test(item);})){
-    keyFormError('模型绑定必须选完整模型名（cn: 或 global: 开头），请从模型列表添加');$('#keyModels').focus();return;
+  if (body.models.some(function(item){return !/^(cn|global|trae):.+/.test(item);})){
+    keyFormError('模型绑定必须选完整模型名（cn: / global: / trae: 开头），请从模型列表添加');$('#keyModels').focus();return;
   }
   var expiry = selectedExpiry();
   if (expiry.error){keyFormError(expiry.error);return;}

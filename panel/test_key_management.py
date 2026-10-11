@@ -512,3 +512,37 @@ class ModelsEndpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TraeModelBindingTest(unittest.TestCase):
+    """锁定模型绑定校验接受 trae: 前缀。
+
+    2026-10-11 实测：后端 splitRealm 已放开 trae（v2.6.22），但**前端**校验仍写死
+    cn|global，用户从模型列表选中 trae 模型后保存被拒——「模型绑定必须选完整模型名
+    （cn: 或 global: 开头）」。同一套前缀集合散在三处（app.py / keys.js / index.html），
+    任何一处漏改都会在用户面前炸出来。
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.sources = {}
+        for name in ("app.py", "keys.js", "index.html"):
+            with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
+                self.sources[name] = fh.read()
+
+    def test_backend_accepts_trae_prefix(self):
+        self.assertIn(r"(cn|global|trae):.+", self.sources["app.py"])
+        self.assertNotIn(r're.fullmatch(r"(cn|global):.+"', self.sources["app.py"])
+
+    def test_frontend_accepts_trae_prefix(self):
+        # keys.js 是源码，index.html 是它的打包产物，两者都要在。
+        for name in ("keys.js", "index.html"):
+            with self.subTest(name=name):
+                self.assertIn(r"/^(cn|global|trae):.+/", self.sources[name],
+                              "%s must accept the trae prefix" % name)
+
+    def test_prefix_stripping_knows_trae(self):
+        """搜索排序里剥前缀的写法也要认得 trae，否则搜 "gl" 时 trae 条目排不对。"""
+        for name in ("keys.js", "index.html"):
+            with self.subTest(name=name):
+                self.assertIn(r"/^(cn|global|trae):/", self.sources[name])
