@@ -836,3 +836,74 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamUpstreamAbortFinishReason 覆盖上游自造的终止值。
+//
+// 2026-10-11 生产实测：WorkBuddy 在交付 439 token 后发 `"finish_reason":"error"`，
+// 旧代码把它判成未知值 → 客户端已经收到正文却拿到 502 "Server error mid-response"
+// （req_SZLHXEUFOVAY372TH655OFS53R，global:glm-5.3）。这里锁定修复后的契约：
+// 正文保留、终态归一为 stop、不写 error 帧、只写一次 [DONE]。
+func TestStreamUpstreamAbortFinishReason(t *testing.T) {
+	for _, reason := range []string{"error", "abort", "canceled", "failed", "interrupted"} {
+		t.Run(reason, func(t *testing.T) {
+			raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial answer\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason + "\"}]}\n\n" +
+				"data: [DONE]\n\n"
+			rec := httptest.NewRecorder()
+			if err := Stream(rec, strings.NewReader(raw)); err != nil {
+				t.Fatalf("upstream abort reason %q must not fail the stream: %v", reason, err)
+			}
+			body := rec.Body.String()
+			if strings.Contains(body, `"error"`) {
+				t.Errorf("abort reason %q produced an error frame: %q", reason, body)
+			}
+			if !strings.Contains(body, "partial answer") {
+				t.Errorf("delivered content was dropped: %q", body)
+			}
+			if n := strings.Count(body, "data: [DONE]"); n != 1 {
+				t.Errorf("[DONE] count=%d want 1: %q", n, body)
+			}
+			if !strings.Contains(body, `"finish_reason":"stop"`) {
+				t.Errorf("terminal frame must carry the normalized stop reason: %q", body)
+			}
+		})
+	}
+}
+
+// TestAggregateUpstreamAbortFinishReason 锁定聚合路径（非流式）同样的归一行为。
+func TestAggregateUpstreamAbortFinishReason(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	chat, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("abort finish reason must aggregate: %v", err)
+	}
+	choices, _ := chat["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices=%v", chat["choices"])
+	}
+	choice, _ := choices[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Errorf("finish_reason=%v want stop", choice["finish_reason"])
+	}
+	message, _ := choice["message"].(map[string]any)
+	if message["content"] != "partial" {
+		t.Errorf("content=%v want partial", message["content"])
+	}
+}
+
+// TestUnknownFinishReasonStillFails 确认归一没有放宽到「什么都接受」：
+// 完全不认识的终态仍然按解析失败处理，不会被静默吞掉。
+func TestUnknownFinishReasonStillFails(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"totally_made_up\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	var streamErr *StreamError
+	if err := Stream(rec, strings.NewReader(raw)); !errors.As(err, &streamErr) {
+		t.Fatalf("unknown reason must still fail, got %v", err)
+	}
+	if streamErr.Code != "upstream_parse" {
+		t.Errorf("code=%q want upstream_parse", streamErr.Code)
+	}
+}

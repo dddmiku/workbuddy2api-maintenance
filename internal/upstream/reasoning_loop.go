@@ -577,6 +577,7 @@ func newStreamState(options []StreamOptions) *streamState {
 	if len(options) > 0 {
 		state.loopGuardEnabled = options[0].ReasoningLoopGuard && reasoningLoopModel(options[0].Model)
 		state.loopRetryAvailable = options[0].LoopRetryAvailable
+		state.model = options[0].Model
 	}
 	return state
 }

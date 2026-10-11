@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -328,6 +329,8 @@ type streamState struct {
 	loopGuardEnabled bool
 	// loopRetryAvailable 由 StreamOptions 传入：调用方还会重发时才压制错误帧。
 	loopRetryAvailable bool
+	// model 只用于日志：上游自造 finish_reason 时必须能定位是哪个模型。
+	model string
 }
 
 func validFinishReason(reason string) bool {
@@ -336,6 +339,37 @@ func validFinishReason(reason string) bool {
 		return true
 	}
 	return false
+}
+
+// abortFinishReasons 是上游用来表示「这次生成被中途掐断」的终态值。
+//
+// WorkBuddy 在 2026-10-11 实测发出过 `"finish_reason":"error"`：它不是 OpenAI 规范值，
+// 但语义明确——上游自己终止了这一轮，且**已经交付了正文并已计费**。把它当成未知值
+// 报解析失败，等于在用户已经收到 439 token 之后再硬回一个 502，客户端显示
+// "Server error mid-response"（见 data/requests.jsonl 的 req_SZLHUF…）。正确的处理是
+// 保留正文、按「上游主动终止」收尾，并把原始值记进日志供排查。
+func abortFinishReasons(reason string) bool {
+	switch reason {
+	case "error", "abort", "aborted", "canceled", "cancelled", "failed", "interrupted":
+		return true
+	}
+	return false
+}
+
+// normalizeFinishReason 把上游终态归一成下游契约认识的值。
+//
+// 已知值原样返回；上游自造的终止值（error/abort/…）映射成 "stop"：正文已经完整交付，
+// 对下游就是一次正常结束，不需要协议层制造一个失败。真正的传输/解析失败仍由
+// StreamError 报告，这条路径只处理「上游给了终态、只是词不认识」。
+// 完全不认识的值返回空串，由调用方决定（保留原有失败语义）。
+func normalizeFinishReason(reason string) (string, bool) {
+	if validFinishReason(reason) {
+		return reason, false
+	}
+	if abortFinishReasons(reason) {
+		return "stop", true
+	}
+	return "", false
 }
 
 // hasVisibleProgress reports whether any choice has produced content, refusal or
@@ -580,10 +614,16 @@ func (s *streamState) observe(obj map[string]any) error {
 		choice["delta"] = normalized
 		delete(choice, "message")
 		if reason, ok := choice["finish_reason"].(string); ok && reason != "" {
-			if !validFinishReason(reason) {
+			normalized, mapped := normalizeFinishReason(reason)
+			if normalized == "" {
 				return &StreamError{Code: "upstream_parse", Message: "upstream stream contained an unknown finish_reason"}
 			}
-			state.finishReason = reason
+			if mapped {
+				// 上游自造的终止值：保留正文并按正常结束收尾，同时留一条 WARN。
+				// 这是可观测性的关键——静默映射会让上游行为变化无从发现。
+				log.Printf("WARN: [upstream] unknown finish_reason %q mapped to %q model=%s", reason, normalized, s.model)
+			}
+			state.finishReason = normalized
 			// WorkBuddy may send a finish marker before the final argument delta or
 			// message snapshot. Validate once all frames through DONE/EOF arrive.
 			// Stream withholds the finish marker until that validation succeeds.

@@ -17,6 +17,48 @@
 
 历史说明：`v2.4.1`–`v2.4.27` 期间补丁号被当作计数器使用，其中多数是修复、少数是新能力，未按本规则区分。规则自 `v2.5.0` 起生效。
 
+## v2.6.21 — 2026-10-11
+
+修上游自造终态导致的「已交付正文却报 502」——客户端看到的 `Server error mid-response`。
+
+### 现象与定位
+
+2026-10-11 14:27:33，`global:glm-5.3` 一次流式请求（`rid=req_SZLHXEUFOVAY372TH655OFS53R`）
+在**已经交付 439 token**、上游**已经计费 0.13 credit** 之后，向客户端回了一个 502：
+
+```
+| #674 | 14:27:33 | global:glm-5.3 | stream | 502 | key=dddmiku | uid=d75fda5a |
+  TTFB=9020ms | in=0 | hit=0 | cache=prev=484199 | tok=439 | 19.4tok/s | total=22.6s |
+```
+
+请求记录里该 attempt 的 `finish_reason` 是 **`"error"`**——这个值直接读自上游原始帧
+（`logging.go` 的观测器不做校验），也就是说**上游 WorkBuddy 自己发了一个 OpenAI 规范外的
+终态** `"finish_reason":"error"`。`validFinishReason` 不认它，于是整条流被判成
+`upstream_parse` 失败，在正文已经出去之后再补一个错误帧。
+
+对用户就是：回答打到一半，客户端弹 `Server error mid-response`。
+
+### 改动
+
+- 新增 `abortFinishReasons` / `normalizeFinishReason`：把上游表示「这轮被我自己掐断」的
+  终态值（`error` / `abort` / `canceled` / `failed` / `interrupted` 等）归一为 `stop`。
+  正文已经交付、上游已经计费，对下游就是一次正常结束，协议层不该凭一个词不认识就制造失败。
+- 归一发生时打一条 WARN（含原始值与模型名），上游行为变化不会静默溜过。
+- **不放宽**「完全不认识」的情况：真正的未知终态仍按 `upstream_parse` 失败处理，
+  回归用例 `TestUnknownFinishReasonStillFails` 锁定这一点。
+
+### 为什么不改客户端侧
+
+上游那个 `finish_reason` 是终态标记，不是错误信封——同一帧没有 `error` 字段、没有错误码，
+把它当错误处理等于把「上游正常收尾」误报成「网关解析失败」。真正的传输/解析失败仍由
+`StreamError` 报告，两条路径互不影响。
+
+### 回归
+
+`TestStreamUpstreamAbortFinishReason`（5 个终态值 × 流式：正文保留、无 error 帧、
+`finish_reason` 归一为 `stop`、`[DONE]` 恰好一次）、`TestAggregateUpstreamAbortFinishReason`
+（非流式同行为）、`TestUnknownFinishReasonStillFails`（未知值仍失败）。
+
 ## v2.6.20 — 2026-10-10
 
 修 v2.6.19 引入的两个面板回归，并把 `cache=` 列接进面板。

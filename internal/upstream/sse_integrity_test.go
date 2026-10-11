@@ -66,7 +66,7 @@ func TestIntegrityFailuresAreNotCompletions(t *testing.T) {
 		{"null payload", integrityEvent("null") + integrityEvent("[DONE]")},
 		{"unknown JSON only", integrityEvent(`{"status":"ok"}`) + integrityEvent("[DONE]")},
 		{"DONE prefix is not DONE", integrityEvent(integrityContent) + integrityEvent("[DONE]garbage")},
-		{"unknown terminal reason", integrityEvent(integrityContent) + integrityFinish("failed") + integrityEvent("[DONE]")},
+		{"unknown terminal reason", integrityEvent(integrityContent) + integrityFinish("totally_made_up") + integrityEvent("[DONE]")},
 		{"tool arguments partial despite tool finish", integrityTool(`{"id":`) + integrityFinish("tool_calls") + integrityEvent("[DONE]")},
 		{"tool arguments partial despite stop", integrityTool(`{"id":`) + integrityFinish("stop") + integrityEvent("[DONE]")},
 		{"tool arguments partial despite DONE", integrityTool(`{"id":`) + integrityEvent("[DONE]")},
