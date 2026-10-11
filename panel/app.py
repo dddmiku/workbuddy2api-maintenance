@@ -666,6 +666,10 @@ def gateway_get(path, timeout=15):
 
 TASK_ENABLE_KEY = {
     "checkin": "checkin_enabled",
+    # Trae 是独立站点，签到有自己的开关（见 scheduler 的 traeCheckAll）。
+    # 漏登记会让面板「跑一次 / 开关」报「任务标识不正确」——网关侧任务已存在，
+    # 只是面板的白名单把它挡在了门外。
+    "trae_check": "trae_check_enabled",
     "travel": "travel_enabled",
     "activity": "activity_enabled",
     "keepalive": "keepalive_enabled",

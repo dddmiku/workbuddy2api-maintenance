@@ -396,3 +396,44 @@ class TaskRealmGroupingTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn("任务", body)
                 self.assertNotIn("排程任务</b>", body)
+
+
+class PanelTaskWhitelistTest(unittest.TestCase):
+    """面板的任务白名单必须覆盖网关的全部任务。
+
+    2026-10-11 用户实测：Trae 签到任务在面板上显示正常，但点「跑一次」报
+    「任务标识不正确」——网关侧任务已存在，只是 app.py 的 TASK_ENABLE_KEY
+    白名单漏登记了新任务。它同时闸住 /api/task/run、/api/task/toggle 与
+    /api/task/log 三条路径，漏一个就等于这个任务在面板上只能看不能用。
+    """
+
+    def test_whitelist_covers_every_gateway_task(self):
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "app.py"), encoding="utf-8") as fh:
+            panel = fh.read()
+        # 从网关源码里取权威任务清单（TaskKeyXxx TaskKey = "xxx"）。
+        src = os.path.join(here, "..", "internal", "scheduler", "tasks.go")
+        with open(os.path.normpath(src), encoding="utf-8") as fh:
+            go = fh.read()
+        want = set(re.findall(r'TaskKey\w+\s+TaskKey\s*=\s*"([a-z_]+)"', go))
+        self.assertTrue(want, "未能从 tasks.go 解析出任务清单")
+        have = set(re.findall(r'^\s{4}"([a-z_]+)":\s*"([a-z_]+)_enabled",', panel, re.M))
+        have = {k for k, _ in have}
+        missing = sorted(want - have)
+        self.assertEqual(missing, [],
+                         "面板白名单缺少这些任务（会导致「跑一次」报任务标识不正确）：%s" % missing)
+
+    def test_every_task_has_an_enable_switch(self):
+        """每个任务的开关字段名必须是 <key>_enabled，与 config 段一致。"""
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "app.py"), encoding="utf-8") as fh:
+            panel = fh.read()
+        block = panel[panel.index("TASK_ENABLE_KEY = {"):]
+        block = block[:block.index("}")]
+        pairs = re.findall(r'"([a-z_]+)":\s*"([a-z_]+)",', block)
+        self.assertTrue(pairs, "未解析到 TASK_ENABLE_KEY")
+        for key, field in pairs:
+            self.assertEqual(field, key + "_enabled",
+                             "%s 的开关字段应为 %s_enabled，实际 %s" % (key, key, field))
