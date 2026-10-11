@@ -16,8 +16,12 @@ PANEL = Path(__file__).resolve().parent
 NODE = shutil.which("node")
 
 
-@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
-class FrontendBehaviorTests(unittest.TestCase):
+class FrontendHarness:
+    """在 Node 里跑真实前端函数的公共夹具。
+
+    单独抽出来是因为后面几个测试类（可读性分组、域完整性）都要用它；
+    直接继承 FrontendBehaviorTests 会把父类那几十条用例在每个子类里重跑一遍。
+    """
     def run_frontend(self, expression, extra_sources=(), fixtures=()):
         """在 Node 里跑前端表达式。
 
@@ -76,6 +80,9 @@ Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',context))
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class FrontendBehaviorTests(FrontendHarness, unittest.TestCase):
     def test_zero_success_timestamp_does_not_hide_error_only_activity(self):
         html = self.run_frontend("""
 S.data={accounts:[{uid:'fixture',pool:{inPool:true,cooling:true,coolRemaining:30,
@@ -1051,3 +1058,162 @@ class RealmBreakdownCompletenessTest(unittest.TestCase):
         init_line = body.index("  go(v);\n  loadAll();")
         self.assertLess(def_line, init_line,
                         "REALM_ORDER 必须先于 init 里的首次渲染赋值")
+
+
+class ReadabilityGroupingTest(FrontendHarness, unittest.TestCase):
+    """概览卡的分组、积分页的自适应列与域分组。
+
+    2026-10-11 用户反馈「列表显示看的不是很清晰」并点名积分有效期页。三处问题：
+      1) 概览两卡把「整体汇总」和「分域明细」平铺成一串同样的 mrow，分不清分组；
+      2) 积分页固定 8 列，多数档位整列都是「—」，真正有数字的那格被灰墙淹没；
+      3) 积分页账号不分组，30 行混在一起看不出哪个域的积分要作废。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+
+    def test_overview_cards_group_their_breakdown(self):
+        """两卡的分域明细必须包在 mgroup 里，不能与总量行平铺成一片。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn("mgroup('按区域'", block,
+                                  "%s 的分域明细必须走 mgroup 分组" % fn)
+
+    def test_mgroup_is_defined_and_escapes(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function mgroup(", body)
+                start = body.index("function mgroup(")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("esc(title)", block, "分组标题必须转义")
+
+    def test_credits_columns_follow_the_data(self):
+        """积分页列必须按实际非零档位生成，不能写死八列。
+
+        生产快照里 1/3 天内两档全为零——写死列时那两列整列是「—」。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:60,within_30d:40,later:0,unlimited:0}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsThead').innerHTML;
+""")
+        self.assertIn("7 天内", result)
+        self.assertIn("30 天内", result)
+        self.assertNotIn("1 天内", result, "零值档位不该出现列")
+        self.assertNotIn("3 天内", result, "零值档位不该出现列")
+
+    def test_credits_omits_next_end_when_nothing_expires(self):
+        """全是「不会过期」的余额时，「最近到期」整列无意义，必须去掉。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'trae',pool:{inPool:true},
+   credits:{remain:500,size:500,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:500,next_end:''}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return {thead:$('#creditsThead').innerHTML, rows:$('#creditsRows').innerHTML};
+""")
+        self.assertIn("不会过期", result["thead"])
+        self.assertNotIn("最近到期", result["thead"], "无到期时间时不该留这一列")
+        self.assertIn("500", result["rows"])
+
+    def test_credits_rows_group_by_realm(self):
+        """积分页账号行按域分组，组头带域标签与快过期合计。"""
+        result = self.run_frontend("""
+function acct(uid,realm,soon){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('g1','global',5),acct('c1','cn',50),acct('t1','trae',0)],
+  pool:{total:3,healthy:3},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        for realm in ("CN", "GLOBAL", "TRAE"):
+            self.assertIn('class="rtag ' + realm.lower() + '"', result,
+                          "缺少 %s 的分组行" % realm)
+        # 组顺序必须是 REALM_ORDER（cn → global → trae），不跟数据顺序走。
+        self.assertLess(result.index('rtag cn'), result.index('rtag global'))
+        self.assertLess(result.index('rtag global'), result.index('rtag trae'))
+        self.assertIn("50", result, "组头应给出该域的快过期合计")
+
+    def test_credits_realm_filter_scopes_the_page(self):
+        """积分页的域筛选只作用于本页，且与账号页的 S.realm 互不影响。"""
+        result = self.run_frontend("""
+function acct(uid,realm){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100}}};}
+S.data={accounts:[acct('g1','global'),acct('c1','cn')],pool:{total:2,healthy:2},creditTotals:{}};
+S.realm='cn';              // 账号页筛成 CN
+S.creditRealm='global';    // 积分页筛成 Global
+renderCreditsPage();
+var meta=$('#creditsMeta').textContent, rows=$('#creditsRows').innerHTML;
+var head=$('#creditsHead').innerHTML;
+return {meta:meta, rows:rows, head:head, acctRealm:S.realm};
+""")
+        self.assertIn("g1", result["rows"])
+        self.assertNotIn("c1", result["rows"], "积分页筛选必须真的过滤行")
+        self.assertIn("国际", result["head"], "头部应标出当前筛选的域")
+        self.assertEqual(result["acctRealm"], "cn", "不能把账号页的筛选覆盖掉")
+
+    def test_schedule_excludes_realms_without_expiry(self):
+        """到期日程必须排除没有逐笔到期的域，且计数里说明排除了几个。
+
+        Trae 的 pay API 只给总额、没有逐包到期时间。不排除的话它会被算进
+        「取到的账号」，让空态读起来像数据缺失。
+        """
+        result = self.run_frontend("""
+function acct(uid,realm,sch){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+S.data={accounts:[
+  acct('c1','cn',[{end:'2026-10-20T00:00:00+08:00',amount:100}]),
+  acct('t1','trae',[])
+],pool:{total:2,healthy:2},creditTotals:{}};
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, count:$('#schedCount').textContent,
+        picker:$('#schedAccount').innerHTML};
+""")
+        self.assertIn("1 个无到期概念的账号已排除", result["count"])
+        self.assertNotIn("t1", result["picker"], "选择器不该列出无日程的域")
+
+    def test_schedule_marks_multi_realm_entries(self):
+        """同一时刻跨域一起到期时要标出两个域——它们是两套账。"""
+        result = self.run_frontend("""
+function acct(uid,realm){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,
+      schedule:[{end:'2026-10-20T00:00:00+08:00',amount:100}]}}};}
+S.data={accounts:[acct('c1','cn'),acct('g1','global')],pool:{total:2,healthy:2},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn('rtag cn', result)
+        self.assertIn('rtag global', result)
+        self.assertIn("200", result, "同一时刻的金额应合并")
+
+    def test_missing_realm_falls_back_to_cn(self):
+        """没有 realm 字段的账号按 cn 归类，不能掉进「其它」桶。
+
+        后端 app.py 的账号解析就是 `or "cn"`；前端若不归一化，空域的号会被
+        realmOf 之外的分组逻辑漏掉，而 realmTag 又把它画成 CN——同一行自相矛盾。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'n1',nickname:'n1',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        self.assertIn('class="rtag cn"', result, "缺省域应归到 CN 组")
+        self.assertIn("国内版 CN", result)
+        self.assertNotIn("其它", result)

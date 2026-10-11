@@ -186,7 +186,7 @@ var IC = {
 };
 
 /* ── 状态 ─────────────────────────────────────────── */
-var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
+var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
 
 // REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
@@ -199,9 +199,22 @@ var REALM_ORDER = ['cn', 'global', 'trae'];
 var REALM_LABEL = { cn: '国内版 CN', global: '国际版 Global', trae: 'Trae CN' };
 // REALM_SHORT 用于「XX 可用 / XX 剩余」这类紧凑行。
 var REALM_SHORT = { cn: '国内', global: '国际', trae: 'Trae' };
+// REALM_NO_SCHEDULE：没有「逐笔到期日程」的域。
+//
+// WorkBuddy 两域的积分按套餐分批到期，cmd/credit 能逐包取出到期时刻；Trae 的
+// pay API 只给一个总额（total_amount），没有分批到期时间，所以它的账号永远
+// 不会有 schedule。用于「到期日程」的参与账号口径——不排除的话，空态会显示成
+// 「取到的账号都没有带到期时间的积分」，让人以为数据缺失，实际是这个域没这项。
+var REALM_NO_SCHEDULE = { trae: true };
 
 function realmName(realm){ return REALM_LABEL[realm] || realm; }
 function realmShort(realm){ return REALM_SHORT[realm] || realm; }
+// realmOf 归一化一个账号的域：缺省/空值按 cn 处理，与后端一致
+// （app.py 的账号解析就是 `or "cn"`）。不归一化的话，空域的号会在分组时
+// 掉进「其它」桶里，而 realmTag 又把它画成 CN——同一行自相矛盾。
+function realmOf(account){
+  return String((account && account.realm) || '').toLowerCase() || 'cn';
+}
 
 var modalCb = null;
 var logKey = null, logName = '';
@@ -374,6 +387,18 @@ function badge(st){ return '<span class="bdg ' + st.cls + '"><i></i>' + st.text 
 function mrow(k, v, cls){
   return '<div class="mrow"><span class="k">' + esc(k) + '</span>' +
     '<span class="v ' + (cls || '') + '">' + esc(v) + '</span></div>';
+}
+// mgroup 概览卡里的子分组：一条带标题的分隔线 + 组内若干行。
+//
+// 「账号池」「积分」两卡各含「整体汇总」与「分域明细」两块。此前平铺成一串
+// 同样的 mrow，分域行和总量行长得一样，扫读时分不出分组。标题与右侧备注
+// 走 esc()，行由调用方拼好（内部是 mrow，已各自转义）。
+function mgroup(title, note, rows){
+  if (!rows) return '';
+  return '<div class="mgroup">' +
+    '<div class="mgroup-h"><span>' + esc(title) + '</span><span class="sp"></span>' +
+    (note ? '<span class="n">' + esc(note) + '</span>' : '') + '</div>' +
+    rows + '</div>';
 }
 function emptyBox(icon, title, sub){
   return '<div class="empty">' + svg(icon, 30) + '<div class="empty-t">' + esc(title) + '</div>' +
@@ -555,19 +580,24 @@ function renderPool(){
     mrow('并发占满', String(p.inFlightFull || 0)) +
     mrow('粘性会话', String(p.stickySessions || 0));
   var rt = p.realmTotals || {};
+  // 分域明细放进带标题的子分组：它与上面的总量行语义不同，混在一起扫读时分不出。
   // 固定顺序（cn → global → trae），不跟对象键的插入顺序走：域多了以后顺序乱跳
   // 会让运维每次刷新都要重新找那一行。只列真的有账号的域。
+  var rows = '', realms = 0;
   REALM_ORDER.forEach(function(k){
     var v = rt[k];
     if (v === undefined) return;
+    var line;
     if (v && typeof v === 'object'){
       var tot = Number(v.total) || 0, ok = Number(v.healthy) || 0;
       if (!tot) return;
-      html += mrow(realmShort(k) + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
+      line = mrow(realmShort(k) + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
     } else {
-      html += mrow(realmShort(k) + '可用', String(v));
+      line = mrow(realmShort(k) + '可用', String(v));
     }
+    rows += line; realms++;
   });
+  if (realms) html += mgroup('按区域', realms + ' 个域', rows);
   $('#poolPanel').innerHTML = html;
 }
 
@@ -617,16 +647,20 @@ function renderCredit(){
     mrow('取到积分', have.length + ' / ' + a.length);
   // 分域小计：按 REALM_ORDER 固定顺序，**包含全部域**（含 trae）。
   // 只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
+  // 与「账号池」同款子分组：合计在上、分域在下，中间有分隔线。
+  var rows = '', realms = 0;
   REALM_ORDER.forEach(function(realm){
-    var subset = have.filter(function(x){ return String(x.realm || '') === realm; });
+    var subset = have.filter(function(x){ return realmOf(x) === realm; });
     if (!subset.length) return;
     var part = sumOf(subset);
     var share = remain ? Math.round(part.remain / remain * 100) : 0;
-    html += mrow(realmShort(realm) + '剩余',
+    rows += mrow(realmShort(realm) + '剩余',
       num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）' +
       (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : ''),
       part.expiring > 0 ? 'w' : '');
+    realms++;
   });
+  if (realms) html += mgroup('按区域', realms + ' 个域', rows);
   if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
   else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
   $('#creditPanel').innerHTML = html;
@@ -673,13 +707,13 @@ function renderAccounts(){
   if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
   if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
   // 按域筛选：接入 trae 后池子里有三种来源，全混在一张表里看不出「哪个域的号出问题了」。
-  if (S.realm) list = list.filter(function(a){ return String(a.realm || '') === S.realm; });
+  if (S.realm) list = list.filter(function(a){ return realmOf(a) === S.realm; });
   if (q) list = list.filter(function(a){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
            (a.uid || '').toLowerCase().indexOf(q) >= 0;
   });
   // 计数按当前域口径给出：筛选到 CN 时，「共 N 个」应当指 CN 的号，不是全池。
-  var scoped = S.realm ? all.filter(function(a){ return String(a.realm || '') === S.realm; }) : all;
+  var scoped = S.realm ? all.filter(function(a){ return realmOf(a) === S.realm; }) : all;
   var countEl = $('#acctCount');
   if (countEl){
     countEl.textContent = (list.length === scoped.length)
@@ -699,7 +733,7 @@ function renderAccounts(){
     var left = daysLeft(a.expiresAt);
     // 每个域都有自己的积分接口（WorkBuddy billing/meter、Trae pay API），都能查。
     // trae 的额度单位与 WorkBuddy 的积分不同，用悬停说明区分，不做跨域合计。
-    var isTrae = String(a.realm || '') === 'trae';
+    var isTrae = realmOf(a) === 'trae';
     // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
@@ -842,15 +876,19 @@ function renderCreditsPage(){
   if (!have.length){
     $('#creditsHead').innerHTML = '';
     $('#creditsBars').innerHTML = '';
+    $('#creditsThead').innerHTML = '';
     $('#creditsRows').innerHTML = '<tr><td colspan="8" data-l="">' +
       emptyBox(IC.coins, d.creditPending ? '正在统计积分' : '暂无积分数据',
         d.creditError ? String(d.creditError) : '稍后自动刷新') + '</td></tr>';
     $('#creditsMeta').textContent = '';
     return;
   }
+  // 域筛选：与账号页同一套（S.creditRealm 只作用于本页，不动账号页的 S.realm）。
+  var scoped = have;
+  if (S.creditRealm) scoped = have.filter(function(x){ return realmOf(x) === S.creditRealm; });
   var total = { within_1d:0, within_3d:0, within_7d:0, within_30d:0, later:0, unlimited:0, sum:0 };
   var remain = 0, soon7 = 0, nextEnd = '';
-  have.forEach(function(x){
+  scoped.forEach(function(x){
     var e = expiryOf(x.credits);
     EXPIRY_BUCKETS.forEach(function(b){ total[b.key] += e[b.key]; });
     total.sum += e.sum;
@@ -868,7 +906,8 @@ function renderCreditsPage(){
       (soon7 > 0 ? '占剩余 ' + pctSoon + '%，到期即作废' : '暂无即将作废的积分') + '</div></div>' +
     '<div class="metric"><div class="k">剩余合计</div>' +
       '<div class="v">' + svg(IC.coins, 15) + '<b>' + num(remain) + '</b><small>积分</small></div>' +
-      '<div class="s">' + have.length + ' / ' + a.length + ' 个账号取到</div></div>' +
+      '<div class="s">' + scoped.length + ' / ' + a.length + ' 个账号取到' +
+      (S.creditRealm ? '（' + realmShort(S.creditRealm) + '）' : '') + '</div></div>' +
     '<div class="metric"><div class="k">最近一次到期</div>' +
       '<div class="v">' + svg(IC.clock, 15) + '<b>' + (nextEnd ? fmtEnd(nextEnd).replace(/（.*$/, '') : '—') + '</b></div>' +
       '<div class="s">' + (nextEnd ? fmtEnd(nextEnd).replace(/^.*（|）$/g, '') : '无到期积分') + '</div></div>';
@@ -882,25 +921,64 @@ function renderCreditsPage(){
       '<div class="exp-bar-t"><i style="width:' + Math.max(1, Math.round(pct)) + '%"></i></div>' +
       '<div class="exp-bar-s">' + pct.toFixed(pct < 10 ? 1 : 0) + '%</div></div>';
   }).join('');
-  // 账号表：按「7 天内到期的积分」降序，有作废风险的在最上面。
-  var rows = have.slice().sort(function(x, y){
+  // 列自适应：1/3/7/30 天四档里，多数时候只有一两档非零，其余整列都是「—」。
+  // 全列铺出来是一堵 8 列的灰墙，真正有数字的那格反而被淹没。所以只保留
+  // **本次筛选下确有余额**的档位（「不会过期」同理），列头跟着数据走。
+  var cols = EXPIRY_BUCKETS.filter(function(b){ return total[b.key] > 0; });
+  // 「最近到期」只在真有到期时间时才有意义；全是不会过期的余额时整列无意义。
+  var showNext = cols.some(function(b){ return b.key !== 'unlimited'; });
+  // 账号表：按域分组（cn → global → trae），组内按「7 天内到期」降序，
+  // 有作废风险的在最上面。分组让「哪个域的积分要浪费了」一眼可辨。
+  var rows = scoped.slice().sort(function(x, y){
     return expiringSoon(y.credits, 7) - expiringSoon(x.credits, 7);
   });
-  $('#creditsRows').innerHTML = rows.map(function(x){
-    var e = expiryOf(x.credits);
-    function cell(v){
-      return '<td class="r" data-l="">' + (v ? '<span class="' +
-        (v === e.within_1d ? 'exp-urgent' : '') + '">' + num(v) + '</span>' : '<span class="exp-zero">—</span>') + '</td>';
-    }
-    return '<tr>' +
-      '<td data-l="账号"><div class="who">' + esc(x.nickname || '') + '</div>' +
-        '<div class="sub mono">' + esc(shortUid(x.uid)) + ' · ' + esc(String(x.realm || '').toUpperCase()) + '</div></td>' +
-      '<td class="r" data-l="剩余"><b>' + num(x.credits.remain) + '</b></td>' +
-      cell(e.within_1d) + cell(e.within_3d) + cell(e.within_7d) + cell(e.within_30d) +
-      '<td class="r" data-l="不会过期">' + (e.unlimited ? num(e.unlimited) : '<span class="exp-zero">—</span>') + '</td>' +
-      '<td data-l="最近到期"><span class="sub">' + esc(fmtEnd(e.next_end)) + '</span></td></tr>';
+  var groups = REALM_ORDER.filter(function(r){
+    return rows.some(function(x){ return realmOf(x) === r; });
+  });
+  // 池里出现但不在 REALM_ORDER 里的域（未来新增）：兜底追加，不静默丢行。
+  var extra = {};
+  rows.forEach(function(x){
+    var r = realmOf(x);
+    if (REALM_ORDER.indexOf(r) < 0) extra[r] = true;
+  });
+  groups = groups.concat(Object.keys(extra));
+  var span = 2 + cols.length + (showNext ? 1 : 0);
+  $('#creditsThead').innerHTML = '<tr><th>账号</th><th class="r">剩余</th>' +
+    cols.map(function(b){ return '<th class="r">' + esc(b.label) + '</th>'; }).join('') +
+    (showNext ? '<th>最近到期</th>' : '') + '</tr>';
+  $('#creditsRows').innerHTML = groups.map(function(realm){
+    var mine = rows.filter(function(x){ return realmOf(x) === realm; });
+    if (!mine.length) return '';
+    var part = mine.reduce(function(s, x){ return s + expiringSoon(x.credits, 7); }, 0);
+    // 备注用 float:right（见 credits.css）：td 必须保持 table-cell，
+    // 否则折叠边框不再绘制它。
+    var head = '<tr class="tbl-grp"><td colspan="' + span + '">' +
+      '<span class="g-sub">' + mine.length + ' 个号' +
+      (part > 0 ? ' · ' + num(part) + ' 快过期' : '') + '</span>' +
+      realmTag(realm) +
+      '<span class="g-nm">' + esc(realmName(realm)) + '</span></td></tr>';
+    return head + mine.map(function(x){
+      var e = expiryOf(x.credits);
+      return '<tr>' +
+        '<td data-l="账号"><div class="who">' + esc(x.nickname || '') + '</div>' +
+          '<div class="sub mono">' + esc(shortUid(x.uid)) + '</div></td>' +
+        '<td class="r" data-l="剩余"><b>' + num(x.credits.remain) + '</b></td>' +
+        cols.map(function(b){
+          var v = e[b.key];
+          var urgent = (b.key === 'within_1d' || b.key === 'within_3d') ? ' exp-urgent' : '';
+          return '<td class="r" data-l="' + esc(b.label) + '">' +
+            (v ? '<span class="' + urgent.trim() + '">' + num(v) + '</span>'
+               : '<span class="exp-zero">—</span>') + '</td>';
+        }).join('') +
+        (showNext ? '<td data-l="最近到期"><span class="sub">' + esc(fmtEnd(e.next_end)) + '</span></td>' : '') +
+        '</tr>';
+    }).join('');
   }).join('');
-  $('#creditsMeta').textContent = have.length + ' 个账号 · 分档互斥，合计 = 剩余';
+  if (!groups.length){
+    $('#creditsRows').innerHTML = '<tr><td colspan="' + span + '" data-l="">' +
+      emptyBox(IC.coins, '该区域没有积分数据', '换个区域或选「全区域」') + '</td></tr>';
+  }
+  $('#creditsMeta').textContent = scoped.length + ' 个账号 · 分档互斥，合计 = 剩余';
   renderSchedule();
 }
 
@@ -912,16 +990,19 @@ function renderCreditsPage(){
 // SCHED_STATE 日程视图状态（范围 + 选中账号）。放在模块级而不是 S 里：
 // 它只影响这一个区块，且切换筛选不该触发整页重绘。
 var SCHED_STATE = { scope:'all', account:'' };
-// schedEntries 把账号列表的 schedule 聚合成「时刻 → {amount, accounts[]}」。
+// schedEntries 把账号列表的 schedule 聚合成「时刻 → {amount, accounts[], realms[]}」。
 function schedEntries(list){
   var byTime = {}, order = [];
   list.forEach(function(x){
     var sch = ((x.credits || {}).expiry || {}).schedule || [];
+    var realm = realmOf(x);
     sch.forEach(function(e){
       var t = e.end; if (!t) return;
-      if (!byTime[t]){ byTime[t] = { end:t, amount:0, accounts:[] }; order.push(t); }
+      if (!byTime[t]){ byTime[t] = { end:t, amount:0, accounts:[], realms:[] }; order.push(t); }
       byTime[t].amount += Number(e.amount) || 0;
       byTime[t].accounts.push(x.nickname || shortUid(x.uid));
+      // 同一时刻可能跨域一起到期（各域的积分是两套账），记下来供行内标注。
+      if (byTime[t].realms.indexOf(realm) < 0) byTime[t].realms.push(realm);
     });
   });
   return order.sort(function(p, q){ return new Date(p) - new Date(q); })
@@ -950,20 +1031,23 @@ function renderSchedule(){
   var rowsEl = $('#schedRows'); if (!rowsEl) return;
   var d = S.data || {}, a = d.accounts || [];
   // 积分到期日程是 WorkBuddy 端点族的概念（cmd/credit 查 billing/meter 得到）。
-  // 非 WorkBuddy 域（trae）没有这项，必须排除——否则它会被算进「取到的账号」里，
-  // 让「没有到期日程」的空态看起来像是数据缺失，而实际是这个域压根没有这个概念。
-  var billable = a;
+  // 非 WorkBuddy 域（trae）的 pay API 只给总额、没有逐笔到期时间，永远不会有
+  // schedule。不排除的话，它们会被算进「取到的账号」，让「没有到期日程」的空态
+  // 读起来像数据缺失，实际是这个域压根没这项。口径见 REALM_NO_SCHEDULE。
+  var billable = a.filter(function(x){ return !REALM_NO_SCHEDULE[realmOf(x)]; });
   var have = billable.filter(function(x){
     return x.credits && typeof x.credits.remain === 'number' &&
            ((x.credits.expiry || {}).schedule || []).length;
   });
-  // 账号选择器：只列真的有日程的号（几十个号全列出来没人用）。
+  // 账号选择器：只列真的有日程的号（几十个号全列出来没人用）。带上域标签，
+  // 免得重名昵称分不出是哪个域的号。
   var picker = $('#schedAccount');
   if (picker){
     picker.innerHTML = '<button data-a="" aria-pressed="' + (!SCHED_STATE.account) + '">全部</button>' +
       have.map(function(x){
         return '<button data-a="' + esc(x.uid) + '" aria-pressed="' +
-          (SCHED_STATE.account === x.uid) + '">' + esc(x.nickname || shortUid(x.uid)) + '</button>';
+          (SCHED_STATE.account === x.uid) + '" title="' + esc(realmName(x.realm)) + '">' +
+          esc(x.nickname || shortUid(x.uid)) + '</button>';
       }).join('');
   }
   var scope = have;
@@ -984,7 +1068,7 @@ function renderSchedule(){
     var skipped = a.length - billable.length;
     countEl.textContent = have.length
       ? ('共 ' + entries.length + ' 笔 · 涉及 ' + scope.length + ' 个账号' +
-         (skipped ? '（' + skipped + ' 个非 WorkBuddy 账号不参与）' : ''))
+         (skipped ? '（' + skipped + ' 个无到期概念的账号已排除）' : ''))
       : '';
   }
   if (!entries.length){
@@ -1004,9 +1088,14 @@ function renderSchedule(){
     var names = e.accounts;
     var label = names.length <= 3 ? names.join('、')
       : (names.slice(0, 3).join('、') + ' 等 ' + names.length + ' 个号');
+    // 涉及多个域时标出来：不同域的积分是两套账，混在一笔里容易误读成「同一个池子」。
+    var realms = e.realms || [];
+    var realmCell = realms.length > 1
+      ? '<span class="sub">' + realms.map(function(r){ return realmTag(r); }).join(' ') + '</span>'
+      : '';
     return '<tr>' +
       '<td data-l="到期时间"><span class="sched-t ' + cls + '">' + esc(fmtStamp(e.end)) + '</span></td>' +
-      '<td data-l="距今"><span class="sub">' + esc(schedRel(e.end)) + '</span></td>' +
+      '<td data-l="距今"><span class="sub">' + esc(schedRel(e.end)) + '</span>' + realmCell + '</td>' +
       '<td class="r" data-l="作废积分"><b class="' + (cls === 'e' ? 'exp-urgent' : '') + '">' +
         num(e.amount) + '</b></td>' +
       '<td data-l="涉及账号"><span class="sub">' + esc(label) + '</span></td></tr>';
@@ -1054,6 +1143,16 @@ $('#acctRealm').addEventListener('click', function(e){
   });
   renderAccounts();
 });
+// 积分有效期页的域筛选：只作用于本页（S.creditRealm），与账号页的 S.realm 互不影响
+// ——两页的筛选是各自的使用场景，联动的结果是「在账号页筛了 CN，切到积分页只剩一半」。
+$('#creditsRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.creditRealm = b.getAttribute('data-r');
+  $$('#creditsRealm button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderCreditsPage();
+});
 // 到期日程的两个筛选：范围（全部/窗口内）与账号。只重绘日程表，不动整页。
 $('#schedScope').addEventListener('click', function(e){
   var b = e.target.closest('button[data-s]'); if (!b) return;
@@ -1096,7 +1195,7 @@ function renderTasks(){
   // 池里出现的域（按 cn → global → trae 固定顺序，避免分组跳动）。
   var present = {};
   ((S.data && S.data.accounts) || []).forEach(function(a){
-    var r = String(a.realm || 'cn').toLowerCase();
+    var r = realmOf(a);
     present[r] = true;
   });
   // 域顺序与文案用全局那一份（REALM_ORDER / REALM_LABEL），不再各写一套。
@@ -1654,7 +1753,7 @@ function renderDone(r){
     '<div class="g"><b>' + esc(a.nickname || '账号') + '</b> 已写入并加载</div></div>' +
     '<div style="margin-top:14px">' +
     mrow('UID', a.uid || '—') +
-    mrow('区域', String(a.realm || '').toUpperCase()) +
+    mrow('区域', realmName(realmOf(a))) +
     mrow('有效期', a.expiresInDays ? (a.expiresInDays + ' 天') : '—') +
     '</div>';
   $('#drFoot').innerHTML = '<button class="btn" id="drMore">再加一个</button>' +

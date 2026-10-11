@@ -33,6 +33,22 @@
 .exp-urgent{color:var(--err);font-weight:600}
 .exp-zero{color:var(--ink-3)}
 
+/* 账号表的域分组行：跨整行的浅底标题条，把「哪个域的积分要作废」分开。
+   数字列随数据自适应（只留非零档位），所以分组行的 colspan 由 JS 算，
+   这里不能写死。
+   备注用 float:right 而不是 flex——td 必须保持 table-cell，否则
+   `border-collapse:collapse` 不再绘制它的边框（见 TableBorderCollapseTests）。 */
+.credits-table .tbl-grp td{background:var(--surface-2);padding:8px 16px;border-bottom:1px solid var(--line)}
+.credits-table .tbl-grp .rtag{margin-right:8px}
+.credits-table .tbl-grp .g-nm{font-size:12.5px;font-weight:600;color:var(--ink-2)}
+.credits-table .tbl-grp .g-sub{float:right;font-size:12px;color:var(--ink-3);
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+/* 窄屏卡片态：分组行还原成普通块，浮动的备注改为紧随其后。 */
+@media (max-width:900px){
+  .credits-table .tbl-grp td{display:block;padding:9px 14px}
+  .credits-table .tbl-grp .g-sub{float:none;margin-left:8px}
+}
+
 @media (max-width:900px){
   .exp-hd{grid-template-columns:minmax(0,1fr)}
 }

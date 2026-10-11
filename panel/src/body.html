@@ -170,25 +170,22 @@
           <div class="ph">
             <h2>按账号</h2>
             <span class="sp"></span>
+            <div class="seg" id="creditsRealm">
+              <button data-r="" aria-pressed="true">全区域</button>
+              <button data-r="cn">CN</button>
+              <button data-r="global">Global</button>
+              <button data-r="trae">Trae</button>
+            </div>
             <span class="sub" id="creditsMeta"></span>
           </div>
           <div class="tblwrap">
-            <table class="tbl">
-              <thead><tr>
-                <th>账号</th>
-                <th class="r">剩余</th>
-                <th class="r">1 天内</th>
-                <th class="r">3 天内</th>
-                <th class="r">7 天内</th>
-                <th class="r">30 天内</th>
-                <th class="r">不会过期</th>
-                <th>最近到期</th>
-              </tr></thead>
+            <table class="tbl credits-table">
+              <thead id="creditsThead"></thead>
               <tbody id="creditsRows"></tbody>
             </table>
           </div>
         </div>
-        <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。</p>
+        <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。没有积分的档位列不会出现——只显示真有余额要作废的那几档。</p>
 
         <div class="panel" style="margin-top:18px">
           <div class="ph">

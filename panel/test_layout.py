@@ -203,6 +203,21 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertIn('colspan="8"', js)
 
 
+    def test_credits_group_rows_keep_table_cell_display(self):
+        """积分页的域分组行必须仍是 table-cell，否则折叠边框不再绘制它。
+
+        见本类开头：td 一旦 display:flex/block 化，`border-collapse:collapse`
+        就把它排除在合并之外，同一行会出现半截横线。所以组内布局只能靠
+        float（.g-sub），基础规则里不能给 td 加 flex。
+        """
+        css = strip_css_comments(read_source("credits.css"))
+        base = css.split("@media")[0]
+        rules = [ln for ln in base.splitlines() if ".credits-table .tbl-grp td{" in ln]
+        self.assertTrue(rules, "缺少积分页分组行样式")
+        self.assertNotIn("display:flex", rules[0])
+        self.assertNotIn("display:block", rules[0])
+        self.assertIn("float:right", base, "备注应靠 float 靠右，而不是 flex")
+
     def test_model_search_input_resets_the_generic_field_style(self):
         """模型搜索框必须把通用输入框样式整个重置掉，否则出现「双层框」。
 
