@@ -4,6 +4,7 @@
 package scheduler
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +192,48 @@ func TestTraeBackoffEscalatesAndCaps(t *testing.T) {
 	}
 	if got := s.noteTraeBackoff("u1"); got != 60*time.Second {
 		t.Fatalf("清零后应回到基数 60s，实际 %s", got)
+	}
+}
+
+// TestTraeClaimGapThrottlesGlobally claim 之间有全局最小间隔。
+//
+// 9074 是上游容量信号，会随负载开合。连打不会「造成」9074，但会把所有账号的
+// 尝试全烧在**同一个关闭窗口**里：实测 2026-10-12 01:39 四个号 5.4 秒跑完、
+// 8 次调用全 9074；01:41 把同样的调用分散在 90 秒里则三次全成功。
+// 分散开的收益是各自撞不同的窗口。
+func TestTraeClaimGapThrottlesGlobally(t *testing.T) {
+	s := New(Config{})
+	// 从未 claim 过：不等待。
+	if err := s.traeWaitClaimGap(context.Background()); err != nil {
+		t.Fatalf("首次不该等待：%v", err)
+	}
+	s.traeNoteClaim()
+	// 刚记过：应等到满 traeClaimGap。用 ctx 取消来验证「确实在等」而不真等 60 秒。
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	err := s.traeWaitClaimGap(ctx)
+	if err == nil {
+		t.Fatal("刚 claim 过就该等待；期望 ctx 超时")
+	}
+	// 把上次时刻推到过去：不再等待。
+	s.mu.Lock()
+	s.traeLastClaim = time.Now().Add(-traeClaimGap - time.Second)
+	s.mu.Unlock()
+	if err := s.traeWaitClaimGap(context.Background()); err != nil {
+		t.Fatalf("已过间隔不该等待：%v", err)
+	}
+}
+
+// TestTraeClaimGapIsNotPerAccount 节流是**全局**的，不分账号。
+//
+// 按账号节流挡不住「四个号各打一次、彼此挨着」——那正是线上 5.4 秒跑完的场景。
+func TestTraeClaimGapIsNotPerAccount(t *testing.T) {
+	s := New(Config{})
+	s.traeNoteClaim()
+	// 换一个「账号」视角：仍应受同一次节流约束（函数签名里根本没有 uid）。
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if err := s.traeWaitClaimGap(ctx); err == nil {
+		t.Fatal("节流必须全局生效，不该因为换账号就放行")
 	}
 }

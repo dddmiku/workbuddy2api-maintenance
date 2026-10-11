@@ -108,6 +108,9 @@ type Scheduler struct {
 	// 基数 60s、每次翻倍、指数封顶 3（最多 8 分钟），而不是线性重试——上游的
 	// 限流是「人多」这种容量信号，短时间猛重试只会让窗口更长。
 	traeBackoff map[string]traeBackoffEntry
+	// traeLastClaim 上一次发出 claim 的时刻（全局，不分账号）。两次之间至少隔
+	// traeClaimGap，让各账号的尝试分散到不同的上游窗口里。
+	traeLastClaim time.Time
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
@@ -538,14 +541,25 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			oc.Status = CheckinAlready
 			alreadyN++
 		default:
+			// 全局节流：距上次 claim 不满 traeClaimGap 就先等。各账号的尝试因此
+			// 分散到不同的上游窗口，而不是一起烧在同一个关闭窗口里。
+			if werr := s.traeWaitClaimGap(ctx); werr != nil {
+				return out, werr
+			}
 			claimed, claimErr := trae.ClaimCheckin(ctx, a, gen)
-			// 9074 是**设备维度**的限流：换一个新派生的设备号重试一次。
-			// 实测同一账号同一 JWT，第 0 代 9074、第 1 代立刻成功。
+			s.traeNoteClaim()
+			// 9074 后换一个新派生的设备号重试一次。注意重试**同样受上面的节流**，
+			// 所以这里先等满间隔——紧挨着重发只会落在同一个关闭窗口里（实测
+			// 01:39 那两次 gen0/gen1 相隔 1 秒，双双 9074）。
 			if trae.IsRateLimited(claimErr) {
+				if werr := s.traeWaitClaimGap(ctx); werr != nil {
+					return out, werr
+				}
 				gen++
 				log.Printf("trae checkin %s: 9074 on device gen %d, rotating to gen %d",
 					logfmt.UID8(st.UID), gen-1, gen)
 				claimed, claimErr = trae.ClaimCheckin(ctx, a, gen)
+				s.traeNoteClaim()
 				// 无论新设备号成没成，都把代数记下来：旧代数已经确认被限流，
 				// 下次还从它开始只会白撞一次（实测 2026-10-12 00:00 那两个号
 				// 连 gen0→gen1 都吃 9074，若只在成功时记住，每轮都要重走一遍 gen0）。
@@ -594,12 +608,48 @@ type traeBackoffEntry struct {
 }
 
 const (
+	// traeClaimGap 两次 claim 调用之间的最小间隔（全局，跨账号）。
+	//
+	// 9074 是上游**容量信号**（"当前参与用户太多"），会随上游负载开合。连打不会
+	// 「造成」9074，但会把所有账号的尝试全部烧在**同一个关闭的窗口**里：实测
+	// 2026-10-12 01:39 四个号 5.4 秒跑完，8 次调用全 9074（含换设备号后的重试）；
+	// 而 01:41 把同样的调用分散在 90 秒里，三次全 success。
+	//
+	// 分散开的收益不是「更礼貌」，而是**各自撞不同的窗口**——窗口开着的那次就成了。
+	// 参考实现（autumnsentiment/Trae2api-cn）同样有 CHECKIN_INTERVAL 全局间隔，
+	// 默认 60 秒。
+	traeClaimGap = 60 * time.Second
 	// traeBackoffBase 首次 9074 后的冷却基数。
 	traeBackoffBase = 60 * time.Second
 	// traeBackoffExpCap 退避指数上限：60s × 2^3 = 8 分钟就够——
 	// 上游限流是短窗口的，退避太久会白白错过当天可签的时机。
 	traeBackoffExpCap = 3
 )
+
+// traeWaitClaimGap 等到距上次 claim 满 traeClaimGap，返回是否因取消而中断。
+//
+// 全局节流：不是按账号，而是限制**整个进程**的发 claim 速率。理由见 traeClaimGap。
+func (s *Scheduler) traeWaitClaimGap(ctx context.Context) error {
+	s.mu.Lock()
+	wait := time.Until(s.traeLastClaim.Add(traeClaimGap))
+	s.mu.Unlock()
+	if wait <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(wait):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// traeNoteClaim 记下刚刚发出了一次 claim。
+func (s *Scheduler) traeNoteClaim() {
+	s.mu.Lock()
+	s.traeLastClaim = time.Now()
+	s.mu.Unlock()
+}
 
 // traeInBackoff 报告该账号是否仍在 9074 退避窗口内。
 func (s *Scheduler) traeInBackoff(uid string) (time.Duration, bool) {
