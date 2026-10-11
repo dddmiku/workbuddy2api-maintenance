@@ -125,34 +125,72 @@ def exchange_refresh_token(refresh_token, client_id=TRAE_CLIENT_ID, host=""):
 
 
 def parse_callback(raw):
-    """从用户粘贴的回调 URL（或裸查询串）里解析出 Trae 凭据。
+    """从用户粘贴的回调 URL（或裸查询串 / 裸 token）里解析出 Trae 凭据。
 
-    接受三种输入，因为用户复制到的东西形态不定：
-      1. 完整回调 URL：http://127.0.0.1:8765/authorize?userJwt=...&userInfo=...
-      2. 只有查询串：userJwt=...&userInfo=...
-      3. 单个 refreshToken 串（老流程/手工只拿到这一项时）
+    接受四种输入，因为用户复制到的东西形态不定：
+      1. 完整回调 URL：http://127.0.0.1:8765/authorize?refreshToken=...
+      2. 只有查询串：refreshToken=...&scope=solo
+      3. 裸 refreshToken（含 base64 里的 + / = 等字符）
+      4. 授权页链接（http://.../authorization?...）—— 这是走错了一步，明确报错
     """
     text = (raw or "").strip()
     if not text:
         raise RuntimeError("没有收到内容，请把浏览器地址栏里的完整链接粘贴进来")
 
+    # 走错一步的常见情形：把「授权页」链接贴回来了，而不是授权完成后的回调。
+    # 直接说清楚，比让它去换 token 然后报一个"token 无效"要好得多。
+    if "trae.cn/authorization" in text or "/authorization?" in text:
+        raise RuntimeError(
+            "这是 Trae 授权页的链接，不是授权完成后的回调链接。"
+            "请先在 Trae 页面完成登录，然后复制跳转到的 127.0.0.1 那条地址。")
+
     query = {}
-    if "://" in text or text.startswith("127.0.0.1") or "?" in text:
-        # 按 URL 解析；解析不出查询串时（例如只是 refreshToken）走下面的兜底。
+    if "?" in text or "://" in text:
         parsed = urllib.parse.urlsplit(text if "://" in text else "http://" + text)
         query = dict(urllib.parse.parse_qsl(parsed.query))
-    if not query:
+    if not _has_credential_param(query):
         # 裸查询串形态：补一个假的 scheme 让 urlsplit 能解析出 query。
         parsed = urllib.parse.urlsplit("http://x/?" + text.lstrip("?"))
-        query = dict(urllib.parse.parse_qsl(parsed.query))
-    if not query:
+        candidate = dict(urllib.parse.parse_qsl(parsed.query))
+        if _has_credential_param(candidate):
+            query = candidate
+    if not _has_credential_param(query):
         # 既不是 URL 也不是查询串：当作裸 refreshToken。
-        if re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,}", text):
+        #
+        # 判定顺序很关键：裸 token 里含 `=`（base64 填充），直接按查询串解析会得到
+        # 一个 `...-E` = `=.18dd...` 的假参数，于是"看起来像查询串"却不是凭据。
+        # 所以先按「解析结果里有没有已知凭据字段」判定，再回退到裸 token 形状检查。
+        if _looks_like_bare_token(text):
             query = {"refreshToken": text}
         else:
             raise RuntimeError("无法从粘贴内容里解析出授权参数，请确认复制的是完整链接")
 
     return _credentials_from_query(query)
+
+
+# _CREDENTIAL_PARAMS 是回调里可能携带凭据的字段名。只有出现其中之一，
+# 这段文本才算"回调参数"而不是"一个恰好含 = 的裸 token"。
+_CREDENTIAL_PARAMS = frozenset({
+    "refreshToken", "refresh_token", "data",
+    "userJwt", "user_jwt", "code", "authCodeInfo", "auth_code_info",
+})
+
+
+def _has_credential_param(query):
+    return any(key in _CREDENTIAL_PARAMS for key in query)
+
+
+def _looks_like_bare_token(text):
+    """判断一段文本是否像一个裸 token。
+
+    真实 refreshToken 形如 `sJWEae4XXVAvUxBRp5zMfVrJazeYFO1-JiyaYP3-E==.18dd695b7837d5a9`：
+    base64 字符集 + `.` 分隔的十六进制尾巴，长度几十到几百。这里只做宽松的形状检查，
+    目的是把「明显是别的东西」（中文说明、含空格的句子、太短的串）挡掉，
+    而不是精确校验 token 语法——校验是上游的事。
+    """
+    if len(text) < 16 or len(text) > 4096:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9._~+/=\-]+", text) is not None
 
 
 def _credentials_from_query(query):

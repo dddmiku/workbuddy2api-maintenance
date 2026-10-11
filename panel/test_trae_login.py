@@ -168,3 +168,52 @@ class WriteTraeAuthFileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealCallbackShapeTest(unittest.TestCase):
+    """锁定 2026-10-11 实测的真实回调形态。
+
+    用户实测的回调是**老流程**：地址栏带 refreshToken（不是 userJwt），
+    且同时带一个 `data` 参数。这里钉住"优先取 refreshToken"这一选择——
+    如果哪天改成优先取 data，这条测试会立刻失败。
+    """
+
+    REAL = ("http://127.0.0.1:8765/authorize?isRedirect=true&scope=solo"
+            "&data=sJWEae4XXVAvUxBRp5zMfVrJazeYFO1-JiyaYP3-E%3D%3D.18dd695b7837d5a9"
+            "&refreshToken=sJWEae4XXVAvUxBRp5zMfVrJazeYFO1-JiyaYP3-E%3D%3D.18dd695b7837d5a9")
+
+    def test_real_callback_prefers_refresh_token_over_data(self):
+        captured = {}
+
+        def fake_exchange(refresh_token, client_id=None, host=""):
+            captured["rt"] = refresh_token
+            return {"token": "JWT", "userInfo": {"UserID": "42", "ScreenName": "u"}}
+
+        with mock.patch.object(trae_login, "exchange_refresh_token", side_effect=fake_exchange):
+            creds = trae_login.parse_callback(self.REAL)
+
+        self.assertEqual(captured["rt"],
+                         "sJWEae4XXVAvUxBRp5zMfVrJazeYFO1-JiyaYP3-E==.18dd695b7837d5a9")
+        self.assertEqual(creds["access_token"], "JWT")
+        self.assertEqual(creds["uid"], "42")
+
+    def test_authorization_page_link_is_rejected_clearly(self):
+        """把「授权页」链接贴回来是走错一步：必须明确说明，而不是去换 token。"""
+        url = trae_login.build_auth_url("t", "m", "1")
+        with self.assertRaises(RuntimeError) as ctx:
+            trae_login.parse_callback(url)
+        self.assertIn("授权页", str(ctx.exception))
+        self.assertIn("127.0.0.1", str(ctx.exception))
+
+    def test_bare_token_with_base64_chars(self):
+        """裸 token 含 + / = 等字符，不能被当成解析失败。"""
+        token = "sJWEae4XXVAvUxBRp5zMfVrJazeYFO1-JiyaYP3-E==.18dd695b7837d5a9"
+        with mock.patch.object(trae_login, "exchange_refresh_token",
+                               return_value={"token": "JWT", "userInfo": {"UserID": "1"}}):
+            creds = trae_login.parse_callback(token)
+        self.assertEqual(creds["access_token"], "JWT")
+
+    def test_human_sentence_rejected(self):
+        """明显不是 token 的文本必须报错，不能被当成裸 token 送去兑换。"""
+        with self.assertRaises(RuntimeError):
+            trae_login.parse_callback("我登录好了，你看看")

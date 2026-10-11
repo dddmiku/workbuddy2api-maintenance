@@ -1392,33 +1392,81 @@ async function startLogin(){
   }
 }
 
-// renderTraeWait：Trae 的等待页不是「等扫码」，而是「等你把回调链接粘回来」。
+// renderTraeWait：Trae 的等待页不是「等扫码」，而是「等你把回调链接拿回来」。
+//
+// 这一步是整个流程唯一容易走错的地方：Trae 授权完成后浏览器会跳到一个
+// http://127.0.0.1:8765/... 的地址，那个地址**必然打不开**（127.0.0.1 是用户自己的
+// 电脑，上面没有监听器）。2026-10-11 实测用户第一反应就是去点它、看到
+// ERR_CONNECTION_REFUSED 以为失败了。所以这里把「报错是正常的」写在最显眼处，
+// 并给一个「从剪贴板读取」按钮——点按钮是用户手势，浏览器允许读剪贴板，
+// 于是整个回传动作变成一次点击而不是 全选→复制→切回来→粘贴。
 function renderTraeWait(){
   $('#drTitle').textContent = 'Trae 授权';
   $('#drBody').innerHTML =
-    '<div class="mtext">1. 点下面的按钮打开 Trae 授权页并完成登录</div>' +
+    '<div class="mtext"><b>第 1 步</b>：点下面的「打开 Trae 授权页」，在 Trae 页面完成登录。</div>' +
     '<div class="url-box" id="urlText" style="margin-top:8px">' + esc(DT.url) + '</div>' +
-    '<div class="mtext" style="margin-top:14px">2. 授权完成后浏览器会停在一个打不开的 ' +
-      '<b>127.0.0.1</b> 地址上，这是正常的。把<b>地址栏里的整条链接</b>复制到下面：</div>' +
-    '<textarea id="traeCallback" rows="4" spellcheck="false" ' +
-      'style="width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
+    '<div class="note w" style="margin-top:14px;line-height:1.65">' +
+      svg(IC.warn, 16) +
+      '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1:8765</code> 并显示' +
+      '「无法访问此网站」。<b>这是正常的，不要关掉那个标签页</b>——' +
+      '凭据就在它的地址栏里，我们需要的是那条链接本身。</div>' +
+    '</div>' +
+    '<div class="mtext" style="margin-top:12px">' +
+      '在<b>那个报错页</b>上按 <code>Ctrl+L</code> 全选地址栏 → <code>Ctrl+C</code> 复制，' +
+      '然后回到这里点下面的按钮：' +
+    '</div>' +
+    '<div style="display:flex;gap:8px;margin-top:10px">' +
+      '<button class="btn pri" id="drPaste" style="flex:1">从剪贴板读取</button>' +
+    '</div>' +
+    '<textarea id="traeCallback" rows="3" spellcheck="false" ' +
+      'style="width:100%;margin-top:10px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
       'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
-      'placeholder="http://127.0.0.1:8765/authorize?userJwt=...&userInfo=..."></textarea>' +
+      'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
     '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
   $('#drFoot').innerHTML =
     '<button class="btn" id="drCancel">重新选择区域</button>' +
-    '<button class="btn" id="drOpen">打开授权页</button>' +
+    '<button class="btn" id="drOpen">打开 Trae 授权页</button>' +
     '<button class="btn pri" id="drSubmit">完成添加</button>';
   $('#drCancel').addEventListener('click', renderPick);
   $('#drOpen').addEventListener('click', function(){ window.open(DT.url, '_blank', 'noopener'); });
   $('#drSubmit').addEventListener('click', submitTraeCallback);
+  $('#drPaste').addEventListener('click', readClipboardIntoCallback);
+}
+
+// readClipboardIntoCallback 读剪贴板并直接提交。
+// 按钮点击是用户手势，浏览器允许 clipboard.readText；不支持或拒绝时退回手动粘贴，
+// 不把"读不到剪贴板"变成死路。
+async function readClipboardIntoCallback(){
+  var msg = $('#traeMsg');
+  try{
+    if (!navigator.clipboard || !navigator.clipboard.readText){
+      if (msg) msg.textContent = '这个浏览器不支持读取剪贴板，请在下面手动 Ctrl+V';
+      return;
+    }
+    var text = await navigator.clipboard.readText();
+    if (!text || !text.trim()){
+      if (msg) msg.textContent = '剪贴板是空的，请先在报错页按 Ctrl+L、Ctrl+C';
+      return;
+    }
+    var box = $('#traeCallback');
+    if (box) box.value = text.trim();
+    submitTraeCallback();
+  }catch(err){
+    if (msg) msg.textContent = '读剪贴板被拒绝，请在下面手动 Ctrl+V';
+  }
 }
 
 async function submitTraeCallback(){
   var box = $('#traeCallback'); if (!box) return;
   var value = (box.value || '').trim();
   var msg = $('#traeMsg');
-  if (!value){ if (msg) msg.textContent = '请先把地址栏里的链接粘贴进来'; return; }
+  if (!value){ if (msg) msg.textContent = '请先把报错页地址栏里的链接粘贴进来'; return; }
+  // 早失败：用户很可能贴回来的是我们自己生成的那条授权链接（还没走完授权），
+  // 或贴了别的网页。这两种都换不出凭据，不如在这里直接说清楚。
+  if (value.indexOf('trae.cn/authorization') >= 0){
+    if (msg) msg.textContent = '这是授权页的链接，不是回调链接。请在 Trae 完成登录后，复制跳转到的 127.0.0.1 那条地址。';
+    return;
+  }
   var btn = $('#drSubmit'); btn.disabled = true; btn.textContent = '正在添加…';
   try{
     var r = await api('api/trae/login/finish', { callback: value });
