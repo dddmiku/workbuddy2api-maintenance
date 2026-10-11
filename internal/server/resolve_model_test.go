@@ -45,3 +45,29 @@ func TestResolveModelEdge(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveModelTraeRealm 覆盖新增的 trae 域前缀：模型名写作 "trae:<model>" 时
+// 剥离前缀并把选号限制在该域。这是嵌入 Trae2api-cn 的入口——没有这一步，
+// Trae 账号永远选不中（池按 realm 过滤，前缀不识别就落到 cn）。
+func TestResolveModelTraeRealm(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantRealm string
+		wantBare  string
+	}{
+		{"trae:glm-5.3", "trae", "glm-5.3"},
+		{"trae:deepseek-v4-pro", "trae", "deepseek-v4-pro"},
+		{"trae:", "trae", ""},
+		// 大小写敏感，与 cn/global 同一约定。
+		{"TRAE:glm-5.3", "cn", "TRAE:glm-5.3"},
+		// 既有两域不受影响。
+		{"cn:glm-5.2", "cn", "glm-5.2"},
+		{"global:gpt-5.4", "global", "gpt-5.4"},
+	}
+	for _, c := range cases {
+		realm, bare := resolveModel(c.in)
+		if realm != c.wantRealm || bare != c.wantBare {
+			t.Errorf("resolveModel(%q)=(%q,%q) want (%q,%q)", c.in, realm, bare, c.wantRealm, c.wantBare)
+		}
+	}
+}

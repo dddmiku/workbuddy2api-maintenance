@@ -273,3 +273,72 @@ func TestResolveRealm(t *testing.T) {
 		}
 	}
 }
+
+// TestRealmTrae 覆盖新增的 trae 域判定。
+//
+// trae 账号靠 auth 文件里的显式 "realm":"trae" 识别（domain 是 Trae 的 host，
+// 不参与判定）。与 global 的关键差异：**不受 global 逃生门影响**——那个开关是
+// 「纯 CN 部署」的路由锁，Trae 出站走完全不同的端点与协议，锁它没有意义。
+func TestRealmTrae(t *testing.T) {
+	withGlobalEnabled(t)
+	a := &Auth{realm: "trae", Domain: "api.trae.cn"}
+	if got := a.Realm(); got != "trae" {
+		t.Errorf("Realm()=%q want trae", got)
+	}
+	if a.IsGlobal() {
+		t.Error("IsGlobal() must be false for a trae account")
+	}
+}
+
+func TestRealmTraeSurvivesEscapeHatch(t *testing.T) {
+	withGlobalDisabled(t)
+	a := &Auth{realm: "trae", Domain: "api.trae.cn"}
+	if got := a.Realm(); got != "trae" {
+		t.Errorf("Realm()=%q want trae even with global disabled (trae is not a WorkBuddy realm)", got)
+	}
+}
+
+// TestParseTraeAccountFile 覆盖 Trae 账号文件的落盘形态：扁平形 + realm=trae。
+// 这是用户登录后写入的文件形状，必须能被 Parse 原样读回。
+func TestParseTraeAccountFile(t *testing.T) {
+	raw := []byte(`{
+		"accessToken": "eyJhbGciOi.jwt.payload",
+		"refreshToken": "trae-refresh-token",
+		"expiresAt": 1791700000,
+		"domain": "api.trae.cn",
+		"realm": "trae",
+		"uid": "12345678"
+	}`)
+	a, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := a.Realm(); got != "trae" {
+		t.Errorf("Realm()=%q want trae", got)
+	}
+	if a.UID != "12345678" {
+		t.Errorf("UID=%q want 12345678", a.UID)
+	}
+	if a.RefreshToken != "trae-refresh-token" {
+		t.Errorf("RefreshToken=%q", a.RefreshToken)
+	}
+}
+
+// TestParseTraeAccountFileNested 覆盖嵌套形（插件 OAuth 输出）同样带 realm。
+func TestParseTraeAccountFileNested(t *testing.T) {
+	raw := []byte(`{
+		"auth": {"accessToken":"jwt", "refreshToken":"rt", "expiresAt":1791700000,
+		         "domain":"api.trae.cn", "realm":"trae"},
+		"account": {"uid":"87654321", "nickname":"trae-user"}
+	}`)
+	a, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := a.Realm(); got != "trae" {
+		t.Errorf("Realm()=%q want trae", got)
+	}
+	if a.Nickname != "trae-user" {
+		t.Errorf("Nickname=%q want trae-user", a.Nickname)
+	}
+}

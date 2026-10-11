@@ -38,6 +38,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/upstream/trae"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -1024,10 +1025,19 @@ const refreshIOTimeout = 30 * time.Second
 // 调用方负责 SaveAtomic。
 //
 // 同账号并发刷新由 Auth.RefreshOnce 合并；URL 与全部头字段使用同一凭据快照。
+// Trae 域的刷新端点是 api.trae.cn 的 ExchangeToken，与 WorkBuddy 的
+// /v2/plugin/auth/token/refresh 完全不同，因此在这里按域分流。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	return a.RefreshOnce(func(snapshot *auth.Auth) (auth.TokenUpdate, error) {
 		if strings.TrimSpace(snapshot.RefreshToken) == "" {
 			return auth.TokenUpdate{}, fmt.Errorf("no refreshToken")
+		}
+		if snapshot.Realm() == trae.Realm {
+			access, refresh, expires, err := trae.Refresh(snapshot)
+			if err != nil {
+				return auth.TokenUpdate{}, err
+			}
+			return auth.TokenUpdate{AccessToken: access, RefreshToken: refresh, ExpiresAt: expires}, nil
 		}
 		url := c.chatBase(snapshot) + "/v2/plugin/auth/token/refresh"
 		ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
@@ -1088,6 +1098,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	a = a.Snapshot()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Trae 域走独立出站：它有自己的端点、鉴权头族与事件协议，WorkBuddy 的
+	// 预算/缓存键/渠道中和等改写对它没有意义（甚至会污染请求体）。转译器把 Trae
+	// 事件流归一成 OpenAI SSE，下游协议栈因此零改动复用。
+	if a.Realm() == trae.Realm {
+		return trae.ChatStream(ctx, a, body, clientIP)
 	}
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
