@@ -218,6 +218,15 @@ func (s *Scheduler) TaskSnapshot() []TaskInfo {
 		}
 		info.Running = s.taskBusy[key]
 		s.taskMu.Unlock()
+		// 内存里没有上次时刻（进程刚重启）时，回落到落盘的完成时刻——
+		// 否则任务页的「上次运行」在每次部署后都变成空白，而日志却还在
+		// （两者取自同一份事实，不该一个有一个没有）。
+		if info.LastRun == nil {
+			if t := taskSink.lastEnded(key); !t.IsZero() {
+				last := t
+				info.LastRun = &last
+			}
+		}
 		out = append(out, info)
 	}
 	return out

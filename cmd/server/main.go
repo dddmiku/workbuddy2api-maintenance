@@ -91,6 +91,14 @@ func main() {
 			log.Printf("WARN: [requests] detail storage unavailable; cumulative usage remains enabled: %v", err)
 		}
 	}
+	// 任务日志落盘：面板的「最近一次日志」原本是纯内存的，容器一重启就没了，
+	// 用户看到「明明运行过」却是空页。落一份到数据目录，重启后仍可读。
+	// 目录取不到时退回纯内存（SetTaskLogDir 自己兜住，不拦启动）。
+	if dir := filepath.Dir(cfg.APIKeysFile); dir != "" && dir != "." {
+		scheduler.SetTaskLogDir(filepath.Join(dir, "task-logs"))
+	} else if cfg.StateFile != "" {
+		scheduler.SetTaskLogDir(filepath.Join(filepath.Dir(cfg.StateFile), "task-logs"))
+	}
 	var closeOpsOnce sync.Once
 	var closeOpsErr error
 	closeOps := func() error {

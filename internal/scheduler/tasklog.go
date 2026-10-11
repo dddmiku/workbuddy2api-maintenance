@@ -7,8 +7,11 @@
 package scheduler
 
 import (
+	"encoding/json"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +33,132 @@ type taskLogSink struct {
 	ring  map[TaskKey][]string
 	prev  map[TaskKey][]string
 	ended map[TaskKey]time.Time
+	// dir 是落盘目录（空 = 不落盘）。日志环原本是纯内存的，容器一重启
+	// 「最近一次日志」就没了——用户看到「明明运行过」却是空页（2026-10-11 实测：
+	// 部署重启后 8 分钟，22:44 那次 trae_check 的运行记录查不到）。落一份到磁盘，
+	// 重启后仍能看到上次跑了什么。
+	dir string
 }
 
 var taskSink = &taskLogSink{
 	ring:  map[TaskKey][]string{},
 	prev:  map[TaskKey][]string{},
 	ended: map[TaskKey]time.Time{},
+}
+
+// SetTaskLogDir 指定任务日志的落盘目录（空 = 纯内存，行为与引入前一致）。
+// 由 main 在装配阶段调用；目录不可写时只记一条日志并退回纯内存，
+// 不能让「日志落不了盘」把启动拦下来。
+func SetTaskLogDir(dir string) {
+	taskSink.mu.Lock()
+	taskSink.dir = dir
+	taskSink.mu.Unlock()
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("WARN: [tasklog] 落盘目录不可用，任务日志将只保留在内存：%v", err)
+		taskSink.mu.Lock()
+		taskSink.dir = ""
+		taskSink.mu.Unlock()
+		return
+	}
+	taskSink.load()
+}
+
+// taskLogFile 单个任务的落盘文件（文件名用任务 key，天然合法且可读）。
+func taskLogFile(dir string, k TaskKey) string {
+	return filepath.Join(dir, string(k)+".json")
+}
+
+// taskLogDoc 落盘形态。带版本号便于以后改结构。
+type taskLogDoc struct {
+	Version int      `json:"version"`
+	Lines   []string `json:"lines"`
+	EndedAt string   `json:"ended_at,omitempty"`
+}
+
+// persistLocked 把某任务的「最近一次」写到磁盘。调用方必须已持 s.mu。
+//
+// 返回写失败的原因（nil = 成功或无需落盘），由**调用方在释放锁之后**记日志。
+// 绝不能在本函数内 log：标准 logger 被 ensureLogTee 分流回 taskSink.Write，
+// 那条路径要拿同一把 s.mu —— 持锁打日志会自死锁（磁盘满/目录只读时必然触发，
+// 表现为整个调度器卡死）。2026-10-11 由 TestBeginTaskMutualExclusion 挂起暴露。
+func (s *taskLogSink) persistLocked(k TaskKey) error {
+	if s.dir == "" {
+		return nil
+	}
+	doc := taskLogDoc{Version: 1, Lines: s.prev[k]}
+	if t := s.ended[k]; !t.IsZero() {
+		doc.EndedAt = t.UTC().Format(time.RFC3339)
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	// 原子写：先写临时文件再 rename，避免读到写了一半的文件。
+	tmp := taskLogFile(s.dir, k) + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, taskLogFile(s.dir, k)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// persistAndReport 在锁外记日志的包装：调用方须**不持** s.mu。
+func (s *taskLogSink) persistAndReport(k TaskKey) {
+	s.mu.Lock()
+	err := s.persistLocked(k)
+	s.mu.Unlock()
+	if err != nil {
+		// 日志是观测手段，写失败不能影响任务执行；只提示一次级别的问题。
+		log.Printf("WARN: [tasklog] 任务日志落盘失败（%s）：%v", k, err)
+	}
+}
+
+// load 启动时把落盘的「最近一次」读回内存。
+func (s *taskLogSink) load() {
+	s.mu.Lock()
+	dir := s.dir
+	s.mu.Unlock()
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var doc taskLogDoc
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc.Lines) == 0 {
+			continue
+		}
+		k := TaskKey(strings.TrimSuffix(e.Name(), ".json"))
+		if k == "" {
+			continue
+		}
+		s.mu.Lock()
+		if s.prev == nil {
+			s.prev = map[TaskKey][]string{}
+		}
+		if s.ended == nil {
+			s.ended = map[TaskKey]time.Time{}
+		}
+		s.prev[k] = doc.Lines
+		if t, err := time.Parse(time.RFC3339, doc.EndedAt); err == nil {
+			s.ended[k] = t
+		}
+		s.mu.Unlock()
+	}
 }
 
 // teeWriter 把日志行同时写进基底 writer 与任务日志环。
@@ -106,13 +229,26 @@ func (s *taskLogSink) end() {
 	s.mu.Lock()
 	// 结束即把这轮定为「最近一次」：否则 prev 里留的还是更早那一轮，
 	// 面板刚跑完一次却显示上一次的内容。
+	var toPersist TaskKey
 	if s.cur != "" {
 		if lines := s.ring[s.cur]; len(lines) > 0 {
 			s.prev[s.cur] = lines
 		}
+		toPersist = s.cur
 	}
 	s.cur = ""
 	s.mu.Unlock()
+	if toPersist != "" {
+		s.persistAndReport(toPersist)
+	}
+}
+
+// lastEnded 返回某任务最后一次执行的完成时刻（零值 = 未知）。
+// 进程重启后内存为空，但落盘的那份还在——任务页的「上次运行」据此恢复。
+func (s *taskLogSink) lastEnded(k TaskKey) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ended[k]
 }
 
 // markEnded 记下某任务最后一次执行的完成时刻（面板据此显示「最近一次」）。
@@ -123,6 +259,7 @@ func (s *taskLogSink) markEnded(k TaskKey) {
 	}
 	s.ended[k] = time.Now()
 	s.mu.Unlock()
+	s.persistAndReport(k)
 }
 
 // emit 把子脚本输出的一行按"当前任务"的上下文记进标准 logger，
