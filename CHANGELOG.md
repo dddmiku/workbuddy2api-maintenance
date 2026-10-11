@@ -38,6 +38,34 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v2.7.4 — 2026-10-11
+
+修 `readClipboardIntoCallback is not defined`，并补一类测试。
+
+### 现象
+
+用户点「从剪贴板读取并添加」报 `获取链接失败：readClipboardIntoCallback is not defined`。
+
+### 原因
+
+我在清理废弃函数（`renderTraeAuto` / `renderTraeWaitUnused`）时，把
+`readClipboardIntoCallback` **一起删掉了**——它当时定义在被我整段替换的区域里，
+而它仍在 `renderTraeAuth` 里被注册成按钮回调。
+
+JS 是运行时解析的：删函数**不会**在 `node --check` 里报错，只在用户真的点那个按钮时
+才炸。所以前几轮的语法检查与测试全绿，问题照样到了用户面前。
+
+### 补的测试
+
+新增 `UndefinedFunctionReferenceTest`：把各 `.js` 里**作为回调注册的函数名**
+（`addEventListener('x', NAME)`）抽出来，逐个查是否有定义，覆盖这一类错误。
+
+写这条测试时它立刻又抓到一次误报并促使我修正——`requests.js` 的 `closeDetail` 是
+**闭包内的嵌套函数**，只收顶层定义会误判，所以定义集合改为收任意缩进层级的函数。
+
+另外验证了这条测试**确实能抓到原 bug**：临时删掉 `readClipboardIntoCallback` 后
+测试失败，恢复后通过。
+
 ## v2.7.3 — 2026-10-11
 
 修两个真问题：Trae 自动回调彻底移除、任务页按账号区域分组；并修掉一个**部署缺陷**。

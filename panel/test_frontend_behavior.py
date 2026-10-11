@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -890,3 +891,51 @@ class VersionAndModelRefreshTest(unittest.TestCase):
         self.assertIn("toast('模型列表已刷新", self.keys_js)
         self.assertIn("btnRefreshModels", self.keys_js)
 
+
+
+class UndefinedFunctionReferenceTest(unittest.TestCase):
+    """禁止「调用了但没定义」的顶层函数。
+
+    2026-10-11 实测：我在删废弃函数时把 `readClipboardIntoCallback` 一起删了，
+    而它仍在 renderTraeAuth 里被注册成按钮回调——用户点「从剪贴板读取并添加」
+    直接报 `readClipboardIntoCallback is not defined`。JS 是运行时解析的，
+    删函数不会在语法检查（node --check）里报错，只在实际点击时炸。
+
+    这里把「作为回调传递的函数名」抽出来逐个查定义，覆盖这一类错误。
+    """
+
+    SOURCES = ("app.js", "keys.js", "usage.js", "requests.js", "update.js", "logs.js")
+
+    def test_event_handler_callbacks_are_defined(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        blobs = {}
+        for name in self.SOURCES:
+            path = os.path.join(here, name)
+            if os.path.exists(path):
+                blobs[name] = open(path, encoding="utf-8").read()
+        # 定义名：既收顶层函数，也收**任意缩进的嵌套函数**——面板里不少回调是
+        # 闭包内的局部函数（如 requests.js 的 closeDetail），只收顶层会误报。
+        defined = set()
+        for body in blobs.values():
+            for m in re.finditer(r"(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", body):
+                defined.add(m.group(1))
+            for m in re.finditer(r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=", body):
+                defined.add(m.group(1))
+            for m in re.finditer(r"([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s*)?function", body):
+                defined.add(m.group(1))
+        # 作为回调直接传递的名字：addEventListener('x', NAME) 或 addEventListener('x', NAME)
+        referenced = set()
+        for body in blobs.values():
+            for m in re.finditer(r"addEventListener\(\s*['\"][\w]+['\"]\s*,\s*([A-Za-z_$][\w$]*)\s*\)", body):
+                referenced.add(m.group(1))
+        missing = sorted(n for n in referenced if n not in defined)
+        self.assertEqual(missing, [], "这些回调被注册但未定义：%s" % missing)
+
+    def test_trae_flow_callbacks_exist(self):
+        """Trae 授权流程的两个按钮回调必须在打包产物里存在。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+        for fn in ("readClipboardIntoCallback", "submitTraeCallback", "renderTraeAuth"):
+            with self.subTest(fn=fn):
+                self.assertIn("function " + fn, index,
+                              "%s 被调用但未定义" % fn)

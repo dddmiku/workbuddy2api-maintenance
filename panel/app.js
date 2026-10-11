@@ -1521,6 +1521,31 @@ function renderTraeAuth(){
   $('#drSubmit2').addEventListener('click', submitTraeCallback);
 }
 
+// readClipboardIntoCallback 读剪贴板并直接提交。
+//
+// 点按钮属于用户手势，浏览器允许 clipboard.readText，于是回传动作从
+// 「全选→复制→切回来→粘贴」变成一次点击。不支持或拒绝时退回手动粘贴，
+// 不把「读不到剪贴板」变成死路。
+async function readClipboardIntoCallback(){
+  var msg = $('#traeMsg');
+  try{
+    if (!navigator.clipboard || !navigator.clipboard.readText){
+      if (msg) msg.textContent = '这个浏览器不支持读取剪贴板，请在下面手动 Ctrl+V';
+      return;
+    }
+    var text = await navigator.clipboard.readText();
+    if (!text || !text.trim()){
+      if (msg) msg.textContent = '剪贴板是空的，请先在报错页按 Ctrl+L、Ctrl+C';
+      return;
+    }
+    var box = $('#traeCallback');
+    if (box) box.value = text.trim();
+    submitTraeCallback();
+  }catch(err){
+    if (msg) msg.textContent = '读剪贴板被拒绝，请在下面手动 Ctrl+V';
+  }
+}
+
 async function submitTraeCallback(){
   var box = $('#traeCallback'); if (!box) return;
   var value = (box.value || '').trim();
