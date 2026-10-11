@@ -1413,7 +1413,40 @@ function actTaskToggle(key, nextEnabled){
     });
 }
 
-/* ── 任务日志 ─────────────────────────────────────── */
+/* ── 任务日志 ───────────────────────────────────────
+ * 弹窗打开期间**自动刷新**：任务日志是有时效的（刚点完「跑一次」就想看它跑成什么样），
+ * 手动点刷新会错过整个执行过程。轮询间隔按状态分档——任务在跑时日志还在长，2 秒一次；
+ * 跑完（或本来就没在跑）降到 5 秒，只等下一次触发。关掉弹窗即停表。
+ *
+ * 后端会区分「当前这一轮」与「上一次那一轮」：任务空闲时给的是**最近一次**的完整日志，
+ * 所以打开弹窗立刻就能看到上次跑了什么，不必先自己触发一遍。
+ */
+var LG = { timer:null, running:false, endedAt:'', lastSig:'' };
+
+// lgStatusText 顶栏右侧的状态文案：运行中 / 最近一次完成时刻。
+function lgStatusText(){
+  if (LG.running) return '运行中…';
+  if (LG.endedAt) return '最近一次 ' + fmtTime(LG.endedAt);
+  return '';
+}
+function lgRenderStatus(){
+  var el = $('#lgStatus');
+  if (el) el.textContent = lgStatusText();
+}
+function lgStopTimer(){
+  if (LG.timer){ clearTimeout(LG.timer); LG.timer = null; }
+}
+// lgSchedule 按当前状态安排下一次拉取：运行中 2s（日志还在长），否则 5s。
+function lgSchedule(){
+  lgStopTimer();
+  if (!logKey) return;
+  LG.timer = setTimeout(async function(){
+    if (!logKey) return;
+    await loadTaskLog();
+    lgSchedule();
+  }, LG.running ? 2000 : 5000);
+}
+
 function openLogModal(title){
   $('#lgTitle').textContent = title;
   $('#scrimL').classList.add('on');
@@ -1422,6 +1455,7 @@ function openLogModal(title){
 function closeLogModal(){
   $('#scrimL').classList.remove('on');
   $('#logModal').classList.remove('on');
+  lgStopTimer();
   logKey = null;
 }
 $('#lgClose').addEventListener('click', closeLogModal);
@@ -1429,16 +1463,31 @@ $('#scrimL').addEventListener('click', closeLogModal);
 $('#lgRefresh').addEventListener('click', function(){ if (logKey) loadTaskLog(); });
 async function openTaskLog(key, name){
   logKey = key; logName = name || key;
+  LG.running = false; LG.endedAt = ''; LG.lastSig = '';
   openLogModal('任务日志 · ' + logName);
   $('#lgBody').textContent = '加载中…';
+  lgRenderStatus();
   await loadTaskLog();
+  lgSchedule();
 }
 async function loadTaskLog(){
   try{
     var r = await api('api/task/log?key=' + encodeURIComponent(logKey));
     var lines = r.lines || [];
-    $('#lgBody').textContent = lines.length ? lines.join('\n') : (r.message || '这次运行还没有输出。');
+    LG.running = !!r.running;
+    LG.endedAt = r.endedAt || '';
+    lgRenderStatus();
+    // 内容没变就不重写 DOM（自动刷新每 2 秒一次，重写会打断选中与滚动位置）。
+    var sig = lines.length + '|' + (lines[lines.length - 1] || '') + '|' + LG.running;
+    if (sig === LG.lastSig) return;
+    LG.lastSig = sig;
+    var body = $('#lgBody');
+    var atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
+    body.textContent = lines.length ? lines.join('\n') : (r.message || '这个任务还没有跑过，点「跑一次」后回来看。');
+    // 跟着日志走：用户本来就在底部（或本来就没滚动）时自动贴底，否则别抢滚动位置。
+    if (atBottom) body.scrollTop = body.scrollHeight;
   }catch(err){
+    lgStopTimer();
     $('#lgBody').textContent = '拉取失败：' + (err && err.message || err);
   }
 }

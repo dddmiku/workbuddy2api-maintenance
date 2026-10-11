@@ -1337,3 +1337,87 @@ return $('#creditsRows').innerHTML;
         self.assertIn('class="rtag cn"', result, "缺省域应归到 CN 组")
         self.assertIn("国内版 CN", result)
         self.assertNotIn("其它", result)
+
+
+class TaskLogLiveRefreshTest(FrontendHarness, unittest.TestCase):
+    """任务日志弹窗：自动刷新 + 显示最近一次。
+
+    2026-10-11 用户要求：「日志实时刷新，然后能看到最近一次的日志」。两件事：
+
+    1) 打开弹窗期间自动轮询（原来只有手动点刷新，会错过整个执行过程）；
+       间隔按状态分档——运行中 2 秒，跑完 5 秒。
+    2) 后端区分「当前这一轮」与「上一次那一轮」，空闲时给**最近一次**的完整日志，
+       所以打开弹窗立刻能看到上次跑了什么，不必先自己触发一遍。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_modal_polls_while_open(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function lgSchedule()", body)
+                # 打开时启动轮询、关闭时停表。
+                self.assertIn("lgSchedule()", body[body.index("async function openTaskLog("):])
+                close = body[body.index("function closeLogModal(){"):]
+                close = close[:close.index("\n}")]
+                self.assertIn("lgStopTimer()", close, "关弹窗必须停表，否则后台一直轮询")
+
+    def test_poll_interval_adapts_to_running_state(self):
+        """运行中 2 秒、空闲 5 秒——日志在长时看的人等不起 5 秒。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function lgSchedule()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("LG.running ? 2000 : 5000", block)
+
+    def test_status_line_shows_running_and_last_run(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function lgStatusText()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("运行中", block)
+                self.assertIn("最近一次", block)
+        # 弹窗头部要有承载它的元素，否则文案无处可写。
+        self.assertIn('id="lgStatus"', self.body)
+        self.assertIn('id="lgStatus"', self.index)
+
+    def test_renders_running_and_last_run_from_api(self):
+        """走真实渲染：running/endedAt 来自后端，状态行必须跟着变。"""
+        result = self.run_frontend("""
+logKey='trae_check';
+LG.running=true; LG.endedAt=''; lgRenderStatus();
+var running = $('#lgStatus').textContent;
+LG.running=false; LG.endedAt='2026-10-11T14:00:00Z'; lgRenderStatus();
+var done = $('#lgStatus').textContent;
+LG.endedAt=''; lgRenderStatus();
+var none = $('#lgStatus').textContent;
+return {running:running, done:done, none:none};
+""")
+        self.assertIn("运行中", result["running"])
+        self.assertIn("最近一次", result["done"])
+        self.assertEqual(result["none"], "", "既没在跑也没跑过时不该占位")
+
+    def test_empty_state_tells_user_how_to_get_a_log(self):
+        """从没跑过时的空态要说明下一步，而不是干巴巴一句「没有输出」。
+
+        这条只做静态核对：空态文案在 loadTaskLog 里，走真实渲染需要网络桩
+        （api() 走 fetch，测试环境没有），静态断言同样能锁住措辞。
+        """
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("async function loadTaskLog()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("跑一次", block, "空态应指引用户去点「跑一次」")
+                self.assertIn("还没有跑过", block)
+
+    def test_content_change_detection_avoids_needless_rewrite(self):
+        """内容没变就不重写 DOM：自动刷新 2 秒一次，重写会打断选中与滚动。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("async function loadTaskLog()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("LG.lastSig", block)
+                self.assertIn("return;", block, "指纹一致应提前返回")

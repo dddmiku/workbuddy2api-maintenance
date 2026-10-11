@@ -13,16 +13,17 @@ import (
 )
 
 type fakeTasks struct {
-	snap   []scheduler.TaskInfo
-	err    error
-	logs   []string
-	logErr error
+	snap    []scheduler.TaskInfo
+	err     error
+	logs    []string
+	logErr  error
+	running bool
 }
 
 func (f fakeTasks) TaskSnapshot() []scheduler.TaskInfo { return f.snap }
 func (f fakeTasks) TriggerTask(key string) error       { return f.err }
-func (f fakeTasks) TaskLog(key string) ([]string, error) {
-	return f.logs, f.logErr
+func (f fakeTasks) TaskLogDetail(key string) (scheduler.TaskLogResult, error) {
+	return scheduler.TaskLogResult{Lines: f.logs, Running: f.running}, f.logErr
 }
 
 func tasksReq(t *testing.T, h *Handler, method, path string) (int, map[string]any) {

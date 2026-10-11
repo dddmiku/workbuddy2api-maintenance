@@ -7,6 +7,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"workbuddy2api/internal/scheduler"
 )
@@ -17,9 +18,10 @@ import (
 type TaskController interface {
 	TaskSnapshot() []scheduler.TaskInfo
 	TriggerTask(key string) error
-	// TaskLog 返回某类任务最近一次执行的日志行（旧 → 新）。
+	// TaskLogDetail 返回某类任务最近一次执行的日志行（旧 → 新）与运行状态。
+	// 正在执行时给**当前**这一轮（实时刷新看的就是它），空闲时给**上一次**那一轮。
 	// 未知 key 返回 scheduler.ErrUnknownTask；跑过但无输出返回空切片。
-	TaskLog(key string) ([]string, error)
+	TaskLogDetail(key string) (scheduler.TaskLogResult, error)
 }
 
 // tasks 返回全部排程任务的快照。
@@ -46,7 +48,7 @@ func (h *Handler) taskLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := r.PathValue("key")
-	lines, err := h.cfg.Tasks.TaskLog(key)
+	res, err := h.cfg.Tasks.TaskLogDetail(key)
 	if err != nil {
 		status := http.StatusBadRequest
 		msg := err.Error()
@@ -56,9 +58,15 @@ func (h *Handler) taskLog(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, status, "task_log_failed", msg)
 		return
 	}
-	_ = writeJSON(w, http.StatusOK, map[string]any{
-		"key": key, "lines": lines, "count": len(lines),
-	})
+	// running 让面板区分「正在跑（日志还在长）」与「已结束（这是最近一次）」，
+	// 并据此决定要不要加快轮询。ended_at 给「最近一次」一个可读时刻。
+	payload := map[string]any{
+		"key": key, "lines": res.Lines, "count": len(res.Lines), "running": res.Running,
+	}
+	if !res.EndedAt.IsZero() {
+		payload["ended_at"] = res.EndedAt.UTC().Format(time.RFC3339)
+	}
+	_ = writeJSON(w, http.StatusOK, payload)
 }
 
 // taskRun 手动触发单类任务。立即返回 202，任务在网关侧后台执行；结果落容器日志。

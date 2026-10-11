@@ -22,9 +22,9 @@ func (f *boundaryTasks) TaskSnapshot() []scheduler.TaskInfo {
 }
 
 func (f *boundaryTasks) TriggerTask(string) error { f.calls++; return nil }
-func (f *boundaryTasks) TaskLog(string) ([]string, error) {
+func (f *boundaryTasks) TaskLogDetail(string) (scheduler.TaskLogResult, error) {
 	f.calls++
-	return []string{"private-management-log"}, nil
+	return scheduler.TaskLogResult{Lines: []string{"private-management-log"}}, nil
 }
 
 func TestManagedKeysCannotAccessAccountAdministration(t *testing.T) {

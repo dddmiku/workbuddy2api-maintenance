@@ -7,6 +7,7 @@ package scheduler
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTaskSnapshotOrderAndSwitches(t *testing.T) {
@@ -119,6 +120,8 @@ func TestTaskLogRing(t *testing.T) {
 	// 断言前先清空，否则用例之间产生顺序依赖——单跑过、全量跑挂。
 	taskSink.mu.Lock()
 	taskSink.ring = map[TaskKey][]string{}
+	taskSink.prev = map[TaskKey][]string{}
+	taskSink.ended = map[TaskKey]time.Time{}
 	taskSink.mu.Unlock()
 
 	// 未知 key：报错而不是空日志。
@@ -171,13 +174,44 @@ func TestTaskLogRing(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("无上下文写入不该进任何任务：%v", lines)
 	}
-	// 重新 begin 会清掉上一轮。
+	// 重新 begin：当前环换成新一轮，但**上一轮的行要留得住**——
+	// 面板「最近一次日志」正是靠它（2026-10-11 用户反馈看不到最近一次）。
 	taskSink.begin(TaskKeyCheckin)
 	taskSink.emit("新一轮")
+	// 运行中读：给的是当前这一轮，且带 running 标记。
+	res, _ := s.TaskLogDetail("checkin")
+	if !res.Running {
+		t.Fatal("begin 之后 running 应为 true")
+	}
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "新一轮") {
+		t.Fatalf("运行中应给当前这一轮：%v", res.Lines)
+	}
 	taskSink.end()
-	lines, _ = s.TaskLog("checkin")
-	if len(lines) != 1 || !strings.Contains(lines[0], "[checkin] 新一轮") {
-		t.Fatalf("新一轮应清空旧记录：%v", lines)
+	// 结束后读：仍是这一轮（它现在成了「最近一次」）。
+	res, _ = s.TaskLogDetail("checkin")
+	if res.Running {
+		t.Fatal("end 之后 running 应为 false")
+	}
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "新一轮") {
+		t.Fatalf("结束后应给最近一轮：%v", res.Lines)
+	}
+	// 再开一轮：上一轮（新一轮那次的 1 行）必须仍可读，直到这轮也结束。
+	taskSink.begin(TaskKeyCheckin)
+	taskSink.emit("第三轮")
+	res, _ = s.TaskLogDetail("checkin")
+	if !res.Running || len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "第三轮") {
+		t.Fatalf("运行中应给第三轮：running=%v lines=%v", res.Running, res.Lines)
+	}
+	taskSink.end()
+	res, _ = s.TaskLogDetail("checkin")
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "第三轮") {
+		t.Fatalf("应给第三轮：%v", res.Lines)
+	}
+	// markEnded 记下完成时刻。
+	taskSink.markEnded(TaskKeyCheckin)
+	res, _ = s.TaskLogDetail("checkin")
+	if res.EndedAt.IsZero() {
+		t.Fatal("markEnded 之后 ended_at 不该为零值")
 	}
 }
 

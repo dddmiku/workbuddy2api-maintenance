@@ -1476,7 +1476,11 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return self._json(200, {"ok": False, "lines": [], "message": "连不上网关或网关未接入排程"})
             lines = payload.get("lines") or []
+            # running/ended_at 透传给面板：前者决定弹窗是否继续自动刷新（任务在跑时
+            # 日志还在长），后者给「最近一次」一个可读时刻。
             return self._json(200, {"ok": True, "lines": lines, "count": len(lines),
+                                    "running": bool(payload.get("running")),
+                                    "endedAt": payload.get("ended_at") or "",
                                     "message": (payload.get("error") or {}).get("message", "")})
 
         if path == "/api/logs":

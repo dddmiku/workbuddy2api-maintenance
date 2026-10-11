@@ -118,7 +118,7 @@ func describe(k TaskKey) (string, string) {
 	case TaskKeyCheckin:
 		return "签到（WorkBuddy）", "WorkBuddy 两域每日签到 + 余额查询；余额恢复后自动解冻冷却中的账号"
 	case TaskKeyTraeCheck:
-		return "签到（Trae）", "Trae 站点独立签到；上游 9074 限流时按天跳过，不重试"
+		return "签到（Trae）", "Trae 站点独立签到；上游 9074 是设备维度限流，换设备号重试一次"
 	case TaskKeyActivity:
 		return "活跃上报", "对话事件连发上报，点亮连登天数、解锁领养前置"
 	case TaskKeyTravel:
@@ -252,6 +252,7 @@ func (s *Scheduler) endTask(k taskKind) {
 	}
 	s.taskBusy[key] = false
 	s.taskLast[key] = time.Now()
+	taskSink.markEnded(key)
 	s.taskWG.Done()
 }
 

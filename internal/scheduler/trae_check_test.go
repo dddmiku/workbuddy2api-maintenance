@@ -4,6 +4,7 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -97,5 +98,57 @@ func TestTraeDeviceGenerationTracksRotation(t *testing.T) {
 	s.noteTraeDeviceGeneration("u1", 2)
 	if got := s.traeDeviceGeneration("u1"); got != 2 {
 		t.Fatalf("应可继续递增到 2，实际 %d", got)
+	}
+}
+
+// TestTaskLogKeepsLastRunWhileIdle 任务空闲时读日志给的是**上一次**那一轮。
+//
+// 2026-10-11 用户要求「能看到最近一次的日志」。原先 begin() 直接清空环，
+// 于是新一轮一开始，上一轮的日志就没了——点开日志正好赶上新一轮启动时，
+// 只能看到半截新日志，看不到上次跑成什么样。
+func TestTaskLogKeepsLastRunWhileIdle(t *testing.T) {
+	s := New(Config{})
+	taskSink.mu.Lock()
+	taskSink.ring = map[TaskKey][]string{}
+	taskSink.prev = map[TaskKey][]string{}
+	taskSink.ended = map[TaskKey]time.Time{}
+	taskSink.mu.Unlock()
+
+	// 第一轮跑完。
+	taskSink.begin(TaskKeyTraeCheck)
+	taskSink.emit("第一轮的内容")
+	taskSink.end()
+
+	// 空闲时读：应给第一轮。
+	res, err := s.TaskLogDetail("trae_check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Running {
+		t.Fatal("空闲时 running 应为 false")
+	}
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "第一轮的内容") {
+		t.Fatalf("空闲时应给上一次那一轮：%v", res.Lines)
+	}
+
+	// 第二轮开始（此时第一轮已被顶掉，但第二轮是「当前」，仍能读到）。
+	taskSink.begin(TaskKeyTraeCheck)
+	taskSink.emit("第二轮的内容")
+	res, _ = s.TaskLogDetail("trae_check")
+	if !res.Running {
+		t.Fatal("begin 之后 running 应为 true")
+	}
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "第二轮的内容") {
+		t.Fatalf("运行中应给当前这一轮：%v", res.Lines)
+	}
+	taskSink.end()
+	// 跑完后：最近一次 = 第二轮。
+	res, _ = s.TaskLogDetail("trae_check")
+	if len(res.Lines) != 1 || !strings.Contains(res.Lines[0], "第二轮的内容") {
+		t.Fatalf("跑完后最近一次应为第二轮：%v", res.Lines)
+	}
+	// 未知任务仍报错。
+	if _, err := s.TaskLogDetail("nosuch"); err != ErrUnknownTask {
+		t.Fatalf("未知 key 应报 ErrUnknownTask，实际 %v", err)
 	}
 }

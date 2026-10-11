@@ -11,6 +11,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 )
 
 // taskLogRing 每类任务保留的日志行数上限（只留最近一次执行的后段，
@@ -19,13 +20,23 @@ const taskLogRing = 400
 
 // taskLogSink 任务日志环。cur 为当前正在执行的任务 key：为空表示没有任务在跑，
 // 此时的日志行一律丢弃——否则运行期日志（HTTP 请求表格等）会把任务日志冲掉。
+//
+// prev 保留**上一次执行**的行与完成时刻：面板要看的是「最近一次跑了什么」，
+// 而执行开始时环会被清空重写，不另存一份的话，点开日志正好赶上新一轮开始
+// 就只能看到半截新日志（2026-10-11 用户反馈「看不到最近一次的日志」）。
 type taskLogSink struct {
-	mu   sync.Mutex
-	cur  TaskKey
-	ring map[TaskKey][]string
+	mu    sync.Mutex
+	cur   TaskKey
+	ring  map[TaskKey][]string
+	prev  map[TaskKey][]string
+	ended map[TaskKey]time.Time
 }
 
-var taskSink = &taskLogSink{ring: map[TaskKey][]string{}}
+var taskSink = &taskLogSink{
+	ring:  map[TaskKey][]string{},
+	prev:  map[TaskKey][]string{},
+	ended: map[TaskKey]time.Time{},
+}
 
 // teeWriter 把日志行同时写进基底 writer 与任务日志环。
 // 基底先写：即便环这一侧出问题，容器日志也不会因此丢行。
@@ -82,6 +93,10 @@ func (s *taskLogSink) Write(p []byte) (int, error) {
 func (s *taskLogSink) begin(k TaskKey) {
 	ensureLogTee()
 	s.mu.Lock()
+	// 把上一轮的行挪进 prev 再清空当前环：新一轮开始时面板仍能读到「上次跑了什么」。
+	if lines := s.ring[k]; len(lines) > 0 {
+		s.prev[k] = lines
+	}
 	s.cur = k
 	s.ring[k] = nil // 新一轮执行从干净的一页开始
 	s.mu.Unlock()
@@ -89,7 +104,24 @@ func (s *taskLogSink) begin(k TaskKey) {
 
 func (s *taskLogSink) end() {
 	s.mu.Lock()
+	// 结束即把这轮定为「最近一次」：否则 prev 里留的还是更早那一轮，
+	// 面板刚跑完一次却显示上一次的内容。
+	if s.cur != "" {
+		if lines := s.ring[s.cur]; len(lines) > 0 {
+			s.prev[s.cur] = lines
+		}
+	}
 	s.cur = ""
+	s.mu.Unlock()
+}
+
+// markEnded 记下某任务最后一次执行的完成时刻（面板据此显示「最近一次」）。
+func (s *taskLogSink) markEnded(k TaskKey) {
+	s.mu.Lock()
+	if s.ended == nil {
+		s.ended = map[TaskKey]time.Time{}
+	}
+	s.ended[k] = time.Now()
 	s.mu.Unlock()
 }
 
@@ -121,17 +153,58 @@ func (scriptSink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// TaskLogResult 是一次任务日志查询的结果。
+type TaskLogResult struct {
+	// Lines 日志行（旧 → 新）。任务在跑时是**当前**这一轮；空闲时是**上一次**那一轮。
+	Lines []string
+	// Running 该任务此刻是否正在执行（面板据此显示「运行中」并加快轮询）。
+	Running bool
+	// StartedAt / EndedAt 本次（或上一次）执行的起止时刻；未知为零值。
+	StartedAt time.Time
+	EndedAt   time.Time
+}
+
 // TaskLog 返回某任务最近一次执行的日志行（旧 → 新）。
-// 未知 key 返回 ErrUnknownTask；已知但尚未跑过返回空切片与 nil。
+//
+// 任务正在执行时返回**当前**这一轮（实时刷新要看的就是它）；空闲时返回
+// **上一次**那一轮（面板的「最近一次日志」）。两者都不存在时返回空切片。
+// 未知 key 返回 ErrUnknownTask。
 func (s *Scheduler) TaskLog(key string) ([]string, error) {
+	res, err := s.TaskLogDetail(key)
+	if err != nil {
+		return nil, err
+	}
+	return res.Lines, nil
+}
+
+// TaskLogDetail 同 TaskLog，但额外给出运行状态与起止时刻。
+func (s *Scheduler) TaskLogDetail(key string) (TaskLogResult, error) {
 	k, ok := kindOf(key)
 	if !ok {
-		return nil, ErrUnknownTask
+		return TaskLogResult{}, ErrUnknownTask
 	}
+	tk := k.key()
 	taskSink.mu.Lock()
 	defer taskSink.mu.Unlock()
-	lines := taskSink.ring[k.key()]
+	// 正在跑：当前环是活的，直接给（含它这一轮已产出的全部行）。
+	// 空闲：给上一轮留下的 prev；没有 prev 时退回当前环（老进程刚升级上来时
+	// 只有 ring 有内容，不能因为没 prev 就报空）。
+	lines := taskSink.ring[tk]
+	running := taskSink.cur == tk
+	if !running && len(taskSink.prev[tk]) > 0 {
+		lines = taskSink.prev[tk]
+	}
 	out := make([]string, len(lines))
 	copy(out, lines)
-	return out, nil
+	res := TaskLogResult{Lines: out, Running: running, EndedAt: taskSink.ended[tk]}
+	// 起止时刻取任务自省表（beginTask/endTask 记的那份，与面板「上次运行」同源）。
+	s.taskMu.Lock()
+	if t, ok := s.taskLast[tk]; ok {
+		res.EndedAt = t
+	}
+	s.taskMu.Unlock()
+	if running {
+		res.StartedAt = time.Now() // 精确开始时刻不可得时给当前时刻，仅用于「运行中」展示
+	}
+	return res, nil
 }
