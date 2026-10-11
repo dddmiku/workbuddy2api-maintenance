@@ -357,10 +357,13 @@ func fullModelNames(models []string) bool {
 	return true
 }
 
-// splitRealm 只做字面前缀识别，不参与任何解析或补全：前缀不是 cn:/global: 时
+// splitRealm 只做字面前缀识别，不参与任何解析或补全：前缀不是已知 realm 时
 // 返回空 realm，调用方据此判定「这不是一个完整模型名」。
+//
+// trae 是第三个域（2026-10-11 接入）。绑定校验与 resolveModel 必须用同一套前缀集合，
+// 否则从 /v1/models 选出来的 trae: 模型会被绑定校验拒掉。
 func splitRealm(model string) (realm, bare string) {
-	for _, candidate := range []string{"cn:", "global:"} {
+	for _, candidate := range []string{"cn:", "global:", "trae:"} {
 		if strings.HasPrefix(model, candidate) {
 			return strings.TrimSuffix(candidate, ":"), model[len(candidate):]
 		}

@@ -318,11 +318,11 @@ func TestVisibleTextHoldsIncompleteToolBlock(t *testing.T) {
 func TestResolveModelName(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"glm-5.3", "glm-5.3"},
-		{"GLM-5.3", "glm-5.3"},          // 查表按小写归一
-		{"gpt-4o", "DeepSeek-V4-Pro"},   // 外部名映射到 Trae 真实名
+		{"GLM-5.3", "glm-5.3"},        // 查表按小写归一
+		{"gpt-4o", "DeepSeek-V4-Pro"}, // 外部名映射到 Trae 真实名
 		{"claude-sonnet-4-5", "glm-5.2"},
 		{"deepseek-v4-pro", "DeepSeek-V4-Pro"}, // 真实名的大小写由表决定
-		{"  glm-5.3  ", "glm-5.3"},      // 去空白
+		{"  glm-5.3  ", "glm-5.3"},             // 去空白
 		// 未知名原样透传：上游的报错比网关自己猜一个替代模型更可用。
 		{"brand-new-model", "brand-new-model"},
 		{"", ""},
