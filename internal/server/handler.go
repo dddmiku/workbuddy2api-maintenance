@@ -72,6 +72,7 @@ import (
 	"workbuddy2api/internal/requestlog"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/upstream/trae"
 	"workbuddy2api/internal/usage"
 	"workbuddy2api/internal/version"
 )
@@ -908,6 +909,19 @@ func (h *Handler) modelList() []map[string]any {
 				}
 			}
 			out = append(out, entry)
+		}
+	}
+	// Trae 域：静态目录（Trae 没有公开的模型列表端点可查，llm_utils_chat 这条路径
+	// 一直用静态表）。只在池里真有 trae 账号时公布——没有号却列出模型，客户端会选到
+	// 一个永远选不到号的模型名，不如不列。
+	if h.cfg.Pool != nil && h.cfg.Pool.ServableForRealm(trae.Realm) {
+		for _, id := range trae.ModelIDs() {
+			out = append(out, map[string]any{
+				"id":       trae.Realm + ":" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "trae",
+			})
 		}
 	}
 	return out

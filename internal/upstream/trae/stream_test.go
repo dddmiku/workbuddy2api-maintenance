@@ -310,3 +310,82 @@ func TestVisibleTextHoldsIncompleteToolBlock(t *testing.T) {
 		t.Errorf("partial tag prefix leaked: %q", got)
 	}
 }
+
+// TestResolveModelName 覆盖模型名映射。
+//
+// Trae 上游按 config_name **精确匹配**（大小写敏感），所以宽松的客户端模型名必须
+// 先映射；映射错了上游会直接拒掉请求，而客户端看到的是一个莫名其妙的参数错误。
+func TestResolveModelName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"glm-5.3", "glm-5.3"},
+		{"GLM-5.3", "glm-5.3"},          // 查表按小写归一
+		{"gpt-4o", "DeepSeek-V4-Pro"},   // 外部名映射到 Trae 真实名
+		{"claude-sonnet-4-5", "glm-5.2"},
+		{"deepseek-v4-pro", "DeepSeek-V4-Pro"}, // 真实名的大小写由表决定
+		{"  glm-5.3  ", "glm-5.3"},      // 去空白
+		// 未知名原样透传：上游的报错比网关自己猜一个替代模型更可用。
+		{"brand-new-model", "brand-new-model"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := ResolveModelName(tc.in); got != tc.want {
+			t.Errorf("ResolveModelName(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestBuildChatBodyAppliesModelAlias 确认映射真的作用到了出站请求体。
+func TestBuildChatBodyAppliesModelAlias(t *testing.T) {
+	prepared := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+	body, err := BuildChatBody(prepared, "req-1")
+	if err != nil {
+		t.Fatalf("BuildChatBody: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if parsed["config_name"] != "DeepSeek-V4-Pro" {
+		t.Errorf("config_name=%v want DeepSeek-V4-Pro", parsed["config_name"])
+	}
+	if parsed["model"] != "DeepSeek-V4-Pro" {
+		t.Errorf("model=%v want DeepSeek-V4-Pro", parsed["model"])
+	}
+	if parsed["function"] != "solo_work_lite" {
+		t.Errorf("function=%v want solo_work_lite", parsed["function"])
+	}
+	if parsed["stream"] != true {
+		t.Errorf("stream=%v want true", parsed["stream"])
+	}
+}
+
+// TestModelIDsSortedAndComplete 确认目录公布的名字集合自洽（别名与真实名都在）。
+func TestModelIDsSortedAndComplete(t *testing.T) {
+	ids := ModelIDs()
+	if len(ids) == 0 {
+		t.Fatal("model catalog is empty")
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i-1] > ids[i] {
+			t.Fatalf("ModelIDs is not sorted: %q > %q", ids[i-1], ids[i])
+		}
+	}
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			t.Errorf("duplicate id %q", id)
+		}
+		seen[id] = true
+	}
+	for _, want := range []string{"glm-5.3", "gpt-4o", "DeepSeek-V4-Pro"} {
+		if !seen[want] {
+			t.Errorf("catalog missing %q", want)
+		}
+	}
+	// 每个别名映射的目标都必须也在清单里，否则客户端按真实名请求会 404。
+	for key, value := range ModelAliases() {
+		if !seen[value] {
+			t.Errorf("alias %q -> %q but %q is not in the published catalog", key, value, value)
+		}
+	}
+}

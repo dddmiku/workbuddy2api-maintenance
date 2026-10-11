@@ -159,13 +159,15 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 		RequestID: requestID,
 		SessionID: requestID,
 	}
-	if model, _ := src["model"].(string); model != "" {
-		body.ConfigName = model
-		body.Model = model
-	} else {
-		body.ConfigName = "glm-5.2"
-		body.Model = "glm-5.2"
+	// 上游按 config_name 精确匹配（大小写敏感），必须先把客户端写的宽松名
+	// （gpt-4o / claude-sonnet-4-5 之类）映射到 Trae 的真实模型名，否则会被拒。
+	// 查不到的模型名原样透传——上游的报错比网关自己猜一个替代模型更可用。
+	name := ResolveModelName(modelFromSource(src))
+	if name == "" {
+		name = "glm-5.2"
 	}
+	body.ConfigName = name
+	body.Model = name
 	if msgs, ok := src["messages"].([]any); ok {
 		for _, m := range msgs {
 			if mm, ok := m.(map[string]any); ok {
