@@ -227,7 +227,9 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   border:1px solid transparent}
 .rtag.cn{background:var(--info-soft);color:var(--info);border-color:var(--info-soft)}
 .rtag.global{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
-.rtag.trae{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-soft)}
+/* trae 不用 warn：琥珀是快过期/告警的语义色（积分卡瓷片整块上警示时用的就是它），
+   域胶囊撞上去会把「Trae」误读成「有积分要作废」。分类色只做区分——用紫罗兰。 */
+.rtag.trae{background:var(--vio-soft);color:var(--vio);border-color:var(--vio-soft)}
 /* 「不适用」：该域没有这项能力（如 trae 没有 WorkBuddy 的积分接口）。
  * 与「—」（暂无数据）区别开，否则运维会以为是查询失败。 */
 .na{color:var(--ink-3);font-size:12px}

@@ -30,6 +30,7 @@ html[data-theme=light]{
   --ok:#009966; --warn:#d08700; --err:#e7000b; --info:#0084d1;
   --ok-soft:rgba(0,153,102,.10); --warn-soft:rgba(208,135,0,.12);
   --err-soft:rgba(231,0,11,.09); --info-soft:rgba(0,132,209,.10);
+  --vio:#7c5cd6; --vio-soft:rgba(124,92,214,.10);
   --canvas:#f7f8fa; --surface:#fff; --surface-2:#fafafa; --sunken:#f2f3f5;
   --line:#e8e8e8; --line-2:#d4d4d4;
   --ink:#0a0a0a; --ink-2:#5c5c5c; --ink-3:#8f8f8f;
@@ -44,6 +45,7 @@ html[data-theme=dark]{
   --ok:#00bc7d; --warn:#fe9a00; --err:#ff6467; --info:#3f9ce0;
   --ok-soft:rgba(0,188,125,.14); --warn-soft:rgba(254,154,0,.14);
   --err-soft:rgba(255,100,103,.14); --info-soft:rgba(63,156,224,.16);
+  --vio:#a78bfa; --vio-soft:rgba(167,139,250,.16);
   --canvas:#1e1e1e; --surface:#2a2a2a; --surface-2:#2f2f2f; --sunken:#252525;
   --line:rgba(255,255,255,.10); --line-2:rgba(255,255,255,.18);
   --ink:#f3f3f3; --ink-2:#b7b7b7; --ink-3:#8a8a8a;
@@ -495,7 +497,9 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   border:1px solid transparent}
 .rtag.cn{background:var(--info-soft);color:var(--info);border-color:var(--info-soft)}
 .rtag.global{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
-.rtag.trae{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-soft)}
+/* trae 不用 warn：琥珀是快过期/告警的语义色（积分卡瓷片整块上警示时用的就是它），
+   域胶囊撞上去会把「Trae」误读成「有积分要作废」。分类色只做区分——用紫罗兰。 */
+.rtag.trae{background:var(--vio-soft);color:var(--vio);border-color:var(--vio-soft)}
 /* 「不适用」：该域没有这项能力（如 trae 没有 WorkBuddy 的积分接口）。
  * 与「—」（暂无数据）区别开，否则运维会以为是查询失败。 */
 .na{color:var(--ink-3);font-size:12px}

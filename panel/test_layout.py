@@ -218,6 +218,23 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertNotIn("display:block", rules[0])
         self.assertIn("float:right", base, "备注应靠 float 靠右，而不是 flex")
 
+    def test_trae_realm_tag_is_not_the_warning_colour(self):
+        """TRAE 域胶囊不能用 warn 琥珀——那是快过期/告警的语义色。
+
+        2026-10-11 用户实测截图：积分卡上 TRAE 瓷片因「有快过期积分」整块上
+        琥珀警示，而域胶囊本身也是琥珀，标题读起来像「这个域在告警」。
+        域是分类信息，只做区分不表示好坏——用专设的 --vio 紫罗兰。
+        """
+        css = strip_css_comments(read_source("css_c.css"))
+        rule = [ln for ln in css.splitlines() if ".rtag.trae{" in ln]
+        self.assertTrue(rule, "缺少 trae 域胶囊配色")
+        self.assertNotIn("--warn", rule[0], "域胶囊不得复用告警色")
+        self.assertIn("--vio", rule[0], "域胶囊应使用紫罗兰分类色")
+        tokens = read_source("css_a.css")
+        # 两套主题都要有这枚令牌，否则暗色/亮色一边会回退成透明。
+        self.assertGreaterEqual(tokens.count("--vio:"), 2)
+        self.assertGreaterEqual(tokens.count("--vio-soft:"), 2)
+
     def test_model_search_input_resets_the_generic_field_style(self):
         """模型搜索框必须把通用输入框样式整个重置掉，否则出现「双层框」。
 
