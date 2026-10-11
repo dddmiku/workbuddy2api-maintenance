@@ -393,12 +393,32 @@ function mrow(k, v, cls){
 // 「账号池」「积分」两卡各含「整体汇总」与「分域明细」两块。此前平铺成一串
 // 同样的 mrow，分域行和总量行长得一样，扫读时分不出分组。标题与右侧备注
 // 走 esc()，行由调用方拼好（内部是 mrow，已各自转义）。
-function mgroup(title, note, rows){
-  if (!rows) return '';
+function mgroup(title, note, body){
+  if (!body) return '';
   return '<div class="mgroup">' +
     '<div class="mgroup-h"><span>' + esc(title) + '</span><span class="sp"></span>' +
     (note ? '<span class="n">' + esc(note) + '</span>' : '') + '</div>' +
-    rows + '</div>';
+    body + '</div>';
+}
+// mcell 汇总小格（.mcells 的两列格）：短标签 + 大数字。值为空/为零时返回 ''，
+// 由调用方决定「0 是否值得占一格」。
+function mcell(k, v, cls){
+  if (v === '' || v == null) return '';
+  return '<div class="mcell"><div class="k">' + esc(k) + '</div>' +
+    '<div class="v ' + (cls || '') + '">' + v + '</div></div>';
+}
+// mtile 分域瓷片：域名胶囊 + 主数字 + 比例条 + 小注。sub 带 .w 时整块上警示
+// （该域有快过期积分），条与文字一起变色，一眼看出「哪个域吃紧」。
+function mtile(realm, value, unit, pct, sub, subWarn){
+  var r = String(realm || '').toLowerCase();
+  var label = r === 'trae' ? 'TRAE' : (r === 'global' ? 'GLOBAL' : 'CN');
+  return '<div class="mtile ' + (subWarn ? 'w' : '') + '">' +
+    '<div class="mtile-h"><span class="rtag ' + esc(r) + '">' + label + '</span>' +
+    '<span class="n">' + esc(sub && sub.count ? sub.count : '') + '</span></div>' +
+    '<div class="mtile-v">' + value + (unit ? '<small>' + esc(unit) + '</small>' : '') + '</div>' +
+    '<div class="mtile-bar"><i style="width:' + Math.max(2, Math.min(100, pct || 0)) + '%"></i></div>' +
+    (sub && sub.text ? '<div class="mtile-s' + (subWarn ? ' w' : '') + '">' + esc(sub.text) + '</div>' : '') +
+    '</div>';
 }
 function emptyBox(icon, title, sub){
   return '<div class="empty">' + svg(icon, 30) + '<div class="empty-t">' + esc(title) + '</div>' +
@@ -568,36 +588,42 @@ function renderPool(){
   var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
   var off = Math.max(0, total - healthy - cooling - dis);
   function w(n){ return total ? (n / total * 100) : 0; }
+  // 汇总块：大字 + 进度条 + 两列小格。格子里只放「0 有意义」的项
+  // （停用 0 是好消息但值得看到；并发占满/粘性会话为 0 时不占格）。
   var html = '<div class="big"><span class="v">' + healthy + '</span><span class="u">/ ' + total + ' 健康</span></div>' +
     '<div class="comp">' +
       '<i class="a" style="width:' + w(healthy) + '%"></i>' +
       '<i class="b" style="width:' + w(cooling) + '%"></i>' +
       '<i class="c" style="width:' + w(dis + off) + '%"></i>' +
     '</div>' +
-    mrow('池内总数', String(total)) +
-    mrow('冷却中', String(cooling), cooling ? 'w' : '') +
-    mrow('已停用', String(dis), dis ? 'w' : '') +
-    mrow('并发占满', String(p.inFlightFull || 0)) +
-    mrow('粘性会话', String(p.stickySessions || 0));
+    '<div class="mcells">' +
+      mcell('池内总数', String(total)) +
+      mcell('冷却中', cooling ? String(cooling) : '0', cooling ? 'w' : 'ok') +
+      mcell('已停用', dis ? String(dis) : '0', dis ? 'e' : '') +
+      mcell('并发占满', p.inFlightFull ? String(p.inFlightFull) : '0', p.inFlightFull ? 'w' : '') +
+      mcell('粘性会话', p.stickySessions ? String(p.stickySessions) : '0') +
+    '</div>';
   var rt = p.realmTotals || {};
-  // 分域明细放进带标题的子分组：它与上面的总量行语义不同，混在一起扫读时分不出。
-  // 固定顺序（cn → global → trae），不跟对象键的插入顺序走：域多了以后顺序乱跳
-  // 会让运维每次刷新都要重新找那一行。只列真的有账号的域。
-  var rows = '', realms = 0;
+  // 分域瓷片：固定顺序（cn → global → trae），不跟对象键的插入顺序走。
+  // 条的长度 = 该域健康占比；全绿 = 全健康，红 = 一个可用都没有。
+  var tiles = '', realms = 0;
   REALM_ORDER.forEach(function(k){
     var v = rt[k];
     if (v === undefined) return;
-    var line;
+    var tot, ok, cls;
     if (v && typeof v === 'object'){
-      var tot = Number(v.total) || 0, ok = Number(v.healthy) || 0;
+      tot = Number(v.total) || 0; ok = Number(v.healthy) || 0;
       if (!tot) return;
-      line = mrow(realmShort(k) + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
+      cls = (tot && ok === tot) ? 'ok' : (ok ? '' : 'e');
     } else {
-      line = mrow(realmShort(k) + '可用', String(v));
+      tot = Number(v) || 0; ok = tot; cls = tot ? 'ok' : 'e';
+      if (!tot) return;
     }
-    rows += line; realms++;
+    tiles += mtile(k, String(ok), '/ ' + tot, ok / tot * 100,
+      { text: ok === tot ? '全部可用' : (ok ? (tot - ok) + ' 个不可用' : '全部不可用') });
+    realms++;
   });
-  if (realms) html += mgroup('按区域', realms + ' 个域', rows);
+  if (realms) html += mgroup('按区域', realms + ' 个域', '<div class="mtiles">' + tiles + '</div>');
   $('#poolPanel').innerHTML = html;
 }
 
@@ -628,6 +654,7 @@ function renderCredit(){
     return {remain: remain, size: size, used: Math.max(0, size - remain),
             count: list.length, expiring: expiring};
   }
+  // 汇总块：大字 + 进度条 + 两列小格（与「账号池」同一模块语言）。
   var total = sumOf(have);
   var remain = total.remain, size = total.size, used = total.used;
   var pct = size ? Math.round(remain / size * 100) : 0;
@@ -636,31 +663,31 @@ function renderCredit(){
       '<i class="a" style="width:' + pct + '%"></i>' +
       '<i class="c" style="width:' + Math.max(0, 100 - pct) + '%"></i>' +
     '</div>' +
-    mrow('已用', num(used)) +
-    mrow('总额度', num(size)) +
-    // 快过期积分：到期即作废。有才显示，并在分域小计里也各自标出来。
-    // mrow 会对值做转义（防止 XSS），所以只能用它的 cls 参数上色，不能塞 HTML。
-    (total.expiring > 0
-      ? mrow('其中快过期', num(total.expiring) + '（' +
-          Math.round(total.expiring / Math.max(1, remain) * 100) + '% 即将作废）', 'w')
-      : '') +
-    mrow('取到积分', have.length + ' / ' + a.length);
-  // 分域小计：按 REALM_ORDER 固定顺序，**包含全部域**（含 trae）。
-  // 只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空行。
-  // 与「账号池」同款子分组：合计在上、分域在下，中间有分隔线。
-  var rows = '', realms = 0;
+    '<div class="mcells">' +
+      mcell('已用', num(used)) +
+      mcell('总额度', num(size)) +
+      mcell('取到积分', have.length + '<small>/ ' + a.length + '</small>') +
+      // 快过期积分：到期即作废，有才显示（mrow 时代就是条件行，格子里同理）。
+      (total.expiring > 0
+        ? mcell('快过期', num(total.expiring) + '<small>' +
+            Math.round(total.expiring / Math.max(1, remain) * 100) + '% 即将作废</small>', 'w')
+        : '') +
+    '</div>';
+  // 分域瓷片：按 REALM_ORDER 固定顺序，**包含全部域**（含 trae）。
+  // 只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空块。
+  // 条的长度 = 该域占全部剩余的份额；该域有快过期积分时整块上警示色。
+  var tiles = '', realms = 0;
   REALM_ORDER.forEach(function(realm){
     var subset = have.filter(function(x){ return realmOf(x) === realm; });
     if (!subset.length) return;
     var part = sumOf(subset);
     var share = remain ? Math.round(part.remain / remain * 100) : 0;
-    rows += mrow(realmShort(realm) + '剩余',
-      num(part.remain) + '（占 ' + share + '% · ' + part.count + ' 个号）' +
-      (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : ''),
-      part.expiring > 0 ? 'w' : '');
+    var sub = { count: part.count + ' 个号',
+                text: '占 ' + share + '%' + (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : '') };
+    tiles += mtile(realm, num(part.remain), '', share, sub, part.expiring > 0);
     realms++;
   });
-  if (realms) html += mgroup('按区域', realms + ' 个域', rows);
+  if (realms) html += mgroup('按区域', realms + ' 个域', '<div class="mtiles">' + tiles + '</div>');
   if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
   else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
   $('#creditPanel').innerHTML = html;

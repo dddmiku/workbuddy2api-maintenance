@@ -89,6 +89,44 @@
    否则提示行会看起来像是挂在分组里面的。特异性高于上面那条。 */
 .mgroup:not(:last-child) .mrow:last-child{border-bottom:1px solid var(--line)}
 
+/* ══ 概览卡的模块化格子 ═════════════════════════════════════════════
+ * 两卡从「一长条 label→value」改成块状模块：
+ *   .mcells  汇总格子（2 列）：已用/总额度/冷却中/粘性会话这类短值，
+ *            竖排一长条每行只用到一半宽度，扫读要上下往返。
+ *   .mtiles  分域瓷片（每域一块）：域名 + 数字 + 比例条 + 小注，
+ *            「哪个域吃紧」从读数字变成看条的长短与颜色。
+ * 值为空/为零的格子不渲染，避免 32 个号里 0 占满、0 粘性占两格死重量。
+ */
+.mcells{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:var(--r2);
+  overflow:hidden;margin:12px 0 2px}
+.mcell{background:var(--surface);padding:9px 12px;min-width:0}
+.mcell .k{font-size:11.5px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mcell .v{font:600 17px/1.25 var(--mono);font-variant-numeric:tabular-nums;margin-top:3px}
+.mcell .v.ok{color:var(--ok)} .mcell .v.w{color:var(--warn)} .mcell .v.e{color:var(--err)}
+.mcell .v small{font-size:11px;font-weight:500;color:var(--ink-3);margin-left:3px}
+
+.mtiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:10px}
+.mtile{border:1px solid var(--line);border-radius:var(--r2);padding:10px 12px;min-width:0;
+  background:var(--surface-2)}
+.mtile-h{display:flex;align-items:baseline;gap:6px;font-size:11.5px;color:var(--ink-2)}
+.mtile-h .rt{font-size:9.5px;padding:0 5px;border-radius:4px;font-weight:600;letter-spacing:.04em}
+.mtile-h .n{margin-left:auto;font-size:11px;color:var(--ink-3);white-space:nowrap}
+.mtile-v{font:600 19px/1.2 var(--mono);font-variant-numeric:tabular-nums;margin-top:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mtile-v small{font-size:11px;font-weight:500;color:var(--ink-3)}
+.mtile-bar{height:4px;background:var(--sunken);border-radius:3px;overflow:hidden;margin-top:7px}
+.mtile-bar i{display:block;height:100%;border-radius:3px;transition:width .3s var(--ease)}
+.mtile-s{font-size:11px;color:var(--ink-3);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mtile-s.w{color:var(--warn)}
+.mtile.ok .mtile-bar i{background:var(--ok)}
+.mtile.w .mtile-bar i{background:var(--warn)}
+.mtile.e .mtile-bar i{background:var(--err)}
+/* 窄屏：格子仍两列放得下；瓷片按内容宽自适应。 */
+@media (max-width:520px){
+  .mcells{grid-template-columns:minmax(0,1fr)}
+}
+
 /* ══ 概览指标卡 ═════════════════════════════════════════════════════ */
 .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}
 .metric{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);

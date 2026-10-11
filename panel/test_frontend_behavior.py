@@ -400,11 +400,13 @@ S.data={accounts:[
 renderCredit();
 return $('#creditPanel').innerHTML;
 """)
-        self.assertIn("国际剩余", result, "应列出国际积分小计")
-        self.assertIn("国内剩余", result, "应列出国内积分小计")
+        self.assertIn('rtag global', result, "应列出国际瓷片")
+        self.assertIn('rtag cn', result, "应列出国内瓷片")
         self.assertIn("150", result, "国际小计应为 100+50")
         self.assertIn("30", result, "国内小计应为 30")
         self.assertIn("180", result, "合计仍应为 180")
+        self.assertIn("占 83%", result, "国际应标出占剩余的份额")
+        self.assertIn("占 17%", result, "国内应标出占剩余的份额")
 
     def test_overview_credit_skips_absent_realm(self):
         """某域一个号都没取到积分时不显示该行，避免堆空行。"""
@@ -413,8 +415,8 @@ S.data={accounts:[{uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:10
 renderCredit();
 return $('#creditPanel').innerHTML;
 """)
-        self.assertIn("国际剩余", result)
-        self.assertNotIn("国内剩余", result)
+        self.assertIn('rtag global', result)
+        self.assertNotIn('rtag cn', result)
 
     def test_model_picker_shows_multiplier_badges(self):
         """模型选择器必须显示扣费倍率——用户此前不知道各模型倍率是多少。
@@ -1044,7 +1046,7 @@ class RealmBreakdownCompletenessTest(unittest.TestCase):
                 start = body.index("function renderPool()")
                 block = body[start:body.index("function renderCredit()", start)]
                 self.assertIn("REALM_ORDER.forEach", block)
-                self.assertIn("realmShort(k)", block)
+                self.assertIn("mtile(k,", block, "分域必须走 mtile 瓷片")
 
     def test_realm_defs_precede_first_use(self):
         """REALM_ORDER 必须在任何 render 调用之前赋值。
@@ -1090,6 +1092,79 @@ class ReadabilityGroupingTest(FrontendHarness, unittest.TestCase):
                 start = body.index("function mgroup(")
                 block = body[start:body.index("\n}", start)]
                 self.assertIn("esc(title)", block, "分组标题必须转义")
+
+    def test_overview_summary_uses_cells_not_mrow(self):
+        """两卡的汇总区必须是两列小格（mcell），不再是 label→value 一长条。
+
+        2026-10-11 用户第二次反馈「大列表没优化」：v2.7.7 只加了分组线，
+        汇总行还是一长条竖排，每行只用到一半宽度。
+        """
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn('<div class="mcells">', block,
+                                  "%s 的汇总必须走 mcells 格子" % fn)
+                    self.assertNotIn("mrow('池内总数'", block)
+                    self.assertNotIn("mrow('已用'", block)
+
+    def test_overview_realm_breakdown_uses_tiles(self):
+        """分域明细必须是瓷片（mtile），带域胶囊 + 比例条。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn("mtile(", block, "%s 的分域必须走 mtile" % fn)
+
+    def test_pool_tiles_show_health_ratio(self):
+        """账号池瓷片的条 = 该域健康占比，副注说明不可用数。"""
+        result = self.run_frontend("""
+S.data={pool:{total:4,healthy:3,cooling:0,disabled:1,
+  realmTotals:{cn:{total:2,healthy:2},global:{total:2,healthy:1,disabled:1}}}};
+renderPool();
+return $('#poolPanel').innerHTML;
+""")
+        self.assertIn('rtag cn', result)
+        self.assertIn('rtag global', result)
+        self.assertIn("全部可用", result, "全健康的域应说明")
+        self.assertIn("1 个不可用", result, "有停用的域应说明")
+        # 条宽：cn 100%，global 50%
+        self.assertIn('width:100%', result)
+        self.assertIn('width:50%', result)
+
+    def test_credit_tiles_warn_when_expiring(self):
+        """积分瓷片：该域有快过期积分时整块上警示，并在副注标出数额。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,expiring:50,
+    expiry:{within_1d:0,within_3d:0,within_7d:50,within_30d:0,later:0,unlimited:0}}},
+  {uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:300}}}
+],pool:{total:2,healthy:2}};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn('mtile w', result, "有快过期的域整块要上警示")
+        self.assertIn('50 快过期', result)
+        self.assertIn("占 25%", result)
+        self.assertIn("占 75%", result)
+
+    def test_zero_value_cells_still_render_meaningful_zeros(self):
+        """停用 0 / 冷却 0 要渲染（那是「健康」的证明）；快过期 0 不渲染。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,expiring:0}}
+],pool:{total:1,healthy:1,cooling:0,disabled:0,inFlightFull:0,stickySessions:0}};
+renderPool(); var pool=$('#poolPanel').innerHTML;
+renderCredit(); var credit=$('#creditPanel').innerHTML;
+return {pool:pool, credit:credit};
+""")
+        self.assertIn("冷却中", result["pool"], "冷却 0 保留——它是健康状态的说明")
+        self.assertIn("已停用", result["pool"], "停用 0 保留")
+        self.assertNotIn("快过期", result["credit"], "没有快过期积分时不该出现这个格子")
+        self.assertNotIn("状态", result["credit"], "无错误/无查询中时不该有状态行")
 
     def test_credits_columns_follow_the_data(self):
         """积分页列必须按实际非零档位生成，不能写死八列。
