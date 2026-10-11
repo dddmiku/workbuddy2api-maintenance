@@ -198,15 +198,21 @@ code,pre,.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
  * 总量行）与分域明细（每域一行）。此前它们首尾相连，平铺成一长条 mrow，
  * 分域行和「粘性会话」这种总量行长得一模一样，扫读时分不出哪里换了一组。
  * 用一条带标题的分隔线把明细组标出来（标题即「按区域」），组内行不再各画底线。
+ *
+ * 分隔线来自**上一行 mrow 的 border-bottom**，不在这里再画一条 border-top：
+ * 两者相邻会渲染成一条双倍粗的线（.mrow 除了最后一个都带底边）。
  */
-.mgroup{margin-top:14px;border-top:1px solid var(--line);padding-top:2px}
-.mgroup-h{display:flex;align-items:baseline;gap:8px;padding:9px 0 3px;
+.mgroup{margin-top:4px;padding-top:2px}
+.mgroup-h{display:flex;align-items:baseline;gap:8px;padding:8px 0 3px;
   font-size:11.5px;font-weight:600;letter-spacing:.06em;color:var(--ink-3);
   text-transform:uppercase}
 .mgroup-h .sp{flex:1}
 .mgroup-h .n{font-weight:500;letter-spacing:0;text-transform:none;font-family:var(--mono)}
 .mgroup .mrow{padding:7px 0}
 .mgroup .mrow:last-child{border-bottom:0}
+/* 组后面还跟着别的行（积分卡的「状态」提示）时，组内最后一行要保留底线，
+   否则提示行会看起来像是挂在分组里面的。特异性高于上面那条。 */
+.mgroup:not(:last-child) .mrow:last-child{border-bottom:1px solid var(--line)}
 
 /* ══ 概览指标卡 ═════════════════════════════════════════════════════ */
 .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}
