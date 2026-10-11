@@ -131,8 +131,11 @@ LOGIN_GLOBAL_MAX_FAILS = 20
 # 留空 = 不限制（默认，行为不变）。
 ADMIN_ALLOW_CIDRS = os.environ.get("WB2API_ADMIN_ALLOW_CIDRS", "")
 COOKIE_NAME = "wb2a_admin"
-# Trae 授权回调路径（经 nginx 暴露为 https://<host>/admin/trae/callback）。
+# Trae 授权回调路径。前缀由网关注入（WB2API_ADMIN_PREFIX，与面板挂载前缀一致），
+# 不写死 /admin——公开发布后别人可能把面板挂在 /panel 或直接挂在根路径，
+# 写死会让拼出来的回调地址指向一个不存在的位置。
 TRAE_CALLBACK_PATH = "/trae/callback"
+ADMIN_PREFIX = "/" + (os.environ.get("WB2API_ADMIN_PREFIX", "/admin").strip().strip("/") or "admin")
 
 # 可信反向代理网段（CIDR，逗号分隔）。只有直连对端落在这些网段内，才采信
 # X-Real-IP / CF-Connecting-IP / X-Forwarded-For —— 这些头客户端能自己伪造，
@@ -2061,7 +2064,7 @@ class Handler(BaseHTTPRequestHandler):
         proto = (self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
         if proto not in ("http", "https"):
             proto = "https"
-        return "%s://%s/admin/trae/callback" % (proto, host)
+        return "%s://%s%s/trae/callback" % (proto, host, ADMIN_PREFIX)
 
     def trae_login_finish(self, body):
         """接收用户粘贴的回调 URL，解析凭据并落盘成 Trae 账号。"""

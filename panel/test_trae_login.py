@@ -277,3 +277,49 @@ class TraeAuthUrlCallbackTest(unittest.TestCase):
     def test_default_callback_is_localhost(self):
         url = trae_login.build_auth_url("t", "m", "1")
         self.assertIn("auth_callback_url=http%3A%2F%2F127.0.0.1%3A8765%2Fauthorize", url)
+
+
+class AdminPrefixPortabilityTest(unittest.TestCase):
+    """锁定面板前缀可配——这是**公开发布**必须的。
+
+    面板被嵌在网关的一个子路径下，这个前缀同时决定：
+      1. 网关路由注册（/admin/ → 面板）
+      2. 代理剥前缀
+      3. 面板拼**公网回调地址**（Trae 授权回调要能被外部访问到）
+
+    写死 "/admin" 会让别的部署形态（挂在 /panel、或直接挂在根）下 Trae 回调
+    指向一个不存在的地址。2026-10-11 用户指出这一点时，三处里有两处是写死的。
+    """
+
+    def test_panel_reads_prefix_from_env(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "app.py"), "r", encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("WB2API_ADMIN_PREFIX", body)
+        self.assertIn("ADMIN_PREFIX", body)
+        # 拼回调地址必须用 ADMIN_PREFIX，不能写死 /admin。
+        start = body.index("def _trae_public_callback(")
+        end = body.index("def trae_login_finish(", start)
+        fn = body[start:end]
+        self.assertIn("ADMIN_PREFIX", fn)
+        self.assertNotIn('"/admin/trae/callback"', fn)
+
+    def test_prefix_normalization(self):
+        """前缀归一化：补前导斜杠、去尾斜杠、空值回落 /admin。"""
+        import importlib
+        cases = [("", "/admin"), ("/admin", "/admin"), ("panel", "/panel"),
+                 ("/panel/", "/panel"), ("/", "/admin"), ("  /x/y  ", "/x/y")]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                os.environ["WB2API_ADMIN_PREFIX"] = raw
+                try:
+                    mod = importlib.reload(trae_login_app())
+                    self.assertEqual(mod.ADMIN_PREFIX, want)
+                finally:
+                    os.environ.pop("WB2API_ADMIN_PREFIX", None)
+                    importlib.reload(trae_login_app())
+
+
+def trae_login_app():
+    import app
+    return app

@@ -28,6 +28,9 @@ import (
 type Options struct {
 	ConfigPath, BaseDir, AuthDir, AdminDir, AdminSocket, RuntimeDir, LogPath, Python string
 	TrustedProxies                                                                   string
+	// AdminPrefix 面板在网关上的挂载前缀（默认 /admin）。代理据此剥前缀，
+	// 并通过 WB2API_ADMIN_PREFIX 传给面板——面板拼公网回调地址时要用它。
+	AdminPrefix string
 	// RetryInitialFailure 首次启动失败时不放弃：返回错误供调用方记录，同时继续在后台
 	// 按退避重试；面板就绪前 /admin 由代理返回错误页，网关 API 不受影响。
 	RetryInitialFailure bool
@@ -99,6 +102,7 @@ func (r *Runtime) command() *exec.Cmd {
 		"WB2API_AUTHS_DIR": r.opts.AuthDir, "WB2API_ADMIN_DIR": r.opts.AdminDir, "WB2API_ADMIN_SOCKET": r.opts.AdminSocket,
 		"WB2API_RUNTIME_DIR": r.opts.RuntimeDir, "WB2API_PANEL_SOCKET": r.socket, "WB2API_LOG_PATH": r.opts.LogPath,
 		"WB2API_TRUSTED_PROXIES": "127.0.0.1/32,::1/128", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+		"WB2API_ADMIN_PREFIX": adminPrefixOr(r.opts.AdminPrefix),
 	}
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -248,6 +252,25 @@ func (r *Runtime) Close() { r.cancel(); <-r.done; r.transport.CloseIdleConnectio
 
 func (r *Runtime) ServeHTTP(w http.ResponseWriter, req *http.Request) { r.proxy.ServeHTTP(w, req) }
 
+// adminPrefixOr 归一化面板挂载前缀（空/仅斜杠 → 默认 /admin），供代理剥前缀与面板共用。
+//
+// 去尾斜杠后还要再判一次空：输入 "/" 会变成 ""，直接返回就会拼出
+// "//trae/callback" 这种坏地址。
+func adminPrefixOr(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "/admin"
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return "/admin"
+	}
+	return prefix
+}
+
 func (r *Runtime) newProxy() *httputil.ReverseProxy {
 	networks := []*net.IPNet{}
 	for _, part := range strings.Split(r.opts.TrustedProxies, ",") {
@@ -258,7 +281,7 @@ func (r *Runtime) newProxy() *httputil.ReverseProxy {
 	target := &url.URL{Scheme: "http", Host: "localhost"}
 	return &httputil.ReverseProxy{Transport: r.transport, Rewrite: func(p *httputil.ProxyRequest) {
 		p.SetURL(target)
-		p.Out.URL.Path = strings.TrimPrefix(p.In.URL.Path, "/admin")
+		p.Out.URL.Path = strings.TrimPrefix(p.In.URL.Path, adminPrefixOr(r.opts.AdminPrefix))
 		p.Out.URL.RawPath = ""
 		p.Out.Host = p.In.Host
 		peer, _, err := net.SplitHostPort(p.In.RemoteAddr)

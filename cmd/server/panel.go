@@ -9,11 +9,34 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/panelruntime"
 	"workbuddy2api/internal/runlog"
 )
+
+// adminPrefixDefault 面板默认挂载前缀。可用 WB2API_ADMIN_PREFIX 覆盖：
+// 面板被嵌进网关的一个子路径下，这个前缀同时用于路由注册、代理剥前缀、以及
+// 面板拼**公网回调地址**（Trae 授权回调）。写死 "/admin" 会让别的部署形态
+// （挂在 /panel、或直接挂在根）下 Trae 回调指向一个不存在的地址。
+const adminPrefixDefault = "/admin"
+
+// adminPrefix 返回归一化后的面板前缀：以 "/" 开头、不以 "/" 结尾。
+func adminPrefix() string {
+	prefix := strings.TrimSpace(os.Getenv("WB2API_ADMIN_PREFIX"))
+	if prefix == "" {
+		return adminPrefixDefault
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return adminPrefixDefault
+	}
+	return prefix
+}
 
 type unifiedLayout struct {
 	enabled bool
@@ -89,14 +112,15 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 	if proxies == "" {
 		proxies = "127.0.0.1/32,::1/128"
 	}
-	return unifiedLayout{enabled: true, panel: panelruntime.Options{ConfigPath: configPath, BaseDir: base, AuthDir: authDir, AdminDir: adminDir, AdminSocket: adminSocket, RuntimeDir: runtimeDir, LogPath: logPath, Python: os.Getenv("WB2A_PYTHON"), TrustedProxies: proxies}}, nil
+	return unifiedLayout{enabled: true, panel: panelruntime.Options{ConfigPath: configPath, BaseDir: base, AuthDir: authDir, AdminDir: adminDir, AdminSocket: adminSocket, RuntimeDir: runtimeDir, LogPath: logPath, AdminPrefix: adminPrefix(), Python: os.Getenv("WB2A_PYTHON"), TrustedProxies: proxies}}, nil
 }
 
 func withPanel(gateway http.Handler, panel *panelruntime.Runtime) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/admin/", panel)
-	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin/", http.StatusTemporaryRedirect)
+	prefix := adminPrefix()
+	mux.Handle(prefix+"/", panel)
+	mux.HandleFunc(prefix, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, prefix+"/", http.StatusTemporaryRedirect)
 	})
 	mux.Handle("/", gateway)
 	return mux
