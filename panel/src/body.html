@@ -62,7 +62,7 @@
     <div id="tabs2">
       <button data-view="tasks">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.2 2"/></svg>
-        排程
+        任务
         <i id="tabTask">—</i>
       </button>
       <button data-view="system">
@@ -127,13 +127,6 @@
             <div class="pb" id="creditPanel"></div>
           </section>
         </div>
-        <div class="vhead sec" style="margin-top:22px">
-          <h1>今日排程</h1>
-          <div class="d">按时间顺序</div>
-          <span class="sp"></span>
-          <button class="btn sm ghost" id="btnGoTasks">全部任务</button>
-        </div>
-        <div class="panel"><div class="pb flush" id="ovTasks"></div></div>
       </section>
 
       <section class="view hide" data-view="accounts">
@@ -295,15 +288,15 @@
       <section class="view hide" data-view="tasks">
         <div class="panel">
           <div class="ph">
-            <b>排程任务</b>
+            <b>任务</b>
             <span class="sp"></span>
-            <span class="sub">按点执行，可手动触发一次</span>
+            <span class="sub">按账号区域分组，按点执行，可手动触发一次</span>
             <button class="btn sm" id="btnTaskReload">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
               刷新
             </button>
           </div>
-          <div class="tiles" id="taskList"></div>
+          <div id="taskList"></div>
         </div>
       </section>
 

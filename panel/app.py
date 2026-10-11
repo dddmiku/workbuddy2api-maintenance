@@ -2041,30 +2041,12 @@ class Handler(BaseHTTPRequestHandler):
         login_trace_id = str(uuid.uuid4())
         machine_id = secrets.token_hex(32)
         device_id = "".join(secrets.choice("0123456789") for _ in range(19))
-        # 优先给**公网回调**地址：Trae 授权完成后直接跳回本服务，凭据自动落盘，
-        # 用户只需要在 Trae 页面点一下登录。回调页在 /trae/callback（nginx 下是
-        # /admin/trae/callback），不经管理会话——浏览器从 Trae 跳回来时没有 cookie。
-        callback = self._trae_public_callback()
-        url = trae_login.build_auth_url(login_trace_id, machine_id, device_id, callback)
-        # 同时给一条本机回调的链接作为兜底：万一 Trae 侧不接受这个回调地址，
-        # 用户仍可用它走「授权后把地址栏粘回来」的老路。
-        fallback = trae_login.build_auth_url(login_trace_id, machine_id, device_id)
-        return {"ok": True, "url": url, "login_id": login_trace_id,
-                "fallback_url": fallback, "auto": bool(callback),
-                "callback": callback}
-
-    def _trae_public_callback(self):
-        """本次请求的对外回调地址；取不到 Host 时返回空（回落手工回传）。"""
-        host = (self.headers.get("X-Forwarded-Host")
-                or self.headers.get("Host") or "").strip()
-        # Host 头来自客户端，必须挡住路径分隔符与控制字符：它会被拼进回调 URL，
-        # 不做检查就是一个注入点（回调地址是我们要发给 Trae 的）。
-        if not host or any(ch in host for ch in " \t\r\n/\\") or len(host) > 255:
-            return ""
-        proto = (self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
-        if proto not in ("http", "https"):
-            proto = "https"
-        return "%s://%s%s/trae/callback" % (proto, host, ADMIN_PREFIX)
+        # 只用**本机回调**（127.0.0.1:8765/authorize）：这是 Trae 唯一接受的回调地址。
+        # 实测把回调指向本服务公网地址时，Trae 侧一律报「网络错误」，服务器上一条
+        # 回调请求都收不到——官方 client_id 的回调白名单只认 localhost。用户实测
+        # 反馈「你的自动全是网络错误」，所以不再提供那条路，界面也不再让人白试。
+        url = trae_login.build_auth_url(login_trace_id, machine_id, device_id)
+        return {"ok": True, "url": url, "login_id": login_trace_id}
 
     def trae_login_finish(self, body):
         """接收用户粘贴的回调 URL，解析凭据并落盘成 Trae 账号。"""

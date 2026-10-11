@@ -187,7 +187,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeAuto:false, traeFallback:'', traeCallback:'' };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
 var modalCb = null;
 var logKey = null, logName = '';
 
@@ -246,7 +246,7 @@ var PAGE = {
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
   usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
   requests:{ t:'请求明细', d:'核对每次调用、重试消费与账号调度' },
-  tasks:   { t:'排程', d:'定时任务开关与手动触发' },
+  tasks:   { t:'任务', d:'按账号区域分组的定时任务' },
   logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
 };
@@ -287,7 +287,6 @@ document.addEventListener('click', function(e){
   if (b) go(b.getAttribute('data-view'));
 });
 $('#btnHome').addEventListener('click', function(){ go('overview'); });
-$('#btnGoTasks').addEventListener('click', function(){ go('tasks'); });
 
 /* ── 窄屏导航 ─────────────────────────────────────── */
 function openNav(){ $('#side').classList.add('open'); $('#scrimNav').classList.add('on'); }
@@ -391,7 +390,7 @@ function render(){
 // renderView 按页面分派；未列出渲染函数的页面保持原样（其数据由各自的 load 函数负责）。
 function renderView(v){
   if (!S.data) return;
-  if (v === 'overview'){ renderMetrics(); renderPool(); renderCredit(); renderOvTasks(); }
+  if (v === 'overview'){ renderMetrics(); renderPool(); renderCredit(); }
   else if (v === 'accounts'){ renderAccounts(); }
   else if (v === 'credits'){ renderCreditsPage(); }
   else if (v === 'tasks'){ renderTasks(); }
@@ -404,7 +403,6 @@ function renderAll(){
   renderMetrics();
   renderPool();
   renderCredit();
-  renderOvTasks();
   renderAccounts();
   renderCreditsPage();
   renderCreditsTab();
@@ -472,7 +470,7 @@ function renderMetrics(){
     metric('可用积分', num(remain), '剩余',
       expiring > 0 ? (num(expiring) + ' 即将过期') : (have.length + ' / ' + a.length + ' 个账号取到'),
       expiring > 0 ? 'w' : (pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok')), pct, IC.coins),
-    metric('排程', taskList().length ? String(taskList().length) : '—', '个任务',
+    metric('任务', taskList().length ? String(taskList().length) : '—', '个任务',
       runs ? (runs + ' 个执行中') : '全部空闲', runs ? 'w' : '', null, IC.clock)
   ].join('');
 }
@@ -492,7 +490,7 @@ function renderNotes(){
     out.push(note('w', '积分数据不可用', String(d.creditError), null));
   }
   if (S.tasks && S.tasks.available === false){
-    out.push(note('a', '排程未接入', '当前网关进程没有加载排程器。', null));
+    out.push(note('a', '任务未接入', '当前网关进程没有加载排程器。', null));
   }
   $('#notes').innerHTML = out.join('');
 }
@@ -626,26 +624,6 @@ function sortTasks(list){
     return ha - hb;
   });
 }
-function renderOvTasks(){
-  var list = taskList();
-  if (!list.length){
-    $('#ovTasks').innerHTML = emptyBox(IC.clock, '暂无排程任务', '网关进程没有加载排程器');
-    return;
-  }
-  $('#ovTasks').innerHTML = sortTasks(list).map(function(t){
-    var st = taskState(t);
-    var time = (t.hours && t.hours.length) ? (pad(t.hours[0]) + ':00') : '—';
-    return '<div class="tl-row">' +
-      '<div class="tl-time">' + time + '</div>' +
-      '<div class="tl-main"><div class="tl-nm">' + esc(t.name) + '</div>' +
-      '<div class="tl-meta">下次 ' + esc(fmtTime(t.next_run)) + ' · 上次 ' + esc(relTime(t.last_run)) + '</div></div>' +
-      '<div class="tl-acts">' + badge(st) +
-      '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
-      '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) + '" title="日志">' +
-      svg(IC.eye, 13) + '</button></div></div>';
-  }).join('');
-}
-
 // realmTag 渲染域标签。
 //
 // 接入 trae 后池子里有三种来源（CN / Global / Trae），纯大写文字（CN/GLOBAL/TRAE）
@@ -1080,32 +1058,74 @@ $('#acctRows').addEventListener('click', function(e){
   if (d) return actDelete(d.getAttribute('data-del'), d.getAttribute('data-name'));
 });
 
+// renderTasks 按**账号区域**分组渲染任务。
+//
+// 分组的依据是后端给的 t.realms（任务实际作用的域），不是按名字猜——签到同时覆盖
+// cn/global/trae 三个域，其余任务只服务 WorkBuddy 两域，猜一定会猜错。
+//
+// 只渲染池里**真有账号**的域：没有 trae 号时列出「Trae」分组只会让人以为漏了配置。
 function renderTasks(){
   var list = taskList();
+  var host = $('#taskList');
+  if (!host) return;
   if (!list.length){
-    $('#taskList').innerHTML = emptyBox(IC.clock, '暂无排程任务',
+    host.innerHTML = emptyBox(IC.clock, '暂无定时任务',
       (S.tasks && S.tasks.error) || '网关进程没有加载排程器');
     return;
   }
-  $('#taskList').innerHTML = sortTasks(list).map(function(t){
-    var st = taskState(t);
-    var hours = (t.hours || []).map(function(h){
-      return '<span class="hour">' + pad(h) + ':00</span>'; }).join('');
-    return '<div class="tile">' +
-      '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' +
-      '<button class="sw" role="switch" data-task="' + esc(t.key) + '" aria-checked="' +
-      (t.enabled ? 'true' : 'false') + '"' + (t.running ? ' disabled' : '') +
-      ' aria-label="' + esc(t.name) + ' 开关"></button></div>' +
-      '<div><div class="tl-nm">' + esc(t.name) + '</div>' +
-      '<div class="detail">' + esc(t.detail || '') + '</div></div>' +
-      '<div class="hours">' + hours + '</div>' +
-      '<div class="tile-f">' +
-      '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
-      '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) +
-      '" title="日志">' + svg(IC.eye, 13) + '</button>' +
-      '<span class="sp"></span><span class="meta">' + esc(fmtTime(t.next_run)) + '</span>' +
-      '</div></div>';
+  // 池里出现的域（按 cn → global → trae 固定顺序，避免分组跳动）。
+  var present = {};
+  ((S.data && S.data.accounts) || []).forEach(function(a){
+    var r = String(a.realm || 'cn').toLowerCase();
+    present[r] = true;
+  });
+  var ORDER = ['cn', 'global', 'trae'];
+  var LABEL = { cn:'CN 国内版', global:'Global 国际版', trae:'Trae CN' };
+  var groups = ORDER.filter(function(r){ return present[r]; });
+  // 兜底：池里没有账号（或数据未到）时，用任务自己声明的域，至少不显示空白。
+  if (!groups.length){
+    var seen = {};
+    list.forEach(function(t){
+      (t.realms || ['cn']).forEach(function(r){ seen[r] = true; });
+    });
+    groups = ORDER.filter(function(r){ return seen[r]; });
+  }
+  var html = groups.map(function(realm){
+    var mine = list.filter(function(t){
+      return (t.realms || ['cn']).indexOf(realm) >= 0;
+    });
+    if (!mine.length) return '';
+    return '<div class="vhead sec" style="margin-top:18px">' +
+        '<h2 style="font-size:14px">' + realmTag(realm) +
+        '<span style="margin-left:8px">' + esc(LABEL[realm] || realm) + '</span></h2>' +
+        '<span class="sp"></span>' +
+        '<span class="sub">' + mine.length + ' 个任务</span>' +
+      '</div>' +
+      '<div class="tiles">' + sortTasks(mine).map(taskTile).join('') + '</div>';
   }).join('');
+  // 没有任何域匹配（理论上不会）：退回平铺，宁可丑也不要空白。
+  host.innerHTML = html || ('<div class="tiles">' + sortTasks(list).map(taskTile).join('') + '</div>');
+}
+
+// taskTile 单个任务卡片。
+function taskTile(t){
+  var st = taskState(t);
+  var hours = (t.hours || []).map(function(h){
+    return '<span class="hour">' + pad(h) + ':00</span>'; }).join('');
+  return '<div class="tile">' +
+    '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' +
+    '<button class="sw" role="switch" data-task="' + esc(t.key) + '" aria-checked="' +
+    (t.enabled ? 'true' : 'false') + '"' + (t.running ? ' disabled' : '') +
+    ' aria-label="' + esc(t.name) + ' 开关"></button></div>' +
+    '<div><div class="tl-nm">' + esc(t.name) + '</div>' +
+    '<div class="detail">' + esc(t.detail || '') + '</div></div>' +
+    '<div class="hours">' + hours + '</div>' +
+    '<div class="tile-f">' +
+    '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
+    '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) +
+    '" title="日志">' + svg(IC.eye, 13) + '</button>' +
+    '<span class="sp"></span><span class="meta">' + esc(fmtTime(t.next_run)) + '</span>' +
+    '</div></div>';
 }
 
 function renderSystem(){
@@ -1119,7 +1139,7 @@ function renderSystem(){
     mrow('冷却账号', String(cool), cool ? 'w' : '') +
     mrow('异常账号', String(bad), bad ? 'e' : 'ok') +
     mrow('账号总数', String(accounts.length)) +
-    mrow('排程任务', taskList().length ? String(taskList().length) : '—');
+    mrow('定时任务', taskList().length ? String(taskList().length) : '—');
 }
 
 /* ── 交互委托 ─────────────────────────────────────── */
@@ -1447,11 +1467,7 @@ async function startLogin(){
       var t = await api('api/trae/login/start', {});
       if (!t.ok){ toast(t.message || '获取 Trae 授权链接失败', 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
       DT.url = t.url; DT.loginId = t.login_id || '';
-      DT.traeAuto = !!t.auto; DT.traeFallback = t.fallback_url || ''; DT.traeCallback = t.callback || '';
       renderTraeAuth();
-      // 自动模式：直接开授权页，用户点一下登录即可，回调会自动落盘。
-      // 手工模式（回调地址取不到）：仍需用户回传地址栏链接。
-      if (DT.traeAuto) window.open(DT.url, '_blank', 'noopener');
       return;
     }
     var r = await api('api/login/start', { realm:DT.realm });
@@ -1466,16 +1482,16 @@ async function startLogin(){
   }
 }
 
-// renderTraeAuth 是 Trae 授权页。
+// renderTraeAuth 是 Trae 授权页 —— **纯手工路**。
 //
-// **默认走手工路**（本机回调 + 粘贴），因为实测公网回调被 Trae 拒绝：
-// 授权页由字节 Passport SDK 驱动，我们用的是官方客户端的 client_id，其注册的回调
-// 白名单只认 localhost——把 auth_callback_url 指向本服务公网地址时，Trae 侧报
-// 「网络错误」，服务器上**一条回调请求都收不到**（nginx 访问日志可证）。
+// 为什么不做自动回调：Trae 授权页由字节 Passport SDK 驱动，我们用的是官方客户端的
+// client_id，其注册的回调白名单只认 localhost。实测把 auth_callback_url 指向本服务
+// 公网地址时，Trae 侧一律报「网络错误」，服务器上**一条回调请求都收不到**
+// （nginx 访问日志可证）。用户实测反馈「你的自动全是网络错误」——这条路对本部署
+// 不可用，所以界面上不再提供它，避免再让人白试一次。
 //
-// 所以不把自动回调摆在主路径上：让用户先点一条走不通的路，再回头找另一条，
-// 比一开始就给他能走通的那条更糟。自动回调保留为折叠选项——万一某个部署形态下
-// Trae 接受了（例如自建 client_id），它一步就能完成。
+// 要支持自动回调，需要自建 client_id 并在 Trae 侧登记本服务的回调地址；在那之前
+// 手工粘贴（本机回调 + 复制地址栏）是唯一走得通的路径。
 function renderTraeAuth(){
   $('#drTitle').textContent = 'Trae 授权';
   $('#drBody').innerHTML =
@@ -1493,71 +1509,18 @@ function renderTraeAuth(){
       'style="width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
       'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
       'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
-    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>' +
-    (DT.traeAuto
-      ? '<details style="margin-top:16px"><summary class="sub" style="cursor:pointer">' +
-        '试试自动回调（多数部署下 Trae 不接受）</summary>' +
-        '<div class="sub" style="margin-top:8px;line-height:1.6">' +
-        '若你的部署有自建 client_id 且已登记本服务的回调地址，可用这条一步完成。' +
-        '回调地址：<code>' + esc(DT.traeCallback || '') + '</code></div>' +
-        '<div style="margin-top:8px"><button class="btn" id="drAutoTry">用公网回调授权</button></div>' +
-        '</details>'
-      : '');
-  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>';
+    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
+    '<button class="btn pri" id="drSubmit2">完成添加</button>';
   $('#drCancel').addEventListener('click', renderPick);
+  // 必须用**本机回调**那条链接：它是 Trae 唯一接受的回调地址。
   $('#drReopen').addEventListener('click', function(){
     window.open(DT.traeFallback || DT.url, '_blank', 'noopener');
   });
   $('#drPaste').addEventListener('click', readClipboardIntoCallback);
-  var autoBtn = $('#drAutoTry');
-  if (autoBtn){
-    autoBtn.addEventListener('click', function(){
-      window.open(DT.url, '_blank', 'noopener');
-      startTraeWatch();
-      var m = $('#traeMsg');
-      if (m) m.textContent = '已用公网回调打开授权页；若 Trae 报「网络错误」，请改走上面第 2 步。';
-    });
-  }
-  $('#drFoot').innerHTML += '<button class="btn pri" id="drSubmit2">完成添加</button>';
   $('#drSubmit2').addEventListener('click', submitTraeCallback);
 }
 
-// startTraeWatch 轮询账号列表，等 trae 账号出现（自动回调成功后自己弹出来）。
-// 计数基线取打开时的 trae 账号数：只要多了一个就说明回调成功。
-function startTraeWatch(){
-  stopPoll(); DT.tries = 0;
-  var baseline = ((S.data && S.data.accounts) || []).filter(function(a){
-    return String(a.realm || '') === 'trae';
-  }).length;
-  DT.timer = setInterval(async function(){
-    if (DT.polling) return;
-    if (DT.tries++ > 60){ stopPoll(); setWait('未检测到新账号。可以走下面的手工粘贴那条路。'); return; }
-    try{
-      DT.polling = true;
-      await loadAll(true);
-      var now = ((S.data && S.data.accounts) || []).filter(function(a){
-        return String(a.realm || '') === 'trae';
-      });
-      if (now.length > baseline){
-        stopPoll();
-        var added = now[now.length - 1];
-        renderDone({ok:true, account:{uid:added.uid, nickname:added.nickname,
-                                     realm:'trae', expiresInDays:daysLeft(added.expiresAt)},
-                    message:'Trae 账号已添加'});
-      }
-    }catch(err){ /* 单次失败继续等 */ }
-    finally { DT.polling = false; }
-  }, 2000);
-}
-
-// renderTraeWait：Trae 的等待页不是「等扫码」，而是「等你把回调链接拿回来」。
-//
-// 这一步是整个流程唯一容易走错的地方：Trae 授权完成后浏览器会跳到一个
-// http://127.0.0.1:8765/... 的地址，那个地址**必然打不开**（127.0.0.1 是用户自己的
-// 电脑，上面没有监听器）。2026-10-11 实测用户第一反应就是去点它、看到
-// ERR_CONNECTION_REFUSED 以为失败了。所以这里把「报错是正常的」写在最显眼处，
-// 并给一个「从剪贴板读取」按钮——点按钮是用户手势，浏览器允许读剪贴板，
-// 于是整个回传动作变成一次点击而不是 全选→复制→切回来→粘贴。
 async function submitTraeCallback(){
   var box = $('#traeCallback'); if (!box) return;
   var value = (box.value || '').trim();

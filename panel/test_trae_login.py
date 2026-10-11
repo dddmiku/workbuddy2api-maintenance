@@ -249,22 +249,9 @@ class CallbackRouteTest(unittest.TestCase):
             self.assertNotIn(secret, page,
                              "callback page must not render %s" % secret)
 
-    def test_public_callback_requires_https_and_safe_host(self):
-        body = self.app_py
-        start = body.index("def _trae_public_callback(")
-        end = body.index("def trae_login_finish(", start)
-        fn = body[start:end]
-        # Host 头来自客户端：必须挡控制字符与路径分隔符（会被拼进发给 Trae 的 URL）。
-        # 源码里写的是转义序列，断言按源码文本比对。
-        self.assertIn(r'" \t\r\n/\\"', fn)
-        self.assertIn("X-Forwarded-Proto", fn)
-        self.assertIn("len(host) > 255", fn)
-
-    def test_login_start_offers_fallback(self):
-        """自动模式失败时仍要能手工粘贴——两条链接都给。"""
-        body = self.app_py
-        self.assertIn("fallback_url", body)
-        self.assertIn("build_auth_url(login_trace_id, machine_id, device_id)", body)
+    def test_login_start_builds_localhost_link(self):
+        """登录入口只生成本机回调链接——Trae 唯一接受的回调地址。"""
+        self.assertIn("build_auth_url(login_trace_id, machine_id, device_id)", self.app_py)
 
 
 class TraeAuthUrlCallbackTest(unittest.TestCase):
@@ -297,12 +284,9 @@ class AdminPrefixPortabilityTest(unittest.TestCase):
             body = fh.read()
         self.assertIn("WB2API_ADMIN_PREFIX", body)
         self.assertIn("ADMIN_PREFIX", body)
-        # 拼回调地址必须用 ADMIN_PREFIX，不能写死 /admin。
-        start = body.index("def _trae_public_callback(")
-        end = body.index("def trae_login_finish(", start)
-        fn = body[start:end]
-        self.assertIn("ADMIN_PREFIX", fn)
-        self.assertNotIn('"/admin/trae/callback"', fn)
+        # 公网回调函数已移除（Trae 不接受它）；回调路由与常量仍在。
+        self.assertNotIn("_trae_public_callback", body)
+        self.assertIn("TRAE_CALLBACK_PATH", body)
 
     def test_prefix_normalization(self):
         """前缀归一化：补前导斜杠、去尾斜杠、空值回落 /admin。"""
@@ -325,17 +309,57 @@ def trae_login_app():
     return app
 
 
-class TraeUIPrimaryPathTest(unittest.TestCase):
-    """Trae 授权页以**手工路为主路径**，自动回调折叠为可选项。
+class TraeUIManualOnlyTest(unittest.TestCase):
+    """Trae 授权页只有**手工路**，自动回调已按用户实测反馈移除。
 
-    实测依据（2026-10-11）：授权页由字节 Passport SDK 驱动，我们用官方客户端的
-    client_id，其回调白名单只认 localhost——把 auth_callback_url 指向本服务公网
-    地址时 Trae 报「网络错误」，服务器上**一条回调请求都收不到**（nginx 访问日志
-    里只有我自己的 curl 探测）。
+    依据（2026-10-11 实测）：授权页由字节 Passport SDK 驱动，我们用官方客户端的
+    client_id，其回调白名单只认 localhost。把 auth_callback_url 指向本服务公网地址
+    时 Trae 一律报「网络错误」，服务器上一条回调请求都收不到（nginx 访问日志可证）。
+    用户反馈「你的自动全是网络错误」——所以界面上不再提供它，避免再让人白试一次。
+    """
 
-    所以不能把走不通的那条摆在主路径上：让用户先点一条、失败了再回头找另一条，
-    比一开始就给能走通的那条更糟。自动回调保留为折叠选项——自建 client_id 且登记了
-    回调地址的部署可以用它一步完成。
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+        self.app_py = open(os.path.join(here, "app.py"), encoding="utf-8").read()
+
+    def test_manual_path_present(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function renderTraeAuth()")
+                block = body[start:body.index("async function submitTraeCallback()", start)]
+                self.assertIn("drReopen", block, "打开授权页")
+                self.assertIn("drPaste", block, "从剪贴板读取")
+                self.assertIn("127.0.0.1", block, "必须说清报错页是正常的")
+
+    def test_manual_uses_localhost_link(self):
+        """必须用本机回调链接——它是 Trae 唯一接受的回调地址。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("DT.traeFallback || DT.url", body)
+
+    def test_no_auto_callback_ui_left(self):
+        """自动回调的 UI 必须彻底移除，不留半截入口。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for gone in ("drAutoTry", "startTraeWatch", "renderTraeAuto",
+                             "renderTraeWaitUnused", "traeAuto"):
+                    self.assertNotIn(gone, body, "%s should be gone" % gone)
+
+    def test_backend_only_builds_localhost_callback(self):
+        """后端也不再生成公网回调链接（生成了也没人用，徒增误解）。"""
+        start = self.app_py.index("def trae_login_start(")
+        block = self.app_py[start:self.app_py.index("def trae_login_finish(", start)]
+        self.assertIn("build_auth_url(login_trace_id, machine_id, device_id)", block)
+        self.assertNotIn("_trae_public_callback()", block)
+
+
+class TaskRealmGroupingTest(unittest.TestCase):
+    """任务页按**账号区域**分组，分组依据是后端给的 t.realms。
+
+    2026-10-11 用户要求「任务点按照实际账号区域分类」。依据必须是任务实际作用的域，
+    不能按名字猜——签到同时覆盖 cn/global/trae 三个域，其余任务只服务 WorkBuddy 两域。
     """
 
     def setUp(self):
@@ -343,38 +367,32 @@ class TraeUIPrimaryPathTest(unittest.TestCase):
         self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
         self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
 
-    def test_manual_path_is_primary(self):
+    def test_groups_by_realm_field(self):
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                start = body.index("function renderTraeAuth()")
-                end = body.index("function startTraeWatch()", start)
-                block = body[start:end]
-                # 主路径：打开授权页 + 剪贴板读取，两者都在折叠区之外。
-                self.assertIn("drReopen", block)
-                self.assertIn("drPaste", block)
-                self.assertIn("127.0.0.1", block, "必须说清报错页是正常的")
+                start = body.index("function renderTasks(){")
+                block = body[start:body.index("function taskTile(", start)]
+                self.assertIn("t.realms", block, "分组必须读 realms 字段")
+                self.assertIn("realmTag(realm)", block, "分组标题用域标签")
 
-    def test_manual_uses_localhost_link(self):
-        """手工路必须用本机回调链接，否则浏览器不会停在带凭据的 127.0.0.1。"""
+    def test_only_renders_realms_with_accounts(self):
+        """只渲染池里真有账号的域：没有 trae 号时列「Trae」分组会让人以为漏了配置。"""
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertIn("DT.traeFallback || DT.url", body)
+                start = body.index("function renderTasks(){")
+                block = body[start:body.index("function taskTile(", start)]
+                self.assertIn("present[r]", block)
 
-    def test_auto_callback_is_secondary(self):
+    def test_overview_no_longer_shows_schedule(self):
+        """概览页不再有「今日排程」卡片（用户要求去掉）。"""
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertIn("drAutoTry", body)
-                start = body.index("function renderTraeAuth()")
-                end = body.index("function startTraeWatch()", start)
-                block = body[start:end]
-                # 自动回调必须出现在 <details> 折叠块里，不能与主路径并列。
-                self.assertIn("<details", block)
-                self.assertLess(block.index("drPaste"), block.index("<details"),
-                                "手工路要排在折叠区之前")
+                self.assertNotIn("今日排程", body)
+                self.assertNotIn("renderOvTasks", body)
+                self.assertNotIn("btnGoTasks", body)
 
-    def test_no_dead_render_function(self):
-        """上一版留下的废弃函数要清掉，否则改一处漏一处。"""
+    def test_sidebar_says_tasks_not_schedule(self):
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertNotIn("renderTraeWaitUnused", body)
-                self.assertNotIn("renderTraeAuto", body)
+                self.assertIn("任务", body)
+                self.assertNotIn("排程任务</b>", body)

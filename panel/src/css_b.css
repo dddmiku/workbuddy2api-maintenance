@@ -36,7 +36,7 @@
 .vhead .d{font-size:12px;color:var(--ink-3)}
 /* 页面标题统一由内容区顶部的 .vhead 显示，各页只保留一行操作条，避免标题重复。 */
 .vacts{display:flex;align-items:center;gap:10px;margin:0 0 12px;min-height:32px;flex-wrap:wrap}
-/* 概览里的分区标题（账号池与积分 / 今日排程）比页面标题低一档。 */
+/* 概览里的分区标题（账号池与积分）比页面标题低一档。 */
 .vhead.sec{margin-top:18px}
 .vhead.sec h1{font-size:15px}
 .rule{display:none}

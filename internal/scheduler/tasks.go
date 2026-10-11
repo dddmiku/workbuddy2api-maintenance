@@ -38,9 +38,17 @@ var (
 // TaskInfo 单类任务的对外快照。时间字段用指针：JSON 里 null 表达"从未运行过 / 已禁用无排程"，
 // 与"1970 年"这类哨兵值区分开，前端不必猜。
 type TaskInfo struct {
-	Key     string     `json:"key"`
-	Name    string     `json:"name"`
-	Detail  string     `json:"detail"`
+	Key    string `json:"key"`
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
+	// Realms 该任务作用于哪些账号域。面板据此**按区域分类**展示任务——
+	// 2026-10-11 用户要求「任务点按照实际账号区域分类」。
+	//
+	// 值必须与任务实现里真实作用的域一致，不能按名字猜：
+	//   - checkin 现在同时覆盖 cn/global（WorkBuddy 端点）与 trae（Trae 自己的端点），
+	//     所以是三个域；其余任务只走 WorkBuddy 端点，trae 账号在调度里被跳过。
+	// 改任务实现时**必须同步改这里**，否则面板会把任务归错组。
+	Realms  []string   `json:"realms"`
 	Hours   []int      `json:"hours"`
 	Enabled bool       `json:"enabled"`
 	NextRun *time.Time `json:"next_run"`
@@ -124,6 +132,22 @@ func describe(k TaskKey) (string, string) {
 	return string(k), ""
 }
 
+// realmsOf 返回该任务实际作用的账号域（面板按此分组展示）。
+//
+// 这份表是**任务实现的事实描述**，不是愿望：写错会让面板把任务归到不存在的域下。
+// 对应关系（与各任务的实现一一对应）：
+//   - checkin：cn/global 走 WorkBuddy 的 billing/meter；trae 走 Trae 自己的 UG API
+//     （见 scheduler.go 的 isWorkBuddy 分支）——三个域都覆盖。
+//   - 其余：只对 WorkBuddy 端点有意义，trae 账号在调度里整条跳过。
+func realmsOf(k TaskKey) []string {
+	switch k {
+	case TaskKeyCheckin:
+		return []string{"cn", "global", "trae"}
+	}
+	// 其余任务只服务 WorkBuddy 两域。
+	return []string{"cn", "global"}
+}
+
 // scheduleOf 单类任务的排程小时与开关状态（来自 Config，即 config.json 的 schedule 段）。
 func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 	switch k {
@@ -165,7 +189,7 @@ func (s *Scheduler) TaskSnapshot() []TaskInfo {
 		hours, enabled := s.scheduleOf(key)
 		info := TaskInfo{
 			Key: string(key), Name: name, Detail: detail,
-			Hours: hours, Enabled: enabled,
+			Hours: hours, Enabled: enabled, Realms: realmsOf(key),
 		}
 		// 禁用任务没有下个时点（nextWake 同样跳过），置 nil 而不是留一个假的未来时刻。
 		if enabled {
