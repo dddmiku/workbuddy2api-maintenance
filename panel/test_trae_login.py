@@ -323,3 +323,40 @@ class AdminPrefixPortabilityTest(unittest.TestCase):
 def trae_login_app():
     import app
     return app
+
+
+class TraeUIBothPathsTest(unittest.TestCase):
+    """Trae 授权页必须**同屏**给出两条路。
+
+    实测：Trae 的授权页由字节 Passport SDK 驱动，我们用官方客户端的 client_id，
+    其回调白名单很可能只含 localhost——把回调指向本服务公网地址时，Trae 侧报
+    「网络错误」，请求根本没到服务器。所以自动回调可能不可用，但值得先试。
+
+    关键是别让用户「先试一条、失败了再找另一条」：两条路要同时可见。
+    另一个易错点：手工路必须用**本机回调**那条链接重新授权——用自动那条授权后，
+    浏览器不会停在带凭据的 127.0.0.1 地址上，用户无从复制。
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+
+    def test_both_paths_visible_on_one_screen(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("drReopen", body, "自动路按钮")
+                self.assertIn("drPaste", body, "手工路按钮")
+                # 两条路在同一个函数里渲染，不需要切页面。
+                start = body.index("function renderTraeAuto()")
+                end = body.index("function startTraeWatch()", start)
+                block = body[start:end]
+                self.assertIn("drReopen", block)
+                self.assertIn("drPaste", block)
+
+    def test_manual_path_uses_localhost_callback(self):
+        """手工路必须用本机回调链接重新授权，否则浏览器不会停在 127.0.0.1。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("drReopenLocal", body)
+                self.assertIn("DT.traeFallback", body)

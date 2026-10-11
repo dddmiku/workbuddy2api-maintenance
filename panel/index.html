@@ -2827,32 +2827,54 @@ async function startLogin(){
   }
 }
 
-// renderTraeAuto 是「一键授权」页：Trae 授权完成后会直接跳回本服务，
-// 凭据自动落盘。用户全程只需要在 Trae 页面点一下登录——与 WorkBuddy 扫码同等操作量。
+// renderTraeAuto 是 Trae 授权页：**同屏给出两条路**，不再让用户先试一条、失败了再找另一条。
 //
-// 面板每 2 秒轮询一次账号列表：回调落盘并重启网关后，新账号会自己出现，
-// 不需要用户回面板确认。
+// 背景：Trae 的授权页由字节 Passport SDK 驱动，我们用的是官方客户端的 client_id，
+// 其注册的回调白名单很可能只含 localhost——实测把回调指向本服务的公网地址时，
+// Trae 侧报「网络错误」，请求根本没到服务器。所以自动回调**可能**不可用，但值得先试：
+// 能用就一步完成，不能用就当场粘贴，不用切页面。
 function renderTraeAuto(){
   $('#drTitle').textContent = 'Trae 授权';
   $('#drBody').innerHTML =
-    '<div class="mtext">已打开 Trae 授权页。在那边点一下登录就行，' +
-      '完成后这里会<b>自动检测到新账号</b>，不用再复制粘贴任何东西。</div>' +
-    '<div style="margin-top:12px"><button class="btn" id="drReopen">没打开？再点一次</button></div>' +
-    '<div class="wait" style="margin-top:14px"><span class="spin"></span>' +
-      '<span id="waitMsg">等待授权完成…</span></div>' +
-    '<div class="sub" id="traeMsg" style="margin-top:10px;line-height:1.6"></div>' +
-    '<div class="sub" style="margin-top:14px;line-height:1.6">' +
-      '如果 Trae 拒绝了这个回调地址，可以用<b>手工方式</b>：' +
+    '<div class="mtext"><b>第 1 步</b>：在 Trae 授权页完成登录。</div>' +
+    '<div style="margin-top:8px"><button class="btn pri" id="drReopen">打开 Trae 授权页</button></div>' +
+    '<div class="wait" style="margin-top:12px"><span class="spin"></span>' +
+      '<span id="waitMsg">若回调地址被接受，这里会自动检测到新账号…</span></div>' +
+    '<div class="note w" style="margin-top:14px;line-height:1.65">' +
+      svg(IC.warn, 16) +
+      '<div class="g"><b>第 2 步：Trae 报「网络错误」时走这条。</b>' +
+      '用下面这个按钮<b>重新授权一次</b>（这次回调到本机），授权后浏览器会跳到' +
+      ' <code>127.0.0.1</code> 并显示打不开——<b>这是正常的，别关那个标签页</b>，' +
+      '按 <code>Ctrl+L</code>、<code>Ctrl+C</code> 复制它的地址：</div>' +
     '</div>' +
-    '<div style="margin-top:8px"><button class="btn" id="drManual">改用手工粘贴</button></div>';
-  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>';
+    '<div style="display:flex;gap:8px;margin-top:10px">' +
+      '<button class="btn" id="drReopenLocal" style="flex:1">① 用本机回调重新授权</button>' +
+      '<button class="btn pri" id="drPaste" style="flex:1">② 从剪贴板读取并添加</button>' +
+    '</div>' +
+    '<textarea id="traeCallback" rows="3" spellcheck="false" ' +
+      'style="width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
+      'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
+      'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
+    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
+  $('#drFoot').innerHTML =
+    '<button class="btn" id="drCancel">重新选择区域</button>' +
+    '<button class="btn" id="drSubmit">完成添加</button>';
   $('#drCancel').addEventListener('click', renderPick);
   $('#drReopen').addEventListener('click', function(){ window.open(DT.url, '_blank', 'noopener'); });
-  $('#drManual').addEventListener('click', function(){ DT.traeManual = true; renderTraeWait(); });
+  // 手工路必须用**本机回调**那条链接重新授权：自动那条的回调指向公网，
+  // 用它授权后浏览器不会停在带凭据的 127.0.0.1 地址上，用户无从复制。
+  $('#drReopenLocal').addEventListener('click', function(){
+    var link = DT.traeFallback || DT.url;
+    window.open(link, '_blank', 'noopener');
+  });
+  $('#drSubmit').addEventListener('click', submitTraeCallback);
+  $('#drPaste').addEventListener('click', readClipboardIntoCallback);
   startTraeWatch();
+  // 自动打开授权页：省掉用户再点一次。
+  window.open(DT.url, '_blank', 'noopener');
 }
 
-// startTraeWatch 轮询账号列表，等 trae 账号出现。
+// startTraeWatch 轮询账号列表，等 trae 账号出现（自动回调成功后自己弹出来）。
 // 计数基线取打开时的 trae 账号数：只要多了一个就说明回调成功。
 function startTraeWatch(){
   stopPoll(); DT.tries = 0;
@@ -2861,7 +2883,7 @@ function startTraeWatch(){
   }).length;
   DT.timer = setInterval(async function(){
     if (DT.polling) return;
-    if (DT.tries++ > 60){ stopPoll(); setWait('等待超时。可以改用手工粘贴，或重新生成链接。'); return; }
+    if (DT.tries++ > 60){ stopPoll(); setWait('未检测到新账号。可以走下面的手工粘贴那条路。'); return; }
     try{
       DT.polling = true;
       await loadAll(true);
