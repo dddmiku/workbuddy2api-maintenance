@@ -96,11 +96,10 @@ type Scheduler struct {
 	// （服务端幂等兜底：重启后当日重复 redeem 会拿 409 正常态，无副作用）。
 	rewardClaimed map[string]string
 
-	// traeRateLimited Trae 签到的当日限流去重：uid → CST 自然日。上游对 claim 有
-	// 账号维度限流（code 9074），旧实现每次调度都无差别重打，限流窗口被一轮轮
-	// 延长（2026-10-11 实测一天四轮全吃 9074）。命中一次即记下，当天不再重试。
-	// 与 adoptTried / rewardClaimed 同口径：进程重启即清零，不持久化。
-	traeRateLimited map[string]string
+	// traeDeviceGen Trae 签到的设备号代数：uid → gen。9074 是设备维度限流，
+	// 换新派生的设备号即可绕过（实测第 0 代 9074、第 1 代立刻成功）。命中后
+	// 代数 +1 并重试一次，成功后记住新代数。进程重启即清零，不持久化。
+	traeDeviceGen map[string]int
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
@@ -437,14 +436,14 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 // UG / pay API，WorkBuddy 走 codebuddy.cn 的 billing/meter。端点、鉴权头族、
 // 风控规则都不同，所以拆成两个任务、两套排程，各自可开关。
 //
-// 关键教训（2026-10-11）：上游对 claim 有**账号维度**的限流（code 9074
-// "当前参与用户太多"）。旧实现把 trae 塞在通用签到里，每次调度都无差别重打
-// claim，于是限流窗口被一轮轮延长——实测同一对号在 17:34 / 19:31 / 21:00 /
-// 21:23 四轮里每次都吃 9074，一天下来一个都没签上。
+// 9074（"当前参与用户太多"）是**设备维度**的限流。实测（2026-10-11）：同一账号
+// 同一 JWT，第 0 代设备号返回 9074，紧接着换新派生的设备号**立刻签到成功**。
+// 所以正确处理是「轮换设备号重试一次」，参考实现 autumnsentiment/Trae2api-cn
+// 的做法完全一致（见其 rotate_checkin_device_id）。
 //
-// 对策是**本地按天去重**：9074 一旦出现，当天不再对该账号重试（与 adoptTried /
-// rewardClaimed 同款语义，进程重启即清零）。上游的限流是短窗口的，明天再来即可；
-// 反复重试只会让窗口更长。
+// 我最初把这个信号误判成账号维度、并做成「当天不再重试」——那是错的：实测四个
+// Trae 账号在换设备号后当天全部签上了，包括被 9074 卡了一整天的两个。设备代数
+// 记在内存（traeDeviceGen），重启即回第 0 代（无害：新设备号只是换个设备身份）。
 
 // runTraeCheck 定时入口：撞车时记日志跳过，不重复打上游。
 func (s *Scheduler) runTraeCheck(ctx context.Context) {
@@ -471,7 +470,6 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
-	today := travelDay(time.Now())
 	for _, st := range statuses {
 		if err := ctx.Err(); err != nil {
 			return out, err
@@ -494,14 +492,8 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			out = append(out, oc)
 			continue
 		}
-		// 本地按天去重：今天已经因 9074 放弃过的号不再重试。
-		// 上游限流是短窗口的，明天自然可以再试；反复重试只会延长窗口。
-		if s.traeRateLimitedToday(st.UID, today) {
-			oc.Status, oc.Detail = CheckinSkipped, "trae: rate limited earlier today"
-			skipN++
-			out = append(out, oc)
-			continue
-		}
+		// 本账号当前用的设备号代数（9074 后递增，见下）。
+		gen := s.traeDeviceGeneration(st.UID)
 		// 与通用签到一致：停机跨过 token 有效期时先补一次刷新。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -530,15 +522,22 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			oc.Status = CheckinAlready
 			alreadyN++
 		default:
-			claimed, claimErr := trae.ClaimCheckin(ctx, a)
+			claimed, claimErr := trae.ClaimCheckin(ctx, a, gen)
+			// 9074 是**设备维度**的限流：换一个新派生的设备号重试一次。
+			// 实测同一账号同一 JWT，第 0 代 9074、第 1 代立刻成功。
+			if trae.IsRateLimited(claimErr) {
+				gen++
+				log.Printf("trae checkin %s: 9074 on device gen %d, rotating to gen %d",
+					logfmt.UID8(st.UID), gen-1, gen)
+				claimed, claimErr = trae.ClaimCheckin(ctx, a, gen)
+				if claimErr == nil {
+					// 新设备号有效：记下代数，后续轮次直接用新的。
+					s.noteTraeDeviceGeneration(st.UID, gen)
+				}
+			}
 			if claimErr != nil {
 				oc.Status, oc.Detail = CheckinFail, "trae: "+claimErr.Error()
 				failN++
-				// 9074 = 上游限流：记进「今天不再试」的表，避免本轮与后续轮次
-				// 反复重打把窗口越推越长。这是本轮修复的核心。
-				if trae.IsRateLimited(claimErr) {
-					s.noteTraeRateLimited(st.UID, today)
-				}
 				log.Printf("trae checkin %s: claim: %v", logfmt.UID8(st.UID), claimErr)
 			} else {
 				oc.Status = CheckinOK
@@ -565,21 +564,25 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 	return out, nil
 }
 
-// traeRateLimitedToday / noteTraeRateLimited：Trae 签到的当日限流去重表。
-// 语义与 adoptTried / rewardClaimed 一致：uid → CST 自然日，进程重启即清零。
-func (s *Scheduler) traeRateLimitedToday(uid, day string) bool {
+// traeDeviceGeneration / noteTraeDeviceGeneration：Trae 签到的设备号代数。
+//
+// 9074 是设备维度的限流，换一个**新派生**的设备号即可立刻签上。代数记在内存：
+// 命中 9074 → 代数 +1 → 用新设备号重试；成功后把代数留住，后续轮次直接用新的，
+// 免得每次都被旧的限流设备号挡一道。进程重启回第 0 代（无害：设备身份换一个而已，
+// 上游对签到是按设备去重，第 0 代本身也能用——只是可能还在限流窗口里）。
+func (s *Scheduler) traeDeviceGeneration(uid string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.traeRateLimited[uid] == day
+	return s.traeDeviceGen[uid]
 }
 
-func (s *Scheduler) noteTraeRateLimited(uid, day string) {
+func (s *Scheduler) noteTraeDeviceGeneration(uid string, gen int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.traeRateLimited == nil {
-		s.traeRateLimited = map[string]string{}
+	if s.traeDeviceGen == nil {
+		s.traeDeviceGen = map[string]int{}
 	}
-	s.traeRateLimited[uid] = day
+	s.traeDeviceGen[uid] = gen
 }
 
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。

@@ -81,20 +81,37 @@ type CreditPack struct {
 //
 // 与 llm_utils_chat 的头族不同：这里只需要 JWT + 设备标识（上游按设备维度做
 // 每日签到去重，x-device-id 缺失会被判成新设备）。设备指纹按 UID 派生，跨请求稳定。
-func checkinHeaders(a *auth.Auth) http.Header {
+//
+// gen 是设备号「代数」：9074 是**设备维度**的限流，换一个全新派生的设备号即可
+// 立刻签上（见 ClaimCheckin 的注释）。gen=0 是默认设备号，命中 9074 后调用方
+// 传 gen+1 重试一次。
+func checkinHeaders(a *auth.Auth, gen int) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
 	h.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
-	h.Set("x-device-id", checkinDeviceID(a.UID))
+	h.Set("x-device-id", checkinDeviceIDGen(a.UID, gen))
 	h.Set("x-device-brand", checkinDeviceBrand)
 	h.Set("x-device-type", checkinDeviceType)
 	return h
 }
 
-// checkinDeviceID 派生 16 位数字设备号（对齐上游对设备 ID 的形态要求）。
+// checkinDeviceID 默认设备号（gen=0）。
 func checkinDeviceID(uid string) string {
-	sum := deviceID(uid, "checkin")
+	return checkinDeviceIDGen(uid, 0)
+}
+
+// checkinDeviceIDGen 派生第 gen 代设备号。
+//
+// gen=0 用原材料的 uid（保持与历史一致，已在用的设备号不因这次改动而改变——
+// 改了会让所有账号在签到侧变成「新设备」，白白丢掉上游的设备维度状态）；
+// gen>0 掺入代数，得到与第 0 代无关的新设备号。
+func checkinDeviceIDGen(uid string, gen int) string {
+	material := uid
+	if gen > 0 {
+		material = fmt.Sprintf("%s#gen%d", uid, gen)
+	}
+	sum := deviceID(material, "checkin")
 	// 取十六进制前缀转十进制并截到 16 位：形态与真实客户端一致（纯数字）。
 	var value uint64
 	for i := 0; i < 16 && i < len(sum); i++ {
@@ -109,7 +126,7 @@ func checkinDeviceID(uid string) string {
 }
 
 // postTraeAPI 向 Trae API 发一个 POST，返回解析后的对象。
-func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any) (map[string]any, error) {
+func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any, gen int) (map[string]any, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -128,7 +145,7 @@ func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any) (m
 	if err != nil {
 		return nil, err
 	}
-	for k, vs := range checkinHeaders(a) {
+	for k, vs := range checkinHeaders(a, gen) {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
@@ -154,7 +171,7 @@ func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any) (m
 
 // CheckinStatusOf 查询签到状态。
 func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
-	data, err := postTraeAPI(ctx, a, checkinStatusPath, nil)
+	data, err := postTraeAPI(ctx, a, checkinStatusPath, nil, 0)
 	if err != nil {
 		return CheckinStatus{}, err
 	}
@@ -177,9 +194,12 @@ func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 
 // RateLimitCode 是上游对签到 claim 的限流业务码（"当前参与用户太多，请稍后再试"）。
 //
-// 它是**账号维度**的短窗口限流，不是设备维度：2026-10-11 实测同一账号换两个
-// 完全不同的 x-device-id 都返回 9074。也正因如此，反复重试只会把窗口越推越长
-// ——调用方拿到它之后应当**当天不再重试**，而不是立刻换参数重打。
+// 它是**设备维度**的，不是账号维度：2026-10-11 实测同一账号（同一 JWT）在同一
+// 分钟内，第 0 代设备号返回 9074，而紧接着用新派生的第 1、2 代设备号**立刻签到
+// 成功**。所以正确的处理是「换设备号重试一次」，而不是放弃这个账号。
+//
+// 注意判据必须用**新派生**的设备号（checkinDeviceIDGen(uid, gen+1)），
+// 单纯重复调用同一个设备号仍然会 9074。
 const RateLimitCode = 9074
 
 // RateLimitError 是 9074 的具名错误：调用方用 errors.As 判定，不必匹配字符串
@@ -202,12 +222,12 @@ func IsRateLimited(err error) bool {
 //
 // 上游用业务码表达结果，不都是 HTTP 错误：
 //   - code 0     成功；
-//   - code 9074  风控（账号维度的短窗口限流），**不要立刻重试**——
-//     第二次请求会延长上游的限流窗口（参考实现踩过这个坑，2026-10-11 本网关
-//     也踩了：一天四轮调度全吃 9074）。调用方应据 IsRateLimited 当天放弃；
+//   - code 9074  设备维度的限流。调用方应换一个**新派生**的设备号重试一次
+//     （传 gen+1 再调本函数）；仍失败才退回有界退避。参考实现
+//     （autumnsentiment/Trae2api-cn）的做法就是「轮换一次再重试」；
 //   - 其它非 0   如实上报，不做"当成已签到"的猜测。
-func ClaimCheckin(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
-	data, err := postTraeAPI(ctx, a, checkinClaimPath, nil)
+func ClaimCheckin(ctx context.Context, a *auth.Auth, gen int) (CheckinStatus, error) {
+	data, err := postTraeAPI(ctx, a, checkinClaimPath, nil, gen)
 	if err != nil {
 		return CheckinStatus{}, err
 	}
@@ -233,7 +253,7 @@ func ClaimCheckin(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 // req_source=1 是通用 IDE 额度（客户端显示的那个总数）。
 func FetchCredits(ctx context.Context, a *auth.Auth) (Credits, error) {
 	data, err := postTraeAPI(ctx, a, entUsagePath,
-		map[string]any{"require_usage": true, "req_source": 1})
+		map[string]any{"require_usage": true, "req_source": 1}, 0)
 	if err != nil {
 		return Credits{}, err
 	}

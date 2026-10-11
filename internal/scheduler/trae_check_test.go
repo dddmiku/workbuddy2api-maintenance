@@ -74,27 +74,28 @@ func TestTraeCheckScheduleIndependent(t *testing.T) {
 	}
 }
 
-// TestTraeRateLimitSkipsRestOfDay 9074 一旦出现，当天不再对该账号重试。
+// TestTraeDeviceGenerationTracksRotation 9074 后设备号代数递增并被记住。
 //
-// 这是本轮修复的核心。上游对 claim 有账号维度限流，旧实现每轮调度都无差别重打，
-// 限流窗口被一轮轮延长（2026-10-11 实测：同一对号 17:34 / 19:31 / 21:00 / 21:23
-// 四轮全吃 9074，一天一个都没签上）。
-func TestTraeRateLimitSkipsRestOfDay(t *testing.T) {
+// 9074 是**设备维度**限流：换新派生的设备号即可立刻签上（实测同一账号同一 JWT，
+// 第 0 代 9074、第 1 代 success）。我最初误判成账号维度、做成「当天放弃」，
+// 实测四个账号换设备号后当天全部签上——所以代数必须记住，后续轮次直接用新的，
+// 免得每次都被旧的限流设备号挡一道。
+func TestTraeDeviceGenerationTracksRotation(t *testing.T) {
 	s := New(Config{})
-	day := travelDay(time.Now())
-	if s.traeRateLimitedToday("u1", day) {
-		t.Fatal("初始不该被标记为限流")
+	if got := s.traeDeviceGeneration("u1"); got != 0 {
+		t.Fatalf("初始代数应为 0，实际 %d", got)
 	}
-	s.noteTraeRateLimited("u1", day)
-	if !s.traeRateLimitedToday("u1", day) {
-		t.Fatal("记下之后当天应判定为限流")
+	s.noteTraeDeviceGeneration("u1", 1)
+	if got := s.traeDeviceGeneration("u1"); got != 1 {
+		t.Fatalf("记录后应为 1，实际 %d", got)
 	}
 	// 别的账号不受影响。
-	if s.traeRateLimitedToday("u2", day) {
-		t.Fatal("限流按账号维度，不该波及其它号")
+	if got := s.traeDeviceGeneration("u2"); got != 0 {
+		t.Fatalf("代数按账号维度，不该波及其它号，实际 %d", got)
 	}
-	// 次日自动失效（自然日切换）。
-	if s.traeRateLimitedToday("u1", travelDay(time.Now().Add(24*time.Hour))) {
-		t.Fatal("跨自然日后应重新可试")
+	// 再递增。
+	s.noteTraeDeviceGeneration("u1", 2)
+	if got := s.traeDeviceGeneration("u1"); got != 2 {
+		t.Fatalf("应可继续递增到 2，实际 %d", got)
 	}
 }
