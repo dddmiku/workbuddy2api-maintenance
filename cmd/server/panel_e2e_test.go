@@ -202,6 +202,81 @@ func TestGoPanelEndToEnd(t *testing.T) {
 		t.Fatalf("401 必须带 message：%v", payload)
 	}
 
+	// 4b) 安卓形态：WB2API_ANDROID=1 时网关自己准备目录与首次运行的配置。
+	//
+	// 这条锁住「默认值只有一处」：安卓特有的取舍（只绑回环、关掉跑不了的脚本类
+	// 任务）写在 Go 里，而不是让 Kotlin 侧复制一份 JSON——后者会在下次改默认值时
+	// 被漏掉。
+	t.Run("安卓形态自建配置", func(t *testing.T) {
+		androidRoot := t.TempDir()
+		androidConfig := filepath.Join(androidRoot, "config", "config.json")
+		// 只建出辅助程序目录，其余目录与配置都由网关自己准备。
+		helpers := t.TempDir()
+		for _, name := range []string{"login", "credit", "fission_bin"} {
+			if err := os.WriteFile(filepath.Join(helpers, "libwb2"+name+".so"), []byte("x"), 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		listen2 := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		// #nosec G204 -- 同上：被测二进制由本测试自己构建
+		cmd2 := exec.CommandContext(ctx2, binary, "-config", androidConfig)
+		cmd2.Dir = androidRoot
+		cmd2.Env = append(os.Environ(),
+			"WB2A_LISTEN="+listen2,
+			"WB2API_PANEL_ENABLED=1",
+			"WB2API_PANEL_GO=1",
+			"WB2API_RUNTIME=native",
+			"WB2API_ANDROID=1",
+			"WB2API_GATEWAY_DIR="+androidRoot,
+			"WB2API_AUTHS_DIR="+filepath.Join(androidRoot, "auths"),
+			"WB2API_ADMIN_DIR="+filepath.Join(androidRoot, "panel-data"),
+			"WB2API_RUNTIME_DIR="+helpers,
+			"WB2API_HELPER_DIR="+helpers,
+		)
+		cmd2.Stdout, cmd2.Stderr = os.Stdout, os.Stderr
+		if err := cmd2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = cmd2.Process.Kill()
+			_, _ = cmd2.Process.Wait()
+		}()
+		if !waitReady(t, listen2, logs) {
+			t.Fatalf("安卓形态未就绪")
+		}
+		raw, err := os.ReadFile(androidConfig)
+		if err != nil {
+			t.Fatalf("网关应自建 config.json：%v", err)
+		}
+		config := string(raw)
+		if !strings.Contains(config, `"listen": "127.0.0.1:7863"`) {
+			t.Fatalf("安卓配置必须只绑回环：%s", config)
+		}
+		// 更要紧的是**生效的**配置也必须是它——自建配置若发生在读配置之后，
+		// 网关会先按内置默认值起来（监听所有网卡），自建的配置要等下次重启才生效。
+		// 判据：日志里的 listening 行必须是 127.0.0.1:7863 之外的测试端口
+		// （WB2A_LISTEN 覆盖），且不能出现 0.0.0.0。
+		if strings.Contains(logs.String(), "listening on 0.0.0.0") {
+			t.Fatalf("安卓上不得监听所有网卡：%s", logs.String())
+		}
+		for _, key := range []string{"school_enabled", "cat_enabled", "redeem_enabled",
+			"lottery_enabled", "makeup_enabled"} {
+			if !strings.Contains(config, `"`+key+`": false`) {
+				t.Fatalf("安卓上脚本类任务 %s 必须默认关闭：%s", key, config)
+			}
+		}
+		if !strings.Contains(config, `"checkin_enabled": true`) {
+			t.Fatalf("Go 实现的任务必须默认开启：%s", config)
+		}
+		for _, dir := range []string{"auths", "auths-trash", "data", "panel-data", "logs"} {
+			if info, err := os.Stat(filepath.Join(androidRoot, dir)); err != nil || !info.IsDir() {
+				t.Fatalf("网关应自建目录 %s：%v", dir, err)
+			}
+		}
+	})
+
 	// 5) 确认走的是 Go 引擎：日志里应有它自己的启动行，且**没有** Python 相关行。
 	logText := logs.String()
 	if !strings.Contains(logText, "Go 版面板引擎") {

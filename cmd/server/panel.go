@@ -52,6 +52,29 @@ func adminPrefix() string {
 	return prefix
 }
 
+// BootstrapAndroidLayout 在**读配置之前**准备安卓端的目录与首次运行的配置。
+//
+// 必须早于 loadConfigOrEnv：那份配置里有两处安卓特有的默认值（只绑回环、
+// 关掉跑不了的脚本类任务），而 loadConfigOrEnv 在没有配置文件时会用内置默认值
+// ——那就把安卓的取舍绕过去了（表现为「安卓上默认监听所有网卡」）。
+//
+// 为什么不让 Kotlin 侧写这份配置：默认值与网关的调度语义强耦合，放在 Go 里是
+// 单一事实来源；写在 Java 里会在下次改默认值时被漏掉（那份 JSON 没人会想起去改）。
+//
+// 只在配置**不存在**时写：用户改过的配置绝不能被覆盖。
+func BootstrapAndroidLayout(configPath string) error {
+	if strings.TrimSpace(os.Getenv("WB2API_ANDROID")) != "1" {
+		return nil
+	}
+	// configPath 形如 <root>/config/config.json，数据根是它上两级。
+	layout := android.NewLayout(filepath.Dir(filepath.Dir(configPath)), os.Getenv("WB2API_HELPER_DIR"))
+	if err := layout.Ensure(); err != nil {
+		return err
+	}
+	_, err := layout.EnsureConfig()
+	return err
+}
+
 type unifiedLayout struct {
 	enabled bool
 	panel   panelruntime.Options

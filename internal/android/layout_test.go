@@ -81,6 +81,21 @@ func TestDefaultConfigBindsLoopbackOnly(t *testing.T) {
 	if !strings.Contains(config, `"enabled": false`) {
 		t.Fatalf("安卓上必须关掉自我热更新：%s", config)
 	}
+	// 脚本类任务默认关闭：APK 里既没有 scripts/*.py 也没有 Python，开着只会在
+	// 每个时点各报一次 WARN（用户看到的是「定时任务一直失败」）。
+	for _, key := range []string{"school_enabled", "cat_enabled", "redeem_enabled",
+		"lottery_enabled", "makeup_enabled"} {
+		if !strings.Contains(config, `"`+key+`": false`) {
+			t.Fatalf("脚本类任务 %s 在安卓上必须默认关闭：%s", key, config)
+		}
+	}
+	// Go 实现的任务必须保持开启（它们不依赖 Python）。
+	for _, key := range []string{"checkin_enabled", "travel_enabled", "activity_enabled",
+		"keepalive_enabled", "trae_check_enabled"} {
+		if !strings.Contains(config, `"`+key+`": true`) {
+			t.Fatalf("Go 实现的任务 %s 必须默认开启：%s", key, config)
+		}
+	}
 }
 
 func TestLibNameMatchesRuntimeLookup(t *testing.T) {

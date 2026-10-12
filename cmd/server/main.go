@@ -44,6 +44,11 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
+	// 安卓端：目录与首次运行的配置必须在读配置之前准备好（见 BootstrapAndroidLayout）。
+	if err := BootstrapAndroidLayout(*cfgPath); err != nil {
+		log.Fatalf("prepare android layout: %v", err)
+	}
+
 	cfg, err := loadConfigOrEnv(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)

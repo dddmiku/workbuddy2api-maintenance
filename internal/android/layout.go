@@ -69,10 +69,16 @@ func (l Layout) Ensure() error {
 
 // DefaultConfig 生成一份开箱可用的安卓配置。
 //
-// 与桌面版的差别只有一处，且是刻意的：**监听 127.0.0.1 而不是 0.0.0.0**。
-// 手机常连公共 Wi-Fi，监听所有网卡意味着同一个网络里的人可以直接调用你的账号池
-// （而且 api_key 默认是空的）。面板与 API 都只服务本机——手机上的客户端 App
-// （如各种 AI 客户端）填 `http://127.0.0.1:7863/v1` 即可。
+// 与桌面版的差别有两处，都是刻意的：
+//
+//  1. **监听 127.0.0.1 而不是 0.0.0.0**。手机常连公共 Wi-Fi，监听所有网卡意味着
+//     同一个网络里的人可以直接调用你的账号池（而且 api_key 默认是空的）。面板与
+//     API 都只服务本机——手机上的客户端 App 填 `http://127.0.0.1:7863/v1` 即可。
+//
+//  2. **脚本类任务默认关闭**（school / cat / redeem / lottery / makeup）。它们跑的是
+//     `scripts/*.py`，而 APK 里既没有那些脚本也没有 Python——开着只会在每个时点
+//     各报一次 WARN，用户看到的是「定时任务一直失败」。Go 实现的任务（签到 / 旅行 /
+//     活跃上报 / 保活 / Trae 签到）不受影响，照常开启。
 func DefaultConfig() string {
 	return `{
   "listen": "127.0.0.1:7863",
@@ -92,22 +98,17 @@ func DefaultConfig() string {
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
-    "school_hours": [12],
-    "cat_hours": [1],
-    "redeem_hours": [9],
-    "lottery_hours": [21],
-    "makeup_hours": [9],
     "trae_check_hours": [10],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
-    "school_enabled": true,
-    "cat_enabled": true,
-    "redeem_enabled": true,
-    "lottery_enabled": true,
-    "makeup_enabled": true,
-    "trae_check_enabled": true
+    "trae_check_enabled": true,
+    "school_enabled": false,
+    "cat_enabled": false,
+    "redeem_enabled": false,
+    "lottery_enabled": false,
+    "makeup_enabled": false
   }
 }
 `
