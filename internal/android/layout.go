@@ -118,6 +118,19 @@ func DefaultConfig() string {
 `
 }
 
+// UpdateDir 是热更新的下载目录：**<Root>/updates**。
+//
+// 注意是 Root 下、不是 DataDir（<Root>/data）下——App 侧 AppPaths.dataRoot()
+// 返回的正是 <files>/data，也就是本结构体的 Root。两侧必须指向同一个位置，否则
+// 网关下载到 A、App 去 B 找安装包，症状是「下载与验签都成功、state 回到 idle，
+// 而安装器始终没被拉起」（2026-10-13 真机实测踩到两次）。
+//
+// 这个约定在 cmd/server/config.go 的 updateDir 里也有一份（从 WB2API_ADMIN_DIR
+// 反推），改这里要一起改。
+func (l Layout) UpdateDir() string {
+	return filepath.Join(l.Root, "updates")
+}
+
 // UpdatedGateway 返回热更新下来的网关二进制路径；没有则返回空串。
 //
 // ═══ 为什么冷启动必须优先用它 ═══
@@ -132,9 +145,7 @@ func DefaultConfig() string {
 //
 // 桌面版同理（见 cmd/desktop/main.go），两边用同一个 current 指针格式。
 func (l Layout) UpdatedGateway() string {
-	// 与网关的 updateDir 默认值一致：<state_file 所在目录>/updates，
-	// 而 state_file 默认是 <root>/data/state.json。
-	dir := filepath.Join(l.DataDir, "updates")
+	dir := l.UpdateDir()
 	raw, err := os.ReadFile(filepath.Join(dir, "current"))
 	if err != nil {
 		return ""

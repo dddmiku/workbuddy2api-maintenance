@@ -300,11 +300,31 @@ func updateDir(c *Config) string {
 	if dir := strings.TrimSpace(c.Update.Dir); dir != "" {
 		return dir
 	}
-	stateDir := filepath.Dir(c.StateFile)
-	if stateDir == "" || stateDir == "." {
-		return filepath.Join("data", "updates")
+	// 安卓：更新目录与 App 侧有一份显式约定（AppPaths.dataRoot()/updates），
+	// 必须用它而不是从 state_file 推导——两侧各自推导过一次，分叉成了
+	// files/data/data/updates 与 files/data/updates，安装器因此永远找不到标记文件。
+	if dir := strings.TrimSpace(os.Getenv("WB2API_UPDATE_DIR")); dir == "" {
+		if base := strings.TrimSpace(os.Getenv("WB2API_ADMIN_DIR")); base != "" &&
+			strings.TrimSpace(os.Getenv("WB2API_ANDROID")) == "1" {
+			// adminDir 是 <root>/panel-data，<root> 就是 App 的数据根
+			// （AppPaths.dataRoot() 返回 <files>/data）。更新目录是 <root>/updates。
+			return filepath.Join(filepath.Dir(base), "updates")
+		}
 	}
-	return filepath.Join(stateDir, "updates")
+	// 从 state_file 推导更新目录：它与 state_file 同处数据目录，而数据目录是
+	// 配置里唯一**必然可写**的地方。
+	//
+	// 注意必须走绝对化：安卓上进程的 cwd 是 "/"（应用无权在根目录建目录），
+	// 桌面版的数据根由启动器通过 WB2A_DESKTOP_ROOT 指定。返回相对路径会让
+	// 「下载到 A、App 去 B 找安装包」——实测症状是下载与验签都成功、state 回到
+	// idle，而安装器始终没被拉起（因为标记文件根本没写到 App 看的地方）。
+	if abs, err := filepath.Abs(c.StateFile); err == nil && abs != "" {
+		return filepath.Join(filepath.Dir(abs), "updates")
+	}
+	if dir, err := os.Getwd(); err == nil && dir != "" {
+		return filepath.Join(dir, "data", "updates")
+	}
+	return filepath.Join("data", "updates")
 }
 
 // loadConfigOrEnv 读配置：配置文件不存在时回落「纯默认 + WB2A_* env」，其余错误原样返回。

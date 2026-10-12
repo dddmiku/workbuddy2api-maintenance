@@ -30,8 +30,18 @@ func TestUpdateDirKeepsFileFallbacks(t *testing.T) {
 	if got, want := updateDir(config), filepath.Join(filepath.Dir(config.StateFile), "updates"); got != want {
 		t.Fatalf("state-derived update directory = %q want %q", got, want)
 	}
+	// state_file 是相对路径时必须**绝对化**。
+	//
+	// 安卓上进程的 cwd 是 "/"，应用无权在根目录建目录；桌面版的数据根由启动器
+	// 通过 WB2A_DESKTOP_ROOT 指定。返回相对路径会让「下载到 A、App 去 B 找安装包」
+	// ——实测症状是下载与验签都成功、state 回到 idle，而安装器始终没被拉起
+	// （标记文件根本没写到 App 看的地方）。
 	config.StateFile = "state.json"
-	if got := updateDir(config); got != filepath.Join("data", "updates") {
-		t.Fatalf("default update directory = %q", got)
+	got := updateDir(config)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("更新目录必须是绝对路径（安卓 cwd 是 /），实际 %q", got)
+	}
+	if filepath.Base(got) != "updates" {
+		t.Fatalf("更新目录应以 updates 结尾，实际 %q", got)
 	}
 }
