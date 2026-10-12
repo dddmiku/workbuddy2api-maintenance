@@ -18,7 +18,7 @@ import (
 //
 // 网关是 App 的**子进程**，它没有 Android 的 Context，拉不起系统安装器
 // （那需要 startActivity）。所以它只负责把校验过的 APK 放到约定位置并写下这个
-// 标记；App 进程看到标记后去起安装器（见 GatewayService.stageApkInstaller）。
+// 标记；App 进程看到标记后去起安装器（见 GatewayService.launchInstaller）。
 //
 // 这条分工是刻意的：下载与验签留在网关（它已经有完整的签名校验与摘要比对），
 // 而「拉起系统 UI」这件事只有 App 做得到。
