@@ -278,6 +278,21 @@ func main() {
 		python = resolved
 		panelEngine = "python"
 		fmt.Printf("使用解释器: %s\n", python)
+	} else {
+		// 面板不需要 Python，但**排程的脚本类任务需要**（school / cat / redeem /
+		// lottery / makeup 跑的是 scripts/*.py，由 scheduler 的 pythonCmd() 起进程）。
+		// 找不到就只是那几个任务跳过——不拦启动，但要把解释器路径传下去。
+		//
+		// 不传的后果是 pythonCmd() 回落 "python3"，而 Windows 官方安装器只给
+		// python.exe（且 PATH 上常有 Store 存根），那些任务会在每个时点各报一次
+		// WARN 然后什么都不做。用户看到的是「定时任务全都不跑」。
+		if resolved, err := findPython(); err == nil {
+			python = resolved
+			fmt.Printf("定时任务将使用解释器: %s\n", python)
+		} else {
+			fmt.Println("提示：未找到 Python 3，定时任务（签到/旅行/抽奖等）会被跳过。")
+			fmt.Println("      网关与面板的其它功能不受影响；需要时从 https://www.python.org/downloads/ 安装。")
+		}
 	}
 
 	// 网关二进制：与启动器同目录（打包时一起放进去）。
@@ -314,6 +329,10 @@ func main() {
 		env = append(env, "WB2API_PANEL_GO=0", "WB2A_PYTHON="+python)
 	} else {
 		env = append(env, "WB2API_PANEL_GO=1")
+		if python != "" {
+			// 面板用不到它，但 scheduler 的 pythonCmd() 会读它去跑 scripts/*.py。
+			env = append(env, "WB2A_PYTHON="+python)
+		}
 	}
 	cmd.Env = append(os.Environ(), env...)
 	if err := cmd.Start(); err != nil {
