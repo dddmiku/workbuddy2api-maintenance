@@ -1,0 +1,128 @@
+// ═══ 更新日志 ═══
+// 2026-10-13：初版——安卓端运行布局与自检（把网关+Go 面板当单二进制跑在手机上）。
+//
+// ═══ 为什么安卓版要自己一份布局 ═══
+//
+// 安卓 App 里没有「当前目录」这个概念可用：进程的 cwd 是 `/`，而应用能写的只有
+// 自己的私有目录（`/data/data/<pkg>/files`）。所以配置、账号、密钥、状态文件的位置
+// 全部要由 App 显式指定，不能靠相对路径。
+//
+// 关键约束：**数据目录必须在应用私有区**。手机上的应用私有区默认只有本应用可读
+// （`/data/data/<pkg>` 权限 0700、属主是应用自己的 uid），把账号与密钥放这里是唯一
+// 安全的落点；放外部存储（`/sdcard`）任何 App 都能读——那里面是能直接调上游的凭据。
+package android
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Layout 是安卓端的运行目录布局。
+//
+// 全部落在 App 私有目录下（由调用方传入，通常是 filesDir）：
+//
+//	<root>/config/config.json
+//	<root>/auths/            <root>/auths-trash/
+//	<root>/data/             <root>/panel-data/
+type Layout struct {
+	Root       string
+	ConfigDir  string
+	Config     string
+	Auths      string
+	AuthTrash  string
+	DataDir    string
+	PanelData  string
+	RuntimeDir string
+	LogDir     string
+}
+
+// NewLayout 按数据根目录拼出布局。
+//
+// RuntimeDir 与 Root 分开：辅助程序（login / credit / fission_bin）在安卓上从 APK 的
+// native lib 目录解出来（见 ExtractHelpers），与用户数据不是同一个位置——用户数据要
+// 能备份/清空，而辅助程序是包的一部分，清掉就该重装。
+func NewLayout(root, runtimeDir string) Layout {
+	return Layout{
+		Root:       root,
+		ConfigDir:  filepath.Join(root, "config"),
+		Config:     filepath.Join(root, "config", "config.json"),
+		Auths:      filepath.Join(root, "auths"),
+		AuthTrash:  filepath.Join(root, "auths-trash"),
+		DataDir:    filepath.Join(root, "data"),
+		PanelData:  filepath.Join(root, "panel-data"),
+		RuntimeDir: runtimeDir,
+		LogDir:     filepath.Join(root, "logs"),
+	}
+}
+
+// Ensure 建出全部目录（幂等，已存在的绝不改动内容）。
+func (l Layout) Ensure() error {
+	for _, dir := range []string{l.ConfigDir, l.Auths, l.AuthTrash, l.DataDir, l.PanelData, l.LogDir} {
+		// 0700：账号与密钥都在这些目录里，不能给同设备上的其它 App 任何读的机会。
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("创建目录 %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// DefaultConfig 生成一份开箱可用的安卓配置。
+//
+// 与桌面版的差别只有一处，且是刻意的：**监听 127.0.0.1 而不是 0.0.0.0**。
+// 手机常连公共 Wi-Fi，监听所有网卡意味着同一个网络里的人可以直接调用你的账号池
+// （而且 api_key 默认是空的）。面板与 API 都只服务本机——手机上的客户端 App
+// （如各种 AI 客户端）填 `http://127.0.0.1:7863/v1` 即可。
+func DefaultConfig() string {
+	return `{
+  "listen": "127.0.0.1:7863",
+  "api_key": "",
+  "api_keys_file": "./data/api_keys.json",
+  "api_keys_socket": "./data/api_keys.sock",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "server": {
+    "max_body_mb": 8
+  },
+  "update": {
+    "enabled": false
+  },
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "travel_hours": [9, 21],
+    "activity_hours": [10],
+    "keepalive_hours": [22],
+    "school_hours": [12],
+    "cat_hours": [1],
+    "redeem_hours": [9],
+    "lottery_hours": [21],
+    "makeup_hours": [9],
+    "trae_check_hours": [10],
+    "checkin_enabled": true,
+    "travel_enabled": true,
+    "activity_enabled": true,
+    "keepalive_enabled": true,
+    "school_enabled": true,
+    "cat_enabled": true,
+    "redeem_enabled": true,
+    "lottery_enabled": true,
+    "makeup_enabled": true,
+    "trae_check_enabled": true
+  }
+}
+`
+}
+
+// EnsureConfig 首次运行时写入默认配置；已存在的一律不动。
+//
+// 绝不覆盖是硬要求：用户改过的配置（换端口、加密钥、调排程）不能在下次启动时
+// 被重置回默认——「重启一次设置就没了」会让人再也不敢改配置。
+func (l Layout) EnsureConfig() (bool, error) {
+	if _, err := os.Stat(l.Config); err == nil {
+		return false, nil
+	}
+	if err := os.WriteFile(l.Config, []byte(DefaultConfig()), 0600); err != nil {
+		return false, fmt.Errorf("写入默认配置: %w", err)
+	}
+	return true, nil
+}

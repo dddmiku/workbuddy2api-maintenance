@@ -68,6 +68,9 @@ type Options struct {
 	Assets fs.FS
 	// LogPath 是网关日志文件（原生模式下 /api/logs 读它）。
 	LogPath string
+	// HelperPaths 显式指定辅助程序路径（名字 → 绝对路径）。安卓端用它指向
+	// APK 的 nativeLibraryDir；桌面/容器留空即按运行目录拼名。
+	HelperPaths map[string]string
 	// Version 是面板自身版本号；空则用 PanelVersion。
 	Version string
 	// Now 可注入时钟（测试用）。
@@ -141,7 +144,7 @@ func New(opts Options) (*Server, error) {
 		socket = ""
 	}
 	management := &ManagementClient{SocketPath: socket, BaseDir: opts.BaseDir}
-	runner := NewRunner(opts.Runtime, opts.Container, opts.RuntimeDir, opts.AuthDir, opts.AdminDir, opts.BaseDir, management)
+	runner := NewRunner(opts.Runtime, opts.Container, opts.RuntimeDir, opts.AuthDir, opts.AdminDir, opts.BaseDir, management, opts.HelperPaths)
 
 	server := &Server{
 		opts:      opts,

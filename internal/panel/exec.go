@@ -61,6 +61,13 @@ type NativeRunner struct {
 	AuthDir    string
 	AdminDir   string
 	GatewayDir string
+	// HelperPaths 显式指定辅助程序的可执行路径（名字 → 绝对路径）。
+	//
+	// 为什么需要它：桌面版里辅助程序就在 RuntimeDir 下、按名字拼路径即可；安卓上
+	// 它们必须放在 APK 的 jniLibs 里改名成 libwb2<name>.so（应用私有目录是 noexec，
+	// 只有 nativeLibraryDir 能执行）。有了这张表，两种形态共用同一段执行逻辑，
+	// 安卓侧不需要为「路径不同」再写一套。
+	HelperPaths map[string]string
 	// Admin 是管理 socket 客户端，用于把 inspect/restart 映射成网关内部接口。
 	Admin *ManagementClient
 }
@@ -68,10 +75,10 @@ type NativeRunner struct {
 // NewRunner 按运行形态选择执行器。
 //
 // 判据是环境变量 WB2API_RUNTIME=native（由网关在拉起面板时注入），与 Python 版同源。
-func NewRunner(runtime, container, runtimeDir, authDir, adminDir, gatewayDir string, admin *ManagementClient) Runner {
+func NewRunner(runtime, container, runtimeDir, authDir, adminDir, gatewayDir string, admin *ManagementClient, helperPaths map[string]string) Runner {
 	if runtime == "native" {
 		return &NativeRunner{RuntimeDir: runtimeDir, AuthDir: authDir, AdminDir: adminDir,
-			GatewayDir: gatewayDir, Admin: admin}
+			GatewayDir: gatewayDir, Admin: admin, HelperPaths: helperPaths}
 	}
 	if container == "" {
 		container = "workbuddy2api"
@@ -170,6 +177,14 @@ func (n *NativeRunner) nativeAllowed(args []string) (string, []string, bool) {
 	return "", nil, false
 }
 
+// resolveHelper 定位一个辅助程序：显式路径优先，其次运行目录按平台拼名。
+func (n *NativeRunner) resolveHelper(name string) string {
+	if path := n.HelperPaths[name]; path != "" {
+		return path
+	}
+	return ResolveGatewayBinary(n.RuntimeDir, name)
+}
+
 func (n *NativeRunner) containerName() string {
 	if name := strings.TrimSpace(os.Getenv("WB2API_CONTAINER")); name != "" {
 		return name
@@ -207,7 +222,7 @@ func (n *NativeRunner) Run(ctx context.Context, args []string, timeout time.Dura
 	if !allowed {
 		return ExecResult{Code: 1, Stderr: "不支持此运行操作"}
 	}
-	executable := ResolveGatewayBinary(n.RuntimeDir, name)
+	executable := n.resolveHelper(name)
 	if !fileExists(executable) {
 		return ExecResult{Code: execMissingCode, Stderr: "运行辅助程序不可用，请检查完整版本包"}
 	}

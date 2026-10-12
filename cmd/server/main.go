@@ -488,17 +488,29 @@ func main() {
 	var panel *panelruntime.Runtime
 	var publicHandler http.Handler = h
 	if layout.enabled {
-		// 面板启动失败（凭据文件损坏、目录不可写、Python 启动过慢等）不再拖垂整个网关：
-		// /v1 继续服务，面板在后台重试。
-		layout.panel.RetryInitialFailure = true
-		panel, err = panelruntime.Start(layout.panel)
-		if err != nil {
-			if panel == nil {
-				log.Fatalf("start embedded panel: %v", err)
+		// 面板引擎二选一（见 cmd/server/panel_go.go）：
+		//   - Go 引擎：桌面/安卓（没有 CPython 可用），或显式 WB2API_PANEL_GO=1；
+		//   - Python 引擎：容器部署的既有形态，未显式切换时行为零变更。
+		if useGoPanel() {
+			goPanel, panelErr := startGoPanel(layout)
+			if panelErr != nil {
+				log.Printf("ERROR: Go 版面板启动失败 (%v)；网关 API 继续服务", panelErr)
+			} else {
+				publicHandler = withPanel(h, goPanel)
 			}
-			log.Printf("ERROR: embedded panel failed to start (%v); API keeps serving and the panel retries in the background", err)
+		} else {
+			// 面板启动失败（凭据文件损坏、目录不可写、Python 启动过慢等）不再拖垂整个网关：
+			// /v1 继续服务，面板在后台重试。
+			layout.panel.RetryInitialFailure = true
+			panel, err = panelruntime.Start(layout.panel)
+			if err != nil {
+				if panel == nil {
+					log.Fatalf("start embedded panel: %v", err)
+				}
+				log.Printf("ERROR: embedded panel failed to start (%v); API keeps serving and the panel retries in the background", err)
+			}
+			publicHandler = withPanel(h, panel)
 		}
-		publicHandler = withPanel(h, panel)
 	}
 	srv := &http.Server{
 		Addr:              cfg.Listen,

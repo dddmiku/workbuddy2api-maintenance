@@ -131,7 +131,12 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 	return unifiedLayout{enabled: true, panel: panelruntime.Options{ConfigPath: configPath, BaseDir: base, AuthDir: authDir, AdminDir: adminDir, AdminSocket: adminSocket, RuntimeDir: runtimeDir, LogPath: logPath, AdminPrefix: adminPrefix(), Python: os.Getenv("WB2A_PYTHON"), TrustedProxies: proxies}}, nil
 }
 
-func withPanel(gateway http.Handler, panel *panelruntime.Runtime) http.Handler {
+// withPanel 把面板挂到 adminPrefix 下，其余路径交回网关。
+//
+// panel 是 http.Handler 而不是 *panelruntime.Runtime：Go 引擎直接是 handler，
+// Python 引擎的 Runtime 也实现了 ServeHTTP（它反代到子进程）。两种引擎在挂载点上
+// 无差别，切换引擎不需要改路由。
+func withPanel(gateway http.Handler, panel http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	prefix := adminPrefix()
 	mux.Handle(prefix+"/", panel)
