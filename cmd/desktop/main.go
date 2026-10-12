@@ -31,6 +31,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"workbuddy2api/internal/hotupdate"
 )
 
 // 版本由构建脚本注入（与网关同一套 ldflags 约定）。
@@ -295,8 +297,15 @@ func main() {
 		}
 	}
 
-	// 网关二进制：与启动器同目录（打包时一起放进去）。
+	// 网关二进制：**优先用热更新后的那份**，其次才是包内自带的。
+	//
+	// 不做这一步，热更新就是个假的：新版本会被下载、校验、交接成功，进程内
+	// 一路正常——直到用户关掉窗口再打开，启动器又从包目录里拉起旧二进制，
+	// 版本悄悄回退。用户看到的是「更新了但重启又变回旧版」。
 	gateway := filepath.Join(runtimeDir, gatewayBinaryName())
+	if updated := hotupdate.CurrentBinary(filepath.Join(layout.DataDir, "updates")); updated != "" {
+		gateway = updated
+	}
 	if _, err := os.Stat(gateway); err != nil {
 		fatal("找不到网关程序 %s：打包不完整，请重新下载。", gateway)
 	}

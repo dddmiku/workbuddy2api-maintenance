@@ -31,11 +31,17 @@ func TestLatestPicksAssetForThisArchitecture(t *testing.T) {
 		"name":         "v9.9.9",
 		"published_at": "2026-09-17T10:00:00Z",
 		"body":         "notes",
+		// 资产清单覆盖三端：测试跑在哪个平台上，就得有对应的那份资产。
+		// 只列 linux 会让 Windows/安卓上跑测试时找不到本机资产而失败。
 		"assets": []map[string]any{
 			{"name": "wb2api-linux-amd64", "size": 11, "browser_download_url": "https://example.invalid/amd64",
 				"digest": "sha256:aaaa"},
 			{"name": "wb2api-linux-arm64", "size": 22, "browser_download_url": "https://example.invalid/arm64",
 				"digest": "sha256:bbbb"},
+			{"name": "wb2api-windows-amd64", "size": 44, "browser_download_url": "https://example.invalid/win-amd64",
+				"digest": "sha256:cccc"},
+			{"name": "wb2api-android-arm64", "size": 55, "browser_download_url": "https://example.invalid/android-arm64",
+				"digest": "sha256:dddd"},
 			{"name": "SHA256SUMS.txt", "size": 33, "browser_download_url": "https://example.invalid/sums"},
 		},
 	}
@@ -215,16 +221,43 @@ func TestNewClientDefaultsRepoAndTimeout(t *testing.T) {
 	}
 }
 
-func TestAssetNameFollowsRuntimeArch(t *testing.T) {
+// TestAssetNameFollowsRuntimePlatform 锁住「三端各拿各的资产」。
+//
+// 安卓的 GOOS 是 "android" 而不是 "linux"（内核是 Linux，但 Go 把它单独标出来）。
+// 不按 GOOS 分的话，手机与桌面都会去下 Linux 的二进制——那个在手机上根本跑不起来。
+func TestAssetNameFollowsRuntimePlatform(t *testing.T) {
 	name, err := assetName()
-	switch runtime.GOARCH {
-	case "amd64", "arm64":
-		if err != nil || name != "wb2api-linux-"+runtime.GOARCH {
-			t.Fatalf("assetName() = %q, %v for %s", name, err, runtime.GOARCH)
+	if err != nil {
+		// 不支持的架构必须报错，且错误里说清是架构问题。
+		if !strings.Contains(err.Error(), "unsupported") {
+			t.Fatalf("assetName() error = %v; 不支持时错误里应含 unsupported", err)
 		}
+		return
+	}
+	var want string
+	switch runtime.GOOS {
+	case "windows":
+		want = "wb2api-windows-" + runtime.GOARCH
+	case "android":
+		want = "wb2api-android-" + runtime.GOARCH
 	default:
-		if err == nil || !strings.Contains(err.Error(), "unsupported") {
-			t.Fatalf("assetName() = %q, %v; unsupported arch must error", name, err)
-		}
+		want = "wb2api-linux-" + runtime.GOARCH
+	}
+	if name != want {
+		t.Fatalf("assetName() = %q，期望 %q（GOOS=%s GOARCH=%s）", name, want, runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// TestBundleOnlyOnLinux 完整运行包只有 Linux 部署有。
+//
+// 桌面与安卓用的是单文件资产：桌面版的数据与程序在同一个文件夹里、由启动器管；
+// 安卓的程序在 APK 的 nativeLibraryDir 里，「解压到目录再整体替换」的前提不成立。
+// 若在这两个平台上仍去要运行包，会去找一个不存在的资产名。
+func TestBundleOnlyOnLinux(t *testing.T) {
+	if runtime.GOOS == "linux" && !bundleSupported() {
+		t.Fatal("Linux 必须支持完整运行包")
+	}
+	if runtime.GOOS != "linux" && bundleSupported() {
+		t.Fatalf("%s 不该走完整运行包路径", runtime.GOOS)
 	}
 }

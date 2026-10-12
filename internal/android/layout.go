@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Layout 是安卓端的运行目录布局。
@@ -79,6 +80,9 @@ func (l Layout) Ensure() error {
 //     `scripts/*.py`，而 APK 里既没有那些脚本也没有 Python——开着只会在每个时点
 //     各报一次 WARN，用户看到的是「定时任务一直失败」。Go 实现的任务（签到 / 旅行 /
 //     活跃上报 / 保活 / Trae 签到）不受影响，照常开启。
+//
+//  3. **自更新默认开启**（与桌面版相反）。桌面版是便携包，用户换一个文件夹就升级了；
+//     手机用户拿不到 APK 之外的东西，自更新是它唯一能自己升级的路。
 func DefaultConfig() string {
 	return `{
   "listen": "127.0.0.1:7863",
@@ -91,7 +95,7 @@ func DefaultConfig() string {
     "max_body_mb": 8
   },
   "update": {
-    "enabled": false
+    "enabled": true
   },
   "schedule": {
     "checkin_hours": [9, 21],
@@ -112,6 +116,37 @@ func DefaultConfig() string {
   }
 }
 `
+}
+
+// UpdatedGateway 返回热更新下来的网关二进制路径；没有则返回空串。
+//
+// ═══ 为什么冷启动必须优先用它 ═══
+//
+// 安卓的热更新替换的是**可执行文件**（网关以文件形式跑在应用私有目录里），
+// 而 APK 的 nativeLibraryDir 是只读的、改不了。所以更新后的二进制落在数据目录，
+// 由这里在每次启动时优先选中。
+//
+// 不做这一步，热更新就是个假的：新版本会被下载、校验、交接成功，进程内一路正常
+// ——直到用户把 App 划掉再打开，又从 nativeLibraryDir 拉起 APK 里的旧二进制，
+// 版本悄悄回退。用户看到的是「更新了但重启又变回旧版」。
+//
+// 桌面版同理（见 cmd/desktop/main.go），两边用同一个 current 指针格式。
+func (l Layout) UpdatedGateway() string {
+	// 与网关的 updateDir 默认值一致：<state_file 所在目录>/updates，
+	// 而 state_file 默认是 <root>/data/state.json。
+	dir := filepath.Join(l.DataDir, "updates")
+	raw, err := os.ReadFile(filepath.Join(dir, "current"))
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(string(raw))
+	if path == "" {
+		return ""
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		return ""
+	}
+	return path
 }
 
 // EnsureConfig 首次运行时写入默认配置；已存在的一律不动。

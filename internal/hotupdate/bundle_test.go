@@ -183,6 +183,11 @@ func TestPrivateAssetAPIAndRedirectCredentialScope(t *testing.T) {
 		}
 	}))
 	defer api.Close()
+	// 完整运行包只有 Linux 部署有（见 bundleSupported）。这个用例验的就是那条
+	// 路径，在别的平台上没有对应的资产可下——跳过而不是改判据，才是在说真话。
+	if !bundleSupported() {
+		t.Skipf("完整运行包只在 Linux 上存在（当前 %s）", runtime.GOOS)
+	}
 	client := NewClient("owner/private", "fixture-token")
 	client.APIBase = api.URL
 	client.Bundle = true

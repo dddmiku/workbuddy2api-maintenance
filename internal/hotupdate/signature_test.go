@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -82,6 +83,11 @@ func TestVerifySignedRelease(t *testing.T) {
 
 	original := version.ReleaseKey
 	t.Cleanup(func() { version.ReleaseKey = original })
+	// 签名校验走的是「完整运行包」那条取件路径，而它只有 Linux 部署有
+	// （见 bundleSupported）。在别的平台上没有对应资产可下，跳过。
+	if !bundleSupported() {
+		t.Skipf("完整运行包只在 Linux 上存在（当前 %s）", runtime.GOOS)
+	}
 	client := NewClient("owner/private", "token")
 	client.APIBase = api.URL
 	client.Bundle = true

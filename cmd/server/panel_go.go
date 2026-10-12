@@ -62,6 +62,19 @@ func goPanelOptions(layout unifiedLayout) panel.Options {
 	}
 }
 
+// panelUpdateDir 是热更新的下载目录。
+//
+// 与网关自身用的必须是**同一个目录**：面板的「检查更新/应用更新」经管理通道
+// 转发给网关，网关把下载件放在这里；下次冷启动时桌面启动器也从这里读 current
+// 指针（否则热更新在重启后会回退，见 cmd/desktop/main.go 的注释）。
+//
+// 这里复用网关自己的 updateDir 解析（含 WB2API_UPDATE_DIR 与 config 的
+// update.dir），而不是另拼一个路径：两处一旦分叉，就会出现「网关把新版本下到 A、
+// 启动器去 B 找 current」——更新成功但重启回退。
+func panelUpdateDir(cfg *Config) string {
+	return updateDir(cfg)
+}
+
 // helperPaths 解析辅助程序的实际路径（名字 → 绝对路径）。
 //
 // 桌面版留空：辅助程序就在 RuntimeDir 下，按平台拼名即可。安卓版必须给显式路径，
@@ -116,9 +129,10 @@ func panelContainer() string {
 // adminHandler 是网关的管理接口 mux：面板与网关在同一个进程里，直接把它交给面板，
 // 由面板在进程内分发（不经 socket/TCP）。分进程部署的形态下传 nil，面板自己回落到
 // socket 路径。
-func startGoPanel(layout unifiedLayout, adminHandler http.Handler) (http.Handler, error) {
+func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler) (http.Handler, error) {
 	opts := goPanelOptions(layout)
 	opts.AdminHandler = adminHandler
+	opts.UpdateDir = panelUpdateDir(cfg)
 	server, err := panel.New(opts)
 	if err != nil {
 		return nil, err

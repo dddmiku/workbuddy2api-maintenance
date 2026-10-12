@@ -506,7 +506,7 @@ func main() {
 		//   - Go 引擎：桌面/安卓（没有 CPython 可用），或显式 WB2API_PANEL_GO=1；
 		//   - Python 引擎：容器部署的既有形态，未显式切换时行为零变更。
 		if useGoPanel() {
-			goPanel, panelErr := startGoPanel(layout, adminMux())
+			goPanel, panelErr := startGoPanel(layout, cfg, adminMux())
 			if panelErr != nil {
 				log.Printf("ERROR: Go 版面板启动失败 (%v)；网关 API 继续服务", panelErr)
 			} else {

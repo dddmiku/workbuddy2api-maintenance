@@ -123,8 +123,22 @@ func (c *Client) apiBase() string {
 	return strings.TrimRight(c.APIBase, "/")
 }
 
-// assetName 本机架构对应的发布资产名。
+// assetName 本机平台与架构对应的发布资产名。
+//
+// 三端共用同一套发布流程，资产名按 GOOS 区分：
+//   - linux/amd64、linux/arm64：容器与服务器部署（既有形态，名字不变）；
+//   - android/arm64：安卓 App（网关以可执行文件形式跑在应用私有目录里）；
+//   - windows/amd64：桌面版。
+//
+// 安卓的 GOOS 是 "android" 而不是 "linux"，虽然内核是 Linux——Go 的 runtime 会
+// 把它单独标出来，资产名也必须跟着分，否则手机去下 Linux 的二进制（用不了）。
 func assetName() (string, error) {
+	if runtime.GOOS == "windows" {
+		return "wb2api-windows-" + runtime.GOARCH, nil
+	}
+	if runtime.GOOS == "android" {
+		return "wb2api-android-" + runtime.GOARCH, nil
+	}
 	switch runtime.GOARCH {
 	case "amd64":
 		return "wb2api-linux-amd64", nil
@@ -142,7 +156,11 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 		return Release{}, err
 	}
 	if c.Bundle {
-		name = runtimeAssetName()
+		// 完整运行包只有 Linux 部署有；其他平台即使误开了 Bundle 也要回落单文件，
+		// 否则会去找一个不存在的资产名、报「没有本机架构的二进制资产」。
+		if bundleSupported() {
+			name = runtimeAssetName()
+		}
 	}
 	if !validRepo(c.Repo) {
 		return Release{}, errors.New("invalid update repository")
@@ -289,7 +307,20 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 	return target, sum, nil
 }
 
-func runtimeAssetName() string { return "wb2api-runtime-linux-" + runtime.GOARCH + ".tar.gz" }
+// runtimeAssetName 完整运行包（网关 + 辅助程序 + 脚本）的资产名。
+//
+// 只有 Linux 部署用完整运行包（它的运行目录就是解压出来的那个目录）。
+// 桌面与安卓用的是单文件资产：桌面版的数据与程序在同一个文件夹里、由启动器管；
+// 安卓的程序在 APK 的 nativeLibraryDir 里，完整包那套「解压到目录再整体替换」
+// 的前提不成立。
+func runtimeAssetName() string {
+	return "wb2api-runtime-linux-" + runtime.GOARCH + ".tar.gz"
+}
+
+// bundleSupported 本平台是否支持「完整运行包」形式的更新。
+func bundleSupported() bool {
+	return runtime.GOOS == "linux"
+}
 
 func validRepo(repo string) bool {
 	parts := strings.Split(repo, "/")

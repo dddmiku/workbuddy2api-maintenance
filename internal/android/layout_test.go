@@ -76,10 +76,12 @@ func TestDefaultConfigBindsLoopbackOnly(t *testing.T) {
 	if strings.Contains(config, "0.0.0.0") {
 		t.Fatalf("不得监听所有网卡：%s", config)
 	}
-	// 自动更新在手机上关掉：便携包靠换 APK 更新，而不是让二进制自我替换
-	// （在安卓上会撞 SELinux 与应用私有目录的 noexec）。
-	if !strings.Contains(config, `"enabled": false`) {
-		t.Fatalf("安卓上必须关掉自我热更新：%s", config)
+	// 自更新在手机上**默认开启**（与桌面版相反）：桌面版是便携包、换个文件夹就升级，
+	// 而手机用户拿不到 APK 之外的东西——自更新是它唯一能自己升级的路。
+	// 可行性已实测：应用私有目录虽不能执行，但网关把新二进制放在数据目录、以可执行
+	// 权限落盘后可以跑（2026-10-13 真机验证）。
+	if !strings.Contains(config, `"enabled": true`) {
+		t.Fatalf("安卓上应默认开启自更新：%s", config)
 	}
 	// 脚本类任务默认关闭：APK 里既没有 scripts/*.py 也没有 Python，开着只会在
 	// 每个时点各报一次 WARN（用户看到的是「定时任务一直失败」）。

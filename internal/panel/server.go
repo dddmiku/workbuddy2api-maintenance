@@ -75,6 +75,9 @@ type Options struct {
 	// HelperPaths 显式指定辅助程序路径（名字 → 绝对路径）。安卓端用它指向
 	// APK 的 nativeLibraryDir；桌面/容器留空即按运行目录拼名。
 	HelperPaths map[string]string
+	// UpdateDir 是热更新下载目录（与网关自身用的是同一个）。面板据此显示
+	// 「当前版本来自更新目录」这类信息。
+	UpdateDir string
 	// Version 是面板自身版本号；空则用 PanelVersion。
 	Version string
 	// Now 可注入时钟（测试用）。
