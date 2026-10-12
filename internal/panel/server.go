@@ -199,7 +199,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "message": "当前来源不在管理入口白名单内"})
 		return
 	}
-	path := r.URL.Path
+	path := s.stripPrefix(r.URL.Path)
+	if path == "" {
+		path = "/"
+	}
 	if path == "/__health" && s.opts.Runtime == "native" {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
 		return
@@ -213,6 +216,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+}
+
+// stripPrefix 剥掉面板的挂载前缀，把路径归一成「面板内部路径」。
+//
+// 为什么必须剥：网关把面板挂在 `<prefix>/`（默认 /admin）下，路由分发后交给面板的
+// 是**完整路径**（/admin/login）。而面板内部的分支是按内部路径写的（/login、/api/state）
+// ——Python 版之所以没这个问题，是因为它躲在网关的反向代理后面，由代理先剥了前缀。
+// 不剥的表现是「登录页反复重定向」：/admin/login 匹配不上 /login 分支，落到
+// 「未登录 → 重定向到 login」，而重定向目标又被加上前缀，于是自己指回自己。
+func (s *Server) stripPrefix(path string) string {
+	base := s.adminBase
+	if base == "" || base == "/" {
+		return path
+	}
+	if path == base {
+		return "/"
+	}
+	if strings.HasPrefix(path, base+"/") {
+		return path[len(base):]
+	}
+	// 不在前缀下的路径原样返回：交给后面的 404 分支，而不是硬塞进面板内部路由。
+	return path
 }
 
 func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
@@ -258,6 +283,8 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 		writeHTML(w, http.StatusOK, body)
 		return
 	case strings.HasPrefix(path, "/vendor/"):
+		// 放在会话检查之后（与 Python 版同序）：vendor 下是面板前端资源，只有
+		// 登录后的 index.html 会引用它。未登录时落到上面的重定向分支即可。
 		name := "vendor/" + baseName(path)
 		body, err := readAsset(s.assets, name)
 		if err != nil {

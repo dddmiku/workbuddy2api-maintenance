@@ -1429,13 +1429,20 @@ func TestStaticRoutes(t *testing.T) {
 			t.Fatalf("应返回 index.html：%d %s", recorder.Code, recorder.Body.String())
 		}
 	})
-	t.Run("vendor 静态资源", func(t *testing.T) {
+	t.Run("vendor 静态资源需要会话", func(t *testing.T) {
 		recorder := h.do(http.MethodGet, "/vendor/qrcode.js", "", map[string]string{"Cookie": cookie})
 		if recorder.Code != 200 {
 			t.Fatalf("应 200，实际 %d", recorder.Code)
 		}
 		if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/javascript") {
 			t.Fatalf("Content-Type 不对：%q", got)
+		}
+	})
+	t.Run("未登录的 vendor 请求被重定向而不是 404", func(t *testing.T) {
+		// 与 Python 版同序：vendor 在会话检查之后。未登录时落到重定向分支。
+		recorder := h.do(http.MethodGet, "/vendor/qrcode.js", "", nil)
+		if recorder.Code != 302 {
+			t.Fatalf("应 302，实际 %d", recorder.Code)
 		}
 	})
 	t.Run("vendor 路径穿越被挡", func(t *testing.T) {

@@ -14,7 +14,6 @@ package panel
 
 import (
 	"context"
-	"strings"
 )
 
 // PoolState 是账号在网关账号池里的状态（对应 /status 的 accounts[] 条目）。
@@ -164,16 +163,14 @@ func (b *StateBuilder) Build(ctx context.Context, forceCredit bool) StatePayload
 	}
 }
 
+// containerRunning 判断网关是否在跑。
+//
+// 原生模式（桌面/安卓）下没有容器可 inspect：判据改成「网关的 HTTP 接口有没有响应」。
+// 不能只看管理 socket——面板本身就是被网关托管的，socket 通了只说明网关进程活着，
+// 而这里要回答的是「服务能不能用」。
 func (b *StateBuilder) containerRunning(ctx context.Context) bool {
-	if b.Runner == nil {
-		return false
-	}
-	container := b.Container
-	if container == "" {
-		container = "workbuddy2api"
-	}
-	result := b.Runner.Run(ctx, []string{"inspect", "-f", "{{.State.Running}}", container}, execShortTimeout, nil)
-	return result.Code == 0 && strings.TrimSpace(result.Stdout) == "true"
+	health := b.Gateway.Get(ctx, "/healthz")
+	return jsonString(health["service"]) == "workbuddy2api"
 }
 
 func poolStateFrom(entry map[string]any) PoolState {

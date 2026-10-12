@@ -55,6 +55,11 @@ func (s *Server) restartContainer(ctx context.Context) (bool, string, float64) {
 		probeCtx, cancel := contextWithTimeout(ctx, minDuration(5*time.Second, remaining))
 		health := s.gateway.Get(probeCtx, "/healthz")
 		cancel()
+		// 判据是「网关在服务」而不是「网关健康」：/healthz 在**一个账号都没有**时
+		// 返回 503（ServableNow 为假），而那种部署（刚装好、还没加号）重启后必然
+		// 拿不到 200。只看 200 会把它报成「重启已执行但健康检查未通过」——用户看到
+		// 一条永远无法满足的失败提示。service 字段与 X-Service 头是网关的身份标识，
+		// 有它、且没有 error 键，就说明进程起来了、能响应了。
 		if jsonString(health["service"]) == "workbuddy2api" && health["error"] == nil {
 			return true, "已重启并加载账号", s.elapsed(started)
 		}
