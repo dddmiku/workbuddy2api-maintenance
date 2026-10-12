@@ -68,6 +68,10 @@ type Options struct {
 	Assets fs.FS
 	// LogPath 是网关日志文件（原生模式下 /api/logs 读它）。
 	LogPath string
+	// AdminHandler 是网关的管理接口（同进程）。给了它就**不经 socket/TCP**，
+	// 直接在进程内分发——Windows 上 net.Dial("unix", …) 不可用（实测 invalid
+	// argument），走 socket 会让密钥/用量/热更新页全挂。空则回落到 socket 路径。
+	AdminHandler http.Handler
 	// HelperPaths 显式指定辅助程序路径（名字 → 绝对路径）。安卓端用它指向
 	// APK 的 nativeLibraryDir；桌面/容器留空即按运行目录拼名。
 	HelperPaths map[string]string
@@ -143,7 +147,7 @@ func New(opts Options) (*Server, error) {
 		log.Printf("WARN: [panel] 读取网关配置失败，管理通道暂不可用: %v", err)
 		socket = ""
 	}
-	management := &ManagementClient{SocketPath: socket, BaseDir: opts.BaseDir}
+	management := &ManagementClient{Handler: opts.AdminHandler, SocketPath: socket, BaseDir: opts.BaseDir}
 	runner := NewRunner(opts.Runtime, opts.Container, opts.RuntimeDir, opts.AuthDir, opts.AdminDir, opts.BaseDir, management, opts.HelperPaths)
 
 	server := &Server{
@@ -162,6 +166,19 @@ func New(opts Options) (*Server, error) {
 	server.credits.now = opts.Now
 	server.state = &StateBuilder{Store: server.store, Gateway: server.gateway, Credits: server.credits,
 		Runner: runner, Container: opts.Container}
+
+	// 启动时就把凭证准备好（Python 版的 main() 也这么做）。
+	//
+	// 为什么要在这里主动 Load 一次：它同时是「首次运行生成 credentials.json +
+	// initial-password.txt」的触发点。不主动触发的话，那两个文件要等到第一次
+	// 有人提交登录表单才出现——而 README 让用户去 panel-data/initial-password.txt
+	// 取初始密码，那时文件还不存在，用户会以为包坏了。
+	//
+	// 凭证损坏时只记日志不返回错误：面板自己会把它显示成「登录凭证文件无效」，
+	// 这比让整个面板起不来更有用（至少运维能看到原因）。
+	if _, err := server.creds.Load(); err != nil {
+		log.Printf("WARN: [panel] 登录凭证不可用：%v", err)
+	}
 	return server, nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +38,19 @@ const managementResponseLimit = 8 << 20
 // 就会出现「网关已启用、面板却报未启用」这种互相矛盾的状态。
 const DefaultAPIKeysFile = "./data/api_keys.json"
 
-// ManagementClient 经本机管理 socket 访问网关内部接口。
+// ManagementClient 访问网关内部接口。
 type ManagementClient struct {
+	// Handler 是**同进程内**的网关管理接口。
+	//
+	// 优先用它，理由有三：
+	//   1. 少一层 socket，就少一类故障（路径解析、权限、残留文件、就绪时序）；
+	//   2. Windows 上 Go 的 net.Dial("unix", …) 直接失败（实测 connect: invalid
+	//      argument），桌面版经 socket 调管理接口**一个都调不通**——密钥页、用量页、
+	//      热更新页会全挂。同进程分发没有这个问题。
+	//   3. 安卓上同样没有 Unix socket 的可靠支持。
+	//
+	// Handler 为空时才退到 socket 路径（面板与网关分进程部署的形态）。
+	Handler http.Handler
 	// SocketPath 是本机管理 socket 的绝对路径；空串表示「密钥管理未启用」。
 	SocketPath string
 	// BaseDir 用于把配置里的 /app/… 路径映射回宿主/桌面目录。
@@ -94,14 +106,19 @@ func ResolveSocketPath(configPath, baseDir string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
-// ManagementEnabled 判断是否配置了可用的管理通道（面板据此显示密钥页）。
-func (c *ManagementClient) ManagementEnabled() bool { return c.SocketPath != "" }
+// ManagementEnabled 判断是否有可用的管理通道（面板据此显示密钥页）。
+func (c *ManagementClient) ManagementEnabled() bool {
+	return c.Handler != nil || c.SocketPath != ""
+}
 
 // Request 调用管理接口，返回 (HTTP 状态码, 解析后的 JSON 对象)。
 //
 // 失败一律映射成 503 + 可读中文：面板的按钮只关心「有没有成功」和「为什么没成功」，
 // 把 Go 的底层错误原文抛给用户没有意义。
 func (c *ManagementClient) Request(ctx context.Context, method, endpoint string, body any) (int, map[string]any) {
+	if c.Handler != nil {
+		return c.requestInProcess(ctx, method, endpoint, body)
+	}
 	if c.SocketPath == "" {
 		return 503, map[string]any{"ok": false, "message": "密钥管理尚未启用"}
 	}
@@ -135,6 +152,41 @@ func (c *ManagementClient) Request(ctx context.Context, method, endpoint string,
 		return 503, map[string]any{"ok": false, "message": "暂时无法连接密钥管理服务，请稍后刷新"}
 	}
 	return resp.StatusCode, result
+}
+
+// requestInProcess 直接把请求交给同进程的管理 handler。
+//
+// 用 httptest.NewRecorder 而不是真的起一个本地监听：面板与网关在同一个进程里，
+// 中间隔一层 loopback TCP 只是白白多两次上下文切换与一次端口占用。
+func (c *ManagementClient) requestInProcess(ctx context.Context, method, endpoint string, body any) (int, map[string]any) {
+	var payload io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 503, map[string]any{"ok": false, "message": "暂时无法连接密钥管理服务，请稍后刷新"}
+		}
+		payload = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://internal"+endpoint, payload)
+	if err != nil {
+		return 503, map[string]any{"ok": false, "message": "暂时无法连接密钥管理服务，请稍后刷新"}
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	recorder := httptest.NewRecorder()
+	c.Handler.ServeHTTP(recorder, req)
+	result := recorder.Result()
+	defer result.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(result.Body, managementResponseLimit+1))
+	if err != nil || len(raw) > managementResponseLimit {
+		return 503, map[string]any{"ok": false, "message": "暂时无法连接密钥管理服务，请稍后刷新"}
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return 503, map[string]any{"ok": false, "message": "暂时无法连接密钥管理服务，请稍后刷新"}
+	}
+	return result.StatusCode, decoded
 }
 
 func (c *ManagementClient) transport() http.RoundTripper {

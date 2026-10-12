@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -159,6 +160,33 @@ func TestGoPanelEndToEnd(t *testing.T) {
 		t.Fatalf("重定向目标应为 login，实际 %q", location)
 	}
 
+	// 3c) 管理接口必须**在进程内**分发得到，而不是走 socket。
+	//
+	// 这一条锁的是 Windows/安卓的可用性：Go 的 net.Dial("unix", …) 在那两个平台上
+	// 直接失败（实测 connect: invalid argument），所以面板与网关同进程时必须直接
+	// 把请求交给管理 mux。走 socket 的表现是「密钥页、用量页、热更新页全挂」。
+	//
+	// 未登录时 /admin/api/usage 会先被会话闸门挡下（401），所以这里用一个
+	// 已登录的会话去验；登录用初始口令文件里的密码。
+	password := readInitialPassword(t, root)
+	session := login(t, client, listen, password)
+	resp = getWithCookie(t, client, "http://"+listen+"/admin/api/usage", session, false)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/admin/api/usage 应 200（管理接口必须同进程可达），实际 %d：%s", resp.StatusCode, body)
+	}
+	var usage map[string]any
+	if err := json.Unmarshal(body, &usage); err != nil {
+		t.Fatalf("用量接口必须回 JSON：%s", body)
+	}
+	if usage["ok"] == nil {
+		t.Fatalf("用量接口信封不对：%v", usage)
+	}
+	if _, present := usage["file"]; !present {
+		t.Fatalf("用量接口应带 file 字段（说明真的走到了网关内部实现）：%v", usage)
+	}
+
 	// 4) 未登录访问面板 API → 401 JSON（前端靠它跳登录页）。
 	resp = get(t, client, "http://"+listen+"/admin/api/state", false)
 	body, _ = io.ReadAll(resp.Body)
@@ -257,6 +285,69 @@ func waitReady(t *testing.T, listen string, logs *strings.Builder) bool {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false
+}
+
+// readInitialPassword 读面板首次生成的初始口令。
+func readInitialPassword(t *testing.T, root string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "panel-data", "initial-password.txt"))
+	if err != nil {
+		t.Fatalf("读初始口令失败：%v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "password: ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "password: "))
+		}
+	}
+	t.Fatalf("初始口令文件里没有 password 行：%s", raw)
+	return ""
+}
+
+// login 登录面板并返回会话 cookie 值。
+func login(t *testing.T, client *http.Client, listen, password string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"username": "wbadmin", "password": password})
+	req, err := http.NewRequest(http.MethodPost, "http://"+listen+"/admin/api/auth/login", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Request", "1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("登录失败：%v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("登录应 200，实际 %d：%s", resp.StatusCode, raw)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "wb2a_admin" && cookie.Value != "" {
+			return cookie.Value
+		}
+	}
+	t.Fatalf("登录没有种下会话 cookie：%v", resp.Cookies())
+	return ""
+}
+
+// getWithCookie 带会话 cookie 发 GET。
+func getWithCookie(t *testing.T, client *http.Client, url, token string, follow bool) *http.Response {
+	t.Helper()
+	clone := *client
+	if !follow {
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: "wb2a_admin", Value: token})
+	resp, err := clone.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s 失败：%v", url, err)
+	}
+	return resp
 }
 
 func get(t *testing.T, client *http.Client, url string, follow bool) *http.Response {

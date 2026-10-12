@@ -112,8 +112,14 @@ func panelContainer() string {
 //
 // 面板构造失败（配置读不到、资源缺失）不该让网关 API 也起不来——面板是运维界面，
 // 网关是服务本身。这与 Python 引擎的 RetryInitialFailure 是同一条取舍。
-func startGoPanel(layout unifiedLayout) (http.Handler, error) {
-	server, err := panel.New(goPanelOptions(layout))
+//
+// adminHandler 是网关的管理接口 mux：面板与网关在同一个进程里，直接把它交给面板，
+// 由面板在进程内分发（不经 socket/TCP）。分进程部署的形态下传 nil，面板自己回落到
+// socket 路径。
+func startGoPanel(layout unifiedLayout, adminHandler http.Handler) (http.Handler, error) {
+	opts := goPanelOptions(layout)
+	opts.AdminHandler = adminHandler
+	server, err := panel.New(opts)
 	if err != nil {
 		return nil, err
 	}

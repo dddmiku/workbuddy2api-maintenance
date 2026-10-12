@@ -418,7 +418,13 @@ func main() {
 	var adminServer *http.Server
 	var connections sync.WaitGroup
 	connectionState := trackConnections(&connections)
-	serveAdmin := func(listener net.Listener) {
+	// 管理接口的 mux 抽成闭包：它既要挂在管理 socket 上（分进程部署），也要
+	// **直接在进程内**交给 Go 面板（同进程部署）。
+	//
+	// 为什么同进程要走进程内分发而不是回环 TCP：Windows 上 Go 的 net.Dial("unix", …)
+	// 直接失败（实测 connect: invalid argument），桌面版经 socket 调管理接口一个都调
+	// 不通——密钥页、用量页、热更新页会全挂。安卓上同样没有可靠的 Unix socket。
+	adminMux := func() *http.ServeMux {
 		mux := http.NewServeMux()
 		if keyStore != nil {
 			mux.Handle("/keys", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
@@ -426,7 +432,10 @@ func main() {
 		}
 		mux.HandleFunc("POST /runtime/reload", reloadHandler(updateManager))
 		mux.Handle("/", h.InternalHandler())
-		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, ConnState: connectionState}
+		return mux
+	}
+	serveAdmin := func(listener net.Listener) {
+		server := &http.Server{Handler: adminMux(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, ConnState: connectionState}
 		adminMu.Lock()
 		if backgroundCtx.Err() != nil {
 			adminMu.Unlock()
@@ -492,7 +501,7 @@ func main() {
 		//   - Go 引擎：桌面/安卓（没有 CPython 可用），或显式 WB2API_PANEL_GO=1；
 		//   - Python 引擎：容器部署的既有形态，未显式切换时行为零变更。
 		if useGoPanel() {
-			goPanel, panelErr := startGoPanel(layout)
+			goPanel, panelErr := startGoPanel(layout, adminMux())
 			if panelErr != nil {
 				log.Printf("ERROR: Go 版面板启动失败 (%v)；网关 API 继续服务", panelErr)
 			} else {

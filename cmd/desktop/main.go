@@ -263,12 +263,22 @@ func main() {
 		fatal("%v", err)
 	}
 
-	python, err := findPython()
-	if err != nil {
-		printPythonHelp(err)
-		os.Exit(1)
+	// 面板引擎：默认 Go（不需要 Python）。要退回 Python 引擎时设 WB2A_DESKTOP_PYTHON=1
+	// 或 WB2API_PANEL_GO=0——那是给「Python 面板还在灰度」的部署留的退路，普通用户
+	// 永远走不到。桌面版默认走 Go 的理由：绝大多数用户机器上没有 python3，
+	// 而 Go 引擎与 Python 引擎功能等价（同一套前端、同一份凭据格式）。
+	panelEngine := "go"
+	python := ""
+	if usePythonPanel() {
+		resolved, err := findPython()
+		if err != nil {
+			printPythonHelp(err)
+			os.Exit(1)
+		}
+		python = resolved
+		panelEngine = "python"
+		fmt.Printf("使用解释器: %s\n", python)
 	}
-	fmt.Printf("使用解释器: %s\n", python)
 
 	// 网关二进制：与启动器同目录（打包时一起放进去）。
 	gateway := filepath.Join(runtimeDir, gatewayBinaryName())
@@ -289,15 +299,23 @@ func main() {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	cmd.Env = append(os.Environ(),
+	env := []string{
 		"WB2API_PANEL_ENABLED=1",
-		"WB2API_GATEWAY_DIR="+layout.Root,
-		"WB2API_AUTHS_DIR="+layout.Auths,
-		"WB2API_ADMIN_DIR="+layout.PanelData,
-		"WB2API_RUNTIME_DIR="+layout.RuntimeDir,
-		"WB2A_PYTHON="+python,
-		"WB2A_LISTEN="+net.JoinHostPort(host, port),
-	)
+		"WB2API_RUNTIME=native",
+		"WB2API_GATEWAY_DIR=" + layout.Root,
+		"WB2API_AUTHS_DIR=" + layout.Auths,
+		"WB2API_ADMIN_DIR=" + layout.PanelData,
+		"WB2API_CONFIG_PATH=" + layout.Config,
+		"WB2API_RUNTIME_DIR=" + layout.RuntimeDir,
+		"WB2A_LISTEN=" + net.JoinHostPort(host, port),
+	}
+	if panelEngine == "python" {
+		// 显式关掉 Go 引擎；WB2A_PYTHON 让网关用它去起 app.py。
+		env = append(env, "WB2API_PANEL_GO=0", "WB2A_PYTHON="+python)
+	} else {
+		env = append(env, "WB2API_PANEL_GO=1")
+	}
+	cmd.Env = append(os.Environ(), env...)
 	if err := cmd.Start(); err != nil {
 		fatal("启动网关失败: %v", err)
 	}
@@ -326,6 +344,25 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("网关已停止。")
+}
+
+// usePythonPanel 判断是否退回 Python 面板引擎。
+//
+// 默认 Go：桌面包里已经不带 CPython 依赖，绝大多数用户机器上没有 python3，
+// 而 Go 引擎与 Python 引擎在功能上等价（同一套前端、同一份凭据格式）。
+// 这个开关是给「Python 面板还在灰度」的部署留的退路。
+func usePythonPanel() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
+	case "0", "false", "no", "off":
+		return true
+	case "1", "true", "yes", "on":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2A_DESKTOP_PYTHON"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func gatewayBinaryName() string {
