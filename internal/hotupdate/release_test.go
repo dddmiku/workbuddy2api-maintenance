@@ -248,6 +248,23 @@ func TestAssetNameFollowsRuntimePlatform(t *testing.T) {
 	}
 }
 
+// TestBundleEnabledFollowsPlatform 宿主传给 Manager 的 Bundle 必须与平台一致。
+//
+// 真机事故（2026-10-13）：安卓上 layout.enabled 为真，Bundle 就被打开了，于是
+// 网关把下载到的**裸二进制**当 tar.gz 解包，直接报 `gzip: invalid header`。
+// 这个判据由宿主（cmd/server）给出，测试在这里锁住它的取值来源。
+func TestBundleEnabledFollowsPlatform(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		if !BundleSupported() {
+			t.Fatal("Linux 必须支持完整运行包")
+		}
+		return
+	}
+	if BundleSupported() {
+		t.Fatalf("%s 上不得启用完整运行包（会把裸二进制当 tar.gz 解包）", runtime.GOOS)
+	}
+}
+
 // TestBundleOnlyOnLinux 完整运行包只有 Linux 部署有。
 //
 // 桌面与安卓用的是单文件资产：桌面版的数据与程序在同一个文件夹里、由启动器管；

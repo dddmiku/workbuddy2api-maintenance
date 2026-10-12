@@ -322,6 +322,10 @@ func bundleSupported() bool {
 	return runtime.GOOS == "linux"
 }
 
+// BundleSupported 是 bundleSupported 的导出形式，供宿主（cmd/server）决定
+// 是否启用完整运行包模式。
+func BundleSupported() bool { return bundleSupported() }
+
 func validRepo(repo string) bool {
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 {

@@ -354,7 +354,12 @@ func main() {
 	// 新实例已经在同一套接字上 accept，本进程只负责把在途请求跑完。
 	handoverDone := make(chan string, 1)
 	updateManager := hotupdate.NewManager(hotupdate.Options{
-		Bundle:        layout.enabled,
+		// Bundle 只对 Linux 部署成立：它的运行目录就是完整运行包解压出来的那个目录，
+		// 「解压到目录再整体替换」才说得通。桌面与安卓的数据目录不是运行目录
+		// （桌面版程序与数据同处一个文件夹但由启动器管；安卓的程序在 APK 的
+		// nativeLibraryDir 里），拿裸二进制当 tar.gz 解包会直接报 gzip 头非法
+		// ——2026-10-13 真机实测踩到。
+		Bundle:        layout.enabled && hotupdate.BundleSupported(),
 		Enabled:       cfg.Update.Enabled,
 		Repo:          cfg.Update.Repo,
 		Token:         cfg.Update.Token,
