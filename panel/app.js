@@ -831,6 +831,13 @@ function renderAccounts(){
         ? '<button class="btn sm" data-revive="' + esc(a.uid) + '" title="' +
           esc(p.disabledReason || '清除网关侧的停用标记') + '">复活</button>'
         : '') +
+      // 补发邀请奖励：只有 Trae 域有 code fission 活动（WorkBuddy 两域没有这套端点）。
+      // 放在账号行上而不是任务页：邀请关系是账号级事实，补发也是按 uid 一次性动作，
+      // 不是可排程的周期任务。
+      (a.realm === 'trae'
+        ? '<button class="btn sm" data-fission="' + esc(a.uid) + '" title="' +
+          '补发邀请奖励（服务端代客户端登录时的那次发奖调用）">补发邀请</button>'
+        : '') +
       '<button class="btn sm" data-toggle="' + esc(a.uid) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' +
       (a.disabled ? '启用' : '停用') + '</button>' +
       '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
@@ -1206,6 +1213,8 @@ $('#schedAccount').addEventListener('click', function(e){
 $('#acctRows').addEventListener('click', function(e){
   var rv = e.target.closest('[data-revive]');
   if (rv) return actRevive(rv.getAttribute('data-revive'));
+  var fs = e.target.closest('[data-fission]');
+  if (fs) return actFission(fs.getAttribute('data-fission'));
   var t = e.target.closest('[data-toggle]');
   if (t) return actToggle(t.getAttribute('data-toggle'), t.getAttribute('data-disabled') === '0');
   var d = e.target.closest('[data-del]');
@@ -1395,6 +1404,22 @@ function actRevive(uid){
         toast(r.message, r.ok ? 'ok' : 'err');
         if (r.ok) await loadAll();
       }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+function actFission(uid){
+  ask('补发邀请奖励',
+    '将代替 TRAE 桌面端，向该账号补发一次「邀请新用户」奖励（500 积分）。\n\n' +
+    '为什么需要它：邀请记录停在「邀请中」不是服务端没发，而是发奖动作在桌面端本地——' +
+    '被邀请人没登过客户端，记录就永远挂着。\n\n' +
+    '重复执行是安全的：上游对已发放的账号返回「已发放」，不会重复加积分。',
+    '补发', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/fission', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('补发失败：' + (err && err.message || err), 'err'); }
       finally{ busy(false); }
     });
 }

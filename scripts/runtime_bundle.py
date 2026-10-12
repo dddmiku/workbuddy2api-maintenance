@@ -11,7 +11,8 @@ from pathlib import Path
 import tarfile
 
 FILES = ('wb2api', 'login', 'credit', 'signin_bin', 'trial_bin', 'activity_bin',
-         'login.sh', 'credit.sh', 'signin.sh', 'trial.sh',
+         'fission_bin',
+         'login.sh', 'credit.sh', 'signin.sh', 'trial.sh', 'fission.sh',
          'scripts/global_region.py', 'scripts/task_common.py', 'scripts/task_runner.py',
          'scripts/school_open_day_2026.py', 'scripts/growth_center.py')
 

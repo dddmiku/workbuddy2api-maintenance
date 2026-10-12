@@ -20,7 +20,8 @@ import (
 
 var runtimeFiles = map[string]os.FileMode{
 	"wb2api": 0755, "login": 0755, "credit": 0755, "signin_bin": 0755, "trial_bin": 0755, "activity_bin": 0755,
-	"login.sh": 0755, "credit.sh": 0755, "signin.sh": 0755, "trial.sh": 0755,
+	"fission_bin": 0755,
+	"login.sh":    0755, "credit.sh": 0755, "signin.sh": 0755, "trial.sh": 0755, "fission.sh": 0755,
 	"scripts/global_region.py": 0644, "scripts/task_common.py": 0644, "scripts/task_runner.py": 0644,
 	"scripts/school_open_day_2026.py": 0644, "scripts/growth_center.py": 0644,
 }

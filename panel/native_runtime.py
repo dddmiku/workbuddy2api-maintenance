@@ -13,6 +13,31 @@ import subprocess
 import key_management
 
 
+def _fission_args_ok(args):
+    """校验 ./fission_bin 的参数：只允许 -uid <数字> 与 -gen <非负整数>。
+
+    原生模式没有容器边界，白名单必须保持窄：任何能拼出任意路径或注入旗标的
+    参数都要拒掉。`-auths` 不接受（由 native_runtime 自己注入 WB2A_AUTH_DIR）。
+    """
+    index = 0
+    while index < len(args):
+        flag = args[index]
+        if flag in ('-uid', '-gen'):
+            if index + 1 >= len(args):
+                return False
+            value = args[index + 1]
+            if flag == '-uid':
+                if not re.fullmatch(r'[0-9]{1,32}', value):
+                    return False
+            else:
+                if not re.fullmatch(r'[0-9]{1,4}', value):
+                    return False
+            index += 2
+            continue
+        return False
+    return True
+
+
 def run(args, timeout=60, check=False):
     args = list(args)
     container = os.environ.get('WB2API_CONTAINER', 'workbuddy2api')
@@ -70,6 +95,10 @@ def run(args, timeout=60, check=False):
             allowed = len(command) in (3, 4) and command[1] in ('--realm=cn', '--realm=global') and command[-1] in ('url', 'poll')
             if len(command) == 4:
                 allowed = allowed and bool(re.fullmatch(r'--session=[a-f0-9]{32}', command[2]))
+        # 邀请奖励补发：只允许 -uid（纯数字）与 -gen（非负整数）两个旗标。
+        # 面板只按 uid 补发，不暴露设备号代数（默认 gen=0 已是账号默认设备）。
+        if command and command[0] == './fission_bin':
+            allowed = _fission_args_ok(command[1:])
         if not allowed:
             return 1, '', '不支持此运行操作'
         executable = Path(os.environ['WB2API_RUNTIME_DIR']) / command[0][2:]

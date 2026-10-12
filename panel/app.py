@@ -1107,6 +1107,25 @@ def _expiring_soon_env():
     return value if re.fullmatch(r"\d+(\.\d+)?(ns|us|µs|ms|s|m|h)", value) else ""
 
 
+def fission_message(row):
+    """把补发结果翻译成一句给运维看的中文。
+
+    上游的业务码在 CLI 里已经翻成 result 三态（granted/already/failed），
+    这里只负责补上「发生了什么」和「下一步」。失败时保留上游原文——排障要看它。
+    """
+    result = row.get("result")
+    before, after = row.get("before"), row.get("after")
+    if result == "granted":
+        delta = row.get("delta") or 0
+        if delta:
+            return "已发放邀请奖励 %.0f → %.0f（+%.0f）" % (before, after, delta)
+        # 上游说 success 但积分没动：通常是奖励已入账、本次是重复触发。
+        return "上游返回成功，但积分未变化（当前 %.0f）；可能此前已发放" % (after or before or 0)
+    if result == "already":
+        return "此前已发放过，无需重复补发（当前 %.0f）" % (before or 0)
+    return "补发失败：%s" % (row.get("error") or "上游未返回结果")
+
+
 def _query_credits():
     """只执行及校验查询；缓存统一由刷新协调器提交，错误不覆盖成功数据。"""
     if not container_running():
@@ -1537,6 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.account_toggle(body))
             if path == "/api/account/revive":
                 return self._json(200, self.account_revive(body))
+            if path == "/api/account/fission":
+                return self._json(200, self.account_fission(body))
             if path == "/api/account/delete":
                 return self._json(200, self.account_delete(body))
             if path == "/api/task/run":
@@ -1570,6 +1591,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/trae/login/finish": {"callback"},
             "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
             "/api/account/revive": {"uid"},
+            "/api/account/fission": {"uid"},
             "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
             "/api/service/restart": set(), "/api/credit": set(),
             "/api/models/refresh": set(),
@@ -2143,6 +2165,37 @@ class Handler(BaseHTTPRequestHandler):
         if not payload.get("was_disabled"):
             return {"ok": True, "message": "该账号未被停用，无需复活"}
         return {"ok": True, "message": "已复活 %s" % uid[:8]}
+
+    def account_fission(self, body):
+        """补发 Trae 邀请奖励（面板「补发邀请奖励」按钮）。
+
+        背景：面板上的邀请记录停在「邀请中」，不是服务端没发，而是**发奖动作在
+        TRAE 桌面端本地**——客户端登录时自己调一次 code_fission/grant。被邀请人
+        没登过桌面端，记录就永远挂着。这里把那一次调用搬到服务端补发。
+
+        走 ./fission_bin（与 ./credit 同一条受限运行通道），只传 -uid，设备号用
+        账号默认代数；重复调用是幂等的（上游返回 1028「已发放」）。
+        """
+        uid = (body.get("uid") or "").strip()
+        if not UID_RE.fullmatch(uid):
+            return {"ok": False, "message": "账号标识不正确"}
+        if not container_running():
+            return {"ok": False, "message": "容器未运行"}
+        rc, out, err = docker(["exec", CONTAINER, "./fission_bin", "-uid", uid],
+                              timeout=120)
+        if rc != 0 and not out.strip():
+            return {"ok": False, "message": err or "补发执行失败"}
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return {"ok": False, "message": "补发输出无法解析", "raw": out[:400]}
+        rows = data.get("accounts") or []
+        if not rows:
+            return {"ok": False, "message": "没有匹配的 Trae 账号（该 uid 可能不是 Trae 域）"}
+        row = rows[0]
+        return {"ok": row.get("result") != "failed",
+                "result": row.get("result"),
+                "message": fission_message(row)}
 
     def task_run(self, body):
         key = (body.get("key") or "").strip()

@@ -56,7 +56,7 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 		return unifiedLayout{}, err
 	}
 	runtimeDir := filepath.Dir(binary)
-	for _, name := range []string{"login", "credit", "signin_bin", "trial_bin", "activity_bin", "scripts/task_common.py"} {
+	for _, name := range []string{"login", "credit", "signin_bin", "trial_bin", "activity_bin", "fission_bin", "scripts/task_common.py"} {
 		if _, err := os.Stat(filepath.Join(runtimeDir, name)); err != nil {
 			return unifiedLayout{}, fmt.Errorf("incomplete runtime: %s is unavailable", name)
 		}

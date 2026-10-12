@@ -28,7 +28,10 @@ import (
 )
 
 // Trae API host（签到与积分都在这台，不是模型网关）。
-const TraeAPIHost = "https://api.trae.cn"
+//
+// 是 var 而非 const：测试用 httptest 临时改写它，覆盖请求组装与响应判定的
+// 完整链路（改回原值由测试的 cleanup 负责）。生产代码从不写它。
+var TraeAPIHost = "https://api.trae.cn"
 
 const (
 	checkinStatusPath = "/trae/api/v2/ug/checkin_credits/status"

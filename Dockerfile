@@ -24,7 +24,8 @@ RUN RELEASE_KEY="$(cat release-signing.pub 2>/dev/null || true)" \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/fission_bin ./cmd/fission
 
 FROM alpine:3.23
 ARG VERSION=dev
@@ -43,7 +44,8 @@ COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
 COPY --from=build /out/trial_bin /app/trial_bin
 COPY --from=build /out/activity_bin /app/activity_bin
-COPY login.sh signin.sh credit.sh trial.sh /app/
+COPY --from=build /out/fission_bin /app/fission_bin
+COPY login.sh signin.sh credit.sh trial.sh fission.sh /app/
 # PID 1 监督脚本：热更新交接后保持容器存活（见 docker-entrypoint.sh 头注释）。
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 # 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
