@@ -538,6 +538,10 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   background:var(--sunken);white-space:nowrap}
 .key-mask{white-space:nowrap;font-size:12.5px}.key-date{font-size:12px;color:var(--ink-2);white-space:nowrap}
 .key-tokens{font-size:12.5px;white-space:nowrap}.key-expiry{white-space:nowrap;font-size:12.5px}
+/* 「总用量与积分」列：token 为主、积分作副行。竖排而不是并排——并排会把这一列
+   撑宽，而密钥表的横向余量本来就紧（见 test_layout 的列宽约束）。 */
+.key-usage{display:flex;flex-direction:column;gap:2px;align-items:flex-start}
+.key-usage .key-credit{white-space:nowrap}
 .key-expiry-expired{color:var(--err);font-weight:500}
 .key-dialog .fld select{width:100%;height:36px;border:1px solid var(--line-2);border-radius:var(--r2);
   padding:0 11px;background:var(--surface);color:var(--ink)}
@@ -1075,7 +1079,7 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
           </div>
           <div class="tblwrap">
             <table class="tbl key-table" data-sticky-head="keys">
-              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量</th><th>限流与占用</th><th>状态与保护</th><th>有效期与创建</th><th class="r">操作</th></tr></thead>
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量与积分</th><th>限流与占用</th><th>状态与保护</th><th>有效期与创建</th><th class="r">操作</th></tr></thead>
               <tbody id="keyRows"><tr><td colspan="8"><div class="empty">正在加载密钥…</div></td></tr></tbody>
             </table>
           </div>
@@ -1163,9 +1167,10 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
               <thead><tr>
                 <th>密钥</th><th class="r">请求</th><th class="r">输入 tokens</th>
                 <th class="r">缓存命中</th><th class="r">输出 tokens</th><th class="r">合计 tokens</th>
+                <th class="r">已用积分</th>
                 <th>最近使用</th><th class="r">模型拆分</th>
               </tr></thead>
-              <tbody id="usageRows"><tr><td colspan="8"><div class="empty">正在加载用量…</div></td></tr></tbody>
+              <tbody id="usageRows"><tr><td colspan="9"><div class="empty">正在加载用量…</div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -3679,6 +3684,23 @@ function selectedKeyLimits(){
   return {value:policy.requests_per_minute || policy.max_concurrent ? policy : null};
 }
 
+// keyCreditCell 渲染「已用积分」单元格。
+//
+// 三态要分清，否则会把「没有观测」误报成「用了 0」：
+//   - credit 为数字 → 显示（0 就是 0，说明确实没扣积分）；
+//   - credit 为 null/undefined 但账本可用 → 「—」，表示该密钥的上游没回传 credit
+//     （缺失≠0，见网关 usage.Totals.Credit 的注释）；
+//   - 账本不可用（usage_available=false）→ 「—」并说明原因。
+function keyCreditCell(key){
+  var c = key.credit;
+  if (typeof c === 'number' && Number.isFinite(c)) {
+    // 积分是小数（实测累计 16721.15），小于 1 时保留两位以免显示成 0。
+    return esc(c === 0 ? '0' : (c < 1 ? c.toFixed(2) : (c < 1000 ? c.toFixed(1) : Math.round(c).toLocaleString('en-US'))));
+  }
+  var why = key.usage_available === false ? '累计用量暂不可读' : '上游未回传该密钥的积分';
+  return '<span class="sub" title="' + esc(why) + '">—</span>';
+}
+
 function renderKeys(){
   var keys = KS.keys || [];
   $('#keyError').textContent = KS.error;
@@ -3707,7 +3729,12 @@ function renderKeys(){
       '<td data-l="模型绑定">' + (models.length
         ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
         : '<span class="sub">不限制</span>') + '</td>' +
-      '<td data-l="总用量" class="mono key-tokens">' + (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') + '</td>' +
+      // token 与积分合成一列：积分是本列的自然补充（「用了多少、扣了多少」），
+      // 单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
+      // 「有效期」与「创建时间」合成了一列，这里沿用同一取舍。
+      '<td data-l="总用量与积分" class="key-tokens"><div class="key-usage"><b class="mono">' +
+        (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') +
+        '</b><span class="sub mono key-credit">' + keyCreditCell(key) + ' 积分</span></div></td>' +
       '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
       '<td data-l="状态与保护" class="key-state"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span>' +
       '<div class="key-state-toggles">' +
@@ -4109,6 +4136,24 @@ function usageIcon(name){
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (paths[name] || paths.sum) + '</svg>';
 }
 
+// usageCreditCell 渲染用量表的「已用积分」。
+//
+// credit 缺失（上游没回传）与真 0 要分开：缺失显示「—」并给出悬停说明，
+// 否则运维会以为该密钥确实没扣积分。
+function usageCreditText(t){
+  var c = (t || {}).credit;
+  if (typeof c !== 'number' || !Number.isFinite(c)) return '—';
+  if (c === 0) return '0';
+  return c < 1 ? c.toFixed(2) : (c < 1000 ? c.toFixed(1) : Math.round(c).toLocaleString('en-US'));
+}
+function usageCreditCell(t){
+  var c = (t || {}).credit;
+  if (typeof c !== 'number' || !Number.isFinite(c)) {
+    return '<span class="sub" title="上游未回传积分">—</span>';
+  }
+  return esc(usageCreditText(t));
+}
+
 function renderUsageRows(keys, totals){
   var rows = (keys || []).map(function(item){ return {item:item, totals:usageTotalsFor(item)}; });
   if (filtered()){
@@ -4116,7 +4161,7 @@ function renderUsageRows(keys, totals){
     rows.sort(function(a, b){ return (Number(b.totals.total_tokens) || 0) - (Number(a.totals.total_tokens) || 0); });
   }
   if (!rows.length){
-    $('#usageRows').innerHTML = '<tr><td colspan="8" data-l=""><div class="empty">' +
+    $('#usageRows').innerHTML = '<tr><td colspan="9" data-l=""><div class="empty">' +
       (filtered() ? '这个时间范围没有用量记录，换个日期或选「全部」看看。' : '还没有用量记录，客户端发一次请求后这里就有数据。') +
       '</div></td></tr>';
     return;
@@ -4128,7 +4173,11 @@ function renderUsageRows(keys, totals){
     var share = max > 0 ? Math.round((Number(t.total_tokens) || 0) / max * 100) : 0;
     var open = !!US.open[item.key_id];
     var models = usageModelsFor(item).map(function(model){
-      return '<li><span>' + esc(model.model) + '</span><span>' + esc(compactTokens(model.totals.total_tokens)) + '</span></li>';
+      // 每行同时给 token 与积分：按模型看「贵不贵」比看 token 量更直接
+      // （实测同一密钥下不同模型的倍率差几十倍）。
+      return '<li><span>' + esc(model.model) + '</span><span>' +
+        esc(compactTokens(model.totals.total_tokens)) + ' · ' +
+        usageCreditText(model.totals) + '</span></li>';
     }).join('');
     var name = item.name ? esc(item.name) : '未命名密钥';
     var mask = item.masked_key ? '<code>' + esc(item.masked_key) + '</code>' : '';
@@ -4140,12 +4189,13 @@ function renderUsageRows(keys, totals){
         '<td class="num" data-l="缓存命中">' + esc(exactTokens(t.cached_tokens)) + '</td>' +
         '<td class="num" data-l="输出">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
       '<td class="num" data-l="合计">' + esc(exactTokens(t.total_tokens)) + '</td>' +
+      '<td class="num" data-l="已用积分">' + usageCreditCell(t) + '</td>' +
       '<td data-l="最近使用">' + esc(usageTime(usageLastUsedFor(item))) + '</td>' +
       '<td class="r" data-l="">' + (models
         ? '<button class="btn sm" data-usage-toggle="' + esc(item.key_id) + '">' + (open ? '收起' : '按模型') + '</button>'
         : '<span class="sub">—</span>') + '</td>' +
       '</tr>' + (open && models
-        ? '<tr><td colspan="8"><ul class="usage-models">' + models + '</ul></td></tr>'
+        ? '<tr><td colspan="9"><ul class="usage-models">' + models + '</ul></td></tr>'
         : '');
   }).join('');
 }

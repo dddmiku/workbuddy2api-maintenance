@@ -190,6 +190,13 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertIn("有效期与创建", body)
         self.assertNotIn("<th>有效期</th>", body)
         self.assertNotIn("<th>创建时间</th>", body)
+        # 同理：积分不单开一列，与「总用量」合成「总用量与积分」——加第 9 列会
+        # 让表宽回到 1440 视口放不下的状态（本用例开头记的就是这个教训）。
+        # 只看**密钥表**那一段：用量统计页是另一张表，它有自己的「已用积分」列，
+        # 不受这里的列宽约束。
+        key_table = body[body.index("key-table"):body.index("</table>", body.index("key-table"))]
+        self.assertIn("总用量与积分", key_table)
+        self.assertNotIn("已用积分", key_table, "密钥表不得为积分单开一列")
         # 渲染侧同样只输出一个时间戳单元格。
         with open(os.path.join(HERE, "keys.js"), "r", encoding="utf-8") as fh:
             js = fh.read()
@@ -197,10 +204,17 @@ class TableBorderCollapseTests(unittest.TestCase):
         self.assertNotIn('data-l="创建时间"', js)
         # colspan 必须与表头列数一致——首屏占位行（body.html）与空态行（keys.js）
         # 都要改，只改一处会让占位行横跨错列数（2026-10-09 漏掉了首屏那处）。
-        self.assertNotIn('colspan="9"', body, "首屏占位行的 colspan 仍是 9")
-        self.assertNotIn('colspan="9"', js, "空态行的 colspan 仍是 9")
-        self.assertIn('colspan="8"', body)
-        self.assertIn('colspan="8"', js)
+        #
+        # 只看**密钥表**：用量统计页在 2026-10-12 加了「已用积分」列，它现在是 9 列，
+        # 那是有意的（那张表没有密钥表的列宽约束）。这里锁的是密钥表仍是 8 列。
+        self.assertNotIn('colspan="9"', key_table, "密钥表首屏占位行的 colspan 仍是 9")
+        self.assertIn('colspan="8"', key_table)
+        # keys.js 里的空态行：取出密钥表那段（到 renderKeys 结束）再断言。
+        keys_js = js[js.index("function renderKeys()"):]
+        end = keys_js.index("$('#keyRows').innerHTML")
+        keys_js = keys_js[:end + 600]
+        self.assertNotIn('colspan="9"', keys_js, "密钥表空态行的 colspan 仍是 9")
+        self.assertIn('colspan="8"', keys_js)
 
 
     def test_credits_group_rows_keep_table_cell_display(self):

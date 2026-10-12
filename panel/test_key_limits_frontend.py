@@ -75,7 +75,10 @@ var key={id:'fixture',name:'fixture',enabled:true,total_tokens:null};KS.keys=[ke
 key.total_tokens=0;renderKeys();return {unknown,zero:$('#keyRows').innerHTML};
 """)
         self.assertIn('title="累计用量暂不可读">—', result["unknown"])
-        self.assertIn('class="mono key-tokens">0</td>', result["zero"])
+        # 真 0 必须渲染成 0（与「不可读」的「—」区分开）。2026-10-12 起 token 与
+        # 积分合成一列，数字包在 <b> 里，断言跟着改（语义不变）。
+        self.assertIn('class="mono">0</b>', result["zero"])
+        self.assertNotIn('title="累计用量暂不可读"', result["zero"])
 
     def test_snapshot_error_does_not_hide_keys_or_claim_zero_active(self):
         result = self.evaluate("""

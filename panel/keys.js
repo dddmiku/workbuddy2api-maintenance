@@ -295,6 +295,23 @@ function selectedKeyLimits(){
   return {value:policy.requests_per_minute || policy.max_concurrent ? policy : null};
 }
 
+// keyCreditCell 渲染「已用积分」单元格。
+//
+// 三态要分清，否则会把「没有观测」误报成「用了 0」：
+//   - credit 为数字 → 显示（0 就是 0，说明确实没扣积分）；
+//   - credit 为 null/undefined 但账本可用 → 「—」，表示该密钥的上游没回传 credit
+//     （缺失≠0，见网关 usage.Totals.Credit 的注释）；
+//   - 账本不可用（usage_available=false）→ 「—」并说明原因。
+function keyCreditCell(key){
+  var c = key.credit;
+  if (typeof c === 'number' && Number.isFinite(c)) {
+    // 积分是小数（实测累计 16721.15），小于 1 时保留两位以免显示成 0。
+    return esc(c === 0 ? '0' : (c < 1 ? c.toFixed(2) : (c < 1000 ? c.toFixed(1) : Math.round(c).toLocaleString('en-US'))));
+  }
+  var why = key.usage_available === false ? '累计用量暂不可读' : '上游未回传该密钥的积分';
+  return '<span class="sub" title="' + esc(why) + '">—</span>';
+}
+
 function renderKeys(){
   var keys = KS.keys || [];
   $('#keyError').textContent = KS.error;
@@ -323,7 +340,12 @@ function renderKeys(){
       '<td data-l="模型绑定">' + (models.length
         ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
         : '<span class="sub">不限制</span>') + '</td>' +
-      '<td data-l="总用量" class="mono key-tokens">' + (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') + '</td>' +
+      // token 与积分合成一列：积分是本列的自然补充（「用了多少、扣了多少」），
+      // 单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
+      // 「有效期」与「创建时间」合成了一列，这里沿用同一取舍。
+      '<td data-l="总用量与积分" class="key-tokens"><div class="key-usage"><b class="mono">' +
+        (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') +
+        '</b><span class="sub mono key-credit">' + keyCreditCell(key) + ' 积分</span></div></td>' +
       '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
       '<td data-l="状态与保护" class="key-state"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span>' +
       '<div class="key-state-toggles">' +

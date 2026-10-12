@@ -85,6 +85,24 @@ function usageIcon(name){
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (paths[name] || paths.sum) + '</svg>';
 }
 
+// usageCreditCell 渲染用量表的「已用积分」。
+//
+// credit 缺失（上游没回传）与真 0 要分开：缺失显示「—」并给出悬停说明，
+// 否则运维会以为该密钥确实没扣积分。
+function usageCreditText(t){
+  var c = (t || {}).credit;
+  if (typeof c !== 'number' || !Number.isFinite(c)) return '—';
+  if (c === 0) return '0';
+  return c < 1 ? c.toFixed(2) : (c < 1000 ? c.toFixed(1) : Math.round(c).toLocaleString('en-US'));
+}
+function usageCreditCell(t){
+  var c = (t || {}).credit;
+  if (typeof c !== 'number' || !Number.isFinite(c)) {
+    return '<span class="sub" title="上游未回传积分">—</span>';
+  }
+  return esc(usageCreditText(t));
+}
+
 function renderUsageRows(keys, totals){
   var rows = (keys || []).map(function(item){ return {item:item, totals:usageTotalsFor(item)}; });
   if (filtered()){
@@ -92,7 +110,7 @@ function renderUsageRows(keys, totals){
     rows.sort(function(a, b){ return (Number(b.totals.total_tokens) || 0) - (Number(a.totals.total_tokens) || 0); });
   }
   if (!rows.length){
-    $('#usageRows').innerHTML = '<tr><td colspan="8" data-l=""><div class="empty">' +
+    $('#usageRows').innerHTML = '<tr><td colspan="9" data-l=""><div class="empty">' +
       (filtered() ? '这个时间范围没有用量记录，换个日期或选「全部」看看。' : '还没有用量记录，客户端发一次请求后这里就有数据。') +
       '</div></td></tr>';
     return;
@@ -104,7 +122,11 @@ function renderUsageRows(keys, totals){
     var share = max > 0 ? Math.round((Number(t.total_tokens) || 0) / max * 100) : 0;
     var open = !!US.open[item.key_id];
     var models = usageModelsFor(item).map(function(model){
-      return '<li><span>' + esc(model.model) + '</span><span>' + esc(compactTokens(model.totals.total_tokens)) + '</span></li>';
+      // 每行同时给 token 与积分：按模型看「贵不贵」比看 token 量更直接
+      // （实测同一密钥下不同模型的倍率差几十倍）。
+      return '<li><span>' + esc(model.model) + '</span><span>' +
+        esc(compactTokens(model.totals.total_tokens)) + ' · ' +
+        usageCreditText(model.totals) + '</span></li>';
     }).join('');
     var name = item.name ? esc(item.name) : '未命名密钥';
     var mask = item.masked_key ? '<code>' + esc(item.masked_key) + '</code>' : '';
@@ -116,12 +138,13 @@ function renderUsageRows(keys, totals){
         '<td class="num" data-l="缓存命中">' + esc(exactTokens(t.cached_tokens)) + '</td>' +
         '<td class="num" data-l="输出">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
       '<td class="num" data-l="合计">' + esc(exactTokens(t.total_tokens)) + '</td>' +
+      '<td class="num" data-l="已用积分">' + usageCreditCell(t) + '</td>' +
       '<td data-l="最近使用">' + esc(usageTime(usageLastUsedFor(item))) + '</td>' +
       '<td class="r" data-l="">' + (models
         ? '<button class="btn sm" data-usage-toggle="' + esc(item.key_id) + '">' + (open ? '收起' : '按模型') + '</button>'
         : '<span class="sub">—</span>') + '</td>' +
       '</tr>' + (open && models
-        ? '<tr><td colspan="8"><ul class="usage-models">' + models + '</ul></td></tr>'
+        ? '<tr><td colspan="9"><ul class="usage-models">' + models + '</ul></td></tr>'
         : '');
   }).join('');
 }

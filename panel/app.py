@@ -1614,17 +1614,25 @@ class Handler(BaseHTTPRequestHandler):
         code, result = key_management.request(socket, "GET", "/keys")
         if code != 200 or not isinstance(result, dict) or not isinstance(result.get("keys"), list):
             return self._json(code, result)
-        totals = {}
+        # 一次遍历同时取 token 与积分：两者同源（同一份 usage 账本），分两次取会
+        # 让两列在并发写入下对不上。
+        totals, credits = {}, {}
         usage_code, usage = key_management.request(socket, "GET", "/usage")
         usage_available = (usage_code == 200 and isinstance(usage, dict) and usage.get("ok") is True
                            and isinstance(usage.get("keys"), list))
         if usage_available:
             for item in usage.get("keys") or []:
                 if isinstance(item, dict) and isinstance(item.get("key_id"), str):
-                    totals[item["key_id"]] = (item.get("totals") or {}).get("total_tokens") or 0
+                    t = item.get("totals") or {}
+                    totals[item["key_id"]] = t.get("total_tokens") or 0
+                    # credit 只在上游 usage 显式带 credit 时累计（缺失≠0），所以
+                    # 这里原样透传，让面板区分「0 积分」与「没有该观测」。
+                    credits[item["key_id"]] = t.get("credit")
         for entry in result["keys"]:
             if isinstance(entry, dict):
-                entry["total_tokens"] = totals.get(entry.get("id"), 0) if usage_available else None
+                kid = entry.get("id")
+                entry["total_tokens"] = totals.get(kid, 0) if usage_available else None
+                entry["credit"] = credits.get(kid) if usage_available else None
         result["usage_available"] = usage_available
         return self._json(200, result)
 

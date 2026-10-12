@@ -1522,3 +1522,107 @@ return {taskRealmAfter:taskRealmAfter, acct:S.realm, credit:S.creditRealm};
         self.assertEqual(result["taskRealmAfter"], "", "任务页筛选不该被其它页带动")
         self.assertEqual(result["acct"], "cn", "账号页筛选不该被任务页改动")
         self.assertEqual(result["credit"], "global", "积分页筛选不该被任务页改动")
+
+
+class CreditUsageDisplayTest(FrontendHarness, unittest.TestCase):
+    """用量统计页与密钥管理页都要显示「用了多少积分」。
+
+    2026-10-12 用户要求。后端 usage 账本本来就按密钥累计 credit（实测全站
+    16721.15），只是面板没展示——这次只是把它透出来，没有新增采集。
+
+    三态必须分清，否则会把「没有观测」误报成「用了 0」：
+      - 数字（含 0）→ 显示；
+      - null（上游没回传 credit，缺失≠0）→ 「—」+ 悬停说明；
+      - 账本不可用 → 「—」+ 说明原因。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.keys_js = (PANEL / "keys.js").read_text(encoding="utf-8")
+        self.usage_js = (PANEL / "usage.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_usage_page_has_credit_column(self):
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("usageRows")
+                head = body[:start]
+                head = head[head.rindex("<thead>"):]
+                self.assertIn("已用积分", head, "用量表应有「已用积分」列")
+
+    def test_keys_page_shows_credit_in_usage_column(self):
+        """密钥表：积分并入「总用量」列，不单开一列。
+
+        单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
+        「有效期」与「创建时间」合成了一列（见 test_layout 的列宽约束）。
+        """
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                key_table = body[body.index("key-table"):body.index("</table>", body.index("key-table"))]
+                self.assertIn("总用量与积分", key_table)
+                self.assertNotIn("已用积分", key_table, "密钥表不得为积分单开一列")
+
+    def test_credit_three_states_are_distinguished(self):
+        """数字 / null / 账本不可用 三态渲染不同。"""
+        result = self.run_frontend("""
+return {
+  num: usageCreditText({credit: 1234.56}),
+  zero: usageCreditText({credit: 0}),
+  small: usageCreditText({credit: 0.02}),
+  missing: usageCreditText({}),
+  nullv: usageCreditText({credit: null})
+};
+""")
+        self.assertEqual(result["num"], "1,235")
+        self.assertEqual(result["zero"], "0", "真 0 要显示 0，不能与「没有观测」混同")
+        self.assertEqual(result["small"], "0.02")
+        self.assertEqual(result["missing"], "—")
+        self.assertEqual(result["nullv"], "—")
+
+    def test_keys_credit_cell_explains_missing(self):
+        """密钥页的「—」要带悬停说明，区分「上游没回传」与「账本读不到」。"""
+        result = self.run_frontend("""
+return {
+  noObs: keyCreditCell({credit: null, usage_available: true}),
+  noLedger: keyCreditCell({credit: null, usage_available: false}),
+  has: keyCreditCell({credit: 1234.56, usage_available: true}),
+  zero: keyCreditCell({credit: 0, usage_available: true})
+};
+""", extra_sources=("keys.js",))
+        self.assertIn("上游未回传", result["noObs"])
+        self.assertIn("累计用量暂不可读", result["noLedger"])
+        self.assertIn("1,235", result["has"])
+        self.assertEqual(result["zero"], "0", "真 0 直接渲染 0，不带「—」说明")
+
+    def test_model_breakdown_includes_credit(self):
+        """「按模型」拆分行要同时给 token 与积分——按模型看贵不贵比看 token 直接。"""
+        result = self.run_frontend("""
+renderUsageRows([
+ {key_id:'k1',name:'a',masked_key:'x',models:[
+   {model:'cn:glm-5.3',totals:{total_tokens:1000,credit:12.5}},
+   {model:'global:deepseek-v4.1-flash',totals:{total_tokens:2000,credit:0}}],
+  totals:{requests:2,total_tokens:3000,credit:12.5}}
+], {});
+US.open={k1:true};
+renderUsageRows([
+ {key_id:'k1',name:'a',masked_key:'x',models:[
+   {model:'cn:glm-5.3',totals:{total_tokens:1000,credit:12.5}},
+   {model:'global:deepseek-v4.1-flash',totals:{total_tokens:2000,credit:0}}],
+  totals:{requests:2,total_tokens:3000,credit:12.5}}
+], {});
+return $('#usageRows').innerHTML;
+""")
+        self.assertIn("cn:glm-5.3", result)
+        self.assertIn("12.5", result, "按模型应带该模型的积分")
+        self.assertIn("0", result, "免费模型显示 0")
+
+    def test_panel_api_passes_credit_through(self):
+        """面板的密钥列表接口必须把 credit 透出来（与 total_tokens 同源一次取）。"""
+        src = (PANEL / "app.py").read_text(encoding="utf-8")
+        start = src.index("def keys_with_usage")
+        block = src[start:src.index("\n    def ", start + 10)]
+        self.assertIn('entry["credit"]', block)
+        self.assertIn('entry["total_tokens"]', block)
+        # 同一次遍历里取两个字段：分两次取会在并发写入下对不上。
+        self.assertIn("totals, credits = {}, {}", block)
