@@ -42,9 +42,12 @@ type Runtime struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	transport   *http.Transport
-	proxy       *httputil.ReverseProxy
-	mu          sync.Mutex
-	cmd         *exec.Cmd
+	// env 是面板子进程的通道相关环境变量（Linux: unix socket 路径；
+	// Windows: 回环 TCP 地址）。由 channel() 按平台给出。
+	env   map[string]string
+	proxy *httputil.ReverseProxy
+	mu    sync.Mutex
+	cmd   *exec.Cmd
 }
 
 func Start(opts Options) (*Runtime, error) {
@@ -78,9 +81,10 @@ func Start(opts Options) (*Runtime, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runtime{dir: dir, socket: filepath.Join(dir, "panel.sock"), opts: opts, cancel: cancel, done: make(chan struct{})}
-	r.transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", r.socket)
-	}, MaxIdleConns: 16, MaxIdleConnsPerHost: 16, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 4 * time.Minute}
+	// 面板通信通道按平台选择：Linux/macOS 走 Unix socket，Windows 走回环 TCP
+	// （Python 标准库在 Windows 上没有 UnixStreamServer，见 panel/app.py main()）。
+	// 2026-10-13 桌面打包实测：不分支会在 Windows 上直接崩在面板启动处。
+	r.transport, r.env = r.channel()
 	r.proxy = r.newProxy()
 	ready := make(chan error, 1)
 	go r.supervise(ctx, ready)
@@ -103,6 +107,10 @@ func (r *Runtime) command() *exec.Cmd {
 		"WB2API_RUNTIME_DIR": r.opts.RuntimeDir, "WB2API_PANEL_SOCKET": r.socket, "WB2API_LOG_PATH": r.opts.LogPath,
 		"WB2API_TRUSTED_PROXIES": "127.0.0.1/32,::1/128", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
 		"WB2API_ADMIN_PREFIX": adminPrefixOr(r.opts.AdminPrefix),
+	}
+	// 通道相关变量由 channel() 按平台给出（unix socket 路径或回环 TCP 地址）。
+	for key, value := range r.env {
+		overrides[key] = value
 	}
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -232,7 +240,7 @@ func (r *Runtime) waitReady(ctx context.Context, exited chan error) error {
 			return fmt.Errorf("panel exited before ready: %v", err)
 		default:
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/__health", nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+r.proxyHost()+"/__health", nil)
 		resp, err := client.Do(req)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
@@ -278,7 +286,9 @@ func (r *Runtime) newProxy() *httputil.ReverseProxy {
 			networks = append(networks, network)
 		}
 	}
-	target := &url.URL{Scheme: "http", Host: "localhost"}
+	// 代理目标：unix 通道下 DialContext 忽略 host，写 localhost 即可；
+	// TCP 通道（Windows）必须给真实地址，否则会去连 localhost:80。
+	target := &url.URL{Scheme: "http", Host: r.proxyHost()}
 	return &httputil.ReverseProxy{Transport: r.transport, Rewrite: func(p *httputil.ProxyRequest) {
 		p.SetURL(target)
 		p.Out.URL.Path = strings.TrimPrefix(p.In.URL.Path, adminPrefixOr(r.opts.AdminPrefix))

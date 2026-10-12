@@ -9,12 +9,25 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/panelruntime"
 	"workbuddy2api/internal/runlog"
 )
+
+// executableName 按平台给辅助程序名补后缀。
+//
+// Windows 上二进制带 .exe，Linux/macOS 不带。判据用 runtime.GOOS 而不是
+// 「文件是否存在」：后者会让 Linux 上恰好存在同名带 .exe 的文件时误判。
+// 非可执行项（scripts/ 下的 .py）原样返回——它们没有平台后缀。
+func executableName(name string) string {
+	if runtime.GOOS != "windows" || strings.Contains(name, "/") {
+		return name
+	}
+	return name + ".exe"
+}
 
 // adminPrefixDefault 面板默认挂载前缀。可用 WB2API_ADMIN_PREFIX 覆盖：
 // 面板被嵌进网关的一个子路径下，这个前缀同时用于路由注册、代理剥前缀、以及
@@ -56,8 +69,11 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 		return unifiedLayout{}, err
 	}
 	runtimeDir := filepath.Dir(binary)
+	// 辅助程序在 Windows 上带 .exe 后缀。Linux 容器里是无后缀的，所以按平台拼名——
+	// 写死无后缀会让桌面版直接报 "incomplete runtime: login is unavailable" 起不来
+	// （2026-10-13 桌面打包实测）。
 	for _, name := range []string{"login", "credit", "signin_bin", "trial_bin", "activity_bin", "fission_bin", "scripts/task_common.py"} {
-		if _, err := os.Stat(filepath.Join(runtimeDir, name)); err != nil {
+		if _, err := os.Stat(filepath.Join(runtimeDir, executableName(name))); err != nil {
 			return unifiedLayout{}, fmt.Errorf("incomplete runtime: %s is unavailable", name)
 		}
 	}

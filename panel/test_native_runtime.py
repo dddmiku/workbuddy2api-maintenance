@@ -50,7 +50,11 @@ for i in range(40):
             run.assert_not_called()
             run.return_value = subprocess.CompletedProcess([], 0, '[]', '')
             self.assertEqual(native_runtime.run(['exec','fixture','./credit'])[0], 0)
-            self.assertEqual(Path(run.call_args[0][0][0]), Path('/runtime/v2.2.0/credit'))
+            # 辅助程序名按平台补后缀（Windows 桌面版是 credit.exe）。
+            # 断言用同一个 helper，而不是写死 'credit'：否则本用例只能在 Linux 上过，
+            # 而它验证的是「解析逻辑」而非某个平台的固定名字。
+            self.assertEqual(Path(run.call_args[0][0][0]),
+                             Path('/runtime/v2.2.0') / native_runtime._executable_name('credit'))
 
     def test_exec_accepts_env_prefix_before_container(self):
         """面板给 ./credit 透传 WB2A_EXPIRING_SOON 时会带 -e 前缀。
@@ -68,7 +72,8 @@ for i in range(40):
                 ['exec', '-e', 'WB2A_EXPIRING_SOON=168h', 'fixture', './credit'])
             self.assertEqual(code, 0, "-e 前缀不该让 ./credit 被拒")
             argv = run.call_args[0][0]
-            self.assertEqual(Path(argv[0]), Path('/runtime/v2.2.0/credit'))
+            self.assertEqual(Path(argv[0]),
+                             Path('/runtime/v2.2.0') / native_runtime._executable_name('credit'))
             self.assertEqual(run.call_args[1]['env']['WB2A_EXPIRING_SOON'], '168h',
                              "透传的窗口必须真的进子进程环境")
 

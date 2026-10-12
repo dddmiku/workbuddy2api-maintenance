@@ -2254,6 +2254,19 @@ class RequestBodyError(ValueError):
 def main():
     os.makedirs(AUTHS_DIR, exist_ok=True)
     socket_path = os.environ.get("WB2API_PANEL_SOCKET")
+    # Windows 的 Python 标准库没有 UnixStreamServer（AF_UNIX 在 Windows 上虽有，
+    # 但 socketserver 不提供该封装）。桌面版因此改走 TCP：由网关传入
+    # WB2API_PANEL_TCP 指定回环端口，绑定 127.0.0.1，仅本机可达。
+    # 2026-10-13 桌面打包实测：不分支会直接 AttributeError 崩在启动处。
+    #
+    # 判据看 TCP 变量本身，不能看 socket_path —— 网关在 TCP 模式下会把
+    # WB2API_PANEL_SOCKET 显式置空串，空串是假值，用 `if socket_path and ...`
+    # 会整段跳过、静默退回硬编码端口 7864（实测踩过）。
+    tcp_addr = os.environ.get("WB2API_PANEL_TCP", "").strip()
+    if tcp_addr and not hasattr(socketserver, "UnixStreamServer"):
+        socket_path = None
+        host, _, port = tcp_addr.rpartition(":")
+        globals()["LISTEN_HOST"], globals()["LISTEN_PORT"] = (host or "127.0.0.1"), int(port)
     if socket_path:
         load_credentials()
         if os.name == "posix" and os.getpgrp() == os.getpid():

@@ -13,6 +13,18 @@ import subprocess
 import key_management
 
 
+def _executable_name(name):
+    """按平台给辅助程序名补后缀。
+
+    Windows 桌面版里辅助程序是 login.exe / credit.exe；Linux 容器里无后缀。
+    不补后缀会让面板的「查积分」「补发邀请」等按钮报「运行辅助程序不可用」
+    （2026-10-13 桌面打包时发现 Go 侧同一处问题）。
+    """
+    if os.name == 'nt' and '/' not in name and '\\' not in name:
+        return name + '.exe'
+    return name
+
+
 def _fission_args_ok(args):
     """校验 ./fission_bin 的参数：只允许 -uid <数字> 与 -gen <非负整数>。
 
@@ -101,7 +113,7 @@ def run(args, timeout=60, check=False):
             allowed = _fission_args_ok(command[1:])
         if not allowed:
             return 1, '', '不支持此运行操作'
-        executable = Path(os.environ['WB2API_RUNTIME_DIR']) / command[0][2:]
+        executable = Path(os.environ['WB2API_RUNTIME_DIR']) / _executable_name(command[0][2:])
         env = dict(os.environ)
         env.update(exec_env)
         env['WB2A_AUTH_DIR'] = os.environ['WB2API_AUTHS_DIR']
