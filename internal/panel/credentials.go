@@ -18,7 +18,6 @@ package panel
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -207,6 +206,16 @@ func (c Credentials) Password() string {
 // 也不加空格，两者一致。字段顺序按结构体声明顺序，与 Python 的插入顺序
 // u → e → n 相同——否则 body 不同、签名对不上。
 func IssueSession(creds Credentials, nonce string, ttl time.Duration) (string, error) {
+	return IssueSessionAt(creds, nonce, ttl, time.Now())
+}
+
+// IssueSessionAt 与 IssueSession 相同，但用调用方给的时刻算过期。
+//
+// 为什么要一个显式时刻的版本：面板的其他部分（限流窗口、冷却剩余、滑动续期判断）
+// 都走注入的时钟。如果签发/校验仍读 time.Now()，测试里推进假时钟后会出现
+// 「令牌按真实时间算过期、按假时间判有效性」的错位——那种错位在生产里不会出现，
+// 却会让「续期、过期、撤销」这三条最容易出错的路径无法被确定性测试覆盖。
+func IssueSessionAt(creds Credentials, nonce string, ttl time.Duration, now time.Time) (string, error) {
 	if nonce == "" {
 		var err error
 		if nonce, err = randomHex(12); err != nil {
@@ -221,7 +230,7 @@ func IssueSession(creds Credentials, nonce string, ttl time.Duration) (string, e
 		U string `json:"u"`
 		E int64  `json:"e"`
 		N string `json:"n"`
-	}{U: creds.Username(), E: time.Now().Add(ttl).Unix(), N: nonce}
+	}{U: creds.Username(), E: now.Add(ttl).Unix(), N: nonce}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -242,6 +251,11 @@ type SessionPayload struct {
 
 // ReadSession 校验会话令牌；无效返回 nil（不返回错误——调用方只关心「有没有登录」）。
 func ReadSession(creds Credentials, token string) *SessionPayload {
+	return ReadSessionAt(creds, token, time.Now())
+}
+
+// ReadSessionAt 与 ReadSession 相同，但用调用方给的时刻判断过期（理由见 IssueSessionAt）。
+func ReadSessionAt(creds Credentials, token string, now time.Time) *SessionPayload {
 	if token == "" || !strings.Contains(token, ".") {
 		return nil
 	}
@@ -277,7 +291,7 @@ func ReadSession(creds Credentials, token string) *SessionPayload {
 		return nil
 	}
 	expires, ok := toInt64(payload.E)
-	if !ok || expires < time.Now().Unix() {
+	if !ok || expires < now.Unix() {
 		return nil
 	}
 	if payload.U != creds.Username() {
@@ -326,25 +340,3 @@ func toInt64(value any) (int64, bool) {
 	}
 	return 0, false
 }
-
-// randomHex 生成 n 字节随机数的 hex 串（对应 Python 的 secrets.token_hex(n)）。
-func randomHex(n int) (string, error) {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
-}
-
-// randomURLSafe 对应 Python 的 secrets.token_urlsafe(n)：base64url，无 padding。
-func randomURLSafe(n int) (string, error) {
-	// token_urlsafe(n) 用 n 字节随机数做 base64url 编码后去掉 padding。
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
-
-// hashPasswordStored 判断是否是本包认识的哈希形态（供 verify 分支用）。
-func isPBKDF2Stored(stored string) bool { return pbkdf2Re.MatchString(stored) }
