@@ -834,7 +834,11 @@ function renderAccounts(){
       // 补发邀请奖励：只有 Trae 域有 code fission 活动（WorkBuddy 两域没有这套端点）。
       // 放在账号行上而不是任务页：邀请关系是账号级事实，补发也是按 uid 一次性动作，
       // 不是可排程的周期任务。
-      (a.realm === 'trae'
+      //
+      // 判域用 realmOf(a) 而不是裸 a.realm：后端对「account 段没有 realm」的账号
+      // 只下发 auth.realm（实测 trae 账号 account.realm 为 None、auth.realm 为
+      // 'trae'），全文件其余判域处一律走 realmOf() 兜底。裸比较是脆的。
+      (realmOf(a) === 'trae'
         ? '<button class="btn sm" data-fission="' + esc(a.uid) + '" title="' +
           '补发邀请奖励（服务端代客户端登录时的那次发奖调用）">补发邀请</button>'
         : '') +

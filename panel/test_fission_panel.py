@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 import unittest
 
+from test_frontend_behavior import FrontendHarness
+
 
 PANEL = Path(__file__).resolve().parent
 
@@ -41,7 +43,7 @@ class FissionPanelTest(unittest.TestCase):
         # 渲染处必须带 realm === 'trae' 的判断。
         start = self.app_js.index("data-fission=")
         head = self.app_js[max(0, start - 400):start]
-        self.assertIn("a.realm === 'trae'", head,
+        self.assertIn("realmOf(a) === 'trae'", head,
                       "补发按钮必须限定在 trae 域")
         self.assertIn("data-fission=", self.index, "生成的 index.html 里也要有")
 
@@ -122,3 +124,69 @@ class FissionPanelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FissionButtonRendersTest(FrontendHarness, unittest.TestCase):
+    """按钮必须在真实渲染路径里出现——只查源码字符串会漏掉「代码在但走不到」。
+
+    2026-10-12 用户实测「没看到按钮」。源码里 data-fission 确实存在，所以源码级
+    断言全绿，但按钮没渲染出来。这类问题只有把 renderAccounts 真正跑一遍才抓得到：
+    账号行渲染函数里任何一处提前 return / 条件写错，源码字符串都照样在。
+    """
+
+    def setUp(self):
+        import re as _re
+        self.app_js = read("app.js")
+
+    def test_realm_guard_uses_realmOf_like_the_rest_of_the_file(self):
+        """必须用 realmOf(a) 而不是 a.realm。
+
+        后端对「account 段没有 realm」的账号只下发 auth.realm（实测 trae 账号
+        account.realm 为 None、auth.realm 为 'trae'），全文件其余地方一律走
+        realmOf() 兜底（缺失按 cn 处理）。只有这一处写裸 a.realm 会与全文件口径
+        不一致——虽然当前后端恰好下发了 'trae'，但裸比较是脆的。
+        """
+        start = self.app_js.index("data-fission=")
+        head = self.app_js[max(0, start - 400):start]
+        self.assertIn("realmOf(a) === 'trae'", head,
+                      "补发按钮必须与全文件同口径地用 realmOf(a)")
+        self.assertNotIn("(a.realm === 'trae'", head,
+                         "不得裸比较 a.realm")
+
+    def test_row_render_actually_emits_the_button(self):
+        """真正跑一遍账号行渲染，断言按钮出现在 HTML 里。
+
+        用 Node 加载 app.js，构造一个 trae 账号喂给渲染函数。这比字符串匹配强：
+        字符串匹配无法发现「函数提前返回」「条件恒假」这类问题。
+        """
+        result = self.run_frontend("""
+function render1(a){
+  S.data = {accounts:[a]};
+  S.filter = 'all'; S.realm = ''; S.q = '';
+  renderAccounts();
+  return $('#acctRows').innerHTML;
+}
+var trae = render1({uid:'1571669390934250', nickname:'trae 用户', realm:'trae',
+            disabled:false, expiresAt:0, credits:{remain:4500,size:4500,used:0},
+            pool:{inPool:true, healthy:true, cooling:false}});
+var cn = render1({uid:'u1', nickname:'cn 用户', realm:'cn', disabled:false, expiresAt:0,
+          credits:{remain:100,size:100,used:0}, pool:{inPool:true, healthy:true, cooling:false}});
+return { trae: trae, cn: cn };
+""")
+        self.assertIn("data-fission=", result["trae"],
+                      "trae 账号行必须渲染出补发按钮")
+        self.assertIn("补发邀请", result["trae"])
+        self.assertNotIn("data-fission=", result["cn"],
+                         "cn 账号不得出现补发按钮")
+
+    def test_realm_missing_falls_back_like_backend(self):
+        """realm 缺失时按 cn 处理（与后端 `or "cn"` 同口径），不出按钮。"""
+        result = self.run_frontend("""
+var a = {uid:'x1', nickname:'no realm', disabled:false, expiresAt:0,
+         credits:{remain:0,size:0,used:0}, pool:{}};
+S.data = {accounts:[a]}; S.filter='all'; S.realm=''; S.q='';
+renderAccounts();
+return { html: $('#acctRows').innerHTML, realm: realmOf(a) };
+""")
+        self.assertEqual(result["realm"], "cn")
+        self.assertNotIn("data-fission=", result["html"])
