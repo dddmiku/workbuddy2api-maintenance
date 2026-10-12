@@ -79,6 +79,15 @@ type Options struct {
 	// 必须一并继承；nil = 本次部署没有管理通道。
 	AdminListener net.Listener
 	OnSwitched    func() // 交接成功后的回调（main 用它触发优雅停机）
+	// StageInstaller 在**安卓**上替代进程交接：把校验过的更新件交给系统安装器。
+	//
+	// 安卓的应用私有目录不能执行（SELinux 的 untrusted_app 域禁止在 app_data_file
+	// 上 execute），所以那套「起新实例、交接监听套接字」的做法在手机上根本走不通。
+	// 传入这个钩子后，Apply 会下载并校验更新件，然后交给它去交给系统安装器；
+	// 返回的字符串是给用户看的提示。
+	//
+	// 其他平台留空 = 走既有的进程交接。
+	StageInstaller func(ctx context.Context, assetPath string) (string, error)
 }
 
 // Manager 热更新管理器。
@@ -317,6 +326,24 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.fail(err)
 		return m.Status(), err
 	}
+	// 安卓：把校验过的更新件交给系统安装器，不走进程交接。
+	//
+	// 放在下载与验签之后、解包/交接之前——那两步在安卓上既做不到（应用私有目录
+	// 不能执行）也没有意义（新二进制由安装器放进新的 nativeLibraryDir）。
+	if m.opts.StageInstaller != nil {
+		message, installErr := m.opts.StageInstaller(ctx, path)
+		if installErr != nil {
+			m.fail(installErr)
+			return m.Status(), installErr
+		}
+		log.Printf("[update] %s", message)
+		m.mu.Lock()
+		m.state = StateIdle
+		m.checkedAt = time.Now().UTC()
+		m.mu.Unlock()
+		return m.Status(), nil
+	}
+
 	stage := ""
 	committed := false
 	defer func() {

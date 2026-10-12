@@ -367,6 +367,9 @@ func main() {
 		Args:          os.Args[1:],
 		Listener:      mainLn,
 		AdminListener: adminLn,
+		// 安卓上更新的是 APK（应用私有目录不能执行），交给系统安装器；
+		// 其他平台返回 nil，走既有的进程交接。
+		StageInstaller: hotupdate.StageInstallerForAndroid(updateDir(cfg)),
 		OnSwitched: func() {
 			select {
 			case handoverDone <- "hot update":

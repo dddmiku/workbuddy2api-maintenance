@@ -137,7 +137,18 @@ func assetName() (string, error) {
 		return "wb2api-windows-" + runtime.GOARCH, nil
 	}
 	if runtime.GOOS == "android" {
-		return "wb2api-android-" + runtime.GOARCH, nil
+		// 安卓上更新的是 **APK**，不是裸二进制。
+		//
+		// 为什么：应用私有目录（/data/data/<pkg>/files）里的文件**不能执行**——
+		// 不是权限位的问题，是 SELinux 的 untrusted_app 域禁止在 app_data_file 上
+		// execute（2026-10-13 真机实测：fork/exec ... permission denied，且
+		// setenforce 0 也需要 root）。唯一可执行的位置是 APK 的 nativeLibraryDir，
+		// 而它是只读的、改不了。
+		//
+		// 所以安卓的自更新走系统机制：下载新 APK → 交给系统安装器 → 用户确认后
+		// Android 原地替换（应用数据保留）→ 新的 nativeLibraryDir 里就是新二进制。
+		// 这条路不需要 root，也是安卓上唯一被支持的自更新方式。
+		return "workbuddy2api-android-" + runtime.GOARCH + ".apk", nil
 	}
 	switch runtime.GOARCH {
 	case "amd64":

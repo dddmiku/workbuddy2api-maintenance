@@ -38,6 +38,34 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v2.15.2 — 2026-10-13
+
+安卓的自更新改为「下载新 APK 交给系统安装器」。
+
+### 原因
+
+v2.15.1 把安卓的更新资产改成了裸二进制，然后在真机上撞上一条硬约束：
+**应用私有目录（`/data/data/<pkg>/files`）里的文件不能执行**。
+
+不是权限位的问题——是 SELinux 的 `untrusted_app` 域禁止在 `app_data_file` 上
+execute。实测报 `fork/exec data/updates/...: permission denied`，而 `setenforce 0`
+也要 root。唯一可执行的位置是 APK 的 `nativeLibraryDir`，而它是只读的、改不了。
+
+### 改动
+
+安卓的更新资产改成 **APK**（`workbuddy2api-android-arm64.apk`），走系统机制：
+
+    网关下载 + 验签 → 放到 <data>/updates/pending-install.apk → App 起系统安装器
+    → 用户确认 → Android 原地替换（应用数据保留）→ 新的 nativeLibraryDir 就是新版
+
+不需要 root，也是安卓上唯一被支持的自更新方式。
+
+分工是刻意的：下载与验签留在网关（它已有完整的签名校验与摘要比对），而「拉起系统
+UI」只有 App 做得到（网关是子进程，没有 Android Context）。两者通过一个固定的
+标记文件交接。
+
+Linux 与桌面不受影响，仍是「下载 → 交接监听套接字」那一套。
+
 ## v2.15.1 — 2026-10-13
 
 修复安卓上热更新报 `gzip: invalid header`。
