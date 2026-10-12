@@ -38,6 +38,56 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v2.14.0 — 2026-10-13
+
+管理面板后端重写为 Go，并把网关打包成安卓 App 与免装 Python 的桌面版。
+
+### 背景
+
+面板此前是 Python（`panel/app.py`），由网关以子进程方式拉起。这带来两个限制：
+
+- **桌面版要求用户机器上有 Python 3**，而绝大多数用户没有；启动器只能给一段
+  「去官网下载并勾选 Add to PATH」的指引。
+- **安卓版不可能带 CPython**，所以「手机上自己跑网关」这条路被堵死。
+
+### 改动
+
+- **`internal/panel`**：面板后端的 Go 版——会话与凭据（与 Python 版逐字节兼容的
+  PBKDF2 / apr1 / 会话令牌）、账号文件读写、积分缓存、受限运行通道、HTTP 层与
+  全部路由。行为按 `panel/test_*.py` 的断言逐项对齐（247 项断言）。
+- **引擎二选一**：`WB2API_PANEL_GO=1` 用 Go，未设时容器部署仍走 Python——
+  在线部署的 credentials.json、登录 cookie、运维习惯都不受影响，切引擎是一次
+  可回退的部署动作。
+- **安卓端**（`android/`）：一个 WebView 承载面板 + 前台服务把 Go 网关当子进程
+  拉起并保活。网关本体与辅助程序打进 APK 的 jniLibs（应用私有目录是 noexec，
+  只有 nativeLibraryDir 能执行）。
+- **桌面版默认走 Go 面板**，不再强求 Python。Python 退路保留
+  （`WB2API_PANEL_GO=0` / `WB2A_DESKTOP_PYTHON=1`）。
+- **管理接口改为进程内分发**：面板与网关同进程时直接调管理 mux，不再经 Unix
+  socket。Go 的 `net.Dial("unix", …)` 在 Windows 上直接失败（实测
+  `connect: invalid argument`），走 socket 会让密钥页、用量页、热更新页全挂。
+- **面板挂载前缀剥离**：网关交给面板的是完整路径（`/admin/login`），面板内部分支
+  按内部路径写（`/login`）。Python 版躲在反代后面、前缀是代理剥的，Go 版必须自己剥，
+  否则登录页会反复重定向（重定向目标被浏览器加上前缀后指回自己）。
+- **`/healthz` 的 503 不再当成「没起来」**：一个账号都没有时它就是 503，而那正是
+  「刚装好还没加号」的部署。改判 `service` 字段（网关身份标识）。
+- **完整性校验按引擎分档**：Go 引擎只用 login/credit/fission_bin，不再要求
+  signin_bin/trial_bin/activity_bin + `scripts/*.py` 全在（安卓包里没有后四个）。
+
+### 新增测试
+
+- `internal/panel/server_test.go`：HTTP 边界的行为等价（闸门顺序、请求体框架、
+  限流文案、账号文件口径、build_state 形状、被拒请求的可读性与排空上限）。
+- `cmd/server/panel_e2e_test.go`：真起网关进程、真发 HTTP，锁住「引擎选择 +
+  前缀剥离 + 面板挂载不挡 API + 管理接口同进程可达」这一整段——只有跑真进程才验得到。
+
+### 安卓端的两个硬约束
+
+- 必须开 CGO + NDK clang：Go 源码 `net/conf.go` 明说安卓上纯 Go 解析器不可用
+  （"DNS requests don't work on Android"），纯 Go 构建的网关一条请求都发不出去。
+- 默认配置只绑 `127.0.0.1`：手机常连公共 Wi-Fi，监听所有网卡等于把账号池暴露给
+  同网段的人（而 `api_key` 默认是空的）。
+
 ## v2.13.1 — 2026-10-12
 
 修复面板「补发邀请」按钮不显示。
