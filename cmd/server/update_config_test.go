@@ -5,6 +5,8 @@ package main
 import (
 	"path/filepath"
 	"testing"
+
+	"workbuddy2api/internal/panel"
 )
 
 func TestUpdateDirUsesSupervisorDirectory(t *testing.T) {
@@ -83,5 +85,21 @@ func TestUpdateDirAndroidAgreesWithApp(t *testing.T) {
 	want := filepath.Join(root, "updates")
 	if got := updateDir(config); got != want {
 		t.Fatalf("安卓反推的更新目录 = %q，期望 %q（App 的 watcher 盯的就是这个）", got, want)
+	}
+}
+
+// TestSessionTTLForHost 只有安卓拿长期会话，桌面与容器保持默认 30 天。
+//
+// 安卓：面板是 App 里 WebView 长期挂着的界面，手机已有锁屏与生物识别，
+// 每次打开都重输密码是纯粹的折磨（用户 2026-10-13 明确要求设为永久）。
+// 桌面/容器：面对的是浏览器，会话有效期是那里唯一的一道门。
+func TestSessionTTLForHost(t *testing.T) {
+	t.Setenv("WB2API_ANDROID", "")
+	if got := sessionTTLForHost(); got != 0 {
+		t.Fatalf("桌面/容器应保持默认 TTL（返回 0 让面板用 30 天），实际 %v", got)
+	}
+	t.Setenv("WB2API_ANDROID", "1")
+	if got := sessionTTLForHost(); got != panel.LongSessionTTL {
+		t.Fatalf("安卓应拿到长期 TTL %v，实际 %v", panel.LongSessionTTL, got)
 	}
 }
