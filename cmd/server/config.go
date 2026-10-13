@@ -181,6 +181,10 @@ type Config struct {
 		Repo string `json:"repo"`
 		// Token 私有仓库读取用；公开仓库留空。
 		Token string `json:"token"`
+		// Proxy 下载加速代理前缀（默认 https://gh-proxy.com）。国内直连
+		// GitHub releases 经常超时或极慢，热更新因此形同虚设。
+		// 设成 "-" 表示直连（不用代理）。
+		Proxy string `json:"proxy"`
 		// Dir 下载与 current 指针目录；空 = 数据目录下的 updates（与 state_file 同盘）。
 		Dir string `json:"dir"`
 	} `json:"update"`

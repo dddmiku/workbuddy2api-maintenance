@@ -67,10 +67,13 @@ type Status struct {
 
 // Options 构造参数。
 type Options struct {
-	Bundle   bool
-	Enabled  bool
-	Repo     string
-	Token    string
+	Bundle  bool
+	Enabled bool
+	Repo    string
+	Token   string
+	// Proxy 是下载加速代理前缀（如 https://gh-proxy.com）。空 = 用 DefaultProxyBase；
+	// 想直连 GitHub 时显式传 "-"（见 NewManager）。
+	Proxy    string
 	Dir      string
 	Binary   string   // 当前可执行文件路径（作为新实例的候选；实际用下载件）
 	Args     []string // 新实例命令行参数（沿用本进程）
@@ -115,6 +118,17 @@ func NewManager(opts Options) *Manager {
 		state:  StateIdle,
 	}
 	manager.client.Bundle = opts.Bundle
+	// 下载加速：默认走代理（国内直连 releases 经常超时，热更新等于没有）。
+	// 传 "-" 表示显式关闭（直连 GitHub）——留空与「不想要代理」无法区分，
+	// 所以用一个不可能与真实地址冲突的哨兵值。
+	switch strings.TrimSpace(opts.Proxy) {
+	case "-":
+		manager.client.ProxyBase = ""
+	case "":
+		manager.client.ProxyBase = DefaultProxyBase
+	default:
+		manager.client.ProxyBase = strings.TrimSpace(opts.Proxy)
+	}
 	return manager
 }
 

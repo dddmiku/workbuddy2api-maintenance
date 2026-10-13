@@ -168,8 +168,24 @@ func (b *StateBuilder) Build(ctx context.Context, forceCredit bool) StatePayload
 // 原生模式（桌面/安卓）下没有容器可 inspect：判据改成「网关的 HTTP 接口有没有响应」。
 // 不能只看管理 socket——面板本身就是被网关托管的，socket 通了只说明网关进程活着，
 // 而这里要回答的是「服务能不能用」。
+//
+// 实现放在 gatewayServing（见 actions.go），与「添加账号」等操作走**同一个判据**。
+// 两处各写一份时它们会不一致：2026-10-13 真机实测，状态显示「运行中」而添加账号
+// 报「容器未运行」——同一件事两个答案，用户完全无从判断该信哪个。
 func (b *StateBuilder) containerRunning(ctx context.Context) bool {
-	health := b.Gateway.Get(ctx, "/healthz")
+	return gatewayServing(ctx, b.Gateway)
+}
+
+// gatewayServing 网关是否在服务：看它回的 service 字段是不是自己。
+//
+// **任何 HTTP 状态码都算连通**——/healthz 在零账号时返回 503，那是「服务活着、只是
+// 池里还没有可服务的号」，正是刚装好还没加号时的正常状态。只认 200 会把首次使用
+// 卡死（v2.15.0 的修复就是为此，v2.16.1 又补了 503 被丢掉响应体的问题）。
+func gatewayServing(ctx context.Context, client *GatewayClient) bool {
+	if client == nil {
+		return false
+	}
+	health := client.Get(ctx, "/healthz")
 	return jsonString(health["service"]) == "workbuddy2api"
 }
 

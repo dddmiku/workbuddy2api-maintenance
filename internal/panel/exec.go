@@ -45,11 +45,6 @@ const (
 	execMissingCode = 127
 )
 
-// execShortTimeout 是「只是问一句状态」这类调用的超时（inspect / healthz）。
-// 它不该跟重启（210s）用同一个预算：状态查询卡住时面板要能快速回退到「未知」，
-// 而不是把首屏一起拖住。
-const execShortTimeout = 20 * time.Second
-
 // DockerRunner 经 docker CLI 操作同机网关容器。
 type DockerRunner struct {
 	Container string

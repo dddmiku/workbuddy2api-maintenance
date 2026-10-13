@@ -116,7 +116,10 @@ func (c *Client) fetchSmall(ctx context.Context, apiURL, browserURL string, limi
 	if target == "" {
 		target = browserURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	// 同样走加速代理：这两个文件也是发行资产（SHA256SUMS.txt 与其签名），
+	// 不代理就会在同一个网络问题上卡住——下载走通了、验签却拿不到清单，更新
+	// 一样失败。
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.proxied(target), nil)
 	if err != nil {
 		return nil, err
 	}

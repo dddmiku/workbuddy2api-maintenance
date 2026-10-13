@@ -105,7 +105,24 @@ type Client struct {
 	Token  string // 私有仓库时用；公开仓库留空即可
 	// APIBase 覆盖 GitHub API 根地址（测试用）；空 = 官方地址。
 	APIBase string
+	// ProxyBase 是下载加速代理的前缀（如 https://gh-proxy.com）。
+	//
+	// 空 = 直连 GitHub。设置后，**资产下载**改走 <ProxyBase>/<原始 GitHub 地址>。
+	//
+	// 为什么只代理下载、不代理 API 查询：查询要带 Authorization 头（私有仓库场景），
+	// 而把令牌发给第三方代理等于把它交出去。下载的是公开的发行资产、且**必须通过
+	// 签名校验**才会被安装（见 manager.go 的验签步骤），所以经过代理不降低信任级别
+	// ——代理能改字节，但改不过签名。
+	ProxyBase string
 }
+
+// DefaultProxyBase 默认的下载加速代理。
+//
+// 国内直连 GitHub 的 releases 经常超时或极慢，热更新因此形同虚设。用户
+// 2026-10-13 明确要求「更新都走 gh-proxy 加速」。
+//
+// 仍可用 config update.proxy 覆盖（设为空串即恢复直连）。
+const DefaultProxyBase = "https://gh-proxy.com"
 
 // NewClient 构造取件客户端；repo 为空回落默认仓库。
 func NewClient(repo, token string) *Client {
@@ -113,6 +130,28 @@ func NewClient(repo, token string) *Client {
 		repo = DefaultRepo
 	}
 	return &Client{Repo: repo, Token: token, HTTP: &http.Client{Timeout: httpTimeout}}
+}
+
+// proxied 把 GitHub 地址改写成经加速代理的地址；未配置代理时原样返回。
+//
+// 只对 github.com / *.githubusercontent.com 生效：这条改写会把目标地址拼进 URL，
+// 若不加限制，一个被篡改的 browser_download_url 就能让网关去请求任意主机
+// （SSRF 面）。release.go 里的资产 URL 来自 GitHub API，但纵深防御不依赖上游可信。
+func (c *Client) proxied(raw string) string {
+	base := strings.TrimRight(strings.TrimSpace(c.ProxyBase), "/")
+	if base == "" || raw == "" {
+		return raw
+	}
+	target, err := url.Parse(raw)
+	if err != nil || target.Scheme != "https" {
+		return raw
+	}
+	host := strings.ToLower(target.Hostname())
+	if host != "github.com" && host != "api.github.com" && host != "objects.githubusercontent.com" &&
+		!strings.HasSuffix(host, ".githubusercontent.com") {
+		return raw
+	}
+	return base + "/" + raw
 }
 
 // apiBase 返回生效的 API 根地址。
@@ -279,7 +318,10 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, release.AssetURL, nil)
+	// 资产下载走加速代理（若已配置）。注意这里**不带头部令牌**：代理是第三方，
+	// 而发行资产本来就是公开的，且下载后必须通过 sha256 + 发布签名校验。
+	downloadURL := c.proxied(release.AssetURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return "", "", err
 	}

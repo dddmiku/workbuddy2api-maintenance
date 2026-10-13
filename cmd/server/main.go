@@ -363,6 +363,7 @@ func main() {
 		Enabled:       cfg.Update.Enabled,
 		Repo:          cfg.Update.Repo,
 		Token:         cfg.Update.Token,
+		Proxy:         cfg.Update.Proxy,
 		Dir:           updateDir(cfg),
 		Args:          os.Args[1:],
 		Listener:      mainLn,

@@ -236,10 +236,23 @@ func firstNonZero(values ...float64) float64 {
 	return 0
 }
 
-// containerRunning 判断网关容器是否在跑（原生模式下 = 网关健康接口是否正常）。
+// containerRunning 判断网关是否在跑。
+//
+// ═══ 为什么与 state.go 共用同一个判据 ═══
+//
+// 这里原本走 runner 的 `inspect` 分支，而 state.go 走 /healthz —— **同一件事两套
+// 实现**。两者会不一致：2026-10-13 真机实测，安卓上面板状态显示「网关运行中」、
+// /api/state 里 containerRunning=true，但点「添加账号」却报「容器未运行，先启动
+// 服务」（登录、任务、积分这些操作都走这个判据），功能直接不可用。
+//
+// 现在两边都走同一个函数：**看网关自己回的 service 字段**。这是唯一能同时回答
+// 「进程活着吗」与「服务可用吗」的判据——面板本身就是被网关托管的，管理通道通了
+// 只说明网关进程在，不代表它在服务。
+//
+// 注意**不能要求 HTTP 200**：一个账号都没有时 /healthz 返回 503，而那正是刚装好、
+// 还没加号时的正常状态；只认 200 会让首次使用被卡死。
 func (s *Server) containerRunning(ctx context.Context) bool {
-	result := s.runner.Run(ctx, []string{"inspect", "-f", "{{.State.Running}}", s.containerName()}, execShortTimeout, nil)
-	return result.Code == 0 && strings.TrimSpace(result.Stdout) == "true"
+	return gatewayServing(ctx, s.gateway)
 }
 
 // taskRun 手动触发一个排程任务。

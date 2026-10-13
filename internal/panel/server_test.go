@@ -1882,3 +1882,39 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// TestContainerRunningAgreesWithState 两个判据必须给出同一个答案。
+//
+// 真机事故（2026-10-13）：安卓上面板状态显示「网关运行中」、/api/state 里
+// containerRunning=true，但点「添加账号」报「容器未运行，先启动服务」——功能直接
+// 不可用。根因是同一件事有两套实现：state.go 读 /healthz 的 service 字段，而
+// actions.go 走 runner 的 inspect 分支（原生模式下依赖管理通道），两者在安卓上
+// 结论相反。
+//
+// 这条测试同时锁住两个入口，避免它们再次分叉。
+func TestContainerRunningAgreesWithState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		code    int
+		body    string
+		running bool
+	}{
+		{"零账号时 503 仍算运行中", 503, `{"service":"workbuddy2api","healthy":0,"total":0}`, true},
+		{"正常 200", 200, `{"service":"workbuddy2api","healthy":5,"total":5}`, true},
+		{"不是本网关", 200, `{"service":"something-else"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.transport.replies["GET /healthz"] = stubReply{Code: tc.code, Body: tc.body}
+			payload := h.server.state.Build(context.Background(), false)
+			viaState := payload.ContainerRun
+			viaAction := h.server.containerRunning(context.Background())
+			if viaState != tc.running {
+				t.Fatalf("/api/state 判为 %v，期望 %v", viaState, tc.running)
+			}
+			if viaAction != viaState {
+				t.Fatalf("两个判据不一致：添加账号等操作用 %v，状态显示用 %v", viaAction, viaState)
+			}
+		})
+	}
+}
