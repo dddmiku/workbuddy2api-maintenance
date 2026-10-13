@@ -102,3 +102,47 @@ func TestTailLogFileSkipsPartialFirstLine(t *testing.T) {
 		t.Fatalf("完整的行必须保留，实际 %q", got)
 	}
 }
+
+// TestResolveHelperFallsBackToGatewayDir 辅助程序不在网关旁边时，要回落到工作目录。
+//
+// 容器形态就是这样：部署脚本把网关本体放在 data/updates/runtime-*/ 下（热更新换的
+// 就是它），而辅助程序留在 /app。只看网关旁边会让「Go 引擎 + 容器形态」下扫码加号、
+// 积分查询、补发邀请全部报「运行辅助程序不可用」——2026-10-13 在 VPS 上隔离验证时
+// 发现（当时报的是启动期的 "incomplete runtime: login is unavailable"）。
+func TestResolveHelperFallsBackToGatewayDir(t *testing.T) {
+	binDir := t.TempDir()  // 模拟 data/updates/runtime-*/（只有网关本体）
+	workDir := t.TempDir() // 模拟 /app（辅助程序在这里）
+	helper := filepath.Join(workDir, platformExecutableName("login"))
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &NativeRunner{RuntimeDir: binDir, GatewayDir: workDir}
+	if got := runner.resolveHelper("login"); got != helper {
+		t.Fatalf("应回落到工作目录的 %q，实际 %q", helper, got)
+	}
+}
+
+// TestResolveHelperPrefersRuntimeDir 两边都有时，网关旁边的优先（桌面/安卓形态）。
+func TestResolveHelperPrefersRuntimeDir(t *testing.T) {
+	binDir := t.TempDir()
+	workDir := t.TempDir()
+	for _, dir := range []string{binDir, workDir} {
+		if err := os.WriteFile(filepath.Join(dir, platformExecutableName("login")), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &NativeRunner{RuntimeDir: binDir, GatewayDir: workDir}
+	if got := runner.resolveHelper("login"); got != filepath.Join(binDir, platformExecutableName("login")) {
+		t.Fatalf("网关旁边有就不该回落，实际 %q", got)
+	}
+}
+
+// TestResolveHelperHonorsExplicitPath 显式指定的路径（安卓的 nativeLibraryDir）最优先。
+func TestResolveHelperHonorsExplicitPath(t *testing.T) {
+	explicit := filepath.Join(t.TempDir(), "libwb2login.so")
+	runner := &NativeRunner{RuntimeDir: t.TempDir(), GatewayDir: t.TempDir(),
+		HelperPaths: map[string]string{"login": explicit}}
+	if got := runner.resolveHelper("login"); got != explicit {
+		t.Fatalf("显式路径应最优先，实际 %q", got)
+	}
+}

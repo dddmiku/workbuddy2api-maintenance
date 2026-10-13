@@ -107,13 +107,34 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 	}
 	// 安卓上辅助程序不在网关旁边，而在 APK 的 nativeLibraryDir（应用私有目录是
 	// noexec，只有那里能执行）。目录由 WB2API_HELPER_DIR 传入，名字是 libwb2*.so。
+	// 辅助程序可能**不在网关旁边**：容器里部署脚本把网关本体放在
+	// data/updates/runtime-*/ 下（热更新要换的就是它），而辅助程序留在 /app。
+	// 只查 exe 同目录会让「Go 引擎 + 容器形态」直接起不来——实测报
+	// "incomplete runtime: login is unavailable"，而 /app/login 明明存在
+	// （2026-10-13 在 VPS 上隔离验证时发现，幸亏没直接切生产）。
+	//
+	// 按顺序找：显式指定 → 网关旁边 → 工作目录（容器里 cwd 就是 /app）。
 	helperDir := strings.TrimSpace(os.Getenv("WB2API_HELPER_DIR"))
+	workDir, _ := os.Getwd()
 	for _, name := range required {
-		path := filepath.Join(runtimeDir, executableName(name))
 		if helperDir != "" {
-			path = filepath.Join(helperDir, android.LibName(strings.TrimSuffix(name, ".py")))
+			path := filepath.Join(helperDir, android.LibName(strings.TrimSuffix(name, ".py")))
+			if _, err := os.Stat(path); err != nil {
+				return unifiedLayout{}, fmt.Errorf("incomplete runtime: %s is unavailable", name)
+			}
+			continue
 		}
-		if _, err := os.Stat(path); err != nil {
+		found := false
+		for _, dir := range []string{runtimeDir, workDir} {
+			if dir == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(dir, executableName(name))); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return unifiedLayout{}, fmt.Errorf("incomplete runtime: %s is unavailable", name)
 		}
 	}

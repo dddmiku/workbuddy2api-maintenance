@@ -186,7 +186,21 @@ func (n *NativeRunner) resolveHelper(name string) string {
 	if path := n.HelperPaths[name]; path != "" {
 		return path
 	}
-	return ResolveGatewayBinary(n.RuntimeDir, name)
+	// 网关旁边优先（桌面/安卓形态），其次工作目录。
+	//
+	// 容器里部署脚本把网关本体放在 data/updates/runtime-*/ 下，辅助程序留在 /app
+	// ——而容器的 cwd 就是 /app。只看网关旁边会让「Go 引擎 + 容器形态」下所有
+	// 辅助程序调用都报「运行辅助程序不可用」（扫码加号、积分、补发邀请全废）。
+	candidate := ResolveGatewayBinary(n.RuntimeDir, name)
+	if fileExists(candidate) {
+		return candidate
+	}
+	if n.GatewayDir != "" {
+		if fallback := ResolveGatewayBinary(n.GatewayDir, name); fileExists(fallback) {
+			return fallback
+		}
+	}
+	return candidate
 }
 
 func (n *NativeRunner) containerName() string {
