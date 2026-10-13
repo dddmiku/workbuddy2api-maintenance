@@ -125,25 +125,31 @@ func DefaultConfig() string {
 // 网关下载到 A、App 去 B 找安装包，症状是「下载与验签都成功、state 回到 idle，
 // 而安装器始终没被拉起」（2026-10-13 真机实测踩到两次）。
 //
-// 这个约定在 cmd/server/config.go 的 updateDir 里也有一份（从 WB2API_ADMIN_DIR
-// 反推），改这里要一起改。
+// 现在这条约定**由启动方显式传递**：App 在起网关时设置 WB2API_UPDATE_DIR
+// （见 GatewayService.startGateway），网关侧 updateDir() 优先读它。也就是说
+// 这里的方法只是「同一个表达式的 Go 侧写法」，真正生效的是环境变量——不要再让
+// 两侧各自推导，那正是前两次分叉的来源。
 func (l Layout) UpdateDir() string {
 	return filepath.Join(l.Root, "updates")
 }
 
 // UpdatedGateway 返回热更新下来的网关二进制路径；没有则返回空串。
 //
+// ⚠ 目前**没有生产调用方**：安卓侧真正读 current 指针的是 Java 的
+// AppPaths.updatedGateway()（App 起进程时决定用哪个二进制）。这里保留一份是因为
+// 指针格式是两端共用的约定，且 Go 侧的测试用它锁定该格式；若将来改由 Go 决定
+// 冷启动二进制，直接用它即可。改动指针格式时，Java 侧必须同步。
+//
 // ═══ 为什么冷启动必须优先用它 ═══
 //
-// 安卓的热更新替换的是**可执行文件**（网关以文件形式跑在应用私有目录里），
-// 而 APK 的 nativeLibraryDir 是只读的、改不了。所以更新后的二进制落在数据目录，
-// 由这里在每次启动时优先选中。
+// 安卓的热更新走的是**系统安装器装新 APK**这条路（应用私有目录不能执行，见
+// hotupdate 的 assetName 注释），装完后 nativeLibraryDir 里就是新二进制，由系统
+// 负责切换——所以安卓上并不依赖这个 current 指针来决定用哪份二进制。指针主要是
+// 桌面版在用（启动器优先用它），以及历史遗留：早期版本曾尝试让网关自我替换。
 //
-// 不做这一步，热更新就是个假的：新版本会被下载、校验、交接成功，进程内一路正常
-// ——直到用户把 App 划掉再打开，又从 nativeLibraryDir 拉起 APK 里的旧二进制，
-// 版本悄悄回退。用户看到的是「更新了但重启又变回旧版」。
-//
-// 桌面版同理（见 cmd/desktop/main.go），两边用同一个 current 指针格式。
+// 不优先用更新后的那份，热更新就是假的：新版本会被下载、校验、交接成功，进程内
+// 一路正常——直到用户把 App 划掉再打开，又拉起旧二进制，版本悄悄回退。用户看到
+// 的是「更新了但重启又变回旧版」。
 func (l Layout) UpdatedGateway() string {
 	dir := l.UpdateDir()
 	raw, err := os.ReadFile(filepath.Join(dir, "current"))

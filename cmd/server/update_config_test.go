@@ -45,3 +45,43 @@ func TestUpdateDirKeepsFileFallbacks(t *testing.T) {
 		t.Fatalf("更新目录应以 updates 结尾，实际 %q", got)
 	}
 }
+
+// TestUpdateDirExplicitBeatsConfig 启动方显式指定的更新目录必须压过配置里的
+// update.dir。
+//
+// 为什么这条重要：启动器（桌面版 cmd/desktop）与 App（安卓 GatewayService）冷
+// 启动时看的都是**它们自己算出来的那个目录**，而它们都会把 WB2API_UPDATE_DIR
+// 传给网关。如果网关让配置里的 update.dir 压过它，用户一改配置两边就分叉——
+// 网关把更新下到 A、启动器去 B 找，症状是「更新成功但重启还是旧版」或「下载与
+// 验签都成功、安装器始终不被拉起」。这两条都在 2026-10-13 真机上实际踩到过。
+func TestUpdateDirExplicitBeatsConfig(t *testing.T) {
+	explicit := filepath.Join(t.TempDir(), "launcher-updates")
+	t.Setenv("WB2API_UPDATE_DIR", explicit)
+	config := Default()
+	config.Update.Dir = filepath.Join(t.TempDir(), "from-config")
+	config.StateFile = filepath.Join(t.TempDir(), "state.json")
+	if got := updateDir(config); got != explicit {
+		t.Fatalf("updateDir() = %q，期望显式的 %q（配置里的 update.dir 不应压过它）", got, explicit)
+	}
+}
+
+// TestUpdateDirAndroidAgreesWithApp 安卓侧「网关写哪里」必须等于「App 看哪里」。
+//
+// App（GatewayService.startGateway）设 WB2API_ADMIN_DIR=<root>/panel-data 与
+// WB2API_UPDATE_DIR=<root>/updates，而它的 watcher 盯的正是 <root>/updates。
+// 这里锁住「即使 App 不显式传 WB2API_UPDATE_DIR，网关从 WB2API_ADMIN_DIR 反推
+// 出来的也必须是同一个目录」——这是 App 侧改动前的兼容路径，也是文档里写下的
+// 那份约定。前两次分叉（v2.15.3、v2.15.4）都是因为这条不成立而没人测。
+func TestUpdateDirAndroidAgreesWithApp(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("WB2API_UPDATE_DIR", "")
+	t.Setenv("WB2API_ANDROID", "1")
+	t.Setenv("WB2API_ADMIN_DIR", filepath.Join(root, "panel-data"))
+	config := Default()
+	config.Update.Dir = ""
+	config.StateFile = filepath.Join(root, "data", "state.json")
+	want := filepath.Join(root, "updates")
+	if got := updateDir(config); got != want {
+		t.Fatalf("安卓反推的更新目录 = %q，期望 %q（App 的 watcher 盯的就是这个）", got, want)
+	}
+}

@@ -40,7 +40,7 @@ func TestLatestPicksAssetForThisArchitecture(t *testing.T) {
 				"digest": "sha256:bbbb"},
 			{"name": "wb2api-windows-amd64", "size": 44, "browser_download_url": "https://example.invalid/win-amd64",
 				"digest": "sha256:cccc"},
-			{"name": "wb2api-android-arm64", "size": 55, "browser_download_url": "https://example.invalid/android-arm64",
+			{"name": "workbuddy2api-android-arm64.apk", "size": 55, "browser_download_url": "https://example.invalid/android-arm64.apk",
 				"digest": "sha256:dddd"},
 			{"name": "SHA256SUMS.txt", "size": 33, "browser_download_url": "https://example.invalid/sums"},
 		},
@@ -234,17 +234,49 @@ func TestAssetNameFollowsRuntimePlatform(t *testing.T) {
 		}
 		return
 	}
-	var want string
-	switch runtime.GOOS {
-	case "windows":
-		want = "wb2api-windows-" + runtime.GOARCH
-	case "android":
-		want = "wb2api-android-" + runtime.GOARCH
-	default:
-		want = "wb2api-linux-" + runtime.GOARCH
+	want, wantErr := assetNameFor(runtime.GOOS, runtime.GOARCH)
+	if wantErr != nil {
+		t.Fatalf("assetNameFor(%s,%s) error = %v", runtime.GOOS, runtime.GOARCH, wantErr)
 	}
 	if name != want {
 		t.Fatalf("assetName() = %q，期望 %q（GOOS=%s GOARCH=%s）", name, want, runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// TestAssetNamePerPlatform 三端的资产名必须在**任意主机**上都能被断言。
+//
+// 真事故（2026-10-13）：这条断言原本写成按 runtime.GOOS 分支，安卓那一支期望
+// "wb2api-android-<arch>"，而实现早已改成 APK 资产 "workbuddy2api-android-<arch>.apk"。
+// 因为该分支只在 GOOS==android 时执行、而本项目从不在安卓上跑 `go test`，这个
+// 错误永远暴露不出来——等于安卓这条最容易出问题的路径**完全没有测试**。
+//
+// 现在断言的是 assetNameFor 这个纯函数，三端一起覆盖，与宿主平台无关。
+// 这些名字必须与发布产物一致：linux 见 tools/private_gateway_release_20260925.py，
+// windows 见 desktop/build.py，android 见 android/build.py 的 APK 输出名。
+func TestAssetNamePerPlatform(t *testing.T) {
+	cases := []struct {
+		goos, goarch string
+		want         string
+	}{
+		{"linux", "amd64", "wb2api-linux-amd64"},
+		{"linux", "arm64", "wb2api-linux-arm64"},
+		{"windows", "amd64", "wb2api-windows-amd64"},
+		{"android", "arm64", "workbuddy2api-android-arm64.apk"},
+	}
+	for _, c := range cases {
+		got, err := assetNameFor(c.goos, c.goarch)
+		if err != nil {
+			t.Errorf("assetNameFor(%s,%s) error = %v", c.goos, c.goarch, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("assetNameFor(%s,%s) = %q，期望 %q", c.goos, c.goarch, got, c.want)
+		}
+	}
+	// 安卓的资产必须以 .apk 结尾：裸二进制在手机上装不起来（SELinux 禁止在
+	// 应用私有目录执行），发错了会让更新下载到一个用不了的文件。
+	if _, err := assetNameFor("android", "386"); err != nil {
+		t.Errorf("assetNameFor(android,386) 不应报错（APK 资产与架构无关）: %v", err)
 	}
 }
 

@@ -124,19 +124,29 @@ func (c *Client) apiBase() string {
 }
 
 // assetName 本机平台与架构对应的发布资产名。
+func assetName() (string, error) {
+	return assetNameFor(runtime.GOOS, runtime.GOARCH)
+}
+
+// assetNameFor 给定 GOOS/GOARCH 的发布资产名。
 //
 // 三端共用同一套发布流程，资产名按 GOOS 区分：
 //   - linux/amd64、linux/arm64：容器与服务器部署（既有形态，名字不变）；
-//   - android/arm64：安卓 App（网关以可执行文件形式跑在应用私有目录里）；
+//   - android/arm64：安卓 App —— 资产是 **APK**，不是裸二进制；
 //   - windows/amd64：桌面版。
 //
 // 安卓的 GOOS 是 "android" 而不是 "linux"，虽然内核是 Linux——Go 的 runtime 会
 // 把它单独标出来，资产名也必须跟着分，否则手机去下 Linux 的二进制（用不了）。
-func assetName() (string, error) {
-	if runtime.GOOS == "windows" {
-		return "wb2api-windows-" + runtime.GOARCH, nil
+//
+// 之所以把它写成接受 goos/goarch 的**纯函数**（而不是直接读 runtime）：资产名
+// 分叉过一次而没人发现——测试里按 runtime.GOOS 分支断言，于是安卓那一支只在
+// 安卓主机上才会执行，而本项目从不在安卓上跑 `go test`，那个断言写错了也永远
+// 不会失败。参数化之后，三端的命名都能在任意主机上被断言。
+func assetNameFor(goos, goarch string) (string, error) {
+	if goos == "windows" {
+		return "wb2api-windows-" + goarch, nil
 	}
-	if runtime.GOOS == "android" {
+	if goos == "android" {
 		// 安卓上更新的是 **APK**，不是裸二进制。
 		//
 		// 为什么：应用私有目录（/data/data/<pkg>/files）里的文件**不能执行**——
@@ -148,15 +158,19 @@ func assetName() (string, error) {
 		// 所以安卓的自更新走系统机制：下载新 APK → 交给系统安装器 → 用户确认后
 		// Android 原地替换（应用数据保留）→ 新的 nativeLibraryDir 里就是新二进制。
 		// 这条路不需要 root，也是安卓上唯一被支持的自更新方式。
-		return "workbuddy2api-android-" + runtime.GOARCH + ".apk", nil
+		//
+		// 前缀是 "workbuddy2api-"（与 APK 文件名一致），不是 linux/windows 那种
+		// "wb2api-"：安卓的资产就是 android/build.py 打出来的那个 APK，两边必须
+		// 同名，否则手机永远找不到可更新的资产。
+		return "workbuddy2api-android-" + goarch + ".apk", nil
 	}
-	switch runtime.GOARCH {
+	switch goarch {
 	case "amd64":
 		return "wb2api-linux-amd64", nil
 	case "arm64":
 		return "wb2api-linux-arm64", nil
 	default:
-		return "", fmt.Errorf("unsupported architecture %q for self-update", runtime.GOARCH)
+		return "", fmt.Errorf("unsupported architecture %q for self-update", goarch)
 	}
 }
 

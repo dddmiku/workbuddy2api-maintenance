@@ -331,6 +331,17 @@ func main() {
 		"WB2API_ADMIN_DIR=" + layout.PanelData,
 		"WB2API_CONFIG_PATH=" + layout.Config,
 		"WB2API_RUNTIME_DIR=" + layout.RuntimeDir,
+		// 更新目录**显式传给网关**，而不是让两边各自推导。
+		//
+		// 启动器冷启动时看的是 <root>/data/updates（上面的 CurrentBinary），
+		// 而网关侧 updateDir() 的优先级是 WB2API_UPDATE_DIR > 配置 update.dir >
+		// 从 state_file 推导。默认情况下后两者恰好也落到同一个目录，但用户一旦
+		// 在配置里改了 update.dir，或环境里带了一个 WB2API_UPDATE_DIR（会被
+		// os.Environ() 继承下去），两边就分叉了：网关把更新下到 A、启动器去 B
+		// 找，症状是「更新成功但重启还是旧版」。
+		//
+		// 这里显式指定，让「启动器看哪里」与「网关写哪里」由同一个表达式给出。
+		"WB2API_UPDATE_DIR=" + filepath.Join(layout.DataDir, "updates"),
 		"WB2A_LISTEN=" + net.JoinHostPort(host, port),
 	}
 	if panelEngine == "python" {

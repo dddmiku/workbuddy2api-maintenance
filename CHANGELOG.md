@@ -61,12 +61,29 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    现在由 `android/build.py` 从 `gateway/VERSION` 折算（`vX.Y.Z → X*1000000+Y*1000+Z`），
    单调递增且一眼能对上版本号。
 
-### 同时清理
+### 同时修掉三处「没人测所以没人发现」的问题
 
-- `android/build.py` 不再导出裸二进制发布资产。安卓的热更新资产就是 **APK 本身**
-  （`release.go` 的 `assetName` 在 android 分支返回 `workbuddy2api-android-<arch>.apk`），
-  再发一份裸二进制只会让更新流程下载到一个在手机上装不起来的文件。
-- 去掉排查期间临时加的 `Log.e` 诊断，恢复正常日志级别。
+排查过程中做了一轮三端一致性核验，暴露出三个真实缺陷，都不是这次症状的原因，
+但都会在用户那里表现成「更新了但没生效」：
+
+1. **安卓的资产名断言是坏的，且永远不会失败**：`release_test.go` 按
+   `runtime.GOOS` 分支断言，安卓那一支期望 `wb2api-android-<arch>`，而实现早已
+   改成 APK 资产 `workbuddy2api-android-<arch>.apk`。因为该分支只在安卓主机上
+   执行、而本项目从不在安卓上跑 `go test`，这个错误**永远暴露不出来**——等于最
+   容易出问题的安卓路径完全没有测试。现在把 `assetName` 拆成纯函数
+   `assetNameFor(goos, goarch)`，三端的命名都能在任意主机上断言。
+2. **桌面启动器与网关可能算出不同的更新目录**：启动器冷启动时看
+   `<root>/data/updates`，而网关的优先级是 `WB2API_UPDATE_DIR` > 配置
+   `update.dir` > 从 `state_file` 推导。默认恰好一致，但用户一改配置（或环境里
+   带了 `WB2API_UPDATE_DIR`，它会被 `os.Environ()` 继承给子进程）两边就分叉。
+   现在启动器与 App 都**显式传** `WB2API_UPDATE_DIR`，让「看哪里」与「写哪里」
+   由同一个表达式给出；并补了测试锁住这条约定（安卓反推路径也一并覆盖）。
+3. **`internal/android` 的 `UpdatedGateway()` 是死代码**，注释还停留在「更新的是
+   裸二进制」的旧模型上。已订正注释、标明真正生效的是 Java 侧的
+   `AppPaths.updatedGateway()`，并保留该函数以锁定两端共用的指针格式。
+
+另外清理：`android/build.py` 不再导出裸二进制发布资产（安卓的更新资产就是 APK
+本身，裸二进制在手机上装不起来）；去掉排查期间临时加的 `Log.e` 诊断。
 
 ## v2.15.4 — 2026-10-13
 
