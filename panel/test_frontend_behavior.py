@@ -1775,3 +1775,73 @@ return {note:$('#updModalNote').innerHTML};
 """, extra_sources=("update.js",))
         self.assertIn("0 B", result["note"])
         self.assertNotIn("— /", result["note"])
+
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class PoolCardStateTest(FrontendHarness, unittest.TestCase):
+    """「账号池」卡的四态。
+
+    2026-10-13 用户截图反馈：卡片显示「0 / 0 健康 · 全部可用」并涂成绿色，而池里
+    明明有 34 个号。两个缺陷叠在一起：
+
+      1. 池数据缺失时（网关未就绪 / 首屏还没拿到 /status），代码把「没有数据」当成
+         「0 个账号」渲染，还因为 healthy === total === 0 涂成绿色「全部可用」——
+         读起来像「一切正常」，而实际是「还不知道」。
+      2. 那句「全部可用」的判据 healthy === total 在真实池子里**永远不成立**：
+         线上 24/34（3 冷却 + 7 停用），只要有一个号不可用就不等，于是这句话一次
+         都没出现过。真正该说的是「不可用的有几个」，与进度条同一口径。
+    """
+
+    def _card(self, expr):
+        """只取「账号池」这一张卡（到下一个 metric 为止）。
+
+        不能切到页面末尾：后面的「可用积分」卡在积分取不到时自己会带 `class="s e"`，
+        会把「池卡没涂红」的断言污染成假失败（2026-10-13 写这条用例时踩到）。
+        """
+        return self.run_frontend(expr + """
+var h=$('#metrics').innerHTML; var i=h.indexOf('账号池');
+var rest=h.slice(i); var end=rest.indexOf('<div class="metric"', 1);
+return {card: end > 0 ? rest.slice(0, end) : rest};
+""", extra_sources=())["card"]
+
+    def test_missing_pool_data_is_not_reported_as_all_available(self):
+        """池数据缺失时不能显示「0 / 0 全部可用」——那是「还不知道」，不是「都正常」。"""
+        card = self._card("S.data={accounts:[],pool:{}};renderMetrics();")
+        self.assertNotIn("全部可用", card)
+        self.assertIn("正在读取", card)
+        # 中性色：不能涂绿（绿=好消息），也不能涂红（红=故障）。
+        self.assertNotIn('class="s ok"', card)
+        self.assertNotIn('class="s e"', card)
+
+    def test_gateway_not_ready_says_so(self):
+        card = self._card("S.data={accounts:[],pool:{},ok:false};renderMetrics();")
+        self.assertIn("网关未就绪", card)
+        self.assertNotIn("全部可用", card)
+
+    def test_partly_unavailable_counts_them(self):
+        """真实线上口径：24/34 必须说出「10 个不可用」，而不是沉默或说全部可用。"""
+        card = self._card("S.data={accounts:[],pool:{total:34,healthy:24,cooling:3,disabled:7}};renderMetrics();")
+        self.assertIn("24 / 34", card)
+        self.assertIn("10 个不可用", card)
+        self.assertIn("3 冷却中", card)
+        self.assertNotIn("全部可用", card)
+
+    def test_fully_available_only_when_every_account_is_healthy(self):
+        card = self._card("S.data={accounts:[],pool:{total:5,healthy:5}};renderMetrics();")
+        self.assertIn("全部可用", card)
+        self.assertIn('class="s ok"', card)
+
+    def test_all_unavailable_is_red(self):
+        card = self._card("S.data={accounts:[],pool:{total:3,healthy:0,cooling:0,disabled:3}};renderMetrics();")
+        self.assertIn("3 个不可用", card)
+        self.assertIn('class="s e"', card)
+
+    def test_pool_panel_shows_empty_state_instead_of_zero_bar(self):
+        """详情卡也要空态：否则是一条全空的进度条 + 「0 / 0 健康」。"""
+        result = self.run_frontend("""
+S.data={accounts:[],pool:{}};renderPool();
+return {panel:$('#poolPanel').innerHTML};
+""")
+        self.assertIn("empty", result["panel"])
+        self.assertIn("正在读取账号池", result["panel"])
+        self.assertNotIn("/ 0 健康", result["panel"])

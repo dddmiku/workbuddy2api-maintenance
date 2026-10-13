@@ -521,12 +521,43 @@ function renderMetrics(){
   var expiring = have.reduce(function(s, x){
     return s + expiringSoon(x.credits, 7); }, 0);
 
+  // 「账号池」卡的副文案与配色。
+  //
+  // ═══ 为什么不能写成 healthy === total ? '全部可用' ═══
+  //
+  // 只要池里有**任何**一个号在冷却或停用，healthy 就不可能等于 total——线上实测
+  // 24/34（3 冷却 + 7 停用），于是那句「全部可用」永远不会出现。真正该说的是
+  // 「不可用的有几个」，与进度条（它把 cooling 与 disabled+off 都算成占用）同一口径。
+  //
+  // 反过来，healthy === total 且 total > 0 时才是真的全可用；那时说是好消息，
+  // 用 ok 绿。
+  var poolSub, poolCls;
+  if (!total){
+    // 池数据缺失（网关未就绪，或首屏还没拿到 /status）。
+    // **绝不能**显示成「0 / 0 · 全部可用」并涂成绿色——那读起来像「一切正常」，
+    // 而实际是「还不知道」（2026-10-13 用户截图反馈：卡片显示 0/0 全部可用，
+    // 而池里明明有 34 个号）。如实说明「未就绪」，用中性色。
+    poolSub = S.data && S.data.ok === false ? '网关未就绪' : '正在读取…';
+    poolCls = '';
+  } else if (healthy === total){
+    poolSub = '全部可用';
+    poolCls = 'ok';
+  } else {
+    var unusable = total - healthy;
+    poolSub = cooling
+      ? (unusable + ' 个不可用（' + cooling + ' 冷却中）')
+      : (unusable + ' 个不可用');
+    poolCls = healthy ? 'w' : 'e';
+  }
+
   $('#metrics').innerHTML = [
-    metric('账号', a.length, on + ' 启用', off + ' 个停用',
-      off ? 'w' : 'ok', null, IC.users),
-    metric('账号池', healthy + ' / ' + total, '健康',
-      cooling ? (cooling + ' 个冷却中') : (dis ? (dis + ' 个停用') : '全部可用'),
-      cooling ? 'w' : (dis ? 'e' : 'ok'), hpct, IC.pulse),
+    metric('账号', S.data ? String(a.length) : '—', S.data ? (on + ' 启用') : '',
+      // 数据还没到（S.data === null）时不能报「0 个停用」——那是把「未知」说成
+      // 「好消息」，而用户会据此以为账号一切正常（同「账号池」卡的判据）。
+      S.data ? (off + ' 个停用') : '正在读取…',
+      S.data ? (off ? 'w' : 'ok') : '', null, IC.users),
+    metric('账号池', total ? (healthy + ' / ' + total) : '—', total ? '健康' : '',
+      poolSub, poolCls, total ? hpct : null, IC.pulse),
     metric('可用积分', num(remain), '剩余',
       expiring > 0 ? (num(expiring) + ' 即将过期') : (have.length + ' / ' + a.length + ' 个账号取到'),
       expiring > 0 ? 'w' : (pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok')), pct, IC.coins),
@@ -588,6 +619,19 @@ function renderPool(){
   var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
   var off = Math.max(0, total - healthy - cooling - dis);
   function w(n){ return total ? (n / total * 100) : 0; }
+  // 池数据缺失（网关未就绪 / 首屏还没拿到 /status）时给一个明确的空态，
+  // 而不是渲染「0 / 0 健康」加一条全空的进度条——那看起来像「池子空了」，
+  // 与「还不知道」是两件事（见 renderMetrics 里同一条判据）。
+  if (!total){
+    $('#poolPanel').innerHTML = '<div class="empty">' + svg(IC.pulse, 30) +
+      '<div class="empty-t">' +
+      (S.data && S.data.ok === false ? '网关未就绪' : '正在读取账号池…') + '</div>' +
+      '<div class="empty-s">' +
+      (S.data && S.data.ok === false
+        ? '网关还没有响应状态接口；启动完成后这里会显示各域的健康账号数。'
+        : '稍候会自动刷新。') + '</div></div>';
+    return;
+  }
   // 汇总块：大字 + 进度条 + 两列小格。格子里只放「0 有意义」的项
   // （停用 0 是好消息但值得看到；并发占满/粘性会话为 0 时不占格）。
   var html = '<div class="big"><span class="v">' + healthy + '</span><span class="u">/ ' + total + ' 健康</span></div>' +
