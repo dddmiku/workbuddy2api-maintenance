@@ -154,9 +154,20 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 .mh .mic{width:32px;height:32px;flex:none;display:grid;place-items:center;border-radius:var(--r2)}
 .mh .mic.w{background:var(--warn-soft);color:var(--warn)}
 .mh .mic.e{background:var(--err-soft);color:var(--err)}
+.mh .mic.ok{background:var(--ok-soft);color:var(--ok)}
 .mbody{padding:16px}
 .mtext{font-size:13px;line-height:1.7;color:var(--ink-2)}
 .mfoot{display:flex;justify-content:flex-end;gap:9px;padding:13px 16px;border-top:1px solid var(--line)}
+/* 更新进度对话框里的进度条。放在 .modal 之外单独写，不复用 .metric .bar —— 那些是
+   卡片内的小进度条（4px、无文字），这里是对话框主视觉，要更粗、要能显示百分比。 */
+.upd-progress{height:8px;margin-top:14px;background:var(--sunken);border-radius:4px;overflow:hidden}
+.upd-progress i{display:block;height:100%;width:0;background:var(--accent);border-radius:4px;
+  transition:width .3s var(--ease)}
+/* 总大小未知时（发布没给 size）不显示假的 0%，改成来回滑动的不确定态。 */
+.upd-progress.unknown i{width:35%;animation:updslide 1.15s ease-in-out infinite}
+@keyframes updslide{0%{margin-left:-35%}100%{margin-left:100%}}
+.upd-progress-note{margin-top:9px;font:12px/1.6 var(--mono);color:var(--ink-3)}
+.upd-progress-note b{color:var(--ink-2);font-weight:500}
 .qr-box{display:grid;place-items:center;padding:14px;background:#fff;border:1px solid var(--line);border-radius:var(--r2)}
 .url-box{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r2);
   background:var(--sunken);font:12px/1.55 var(--mono);color:var(--ink-2);word-break:break-all}

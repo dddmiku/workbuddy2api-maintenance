@@ -187,7 +187,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
 
 // REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
 //
@@ -1749,9 +1749,21 @@ async function startLogin(){
 // 手工粘贴（本机回调 + 复制地址栏）是唯一走得通的路径。
 function renderTraeAuth(){
   $('#drTitle').textContent = 'Trae 授权';
+  // 第 1 步用**真正的 <a> 链接**，不用 button + window.open。
+  //
+  // 为什么：手机 App 的 WebView 没有地址栏，而 Trae 授权流程要求用户在最后一步
+  // 复制地址栏里的回调链接。所以这一步必须把授权页甩到**系统浏览器**里去——
+  // App 侧靠 shouldOverrideUrlLoading 接住外链并 startActivity(ACTION_VIEW)。
+  // 真实链接的导航一定会经过那个回调；而 window.open 在 WebView 里的行为取决于
+  // 多窗口设置，不如链接确定。顺带桌面用户也能右键复制这个链接。
+  var authURL = DT.url || '';
   $('#drBody').innerHTML =
     '<div class="mtext"><b>第 1 步</b>：点下面的按钮打开 Trae 授权页并完成登录。</div>' +
-    '<div style="margin-top:8px"><button class="btn pri" id="drReopen" style="width:100%">打开 Trae 授权页</button></div>' +
+    '<div style="margin-top:8px">' +
+      '<a class="btn pri" id="drReopen" href="' + esc(authURL) + '" target="_blank" ' +
+      'rel="noopener" style="width:100%;box-sizing:border-box;text-align:center;' +
+      'text-decoration:none;display:block;line-height:1.9">打开 Trae 授权页</a>' +
+    '</div>' +
     '<div class="note w" style="margin-top:14px;line-height:1.65">' +
       svg(IC.warn, 16) +
       '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1</code> 并显示' +
@@ -1768,9 +1780,13 @@ function renderTraeAuth(){
   $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
     '<button class="btn pri" id="drSubmit2">完成添加</button>';
   $('#drCancel').addEventListener('click', renderPick);
-  // 必须用**本机回调**那条链接：它是 Trae 唯一接受的回调地址。
-  $('#drReopen').addEventListener('click', function(){
-    window.open(DT.traeFallback || DT.url, '_blank', 'noopener');
+  // 链接本身负责导航；这里只在拿不到链接时给出可读提示，不让用户点一个空链接。
+  $('#drReopen').addEventListener('click', function(e){
+    if (!authURL){
+      e.preventDefault();
+      var msg = $('#traeMsg');
+      if (msg) msg.textContent = '授权链接还没生成好，请点「重新选择区域」再试一次。';
+    }
   });
   $('#drPaste').addEventListener('click', readClipboardIntoCallback);
   $('#drSubmit2').addEventListener('click', submitTraeCallback);

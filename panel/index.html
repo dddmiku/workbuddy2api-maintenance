@@ -424,9 +424,20 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 .mh .mic{width:32px;height:32px;flex:none;display:grid;place-items:center;border-radius:var(--r2)}
 .mh .mic.w{background:var(--warn-soft);color:var(--warn)}
 .mh .mic.e{background:var(--err-soft);color:var(--err)}
+.mh .mic.ok{background:var(--ok-soft);color:var(--ok)}
 .mbody{padding:16px}
 .mtext{font-size:13px;line-height:1.7;color:var(--ink-2)}
 .mfoot{display:flex;justify-content:flex-end;gap:9px;padding:13px 16px;border-top:1px solid var(--line)}
+/* 更新进度对话框里的进度条。放在 .modal 之外单独写，不复用 .metric .bar —— 那些是
+   卡片内的小进度条（4px、无文字），这里是对话框主视觉，要更粗、要能显示百分比。 */
+.upd-progress{height:8px;margin-top:14px;background:var(--sunken);border-radius:4px;overflow:hidden}
+.upd-progress i{display:block;height:100%;width:0;background:var(--accent);border-radius:4px;
+  transition:width .3s var(--ease)}
+/* 总大小未知时（发布没给 size）不显示假的 0%，改成来回滑动的不确定态。 */
+.upd-progress.unknown i{width:35%;animation:updslide 1.15s ease-in-out infinite}
+@keyframes updslide{0%{margin-left:-35%}100%{margin-left:100%}}
+.upd-progress-note{margin-top:9px;font:12px/1.6 var(--mono);color:var(--ink-3)}
+.upd-progress-note b{color:var(--ink-2);font-weight:500}
 .qr-box{display:grid;place-items:center;padding:14px;background:#fff;border:1px solid var(--line);border-radius:var(--r2)}
 .url-box{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r2);
   background:var(--sunken);font:12px/1.55 var(--mono);color:var(--ink-2);word-break:break-all}
@@ -1352,6 +1363,32 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
   </div>
 </div>
 
+<!-- 更新进度对话框：点「立即更新」之后弹出，全程显示下载/校验/切换的进度。
+     与上面的通用 modal 分开：那个是「问一句就关」，这个是**常驻进度面板**，
+     按钮的语义（取消/关闭）和内容（进度条 + 字节数 + 阶段）都不一样，
+     塞进通用 modal 会让两边的逻辑互相牵制。
+
+     为什么要有它：下载包十几 MB，慢网络下要等几十秒。此前只在卡片里给一行静止的
+     「下载中…」，用户分不清是在下载、卡住了、还是已经失败（2026-10-13 用户要求
+     「下载改为弹窗加进度条」）。 -->
+<div class="scrim" id="scrimU"></div>
+<div class="modal" id="updModal" role="dialog" aria-modal="true" aria-labelledby="updModalTitle">
+  <div class="mh">
+    <div class="mic w" id="updModalIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4.5 20.5h15"/></svg>
+    </div>
+    <h3 id="updModalTitle">正在更新</h3>
+  </div>
+  <div class="mbody">
+    <div class="mtext" id="updModalText">正在准备…</div>
+    <div class="upd-progress" id="updModalBar"><i style="width:0%"></i></div>
+    <div class="upd-progress-note" id="updModalNote"></div>
+  </div>
+  <div class="mfoot">
+    <button class="btn" id="updModalClose">后台运行</button>
+  </div>
+</div>
+
 <div class="scrim" id="scrimL"></div>
 <div class="modal wide" id="logModal" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
   <div class="mh">
@@ -1626,7 +1663,7 @@ var IC = {
 
 /* ── 状态 ─────────────────────────────────────────── */
 var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
-var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false, traeFallback:'' };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
 
 // REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
 //
@@ -3188,9 +3225,21 @@ async function startLogin(){
 // 手工粘贴（本机回调 + 复制地址栏）是唯一走得通的路径。
 function renderTraeAuth(){
   $('#drTitle').textContent = 'Trae 授权';
+  // 第 1 步用**真正的 <a> 链接**，不用 button + window.open。
+  //
+  // 为什么：手机 App 的 WebView 没有地址栏，而 Trae 授权流程要求用户在最后一步
+  // 复制地址栏里的回调链接。所以这一步必须把授权页甩到**系统浏览器**里去——
+  // App 侧靠 shouldOverrideUrlLoading 接住外链并 startActivity(ACTION_VIEW)。
+  // 真实链接的导航一定会经过那个回调；而 window.open 在 WebView 里的行为取决于
+  // 多窗口设置，不如链接确定。顺带桌面用户也能右键复制这个链接。
+  var authURL = DT.url || '';
   $('#drBody').innerHTML =
     '<div class="mtext"><b>第 1 步</b>：点下面的按钮打开 Trae 授权页并完成登录。</div>' +
-    '<div style="margin-top:8px"><button class="btn pri" id="drReopen" style="width:100%">打开 Trae 授权页</button></div>' +
+    '<div style="margin-top:8px">' +
+      '<a class="btn pri" id="drReopen" href="' + esc(authURL) + '" target="_blank" ' +
+      'rel="noopener" style="width:100%;box-sizing:border-box;text-align:center;' +
+      'text-decoration:none;display:block;line-height:1.9">打开 Trae 授权页</a>' +
+    '</div>' +
     '<div class="note w" style="margin-top:14px;line-height:1.65">' +
       svg(IC.warn, 16) +
       '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1</code> 并显示' +
@@ -3207,9 +3256,13 @@ function renderTraeAuth(){
   $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
     '<button class="btn pri" id="drSubmit2">完成添加</button>';
   $('#drCancel').addEventListener('click', renderPick);
-  // 必须用**本机回调**那条链接：它是 Trae 唯一接受的回调地址。
-  $('#drReopen').addEventListener('click', function(){
-    window.open(DT.traeFallback || DT.url, '_blank', 'noopener');
+  // 链接本身负责导航；这里只在拿不到链接时给出可读提示，不让用户点一个空链接。
+  $('#drReopen').addEventListener('click', function(e){
+    if (!authURL){
+      e.preventDefault();
+      var msg = $('#traeMsg');
+      if (msg) msg.textContent = '授权链接还没生成好，请点「重新选择区域」再试一次。';
+    }
   });
   $('#drPaste').addEventListener('click', readClipboardIntoCallback);
   $('#drSubmit2').addEventListener('click', submitTraeCallback);
@@ -4902,8 +4955,10 @@ usageInit();
  * 状态来自网关的本机管理接口 GET /update；真正的升级动作走
  * POST /update/apply，由网关下载校验后把监听套接字交给新进程，
  * 旧进程继续把在途请求（含长流式对话）跑完再退出，所以前台不需要重连。
+ *
+ * 2026-10-13：点「立即更新」后弹出进度对话框，全程显示下载/校验/切换进度。
  */
-var UP = { data:null, timer:null, loading:false };
+var UP = { data:null, timer:null, loading:false, modal:false, modalBusy:false, modalDone:false };
 var UP_STATE = {
   idle:      { t:'空闲',   cls:''   },
   checking:  { t:'检查中', cls:'w'  },
@@ -4923,6 +4978,16 @@ function upBytes(n){
   if (n < 1024) return n + ' B';
   if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
   return (n / 1048576).toFixed(1) + ' MB';
+}
+
+// upDownBytes 与 upBytes 相同，但 0 显示为「0 B」而不是「—」。
+//
+// upBytes 的「—」语义是**缺失**（发布没给大小），而下载进度里的 0 是真实观测到的
+// 「已下载 0 字节」。两者混用会让刚开始下载时显示「— / 19.1 MB」，看起来像字节数
+// 没在动（2026-10-13 加进度条时发现）。
+function upDownBytes(n){
+  n = Number(n) || 0;
+  return n === 0 ? '0 B' : upBytes(n);
 }
 
 function renderUpdate(){
@@ -4973,25 +5038,6 @@ function renderUpdate(){
     mrow('上次检查', s.checked_at ? relTime(s.checked_at) : '—') +
     mrow('仓库', s.repo || '—');
   box.innerHTML = rows;
-  // 下载进度条：更新包十几 MB，慢网络下要等几十秒。此前只有一个静止的「下载中…」，
-  // 用户分不清是在下载、卡住了、还是已经失败（2026-10-13 用户要求给进度条）。
-  //
-  // 只在 downloading 且总大小已知时显示；asset_size 为 0（发布没给 size）时退回到
-  // 不确定态，不显示一个假的 0%。
-  var prog = $('#updProgress');
-  if (prog){
-    if (s.state === 'downloading' && s.asset_size > 0){
-      var pct = Math.max(0, Math.min(100, Math.round((s.progress || 0) * 100)));
-      prog.style.display = '';
-      prog.innerHTML =
-        '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
-        '<div class="sub">' + upBytes(s.downloaded_bytes || 0) + ' / ' + upBytes(s.asset_size) +
-        ' · ' + pct + '%</div>';
-    } else {
-      prog.style.display = 'none';
-      prog.innerHTML = '';
-    }
-  }
   $('#updState').innerHTML = upState(s.state);
   $('#btnUpdCheck').disabled = busy;
   // 「立即更新」只在**确实有可升级版本**时可用：
@@ -5008,6 +5054,124 @@ function renderUpdate(){
   else if (s.checked_at) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
   else hint = '点「立即更新」会先检查远端版本';
   $('#updHint').textContent = hint;
+  renderUpdateModal(s);
+}
+
+// ── 更新进度对话框 ──────────────────────────────────────────────────────
+//
+// 点「立即更新」后弹出，直到成功或失败才自动收起。它读的是与卡片**同一个**
+// /update 快照（renderUpdate 每次都会调过来），所以进度与卡片永远一致。
+
+/** 打开进度对话框。 */
+function openUpdateModal(){
+  UP.modal = true;
+  UP.modalBusy = false;
+  UP.modalDone = false;
+  $('#updModalTitle').textContent = '正在更新';
+  // 图标类必须**显式重置**：上一次失败时它被设成 'mic e'，不重置的话重试时
+  // 标题写着「正在更新」而图标还是红色叹号，自相矛盾。
+  $('#updModalIcon').className = 'mic w';
+  $('#updModalText').textContent = '正在准备…';
+  $('#updModalNote').textContent = '';
+  var bar = $('#updModalBar');
+  bar.classList.remove('unknown');
+  bar.querySelector('i').style.width = '0%';
+  $('#updModalClose').textContent = '后台运行';
+  $('#updModalClose').disabled = false;
+  $('#scrimU').classList.add('on');
+  $('#updModal').classList.add('on');
+}
+
+function closeUpdateModal(){
+  UP.modal = false;
+  $('#scrimU').classList.remove('on');
+  $('#updModal').classList.remove('on');
+}
+
+/** 按当前状态刷新对话框。没打开时什么都不做。 */
+function renderUpdateModal(s){
+  if (!UP.modal) return;
+  var bar = $('#updModalBar');
+  var fill = bar.querySelector('i');
+  var text = $('#updModalText');
+  var note = $('#updModalNote');
+  var state = s.state || 'idle';
+  var total = Number(s.asset_size) || 0;
+  var done = Number(s.downloaded_bytes) || 0;
+
+  if (state === 'failed'){
+    // 终态：把原因写清楚，按钮变成「关闭」。不自动收起——用户需要读到失败原因。
+    UP.modalDone = true;
+    $('#updModalTitle').textContent = '更新失败';
+    $('#updModalIcon').className = 'mic e';
+    text.textContent = s.last_error || '更新失败，请查看网关日志。';
+    bar.classList.remove('unknown');
+    fill.style.width = '0%';
+    note.textContent = '';
+    $('#updModalClose').textContent = '关闭';
+    return;
+  }
+
+  if (state === 'checking' || state === 'downloading' || state === 'handover'){
+    UP.modalBusy = true;
+  }
+
+  if (state === 'checking'){
+    text.textContent = '正在检查远端版本…';
+    bar.classList.add('unknown');
+    note.textContent = '';
+    return;
+  }
+
+  if (state === 'downloading'){
+    // 总大小未知（发布没给 size）时用不确定态滑动，而不是显示一个假的 0%
+    // ——那会让人以为卡住了。
+    //
+    // 已下载字节一律用 upDownBytes 而不是 upBytes：upBytes(0) 是「—」（它的语义
+    // 是「缺失」），但这里的 0 是真实的「还没下到字节」，显示成「— / 19.1 MB」
+    // 会让人以为字节数根本没在动。
+    if (total > 0){
+      var pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+      bar.classList.remove('unknown');
+      fill.style.width = pct + '%';
+      text.textContent = '正在下载更新包…';
+      note.innerHTML = '<b>' + upDownBytes(done) + '</b> / ' + upBytes(total) + ' · ' + pct + '%';
+    } else {
+      bar.classList.add('unknown');
+      text.textContent = '正在下载更新包…';
+      note.innerHTML = '<b>' + upDownBytes(done) + '</b>';
+    }
+    return;
+  }
+
+  if (state === 'handover'){
+    // 下载已完成：进度条补满，明确告诉用户「不会再等很久」。
+    bar.classList.remove('unknown');
+    fill.style.width = '100%';
+    text.textContent = '下载完成，正在切换到新版本…';
+    note.textContent = '正在进行的对话会继续跑完，不会中断。';
+    return;
+  }
+
+  // 走到 idle 时**不能**直接宣布成功：申请提交后的第一次轮询可能比网关的状态
+  // 更新更早，此时 state 还是 idle，会把「刚开始」误报成「已完成」。
+  // 只有确实经历过 checking/downloading/handover 之后回到 idle，才算完成。
+  if (state === 'idle' && UP.modalBusy){
+    UP.modalDone = true;
+    bar.classList.remove('unknown');
+    fill.style.width = '100%';
+    $('#updModalTitle').textContent = '更新完成';
+    $('#updModalIcon').className = 'mic ok';
+    text.textContent = '已切换到新版本 ' + (s.current || '') + '。';
+    note.textContent = '页面稍后会自动恢复；若长时间无响应，手动刷新一次即可。';
+    $('#updModalClose').textContent = '关闭';
+    return;
+  }
+
+  // 还没看到任何进行中的状态：保持「正在准备…」，等下一轮轮询。
+  text.textContent = '正在准备…';
+  bar.classList.add('unknown');
+  note.textContent = '';
 }
 
 async function loadUpdate(){
@@ -5033,10 +5197,11 @@ function startUpdatePoll(){
   UP.timer = setInterval(async function(){
     ticks++;
     await loadUpdate();
-    var st = UP.data && UP.data.status && UP.data.status.state;
+    var s = (UP.data && UP.data.status) || {};
     // 交接完成后旧进程随时会退出，继续轮询会看到连接错误，到点就停。
-    if (ticks > 240 || st === 'failed') stopUpdatePoll();
-  }, 2000);
+    if (ticks > 240 || s.state === 'failed') stopUpdatePoll();
+    // 走到 idle 且对话框已经看过下载/切换阶段 → 更新完成，停轮询。
+    if (UP.modalDone && s.state === 'idle') stopUpdatePoll();  }, 2000);
 }
 
 async function actUpdateCheck(){
@@ -5066,7 +5231,9 @@ async function actUpdateApply(){
       try{
         var r = await api('api/update/apply', {});
         if (r.ok === false){ toast(r.message || '更新未开始', 'err'); await loadUpdate(); return; }
-        toast('已开始更新，正在下载与切换', 'ok');
+        // 点完确认就直接弹进度框——用户此刻最想知道的就是「在下没在动」。
+        // 先弹再拉数据，避免开头几秒没有任何反馈。
+        openUpdateModal();
         renderUpdate();
         startUpdatePoll();
       }catch(err){
@@ -5077,8 +5244,12 @@ async function actUpdateApply(){
 
 document.addEventListener('click', function(e){
   if (e.target.closest('#btnUpdCheck')){ actUpdateCheck(); return; }
-  if (e.target.closest('#btnUpdApply')){ actUpdateApply(); }
+  if (e.target.closest('#btnUpdApply')){ actUpdateApply(); return; }
+  // 「后台运行」只收起对话框，**不取消更新**：更新跑在网关进程里，关掉界面
+  // 不会影响它；用户想走开时不该被一个对话框按住。
+  if (e.target.closest('#updModalClose')){ closeUpdateModal(); return; }
 });
+$('#scrimU').addEventListener('click', closeUpdateModal);
 
 /* ── 重复推理保护（命中后重发 / 命中即停止）────────────────
  * 运行期开关，走网关本机管理接口 GET/POST /features/reasoning-loop。

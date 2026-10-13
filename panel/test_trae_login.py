@@ -334,10 +334,20 @@ class TraeUIManualOnlyTest(unittest.TestCase):
                 self.assertIn("127.0.0.1", block, "必须说清报错页是正常的")
 
     def test_manual_uses_localhost_link(self):
-        """必须用本机回调链接——它是 Trae 唯一接受的回调地址。"""
+        """必须用本机回调链接——它是 Trae 唯一接受的回调地址。
+
+        2026-10-13：改用真正的 `<a href=DT.url>` 而不是 `window.open(...)`。
+        原因是手机 App 的 WebView 没有地址栏，而 Trae 流程要求用户复制地址栏里的
+        回调链接；`<a target="_blank">` 的导航一定会经过 WebView 的
+        shouldOverrideUrlLoading，由 App 交给系统浏览器，行为比 window.open 确定。
+        所以这里断言的是「用的是 DT.url 那条链接」，不再绑定具体的打开方式。
+        """
         for name, body in (("app.js", self.app_js), ("index.html", self.index)):
             with self.subTest(name=name):
-                self.assertIn("DT.traeFallback || DT.url", body)
+                self.assertIn('href="\' + esc(authURL) + \'"', body)
+                self.assertIn("var authURL = DT.url || ''", body)
+                # 链接必须来自后端给的那条本机回调地址，不能是别处拼出来的。
+                self.assertNotIn("_trae_public_callback", body)
 
     def test_no_auto_callback_ui_left(self):
         """自动回调的 UI 必须彻底移除，不留半截入口。"""

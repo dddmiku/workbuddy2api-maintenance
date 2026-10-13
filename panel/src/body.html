@@ -457,6 +457,32 @@
   </div>
 </div>
 
+<!-- 更新进度对话框：点「立即更新」之后弹出，全程显示下载/校验/切换的进度。
+     与上面的通用 modal 分开：那个是「问一句就关」，这个是**常驻进度面板**，
+     按钮的语义（取消/关闭）和内容（进度条 + 字节数 + 阶段）都不一样，
+     塞进通用 modal 会让两边的逻辑互相牵制。
+
+     为什么要有它：下载包十几 MB，慢网络下要等几十秒。此前只在卡片里给一行静止的
+     「下载中…」，用户分不清是在下载、卡住了、还是已经失败（2026-10-13 用户要求
+     「下载改为弹窗加进度条」）。 -->
+<div class="scrim" id="scrimU"></div>
+<div class="modal" id="updModal" role="dialog" aria-modal="true" aria-labelledby="updModalTitle">
+  <div class="mh">
+    <div class="mic w" id="updModalIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4.5 20.5h15"/></svg>
+    </div>
+    <h3 id="updModalTitle">正在更新</h3>
+  </div>
+  <div class="mbody">
+    <div class="mtext" id="updModalText">正在准备…</div>
+    <div class="upd-progress" id="updModalBar"><i style="width:0%"></i></div>
+    <div class="upd-progress-note" id="updModalNote"></div>
+  </div>
+  <div class="mfoot">
+    <button class="btn" id="updModalClose">后台运行</button>
+  </div>
+</div>
+
 <div class="scrim" id="scrimL"></div>
 <div class="modal wide" id="logModal" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
   <div class="mh">

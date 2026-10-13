@@ -44,7 +44,13 @@ function norm(id) {
 function node(rawId) {
   const id = norm(rawId);
   if (!nodes.has(id)) nodes.set(id, {innerHTML:'', textContent:'', value:'', disabled:false,
-    options:[], style:{}, attrs:{}, events:{}, classList:{add(){},remove(){},toggle(){}},
+    options:[], style:{}, attrs:{}, events:{},
+    // classList 必须**记录**状态而不是空实现：进度条的「不确定态」靠
+    // bar.classList.add('unknown') 表达，空实现会让断言永远看不出差异。
+    classList:(function(){const set=new Set();
+      return {add(c){set.add(c)},remove(c){set.delete(c)},
+        toggle(c,f){if(f===undefined)f=!set.has(c);f?set.add(c):set.delete(c);return f},
+        contains(c){return set.has(c)},_all(){return Array.from(set)}};})(),
     setAttribute(k,v){this.attrs[k]=String(v)}, getAttribute(k){return this.attrs[k]},
     removeAttribute(k){delete this.attrs[k]}, addEventListener(k,v){this.events[k]=v},
     querySelector(s){return node(id+' '+s)},querySelectorAll(){return []}});
@@ -1626,3 +1632,146 @@ return $('#usageRows').innerHTML;
         self.assertIn('entry["total_tokens"]', block)
         # 同一次遍历里取两个字段：分两次取会在并发写入下对不上。
         self.assertIn("totals, credits = {}, {}", block)
+
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class UpdateProgressModalTest(FrontendHarness, unittest.TestCase):
+    """点「立即更新」后的进度对话框。
+
+    2026-10-13 用户要求「下载改为弹窗加进度条」。此前的实现只在更新卡片里查
+    `#updProgress`，而**那个元素从来没有出现在页面里**——`if (prog)` 永远为假，
+    进度条实际上一次都没渲染过。这组用例同时锁住「元素存在」与「进度真的在动」。
+    """
+
+    def test_progress_element_exists_in_markup(self):
+        """#updProgress 从未存在过的那次教训：JS 查的元素必须在页面里有。"""
+        html = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
+        self.assertIn('id="updModalBar"', html, "进度条元素必须真的在页面里")
+        self.assertIn('id="updModal"', html)
+        self.assertIn('id="updModalClose"', html)
+
+    def test_downloading_shows_percentage(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:20000000,downloaded_bytes:5000000,progress:0.25}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        note:$('#updModalNote').innerHTML,
+        width:$('#updModalBar i').style.width,
+        unknown:$('#updModalBar').classList.contains('unknown'),
+        open:$('#updModal').classList.contains('on')};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "正在更新")
+        self.assertEqual(result["width"], "25%")
+        self.assertIn("4.8 MB", result["note"])
+        self.assertIn("19.1 MB", result["note"])
+        self.assertIn("25%", result["note"])
+        self.assertFalse(result["unknown"])
+        self.assertTrue(result["open"])
+
+    def test_unknown_size_uses_indeterminate_bar(self):
+        """发布没给 size 时不能显示假的 0%——那看起来像卡住了。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:0,downloaded_bytes:1200000}};
+openUpdateModal(); renderUpdate();
+return {unknown:$('#updModalBar').classList.contains('unknown'),
+        width:$('#updModalBar i').style.width, note:$('#updModalNote').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["unknown"], "总大小未知时必须走不确定态")
+        self.assertIn("1.1 MB", result["note"])
+
+    def test_handover_shows_full_bar_and_reassures(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'handover',asset_size:100}};
+openUpdateModal(); renderUpdate();
+return {text:$('#updModalText').textContent, note:$('#updModalNote').textContent,
+        width:$('#updModalBar i').style.width};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["width"], "100%")
+        self.assertIn("切换", result["text"])
+        self.assertIn("不会中断", result["note"])
+
+    def test_failure_stops_and_reports_the_reason(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'failed',
+  last_error:'下载资产与签名清单不一致'}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className, close:$('#updModalClose').textContent,
+        open:$('#updModal').classList.contains('on')};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "更新失败")
+        self.assertIn("签名清单不一致", result["text"])
+        self.assertIn("e", result["icon"])
+        self.assertEqual(result["close"], "关闭")
+        self.assertTrue(result["open"], "失败时不该自动收起，用户要读到原因")
+
+    def test_reopening_after_failure_resets_the_icon(self):
+        """重试时图标必须回到「进行中」：否则标题写着正在更新、图标还是红叹号。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'failed',last_error:'x'}};
+openUpdateModal(); renderUpdate();
+var afterFail=$('#updModalIcon').className;
+openUpdateModal();
+return {afterFail:afterFail, afterReopen:$('#updModalIcon').className,
+        title:$('#updModalTitle').textContent};
+""", extra_sources=("update.js",))
+        self.assertIn("e", result["afterFail"])
+        self.assertEqual(result["afterReopen"], "mic w")
+        self.assertEqual(result["title"], "正在更新")
+
+    def test_completion_switches_to_done(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'handover',asset_size:100}};
+openUpdateModal(); renderUpdate();
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',asset_size:100}};
+renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className, width:$('#updModalBar i').style.width};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "更新完成")
+        self.assertIn("v3.0.1", result["text"])
+        self.assertIn("ok", result["icon"])
+        self.assertEqual(result["width"], "100%")
+
+    def test_modal_closed_means_no_rendering(self):
+        """没打开对话框时，状态变化不得把对话框内容改掉（避免下次打开看到旧值）。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:100,downloaded_bytes:50}};
+renderUpdate();
+return {open:$('#updModal').classList.contains('on'),
+        text:$('#updModalText').textContent,
+        width:String($('#updModalBar i').style.width)};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["open"])
+        self.assertNotEqual(result["width"], "50%")
+        self.assertEqual(result["width"], "undefined")
+
+    def test_idle_before_any_progress_is_not_reported_as_done(self):
+        """提交更新后的第一次轮询可能比网关状态更新更早，此时 state 仍是 idle。
+
+        若不看「是否经历过进行中的阶段」，会把「刚开始」直接误报成「更新完成」
+        ——用户看到「已切换到新版本」，而实际上什么都没发生。
+        """
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'idle',asset_size:100}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className};
+""", extra_sources=("update.js",))
+        self.assertNotEqual(result["title"], "更新完成")
+        self.assertEqual(result["title"], "正在更新")
+        self.assertNotIn("ok", result["icon"])
+
+    def test_zero_bytes_download_is_shown_as_zero_not_dash(self):
+        """upBytes(0) 是「—」（表示缺失），但下载进度里的 0 是真实的 0 字节。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:20000000,downloaded_bytes:0}};
+openUpdateModal(); renderUpdate();
+return {note:$('#updModalNote').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertIn("0 B", result["note"])
+        self.assertNotIn("— /", result["note"])
