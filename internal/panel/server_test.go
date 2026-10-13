@@ -1918,3 +1918,47 @@ func TestContainerRunningAgreesWithState(t *testing.T) {
 		})
 	}
 }
+
+// ── 安卓自动登录（App 用初始凭据换会话 cookie，不再让用户手抄） ──────────
+//
+// App 的自动登录走的是与浏览器登录**同一个**接口，但请求方是
+// HttpURLConnection（MainActivity.performAutoLogin）。它与浏览器的差别只有两点：
+//   - 不带 Origin 头（浏览器一定会带）；
+//   - 自己读 Set-Cookie，而不是靠浏览器自动存。
+//
+// 这两点都必须成立，否则安卓端会静默回落到「显示凭据让用户手抄」。
+func TestAutoLoginWorksWithoutOriginHeader(t *testing.T) {
+	h := newHarness(t)
+	h.writeCredentials()
+	// 显式不带 Origin：originOK 对空 Origin 必须放行，否则 App 永远登不进去。
+	recorder := h.do(http.MethodPost, "/api/auth/login",
+		`{"username":"wbadmin","password":"secret-password"}`,
+		map[string]string{"X-Admin-Request": "1"})
+	if recorder.Code != 200 {
+		t.Fatalf("不带 Origin 的登录应 200，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	// Set-Cookie 必须是 App 能直接解析的裸 `name=value` 前缀（MainActivity 截到
+	// 第一个分号）。若把值写成带引号或有前缀的形式，App 那边解析会失败。
+	headers := recorder.Header().Values("Set-Cookie")
+	if len(headers) == 0 {
+		t.Fatal("登录必须返回 Set-Cookie，否则 App 拿不到会话")
+	}
+	valid := ""
+	for _, header := range headers {
+		if !strings.HasPrefix(header, CookieName+"=") {
+			continue
+		}
+		value := strings.SplitN(header, ";", 2)[0]
+		if strings.TrimPrefix(value, CookieName+"=") != "" {
+			valid = value
+		}
+	}
+	if valid == "" {
+		t.Fatalf("Set-Cookie 里没有可用的会话值：%v", headers)
+	}
+	// App 会原样把这串塞回 Cookie 头，必须能通过会话校验。
+	session := h.do(http.MethodGet, "/api/session", "", map[string]string{"Cookie": valid})
+	if session.Code != 200 {
+		t.Fatalf("App 回填的 cookie 必须有效，实际 %d", session.Code)
+	}
+}
