@@ -66,9 +66,11 @@ func TestExplicitRollbackStillDownloadsSelectedLatestRelease(t *testing.T) {
 			if explicit {
 				target = "v2.1.25"
 			}
-			if _, err := manager.Apply(context.Background(), target); err == nil {
-				t.Fatal("fixture must fail before handover")
-			}
+			// 这条测试只关心**选版本**（降级必须显式指定），不关心交接本身。
+			// 所以不断言 Apply 的成败：Windows 上它会在下载后以「重启后生效」正常
+			// 返回，Unix 上则因 fixture 不是可执行文件而在交接处失败——两者都是
+			// 预期行为，断言其中一种会让测试变成平台相关的。
+			_, _ = manager.Apply(context.Background(), target)
 			if downloaded.Load() != explicit {
 				t.Fatalf("downloaded = %v; downgrade must require an explicit target", downloaded.Load())
 			}

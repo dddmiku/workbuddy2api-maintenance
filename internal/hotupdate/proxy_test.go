@@ -3,6 +3,14 @@
 package hotupdate
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -70,5 +78,120 @@ func TestManagerProxySentinel(t *testing.T) {
 func TestDefaultProxyIsHTTPS(t *testing.T) {
 	if !strings.HasPrefix(DefaultProxyBase, "https://") {
 		t.Fatalf("默认代理必须走 https，实际 %q", DefaultProxyBase)
+	}
+}
+
+// TestDownloadFallsBackToDirect 代理不可用时必须回落到直连。
+//
+// 代理是第三方服务，会挂、会限流、也可能某天消失。只走代理等于把「能不能更新」
+// 押在它身上；只走直连又会在被墙时完全卡住。所以两条都要试。
+//
+// 注意 proxied() 只改写 GitHub 主机（SSRF 纵深防御），所以这里不能靠一个本地
+// 假代理来观察——直接用 downloadURLs 给出的候选，按顺序喂给 fetchAsset 验证
+// 「第一条失败、第二条成功」这条路径。
+func TestDownloadFallsBackToDirect(t *testing.T) {
+	content := []byte("#!/bin/sh\necho wb2api\n")
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // 模拟代理挂掉
+	}))
+	defer dead.Close()
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(content)
+	}))
+	defer alive.Close()
+
+	client := NewClient("", "")
+	dir := t.TempDir()
+	target := filepath.Join(dir, "asset")
+
+	// 第一条（死）必须失败，第二条（活）必须成功——这就是回落。
+	if _, err := client.fetchAsset(context.Background(), dead.URL, target, int64(len(content)), digest, nil); err == nil {
+		t.Fatal("死地址应当失败")
+	}
+	got, err := client.fetchAsset(context.Background(), alive.URL, target, int64(len(content)), digest, nil)
+	if err != nil {
+		t.Fatalf("活地址应当成功: %v", err)
+	}
+	if got != digest {
+		t.Fatalf("摘要 = %s，期望 %s", got, digest)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != string(content) {
+		t.Fatalf("落盘内容不对: %v", err)
+	}
+}
+
+// TestDownloadURLsOrder 候选地址必须「代理在前、直连在后」。
+func TestDownloadURLsOrder(t *testing.T) {
+	const asset = "https://github.com/o/r/releases/download/v1/a"
+	c := &Client{ProxyBase: "https://gh-proxy.com"}
+	got := c.downloadURLs(asset)
+	want := []string{"https://gh-proxy.com/" + asset, asset}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("候选顺序 = %v，期望 %v", got, want)
+	}
+	// 未配置代理时只有直连，不该重复试同一个地址。
+	if only := (&Client{}).downloadURLs(asset); len(only) != 1 || only[0] != asset {
+		t.Fatalf("未配置代理时 = %v，期望只有直连", only)
+	}
+}
+
+// TestFetchAssetRejectsDigestMismatch 内容校验失败必须报错。
+//
+// 摘要不符说明拿到的字节是错的（代理篡改或传输损坏），换一条路重来也是同样的
+// 内容；这时要显式报错，而不是靠重试掩盖——自更新的信任根不能被「多试几次」稀释。
+func TestFetchAssetRejectsDigestMismatch(t *testing.T) {
+	content := []byte("tampered")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(content)
+	}))
+	defer server.Close()
+
+	client := NewClient("", "")
+	dir := t.TempDir()
+	_, err := client.fetchAsset(context.Background(), server.URL, filepath.Join(dir, "asset"),
+		int64(len(content)), strings.Repeat("0", 64), nil)
+	if err == nil {
+		t.Fatal("摘要不符必须报错")
+	}
+	// 失败不得留下半成品。
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("失败后残留文件: %v", entries)
+	}
+}
+
+// TestProgressOf 进度折算的边界。
+func TestProgressOf(t *testing.T) {
+	cases := []struct {
+		downloaded, total int64
+		want              float64
+	}{
+		{0, 100, 0},    // 还没开始
+		{50, 100, 0.5}, // 一半
+		{100, 100, 1},  // 完成
+		{120, 100, 1},  // 超出时夹到 1，不报 >1
+		{50, 0, 0},     // 总大小未知 → 不确定态
+		{-5, 100, 0},   // 异常输入不产生负进度
+	}
+	for _, c := range cases {
+		if got := progressOf(c.downloaded, c.total); got != c.want {
+			t.Errorf("progressOf(%d,%d) = %v，期望 %v", c.downloaded, c.total, got, c.want)
+		}
+	}
+}
+
+// TestHandoverSupportedMatchesPlatform 交接能力必须与平台一致。
+//
+// Windows 无法复制监听套接字（dup + FD 继承是 Unix 机制），所以那里的更新只能
+// 「下载落盘 + 重启生效」。把它写成一个常量而不是散落的 runtime.GOOS 判断，
+// 是为了让「哪些平台支持运行中更新」只有一处答案。
+func TestHandoverSupportedMatchesPlatform(t *testing.T) {
+	if runtime.GOOS == "windows" && HandoverSupported {
+		t.Fatal("Windows 上不支持运行中交接")
+	}
+	if runtime.GOOS != "windows" && !HandoverSupported {
+		t.Fatalf("%s 上应当支持运行中交接", runtime.GOOS)
 	}
 }

@@ -203,9 +203,37 @@ function usageLastUsedFor(item){
   return item.last_used_at;
 }
 
-// usageModelsFor 仅在全部时间展示模型拆分，现有天桶没有模型维度。
+// usageModelsFor 返回当前筛选范围内的模型拆分。
+//
+// 全时段用全时段桶；选了日期范围就用账本的「天 × 模型」两维桶，把范围内的各天按模型
+// 相加。**不再返回空**——此前筛选态下模型拆分整列变成「—」点不动（2026-10-13 用户
+// 实测截图），而那个按钮恰恰是判断「哪条流量贵」的唯一入口，筛选态下最需要它。
+//
+// 旧账本没有这一维（DayModels 为空）时退回空列表：宁可显示「—」，也不能拿全时段的
+// 模型明细冒充所选范围的数据（那是假数据，2026-09-18 已明确禁止）。
+//
+// credit 的三态与账本一致（缺失 ≠ 0）：只要有一天没观测到 credit，合计就标为缺失
+// （undefined），否则会把「不知道」显示成「免费」。
 function usageModelsFor(item){
-  return filtered() ? [] : (item.models || []);
+  if (!filtered()) return item.models || [];
+  var days = item.day_models || [];
+  if (!days.length) return [];
+  var merged = {};
+  selectedDays(days).forEach(function(day){
+    (day.models || []).forEach(function(model){
+      var current = merged[model.model];
+      if (!current) {
+        current = {model: model.model, totals: {total_tokens: 0, credit: 0}};
+        merged[model.model] = current;
+      }
+      var t = model.totals || {};
+      current.totals.total_tokens += Number(t.total_tokens) || 0;
+      if (typeof t.credit !== 'number') current.totals.credit = undefined;
+      else if (current.totals.credit !== undefined) current.totals.credit += t.credit;
+    });
+  });
+  return Object.keys(merged).map(function(k){ return merged[k]; })
+    .sort(function(a, b){ return (b.totals.total_tokens || 0) - (a.totals.total_tokens || 0); });
 }
 
 async function loadUsage(){

@@ -1878,7 +1878,22 @@ function startPoll(){
       var r = await api('api/login/poll', { realm:DT.realm, login_id:DT.loginId });
       if (r.ok){ stopPoll(); renderDone(r); return; }
       if (r.pending && DT.tries % 3 === 0) setWait('等待扫码…');
-    }catch(err){ /* 单次失败继续等 */ }
+      // 非 pending 的失败是**终态**（凭证已保存但重载失败、state 过期等），
+      // 必须停下来报给用户。
+      //
+      // 曾经这里只处理 pending、其余一律忽略，于是「凭证已保存但重启失败」这类
+      // 错误被静默吞掉：界面永远停在「等待扫码…」，而用户看到上游明明提示
+      // 「登录成功」——2026-10-13 Windows 版实测（reload 在 Windows 上必然失败，
+      // 见 cmd/server/panel.go 的 reloadHandler 注释）。
+      if (!r.pending){
+        stopPoll();
+        setWait('添加失败：' + (r.message || '未知错误'));
+        return;
+      }
+    }catch(err){
+      // 网络抖动继续等；但连续失败也要给个说法，否则同样表现为「卡住」。
+      if (DT.tries > 3 && DT.tries % 5 === 0) setWait('连接异常，重试中…（' + (err.message || err) + '）');
+    }
     finally { DT.polling = false; }
   }, 3000);
 }

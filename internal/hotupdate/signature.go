@@ -111,15 +111,29 @@ func sumsDigest(sums, name string) (string, bool) {
 }
 
 // fetchSmall 下载小文件（清单与签名）：限长、限次，避免用大文件把内存撑爆。
+//
+// 与资产下载同一套回落策略：**代理优先、直连兜底**。这两个文件也是发行资产
+// （SHA256SUMS.txt 与其签名），不回落就会在代理挂掉时卡住——下载走通了、验签却
+// 拿不到清单，更新一样失败。
 func (c *Client) fetchSmall(ctx context.Context, apiURL, browserURL string, limit int64) ([]byte, error) {
 	target := apiURL
 	if target == "" {
 		target = browserURL
 	}
-	// 同样走加速代理：这两个文件也是发行资产（SHA256SUMS.txt 与其签名），
-	// 不代理就会在同一个网络问题上卡住——下载走通了、验签却拿不到清单，更新
-	// 一样失败。
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.proxied(target), nil)
+	var lastErr error
+	for _, candidate := range c.downloadURLs(target) {
+		body, err := c.fetchSmallFrom(ctx, candidate, limit)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// fetchSmallFrom 从单个地址取小文件。
+func (c *Client) fetchSmallFrom(ctx context.Context, url string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

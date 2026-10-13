@@ -60,9 +60,19 @@ type Status struct {
 	UpdateReady       bool      `json:"update_ready"`
 	AssetName         string    `json:"asset_name"`
 	AssetSize         int64     `json:"asset_size"`
-	CheckedAt         time.Time `json:"checked_at"`
-	LastError         string    `json:"last_error"`
-	InheritedFD       bool      `json:"inherited_fd"`
+	// DownloadedBytes / Progress 是下载进度，供面板与 App 显示进度条。
+	//
+	// 为什么要有它：更新包十几 MB，在网络慢的时候要等几十秒。此前界面上只有一个
+	// 静止的「正在更新…」，用户分不清是在下载、卡住了、还是已经失败（2026-10-13
+	// 用户要求安卓端给进度条）。
+	//
+	// Progress 是 0~1；AssetSize 未知时为 0，调用方应回落到不确定态（转圈）而不是
+	// 显示一个假的 0%。
+	DownloadedBytes int64     `json:"downloaded_bytes"`
+	Progress        float64   `json:"progress"`
+	CheckedAt       time.Time `json:"checked_at"`
+	LastError       string    `json:"last_error"`
+	InheritedFD     bool      `json:"inherited_fd"`
 }
 
 // Options 构造参数。
@@ -105,6 +115,9 @@ type Manager struct {
 	lastError  string
 	busy       bool
 	visibility Visibility
+	// downloaded 是本次下载已落盘的字节数（供进度条）。由 DownloadWithProgress
+	// 的回调在下载线程上写入，读侧在 statusLocked 里持同一把锁。
+	downloaded int64
 }
 
 // NewManager 构造管理器；Dir 为空时回落到系统临时目录下的固定子目录。
@@ -325,9 +338,16 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	m.mu.Lock()
 	m.latest = release
 	m.state = StateDownloading
+	// 进入下载态时清零进度，避免沿用上一轮的残留值（否则进度条会从 80% 开始）。
+	m.downloaded = 0
 	m.mu.Unlock()
 
-	path, sum, err := m.client.Download(ctx, release, m.opts.Dir)
+	path, sum, err := m.client.DownloadWithProgress(ctx, release, m.opts.Dir,
+		func(written, total int64) {
+			m.mu.Lock()
+			m.downloaded = written
+			m.mu.Unlock()
+		})
 	if err != nil {
 		m.fail(err)
 		return m.Status(), err
@@ -377,6 +397,27 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	m.mu.Lock()
 	m.state = StateHandover
 	m.mu.Unlock()
+
+	// 平台不支持运行中交接（Windows）：下载件已经落盘，写 current 指针让**下次启动**
+	// 用新版，然后如实告诉用户重启生效。
+	//
+	// 不做这件事的后果很具体：Windows 上更新会一路成功到交接，然后报
+	// 「dup listener: listener inheritance is unsupported on Windows」——用户看到的
+	// 是「更新失败」，而实际上新版本已经下载校验完毕、只差一次重启（2026-10-13 实测）。
+	if !HandoverSupported {
+		if err := writeCurrentPointer(m.opts.Dir, path); err != nil {
+			m.fail(fmt.Errorf("写入更新指针失败：%w", err))
+			return m.Status(), err
+		}
+		pruneUpdateDir(m.opts.Dir, path)
+		m.mu.Lock()
+		m.state = StateIdle
+		m.checkedAt = time.Now().UTC()
+		m.lastError = ""
+		m.mu.Unlock()
+		log.Printf("[update] %s 已下载并校验；本平台不支持运行中交接，重启后生效", release.Tag)
+		return m.Status(), nil
+	}
 
 	if err := handover(path, m.opts.Args, m.opts.Listener, m.opts.AdminListener, readyTimeout, func() error {
 		if err := ctx.Err(); err != nil {
@@ -498,6 +539,8 @@ func (m *Manager) statusLocked() Status {
 		UpdateReady:       available && m.latest.Tag != "" && m.latest.UpdateAvailable(),
 		AssetName:         m.latest.AssetName,
 		AssetSize:         m.latest.AssetSize,
+		DownloadedBytes:   m.downloaded,
+		Progress:          progressOf(m.downloaded, m.latest.AssetSize),
 		CheckedAt:         m.checkedAt,
 		LastError:         m.lastError,
 		InheritedFD:       Inherited(),
@@ -518,4 +561,18 @@ func (m *Manager) fail(err error) {
 	m.lastError = err.Error()
 	m.mu.Unlock()
 	log.Printf("ERROR: [update] %v", err)
+}
+
+// progressOf 把「已下载 / 总大小」折成 0~1。
+//
+// 总大小未知（发布没给 size）时返回 0，调用方应显示不确定态（转圈）而不是一个
+// 假的 0%——那会让人以为卡住了。同理，超出总大小时夹到 1，不报 >1 的值。
+func progressOf(downloaded, total int64) float64 {
+	if total <= 0 || downloaded <= 0 {
+		return 0
+	}
+	if downloaded >= total {
+		return 1
+	}
+	return float64(downloaded) / float64(total)
 }

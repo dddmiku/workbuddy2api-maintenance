@@ -73,6 +73,25 @@ function renderUpdate(){
     mrow('上次检查', s.checked_at ? relTime(s.checked_at) : '—') +
     mrow('仓库', s.repo || '—');
   box.innerHTML = rows;
+  // 下载进度条：更新包十几 MB，慢网络下要等几十秒。此前只有一个静止的「下载中…」，
+  // 用户分不清是在下载、卡住了、还是已经失败（2026-10-13 用户要求给进度条）。
+  //
+  // 只在 downloading 且总大小已知时显示；asset_size 为 0（发布没给 size）时退回到
+  // 不确定态，不显示一个假的 0%。
+  var prog = $('#updProgress');
+  if (prog){
+    if (s.state === 'downloading' && s.asset_size > 0){
+      var pct = Math.max(0, Math.min(100, Math.round((s.progress || 0) * 100)));
+      prog.style.display = '';
+      prog.innerHTML =
+        '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
+        '<div class="sub">' + upBytes(s.downloaded_bytes || 0) + ' / ' + upBytes(s.asset_size) +
+        ' · ' + pct + '%</div>';
+    } else {
+      prog.style.display = 'none';
+      prog.innerHTML = '';
+    }
+  }
   $('#updState').innerHTML = upState(s.state);
   $('#btnUpdCheck').disabled = busy;
   // 「立即更新」只在**确实有可升级版本**时可用：

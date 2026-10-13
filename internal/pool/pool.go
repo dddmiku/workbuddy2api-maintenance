@@ -169,6 +169,26 @@ func (p *Pool) modelIsPaid(realm, model string) bool {
 	return p.paidModels[model]
 }
 
+// ModelIsPaid 是 modelIsPaid 的导出形式，供 handler 判断「跨域回落会不会把免费请求
+// 变成付费请求」。
+//
+// 为什么要暴露这个判据：global → CN 的同名回落只按**可用性**决定（见
+// handler.go 的回落分支），不比较两域倍率。而实测同名模型两域倍率可以不同——
+// global:deepseek-v4.1-flash 是 x0.00（免费），cn:deepseek-v4.1-flash 是 x0.11
+// （付费）。于是调用方点名要免费模型，却被静默换成付费的同一个名字，真实扣费
+// （2026-10-13 实测单次 10.03）还记在免费模型名下，面板上就出现「免费模型用了
+// 260.89 积分」这种自相矛盾的数字。
+//
+// 未注入付费表时恒 false（与 modelIsPaid 同口径）：此时无从判断，保持回落行为不变。
+func (p *Pool) ModelIsPaid(realm, model string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.modelIsPaid(realm, model)
+}
+
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。
 func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	p.mu.Lock()

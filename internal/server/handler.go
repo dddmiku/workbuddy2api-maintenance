@@ -613,8 +613,16 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 			log.Printf("ERROR: [update] apply failed: %v", err)
 		}
 	}()
+	// 提示语按平台区分：Linux 上是「新实例接管、本实例跑完在途请求再退出」，
+	// 而 Windows 上无法交接监听套接字，只会下载落盘、**重启后生效**。
+	// 用同一句话会让 Windows 用户以为「更新完了」，然后重启发现还是旧版
+	// （2026-10-13 实测：那里的 apply 曾直接报 dup listener 失败）。
+	message := "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出"
+	if !hotupdate.HandoverSupported {
+		message = "已开始下载更新：完成后**重启本程序**即生效（本平台不支持运行中替换）"
+	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "message": "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出",
+		"ok": true, "message": message,
 		"status": h.cfg.Update.Status(),
 	})
 }
@@ -1266,12 +1274,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 存在熔断、在途占满等其它不可用原因时不回落——那些是暂时状态或与限流无关，
 	// 静默改道到另一个域会让调用方看到与预期不符的模型行为。
 	// 回落只改选号域与出站路由：模型名（裸名）与请求体都不变，账本仍记在调用方请求的名字上。
+	//
+	// ═══ 免费模型不得被换成付费的同名模型 ═══
+	//
+	// 「同名」不等于「同价」。实测两域倍率可以不同：
+	//	global:deepseek-v4.1-flash = x0.00（免费）   cn:deepseek-v4.1-flash = x0.11（付费）
+	// 调用方点名要免费模型，回落却把它送到 CN 的付费同名模型上，于是产生**调用方没有
+	// 要求的真实扣费**；而且这笔钱按「账本记调用方请求的名字」的既有约定，会记到
+	// global:deepseek-v4.1-flash 名下——面板上就出现「免费模型用了 260.89 积分」这种
+	// 自相矛盾的数字（2026-10-13 用户实测，单次最高 10.03）。
+	//
+	// 所以补一条价格判据：global 侧免费、cn 侧付费时**不回落**。宁可如实报「global
+	// 域当前无可用号」让调用方自己决定（换模型或等恢复），也不静默产生计划外扣费。
+	//
+	// 反向（global 付费 / cn 免费）不受影响：那样回落只会更省，不违背调用方预期。
 	if realm == "global" && h.cfg.Pool != nil {
 		if info, ok := requestKeyInfo(r); ok && info.GlobalFallbackToCN != nil && *info.GlobalFallbackToCN {
 			if state := h.cfg.Pool.RealmRateStateForModel("global", bareModel); state.AllRateLimited() {
 				if cnState := h.cfg.Pool.RealmRateStateForModel("cn", bareModel); cnState.Available > 0 {
-					log.Printf("INFO: [server] global realm rate limited for model=%s — falling back to cn by key request", bareModel)
-					realm = "cn"
+					if h.cfg.Pool.ModelIsPaid("cn", bareModel) && !h.cfg.Pool.ModelIsPaid("global", bareModel) {
+						log.Printf("INFO: [server] 不回落 cn：global:%s 是免费模型而 cn:%s 付费，回落会产生计划外扣费",
+							bareModel, bareModel)
+					} else {
+						log.Printf("INFO: [server] global realm rate limited for model=%s — falling back to cn by key request", bareModel)
+						realm = "cn"
+					}
 				}
 			}
 		}

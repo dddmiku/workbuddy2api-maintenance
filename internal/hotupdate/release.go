@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -289,6 +290,14 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 // Download 把资产下载到 dir，返回文件路径与 SHA-256。
 // 发布端提供 digest 时逐字节校验；未提供则只回报实测值，由调用方决定是否信任。
 func (c *Client) Download(ctx context.Context, release Release, dir string) (string, string, error) {
+	return c.DownloadWithProgress(ctx, release, dir, nil)
+}
+
+// DownloadWithProgress 与 Download 相同，但把已下载字节数回调出去（供进度条）。
+//
+// onProgress 可为 nil。回调在下载线程上同步调用，实现方要自己保证轻量（不阻塞、
+// 不长时间持锁）——它每次读满一块就会被调用一次。
+func (c *Client) DownloadWithProgress(ctx context.Context, release Release, dir string, onProgress func(written, total int64)) (string, string, error) {
 	if release.AssetAPIURL != "" {
 		release.AssetURL = release.AssetAPIURL
 	}
@@ -318,60 +327,110 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
-	// 资产下载走加速代理（若已配置）。注意这里**不带头部令牌**：代理是第三方，
-	// 而发行资产本来就是公开的，且下载后必须通过 sha256 + 发布签名校验。
-	downloadURL := c.proxied(release.AssetURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	// 下载地址候选：**加速代理优先，直连兜底**。
+	//
+	// 代理能让国内访问快很多，但它是个第三方服务，会挂、会限流、也可能某天消失。
+	// 只走代理等于把「能不能更新」押在它身上；只走直连又会在被墙时完全卡住。
+	// 所以两条都试：代理失败就回落到 GitHub 直连。
+	//
+	// 回落不降低信任级别：下载完仍要过 sha256 + 发布签名两道校验（见下与
+	// VerifySignedRelease），代理和直连都只是搬运工，改不了内容。
+	candidates := c.downloadURLs(release.AssetURL)
+
+	target := filepath.Join(dir, url.PathEscape(release.Tag)+"-"+url.PathEscape(release.AssetName))
+	var lastErr error
+	for index, candidate := range candidates {
+		sum, err := c.fetchAsset(ctx, candidate, target, release.AssetSize, want, onProgress)
+		if err == nil {
+			if index > 0 {
+				log.Printf("[update] 加速代理不可用，已回落到直连：%s", candidate)
+			}
+			return target, sum, nil
+		}
+		lastErr = err
+		if index < len(candidates)-1 {
+			// 只在还有下一条可试时才提示，最后一条失败由调用方统一报错。
+			log.Printf("[update] 下载失败，尝试下一个地址：%s（%v）", candidate, err)
+		}
+	}
+	return "", "", lastErr
+}
+
+// downloadURLs 返回本次下载要依次尝试的地址：代理优先、直连兜底。
+//
+// 未配置代理时只有一个（直连）；配置了但代理前缀恰好与直连相同（不该发生）也去重，
+// 避免把同一个地址试两遍、白等一次超时。
+func (c *Client) downloadURLs(assetURL string) []string {
+	direct := assetURL
+	if c.ProxyBase == "" {
+		return []string{direct}
+	}
+	proxied := c.proxied(assetURL)
+	if proxied == direct {
+		return []string{direct}
+	}
+	return []string{proxied, direct}
+}
+
+// fetchAsset 从 url 下载到 target，校验大小与 sha256 后原子落盘；返回实测摘要。
+//
+// 校验失败**不**回落：那说明拿到的字节是错的（代理篡改、传输损坏），换一条路重来
+// 也应当是同样的内容；真出问题要让它显式报错，而不是靠重试掩盖。
+func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize int64, want string, onProgress func(written, total int64)) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	req.Header.Set("User-Agent", "workbuddy2api-self-update")
 	req.Header.Set("Accept", "application/octet-stream")
 	resp, err := c.do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("download asset: %w", err)
+		return "", fmt.Errorf("download asset: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("download asset: HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("download asset: HTTP %d", resp.StatusCode)
 	}
 
-	target := filepath.Join(dir, url.PathEscape(release.Tag)+"-"+url.PathEscape(release.AssetName))
-	file, err := os.CreateTemp(dir, ".download-*.part")
+	file, err := os.CreateTemp(filepath.Dir(target), ".download-*.part")
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	tmp := file.Name()
 	defer os.Remove(tmp)
 	defer file.Close()
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(file, hasher), io.LimitReader(resp.Body, maxReleaseBytes+1))
+	body := io.LimitReader(resp.Body, maxReleaseBytes+1)
+	if onProgress != nil {
+		body = &progressReader{reader: body, total: assetSize, report: onProgress}
+	}
+	written, copyErr := io.Copy(io.MultiWriter(file, hasher), body)
 	if copyErr != nil {
-		return "", "", fmt.Errorf("download asset: %w", copyErr)
+		return "", fmt.Errorf("download asset: %w", copyErr)
 	}
 	if written > maxReleaseBytes {
-		return "", "", fmt.Errorf("asset exceeds %d bytes", maxReleaseBytes)
+		return "", fmt.Errorf("asset exceeds %d bytes", maxReleaseBytes)
 	}
-	if release.AssetSize > 0 && written != release.AssetSize {
-		return "", "", fmt.Errorf("asset size mismatch: want %d got %d", release.AssetSize, written)
+	if assetSize > 0 && written != assetSize {
+		return "", fmt.Errorf("asset size mismatch: want %d got %d", assetSize, written)
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
 	if want != "" && !strings.EqualFold(want, sum) {
-		return "", "", fmt.Errorf("sha256 mismatch: want %s got %s", want, sum)
+		return "", fmt.Errorf("sha256 mismatch: want %s got %s", want, sum)
 	}
 	if err := file.Chmod(0o755); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if err := file.Close(); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if err := os.Rename(tmp, target); err != nil {
-		return "", "", err
+		return "", err
 	}
-	return target, sum, nil
+	return sum, nil
 }
 
 // runtimeAssetName 完整运行包（网关 + 辅助程序 + 脚本）的资产名。
@@ -527,4 +586,24 @@ func (c *Client) repoMetaStatus(ctx context.Context) (int, error) {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	return resp.StatusCode, nil
+}
+
+// progressReader 统计已读字节并按块回调进度。
+//
+// 每读一块报一次：更新包十几 MB、块 32KB，也就是几百次回调，开销可以忽略；
+// 而按固定字节间隔（如每 1MB）报会让小文件完全看不到进度。
+type progressReader struct {
+	reader io.Reader
+	total  int64
+	read   int64
+	report func(written, total int64)
+}
+
+func (p *progressReader) Read(buffer []byte) (int, error) {
+	n, err := p.reader.Read(buffer)
+	if n > 0 {
+		p.read += int64(n)
+		p.report(p.read, p.total)
+	}
+	return n, err
 }

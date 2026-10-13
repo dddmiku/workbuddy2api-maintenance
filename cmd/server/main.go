@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -438,13 +439,30 @@ func main() {
 	// 为什么同进程要走进程内分发而不是回环 TCP：Windows 上 Go 的 net.Dial("unix", …)
 	// 直接失败（实测 connect: invalid argument），桌面版经 socket 调管理接口一个都调
 	// 不通——密钥页、用量页、热更新页会全挂。安卓上同样没有可靠的 Unix socket。
+	// 进程内重载：重新读 auths 与 config，原地更新号池。
+	//
+	// 面板加号 / 删号 / 改任务开关后都走它。**不换进程**是刻意的：Windows 上无法
+	// 交接监听套接字（见 internal/hotupdate/fd_windows.go），走交接会让「加一个账号」
+	// 在 Windows 上永远失败——2026-10-13 用户实测：扫码登录成功、凭证已落盘，面板
+	// 却一直停在「等待扫码…」。原地重载不需要新进程，三端行为一致，而且更快
+	// （毫秒级、无中断、不打断在途请求）。
+	reloadRuntime := func(ctx context.Context) error {
+		fresh, err := auth.LoadDir(cfg.AuthDir)
+		if err != nil {
+			return fmt.Errorf("重新读取账号失败：%w", err)
+		}
+		p.SyncToDir(fresh)
+		log.Printf("[reload] 已重新加载 %d 个账号（进程内，未重启）", len(fresh))
+		return nil
+	}
+
 	adminMux := func() *http.ServeMux {
 		mux := http.NewServeMux()
 		if keyStore != nil {
 			mux.Handle("/keys", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
 			mux.Handle("/keys/", keyStore.AdminHandler(cfg.Features.ReasoningLoopGuard))
 		}
-		mux.HandleFunc("POST /runtime/reload", reloadHandler(updateManager))
+		mux.HandleFunc("POST /runtime/reload", reloadHandler(reloadRuntime, updateManager))
 		mux.Handle("/", h.InternalHandler())
 		return mux
 	}

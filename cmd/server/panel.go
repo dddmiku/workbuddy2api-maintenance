@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -208,10 +209,37 @@ func withPanel(gateway http.Handler, panel http.Handler) http.Handler {
 	return mux
 }
 
-func reloadHandler(manager *hotupdate.Manager) http.HandlerFunc {
+// reloadHandler 处理 /runtime/reload：让网关重新加载配置与账号。
+//
+// ═══ 为什么需要它，以及为什么不能只靠进程交接 ═══
+//
+// 面板加号 / 删号 / 改任务开关之后，网关必须重新读一遍 auths 与 config 才生效。
+// Linux 上的做法是「起新实例、交接监听套接字、旧进程退出」——但那在 **Windows
+// 上根本做不到**（见 internal/hotupdate/fd_windows.go：无法复制监听套接字）。
+//
+// 后果很具体（2026-10-13 用户实测）：Windows 桌面版扫码登录，上游显示「登录成功」，
+// 面板却一直停在「等待扫码…」——因为凭证已经写进 auths 了，但随后的 reload 失败，
+// 面板把整件事报成失败，前端只认 ok=true，于是无限轮询。
+//
+// 所以这里改成**进程内重载**：重新读 auths 与 config，原地更新号池。不需要新进程，
+// 也就不需要套接字交接，Windows 上同样成立；顺带比换进程更快（毫秒级，无中断）。
+//
+// 热更新（换二进制）仍然走 handover——那个确实需要新进程，且只在 Linux/桌面换版本
+// 时发生，不是「加一个账号」的必经路径。
+func reloadHandler(reload func(context.Context) error, manager *hotupdate.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// This handler is installed only on the private management socket.
 		w.Header().Set("Content-Type", "application/json")
+		if reload != nil {
+			if err := reload(r.Context()); err != nil {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "message": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+		}
+		// 没有进程内重载能力时（不该发生）才回落到交接。
 		if err := manager.Reload(r.Context()); err != nil {
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "message": err.Error()})

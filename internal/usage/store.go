@@ -129,9 +129,18 @@ type KeyUsage struct {
 	Totals    Totals       `json:"totals"`
 	Models    []ModelUsage `json:"models"`
 	// Days 是该密钥的按天累计量（新到旧排序），面板按密钥筛日期时读它。
-	Days        []DayUsage `json:"days"`
-	FirstUsedAt time.Time  `json:"first_used_at"`
-	LastUsedAt  time.Time  `json:"last_used_at"`
+	Days []DayUsage `json:"days"`
+	// DayModels 是该密钥「每天 × 每个模型」的累计量（新到旧排序）。
+	//
+	// 为什么需要这一维：Models 只有全时段口径，Days 只有总量口径。面板一旦按日期
+	// 筛选，就既不能拿全时段的模型明细冒充（那是假数据，2026-09-18 已明确禁止），
+	// 也没有按天的模型明细可用——于是「按模型」按钮在筛选态直接消失。
+	//
+	// 后果是具体的（2026-10-13 用户实测截图）：勾选「今天」后「模型拆分」列整列变成
+	// 「—」，点不动；而这个按钮恰恰是判断「哪条流量贵」的唯一入口，筛选态下最需要它。
+	DayModels   []DayModels `json:"day_models"`
+	FirstUsedAt time.Time   `json:"first_used_at"`
+	LastUsedAt  time.Time   `json:"last_used_at"`
 }
 
 // Snapshot 一次读取结果：总量 + 按密钥明细（按总 token 降序）。
@@ -151,15 +160,25 @@ type DayUsage struct {
 	Totals Totals `json:"totals"`
 }
 
+// DayModels 单日 × 单模型的累计量。
+type DayModels struct {
+	Day    string       `json:"day"`
+	Models []ModelUsage `json:"models"`
+}
+
 // keyRecord 落盘用的单密钥记录。
 type keyRecord struct {
-	Name        string             `json:"name"`
-	MaskedKey   string             `json:"masked_key"`
-	Totals      Totals             `json:"totals"`
-	Models      map[string]*Totals `json:"models"`
-	Days        map[string]*Totals `json:"days,omitempty"`
-	FirstUsedAt time.Time          `json:"first_used_at"`
-	LastUsedAt  time.Time          `json:"last_used_at"`
+	Name      string             `json:"name"`
+	MaskedKey string             `json:"masked_key"`
+	Totals    Totals             `json:"totals"`
+	Models    map[string]*Totals `json:"models"`
+	Days      map[string]*Totals `json:"days,omitempty"`
+	// DayModels 是「天 → 模型 → 累计量」两维桶，供面板在日期筛选下仍能给出模型拆分
+	// （见 KeyUsage.DayModels）。用 omitempty：老账本没有这一维，读入后为空、照常工作，
+	// 新请求到达时自然补上。
+	DayModels   map[string]map[string]*Totals `json:"day_models,omitempty"`
+	FirstUsedAt time.Time                     `json:"first_used_at"`
+	LastUsedAt  time.Time                     `json:"last_used_at"`
 }
 
 // document 账本文件结构。
@@ -232,6 +251,10 @@ func (s *Store) load() error {
 	for _, record := range doc.Keys {
 		if record != nil {
 			trimModelBuckets(record.Models)
+			for _, models := range record.DayModels {
+				trimModelBuckets(models)
+			}
+			trimDayModels(record.DayModels)
 		}
 	}
 	s.doc = doc
@@ -322,6 +345,23 @@ func (s *Store) RecordOutcome(keyID, name, maskedKey, model string, prompt, comp
 		}
 		counter.add(prompt, completion, cached, credit, hasCredit, outcome)
 		trimModelBuckets(record.Models)
+		// 天 × 模型两维桶：面板按日期筛选时要能看到该范围内的模型拆分（见 DayModels）。
+		if record.DayModels == nil {
+			record.DayModels = map[string]map[string]*Totals{}
+		}
+		byModel := record.DayModels[day]
+		if byModel == nil {
+			byModel = map[string]*Totals{}
+			record.DayModels[day] = byModel
+		}
+		dayModel := byModel[model]
+		if dayModel == nil {
+			dayModel = &Totals{}
+			byModel[model] = dayModel
+		}
+		dayModel.add(prompt, completion, cached, credit, hasCredit, outcome)
+		trimModelBuckets(byModel)
+		trimDayModels(record.DayModels)
 	}
 	s.dirty = true
 }
@@ -374,6 +414,22 @@ func trimModelBuckets(models map[string]*Totals) {
 	}
 }
 
+// trimDayModels 把「天 × 模型」两维桶裁到最近 maxDayBuckets 天。
+// 每天内部的模型桶由 trimModelBuckets 各自裁剪（与单密钥全时段模型桶同一上限）。
+func trimDayModels(days map[string]map[string]*Totals) {
+	if len(days) <= maxDayBuckets {
+		return
+	}
+	keys := make([]string, 0, len(days))
+	for key := range days {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys[:len(keys)-maxDayBuckets] {
+		delete(days, key)
+	}
+}
+
 // Snapshot 返回当前累计值的深拷贝快照。
 //
 // 视图 = 盘上账本 + 本进程尚未落盘的新增量。为什么不能只看内存：热更新期间旧进程
@@ -407,6 +463,7 @@ func (s *Store) Snapshot() Snapshot {
 			MaskedKey:   record.MaskedKey,
 			Totals:      record.Totals,
 			Days:        sortDays(record.Days),
+			DayModels:   sortDayModels(record.DayModels),
 			FirstUsedAt: record.FirstUsedAt,
 			LastUsedAt:  record.LastUsedAt,
 		}
@@ -447,6 +504,33 @@ func sortDays(buckets map[string]*Totals) []DayUsage {
 			continue
 		}
 		days = append(days, DayUsage{Day: day, Totals: *totals})
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+	return days
+}
+
+// sortDayModels 把「天 × 模型」桶摊平成按日期倒序的切片；同一天内模型按 token 降序。
+// 排序与 sortDays、models 的既有口径一致，面板无需为两维桶写第二套排序。
+func sortDayModels(buckets map[string]map[string]*Totals) []DayModels {
+	if len(buckets) == 0 {
+		return []DayModels{}
+	}
+	days := make([]DayModels, 0, len(buckets))
+	for day, models := range buckets {
+		entry := DayModels{Day: day, Models: make([]ModelUsage, 0, len(models))}
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			entry.Models = append(entry.Models, ModelUsage{Model: model, Totals: *totals})
+		}
+		sort.Slice(entry.Models, func(i, j int) bool {
+			if entry.Models[i].Totals.TotalTokens != entry.Models[j].Totals.TotalTokens {
+				return entry.Models[i].Totals.TotalTokens > entry.Models[j].Totals.TotalTokens
+			}
+			return entry.Models[i].Model < entry.Models[j].Model
+		})
+		days = append(days, entry)
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
 	return days
@@ -668,6 +752,7 @@ func deltaDocument(mine, prev document) document {
 			Totals:      totalsDelta,
 			Models:      make(map[string]*Totals, len(current.Models)),
 			Days:        deltaDays(current.Days, before.Days),
+			DayModels:   deltaDayModels(current.DayModels, before.DayModels),
 			FirstUsedAt: current.FirstUsedAt,
 			LastUsedAt:  current.LastUsedAt,
 		}
@@ -710,6 +795,41 @@ func deltaDays(mine, prev map[string]*Totals) map[string]*Totals {
 	return out
 }
 
+// deltaDayModels 逐天、逐模型算增量，与 deltaDays / deltaModels 同一口径。
+// 整层都为空时返回 nil，让 omitempty 生效、不把空壳写进账本。
+func deltaDayModels(mine, prev map[string]map[string]*Totals) map[string]map[string]*Totals {
+	out := map[string]map[string]*Totals{}
+	for day, models := range mine {
+		beforeModels := prev[day]
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			var before Totals
+			if beforeModels != nil {
+				if old := beforeModels[model]; old != nil {
+					before = *old
+				}
+			}
+			delta := deltaTotals(*totals, before)
+			if delta == (Totals{}) {
+				continue
+			}
+			byModel := out[day]
+			if byModel == nil {
+				byModel = map[string]*Totals{}
+				out[day] = byModel
+			}
+			copied := delta
+			byModel[model] = &copied
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // addDocument 把增量并进基线账本（总量、按密钥、按模型逐层累加）。
 func addDocument(base, delta document) document {
 	base.Version = Version
@@ -735,6 +855,7 @@ func addDocument(base, delta document) document {
 			copied := *add
 			copied.Models = cloneModels(add.Models)
 			copied.Days = cloneModels(add.Days)
+			copied.DayModels = cloneDayModels(add.DayModels)
 			base.Keys[id] = &copied
 			continue
 		}
@@ -782,8 +903,41 @@ func addDocument(base, delta document) document {
 			}
 		}
 		trimDayBuckets(current.Days)
+		current.DayModels = addDayModels(current.DayModels, add.DayModels)
 	}
 	trimDayBuckets(base.Days)
+	return base
+}
+
+// addDayModels 把「天 × 模型」增量并进基线。
+func addDayModels(base, delta map[string]map[string]*Totals) map[string]map[string]*Totals {
+	if len(delta) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]map[string]*Totals{}
+	}
+	for day, models := range delta {
+		byModel := base[day]
+		if byModel == nil {
+			byModel = map[string]*Totals{}
+			base[day] = byModel
+		}
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			if existing := byModel[model]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				byModel[model] = &merged
+			} else {
+				copied := *totals
+				byModel[model] = &copied
+			}
+		}
+		trimModelBuckets(byModel)
+	}
+	trimDayModels(base)
 	return base
 }
 
@@ -822,7 +976,20 @@ func cloneDocument(doc document) document {
 		copied := *record
 		copied.Models = cloneModels(record.Models)
 		copied.Days = cloneModels(record.Days)
+		copied.DayModels = cloneDayModels(record.DayModels)
 		out.Keys[id] = &copied
+	}
+	return out
+}
+
+// cloneDayModels 深拷贝「天 × 模型」两维桶。
+func cloneDayModels(source map[string]map[string]*Totals) map[string]map[string]*Totals {
+	if source == nil {
+		return nil
+	}
+	out := make(map[string]map[string]*Totals, len(source))
+	for day, models := range source {
+		out[day] = cloneModels(models)
 	}
 	return out
 }

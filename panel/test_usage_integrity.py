@@ -36,6 +36,43 @@ usageModelsFor({totals:{total_tokens:200},days:[{day:'2026-09-17',totals:{total_
 models:[{model:'a',totals:{total_tokens:100}},{model:'b',totals:{total_tokens:100}}]})""")
         self.assertEqual(result, [], "daily model data cannot be recovered by proportional scaling")
 
+    def test_date_filter_uses_daily_model_buckets_when_present(self):
+        # 2026-10-13 用户实测：勾选日期后「模型拆分」整列变成「—」点不动。账本新增
+        # 「天 × 模型」两维桶后，筛选态必须仍能给出该范围内的模型拆分。
+        result = self.run_usage("""US.from='2026-10-13';US.to='2026-10-13';
+usageModelsFor({totals:{total_tokens:9999},
+models:[{model:'lifetime-only',totals:{total_tokens:9999}}],
+days:[{day:'2026-10-13',totals:{total_tokens:300}}],
+day_models:[{day:'2026-10-13',models:[
+  {model:'cn:glm-5.3',totals:{total_tokens:200,credit:1.5}},
+  {model:'cn:hy3',totals:{total_tokens:100,credit:0}}]},
+ {day:'2026-10-12',models:[{model:'cn:glm-5.3',totals:{total_tokens:777,credit:9.9}}]}]})""")
+        self.assertEqual([m["model"] for m in result], ["cn:glm-5.3", "cn:hy3"])
+        self.assertEqual(result[0]["totals"]["total_tokens"], 200)
+        self.assertEqual(result[0]["totals"]["credit"], 1.5)
+        self.assertNotIn("lifetime-only", [m["model"] for m in result],
+                         "筛选态不得混入全时段的模型明细")
+
+    def test_date_filter_sums_models_across_selected_days(self):
+        result = self.run_usage("""US.from='2026-10-12';US.to='2026-10-13';
+usageModelsFor({totals:{},models:[],days:[],
+day_models:[{day:'2026-10-13',models:[{model:'cn:glm-5.3',totals:{total_tokens:200,credit:1.5}}]},
+ {day:'2026-10-12',models:[{model:'cn:glm-5.3',totals:{total_tokens:100,credit:0.5}},
+                            {model:'cn:hy3',totals:{total_tokens:50,credit:0}}]},
+ {day:'2026-10-01',models:[{model:'cn:glm-5.3',totals:{total_tokens:5000,credit:99}}]}]})""")
+        byModel = {m["model"]: m["totals"] for m in result}
+        self.assertEqual(byModel["cn:glm-5.3"]["total_tokens"], 300)
+        self.assertEqual(byModel["cn:glm-5.3"]["credit"], 2.0)
+        self.assertEqual(byModel["cn:hy3"]["total_tokens"], 50)
+        self.assertEqual(len(result), 2, "范围外的天不得计入")
+
+    def test_date_filter_reports_missing_credit_as_unknown_not_zero(self):
+        # 缺失 ≠ 0：某天没观测到 credit 时，合计不能显示成「免费」。
+        result = self.run_usage("""US.from='2026-10-13';US.to='2026-10-13';
+usageModelsFor({totals:{},models:[],days:[],
+day_models:[{day:'2026-10-13',models:[{model:'cn:glm-5.3',totals:{total_tokens:100}}]}]})""")
+        self.assertNotIn("credit", result[0]["totals"], "缺观测时不应给出 0 积分")
+
     def test_no_daily_history_means_no_data_for_selected_day(self):
         result = self.run_usage("US.from='2026-09-17';US.to='2026-09-17';usageTotalsForScope({totals:{requests:200,total_tokens:9999},days:[]})")
         self.assertEqual(result.get("requests"), 0)
