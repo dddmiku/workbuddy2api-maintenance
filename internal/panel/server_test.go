@@ -158,7 +158,7 @@ func newHarness(t *testing.T) *harness {
 
 	assets := fstest.MapFS{
 		"index.html":       &fstest.MapFile{Data: []byte("<html>panel</html>")},
-		"login.html":       &fstest.MapFile{Data: []byte("<html>login</html>")},
+		"login.html":       &fstest.MapFile{Data: []byte("<html>login</html><span id=\"hint\">会话有效期 30 天</span>")},
 		"vendor/qrcode.js": &fstest.MapFile{Data: []byte("// qrcode")},
 	}
 	server, err := New(Options{
@@ -1842,4 +1842,43 @@ func TestContainerRunningFalseWhenHealthzIsNotGateway(t *testing.T) {
 	if payload.ContainerRun {
 		t.Fatal("service 字段不是 workbuddy2api 时必须判为未运行")
 	}
+}
+
+// TestLoginPageSessionHintFollowsTTL 登录页那句「会话有效期 …」必须反映本次运行
+// 的真实 TTL。
+//
+// 曾经它是页面里写死的「30 天」，而安卓端签发的是长期会话——登录页于是在对用户
+// 说假话，而且是关于「多久要重登一次」这种用户会当成事实的提示。
+func TestLoginPageSessionHintFollowsTTL(t *testing.T) {
+	h := newHarness(t)
+	// 默认（桌面/容器）：30 天。
+	body := h.do(http.MethodGet, "/login", "", nil).Body.String()
+	if !strings.Contains(body, "会话有效期 30 天") {
+		t.Fatalf("默认应显示 30 天，实际：%s", firstLine(body))
+	}
+	// 页面上不得出现任何模板残留（注入是替换现成文案，不是填占位符）。
+	if strings.Contains(body, "{{") {
+		t.Fatal("登录页出现模板残留")
+	}
+
+	// 安卓：长期有效。
+	h2 := newHarness(t)
+	h2.server.opts.SessionTTL = LongSessionTTL
+	body2 := h2.do(http.MethodGet, "/login", "", nil).Body.String()
+	if !strings.Contains(body2, "会话长期有效") {
+		t.Fatalf("安卓应显示长期有效，实际：%s", firstLine(body2))
+	}
+	if strings.Contains(body2, "30 天") {
+		t.Fatal("安卓上不得再出现 30 天")
+	}
+}
+
+func firstLine(s string) string {
+	if idx := strings.Index(s, "hint"); idx >= 0 && idx+80 < len(s) {
+		return s[idx : idx+80]
+	}
+	if len(s) > 120 {
+		return s[:120]
+	}
+	return s
 }

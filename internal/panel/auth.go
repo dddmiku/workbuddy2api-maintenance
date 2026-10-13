@@ -44,6 +44,34 @@ const maxRevokedSessions = 4096
 // 这个常量只给测试当默认值的参照点。
 const renewThreshold = SessionTTL / 3
 
+// sessionHint 登录页上那句「会话有效期 …」的文案。
+//
+// 超过一年就说「长期有效」而不是报一个「36500 天」之类的数字：那个数字既难读，
+// 也会让用户以为还要惦记着它。安卓端设的就是这种长期会话（见 LongSessionTTL）。
+func sessionHint(ttl time.Duration) string {
+	if ttl >= 365*24*time.Hour {
+		return "会话长期有效"
+	}
+	return formatMessage("会话有效期 %d 天", int(ttl/(24*time.Hour)))
+}
+
+// loginHintLiteral 是 login.html 里那句写死的默认文案，也是注入时的锚点。
+//
+// 锚在**现成文案**上而不是留一个 {{占位符}}，是因为同一份 login.html 也被 Python
+// 引擎逐字读出来发给浏览器（panel/app.py 的 LOGIN_PATH）。留占位符会让容器部署的
+// 登录页上直接显示 "{{SESSION_HINT}}"——那是把一个「安卓端文案不准」的小问题，
+// 换成「容器端界面出现模板变量」的更大问题。
+const loginHintLiteral = "会话有效期 30 天"
+
+// replaceSessionHint 把登录页里的默认会话文案换成本次运行的真实值。
+func replaceSessionHint(page string, ttl time.Duration) string {
+	hint := sessionHint(ttl)
+	if hint == loginHintLiteral {
+		return page // 默认值：页面里本来就是它，不必替换
+	}
+	return strings.Replace(page, loginHintLiteral, hint, 1)
+}
+
 // sessionTTL 本次运行的会话有效期：Options.SessionTTL 优先，未设则用默认 30 天。
 //
 // 走方法而不是直接用常量，是为了让「同一个部署里所有签发/续期/判过期的地方」

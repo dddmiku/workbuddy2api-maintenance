@@ -287,7 +287,17 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 			writeHTML(w, http.StatusInternalServerError, "登录页缺失: "+err.Error())
 			return
 		}
-		writeHTML(w, http.StatusOK, body)
+		// 会话有效期由服务端注入，不写死在页面里。
+		//
+		// 写死过一版「30 天」，而安卓端实际是长期有效（见 Options.SessionTTL）——
+		// 登录页于是在对用户说假话，而且是关于「多久要重登一次」这种会被用户当成
+		// 事实的提示。
+		//
+		// 注入方式是**替换页面里那句现成文案**，而不是留一个 {{占位符}}：同一份
+		// login.html 也被 Python 引擎逐字读出来发给浏览器（panel/app.py 的
+		// LOGIN_PATH），留占位符会让容器部署的登录页上直接显示 "{{SESSION_HINT}}"。
+		// 只替换这一处硬编码文案，两边就都拿到可读的结果。
+		writeHTML(w, http.StatusOK, replaceSessionHint(string(body), s.sessionTTL()))
 		return
 	}
 	if session == nil {

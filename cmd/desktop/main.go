@@ -369,12 +369,17 @@ func main() {
 		os.Exit(0)
 	}()
 
-	panelURL := fmt.Sprintf("http://%s/", addr)
+	// 面板挂在网关的子路径下（默认 /admin），**不是根路径**。
+	//
+	// 曾经这里打印并打开的是 "http://<addr>/"，用户按它打开就是 404——面板根本不在
+	// 根上（2026-10-13 用户实测：日志只给了 ip:端口，打开后 404）。前缀与网关注册
+	// 路由用的是同一个环境变量 WB2API_ADMIN_PREFIX，所以这里读它而不是写死 "/admin"。
+	panelURL := fmt.Sprintf("http://%s%s/", addr, desktopAdminPrefix())
 	if waitForHealth(addr, 30*time.Second) {
-		fmt.Printf("\n网关已启动：%s\n管理面板：%s\n（关闭本窗口即停止服务）\n\n", addr, panelURL)
+		fmt.Printf("\n网关已启动：http://%s\n管理面板：%s\n（关闭本窗口即停止服务）\n\n", addr, panelURL)
 		openBrowser(panelURL)
 	} else {
-		fmt.Printf("\n网关启动较慢或失败，请查看上方日志。地址：%s\n\n", addr)
+		fmt.Printf("\n网关启动较慢或失败，请查看上方日志。\n管理面板（就绪后打开）：%s\n\n", panelURL)
 	}
 
 	// 等网关退出；它退了启动器也就该退了（窗口关掉 = 服务停止）。
@@ -390,6 +395,26 @@ func main() {
 // 默认 Go：桌面包里已经不带 CPython 依赖，绝大多数用户机器上没有 python3，
 // 而 Go 引擎与 Python 引擎在功能上等价（同一套前端、同一份凭据格式）。
 // 这个开关是给「Python 面板还在灰度」的部署留的退路。
+// desktopAdminPrefix 面板的挂载前缀（默认 /admin），与网关注册路由用的是同一个
+// 环境变量 WB2API_ADMIN_PREFIX。
+//
+// 归一化规则必须与 cmd/server/panel.go 的 adminPrefix() 一致：以 "/" 开头、不以
+// "/" 结尾。两处不一致会让启动器打开的地址与网关实际挂载的位置错开一位
+// （"/admin/" 与 "/admin" 拼出 "//"），用户看到的是 404。
+func desktopAdminPrefix() string {
+	prefix := strings.TrimSpace(os.Getenv("WB2API_ADMIN_PREFIX"))
+	if prefix == "" {
+		return "/admin"
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	if trimmed := strings.TrimRight(prefix, "/"); trimmed != "" {
+		prefix = trimmed
+	}
+	return prefix
+}
+
 func usePythonPanel() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
 	case "0", "false", "no", "off":
