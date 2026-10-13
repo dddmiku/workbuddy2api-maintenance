@@ -251,14 +251,20 @@ func main() {
 	if err != nil {
 		fatal("无法定位程序自身: %v", err)
 	}
-	runtimeDir := filepath.Dir(exe)
+	exeDir := filepath.Dir(exe)
 
 	// 数据根目录：优先环境变量（便于把数据放到别处），否则用可执行文件旁边。
 	// macOS 的 .app 里可执行文件在 Contents/MacOS/，数据要放到 .app **外面**，
 	// 由启动脚本通过 WB2A_DESKTOP_ROOT 指定，否则写进只读包体会失败。
 	root := strings.TrimSpace(os.Getenv("WB2A_DESKTOP_ROOT"))
 	if root == "" {
-		root = runtimeDir
+		root = exeDir
+	}
+	// 运行目录（网关与辅助程序所在）：单文件分发时先把内嵌的那份解到 <root>/runtime。
+	// 必须在算出 root 之后——解压目标就在数据目录下。
+	runtimeDir, err := runtimeDirFor(root)
+	if err != nil {
+		fatal("%v", err)
 	}
 	layout := layoutFor(root, runtimeDir)
 	if err := ensureLayout(layout); err != nil {
@@ -395,6 +401,20 @@ func main() {
 // 默认 Go：桌面包里已经不带 CPython 依赖，绝大多数用户机器上没有 python3，
 // 而 Go 引擎与 Python 引擎在功能上等价（同一套前端、同一份凭据格式）。
 // 这个开关是给「Python 面板还在灰度」的部署留的退路。
+func usePythonPanel() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
+	case "0", "false", "no", "off":
+		return true
+	case "1", "true", "yes", "on":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2A_DESKTOP_PYTHON"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // desktopAdminPrefix 面板的挂载前缀（默认 /admin），与网关注册路由用的是同一个
 // 环境变量 WB2API_ADMIN_PREFIX。
 //
@@ -415,18 +435,31 @@ func desktopAdminPrefix() string {
 	return prefix
 }
 
-func usePythonPanel() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
-	case "0", "false", "no", "off":
-		return true
-	case "1", "true", "yes", "on":
-		return false
+// runtimeDirFor 网关与辅助程序所在的目录。单文件分发时先把内嵌的那份解出来。
+//
+// 目录分发（历史形态）：exe 旁边就有网关与辅助程序，原样返回 exe 所在目录，
+// 行为与以前逐字一致。
+//
+// 单文件分发：exe 旁边什么都没有，网关与辅助程序**嵌在启动器里**，首次运行时解到
+// <root>/runtime。解到数据目录而不是 exe 旁边，是因为 exe 可能在只读位置
+// （Program Files、只读 U 盘），而数据目录一定可写；副作用是「程序 + 数据」都在
+// 同一个可写目录里，用户备份仍然是拷一个文件夹。
+//
+// 幂等：已存在且校验和一致的文件不重写，所以每次启动不会重复解压（那会让启动
+// 平白慢几百毫秒，还会天天改 mtime）。
+func runtimeDirFor(root string) (string, error) {
+	if !hasEmbeddedRuntime() {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Dir(exe), nil
 	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2A_DESKTOP_PYTHON"))) {
-	case "1", "true", "yes", "on":
-		return true
+	dir := filepath.Join(root, "runtime")
+	if err := extractEmbeddedRuntime(dir); err != nil {
+		return "", err
 	}
-	return false
+	return dir, nil
 }
 
 func gatewayBinaryName() string {
