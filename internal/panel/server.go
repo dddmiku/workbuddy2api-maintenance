@@ -78,6 +78,13 @@ type Options struct {
 	// UpdateDir 是热更新下载目录（与网关自身用的是同一个）。面板据此显示
 	// 「当前版本来自更新目录」这类信息。
 	UpdateDir string
+	// SessionTTL 是登录会话的有效期；0 表示用默认的 SessionTTL（30 天）。
+	//
+	// 安卓端会把它设成极长（见 cmd/server 的 Android 分支）：手机上的面板是 WebView
+	// 里长期挂着的界面，用户每次打开 App 都要重新输一遍密码是纯粹的折磨，而手机
+	// 本身已经有锁屏与生物识别这道门。桌面与容器仍用 30 天——它们面对的是浏览器，
+	// 会话有效期是那里唯一的一道门。
+	SessionTTL time.Duration
 	// Version 是面板自身版本号；空则用 PanelVersion。
 	Version string
 	// Now 可注入时钟（测试用）。
@@ -328,7 +335,10 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 			"ok":        true,
 			"username":  doc.Username(),
 			"expiresAt": session.Expires,
-			"ttl":       int64(SessionTTL / time.Second),
+			// 报**本次运行实际用的** TTL，而不是那个 30 天的常量：安卓端把它设成
+			// 长期（见 Options.SessionTTL），报常量会让界面显示一个与事实不符的
+			// 「30 天后过期」。
+			"ttl":       int64(s.sessionTTL() / time.Second),
 			"inherited": jsonBool(doc["inherited"], false),
 		})
 		return

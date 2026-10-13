@@ -36,6 +36,17 @@ import (
 // SessionTTL 与 Python 版一致：30 天。管理台是长期挂着的运维界面。
 const SessionTTL = 30 * 24 * time.Hour
 
+// LongSessionTTL 是「长期有效」的会话有效期：100 年。
+//
+// 安卓端用它（见 cmd/server 的 Android 分支）。手机上的面板是 App 里 WebView 长期
+// 挂着的界面，而手机本身已经有锁屏与生物识别这道门；让用户每次打开 App 都重新输
+// 一遍面板密码，换来的是零安全增益与实打实的折磨。
+//
+// 用 100 年而不是「永不过期」：令牌里的 e 字段是 int64 的 unix 秒，必须有具体值，
+// 而「不过期」需要一个哨兵值——那会让所有读 e 的地方都要多一个分支。100 年足够
+// 长到等同于永久（远超设备寿命），又不需要任何特殊判断。
+const LongSessionTTL = 100 * 365 * 24 * time.Hour
+
 // Credentials 是 credentials.json 的结构。
 //
 // 用 map 而不是 struct 是为了**保住未知字段**：Python 版会把整个 doc 读进来、

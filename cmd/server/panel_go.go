@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/android"
 	"workbuddy2api/internal/panel"
@@ -59,7 +60,28 @@ func goPanelOptions(layout unifiedLayout) panel.Options {
 		LogPath:         opts.LogPath,
 		Assets:          panelassets.FrontendFiles(),
 		HelperPaths:     helperPaths(opts.RuntimeDir),
+		SessionTTL:      sessionTTLForHost(),
 	}
+}
+
+// sessionTTLForHost 本次运行的会话有效期。
+//
+// 安卓端设为长期有效（100 年）：那里的面板是 App 内 WebView 长期挂着的界面，
+// 手机本身已有锁屏与生物识别这道门，而「每次打开 App 都重新输一遍面板密码」
+// 换来的是零安全增益与实打实的折磨。用户 2026-10-13 明确要求「手机端登录有效期
+// 设为永久」。
+//
+// 桌面与容器仍用默认 30 天：它们面对的是浏览器，会话有效期是那里唯一的一道门，
+// 而且桌面版每次启动都会拉起浏览器，重登成本本来就不高。
+//
+// 用 WB2API_ANDROID 判定而不是 runtime.GOOS：容器里跑的是 linux 二进制，
+// 安卓上跑的是 android 二进制，这个环境变量是 App 起进程时显式设的（见
+// GatewayService.startGateway），比 GOOS 更直接地表达「这是手机形态」。
+func sessionTTLForHost() time.Duration {
+	if strings.TrimSpace(os.Getenv("WB2API_ANDROID")) == "1" {
+		return panel.LongSessionTTL
+	}
+	return 0 // 0 = 用面板默认的 SessionTTL（30 天）
 }
 
 // panelUpdateDir 是热更新的下载目录。

@@ -1758,3 +1758,57 @@ func TestLateBodyDrainIsBounded(t *testing.T) {
 
 // crlf 是 HTTP 头的行分隔符（写成常量以免在测试里到处转义）。
 const crlf = "\r\n"
+
+// TestLongSessionTTLIsHonored 安卓端把会话设成长期有效时，签发与续期都必须照办。
+//
+// 背景（2026-10-13）：手机上的面板是 App 里 WebView 长期挂着的界面，每次打开都要
+// 重新输密码是纯粹的折磨，而手机本身已有锁屏与生物识别。用户明确要求「手机端登录
+// 有效期设为永久」。这里锁住的是**整条链**都取同一个值——只改签发不改续期，
+// 会出现「登录时给长期令牌、一次续期后又缩回 30 天」，症状是「用几天又掉登录」。
+func TestLongSessionTTLIsHonored(t *testing.T) {
+	h := newHarness(t)
+	h.server.opts.SessionTTL = LongSessionTTL
+	doc := h.writeCredentials()
+
+	// 1) 登录返回的 ttl 必须是长期值。
+	recorder := h.postJSON(doc, "/api/auth/login", map[string]any{
+		"username": "wbadmin", "password": "secret-password"})
+	if recorder.Code != 200 {
+		t.Fatalf("登录应 200，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if ttl, _ := jsonNumber(body["ttl"]); int64(ttl) != int64(LongSessionTTL/time.Second) {
+		t.Fatalf("登录返回的 ttl = %v，期望 %d（长期）", body["ttl"], int64(LongSessionTTL/time.Second))
+	}
+
+	token := ""
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == CookieName && cookie.Value != "" {
+			token = cookie.Value
+		}
+	}
+	if token == "" {
+		t.Fatal("登录必须下发会话 cookie")
+	}
+	// 2) 令牌本身在远超 30 天后仍然有效。
+	payload := ReadSessionAt(doc, token, h.clock.Now().Add(SessionTTL+24*time.Hour))
+	if payload == nil {
+		t.Fatal("长期会话在 30 天之后必须仍然有效（否则安卓端还是会掉登录）")
+	}
+	// 3) 把时钟推到「30 天已过、但长期 TTL 未到」时请求一次，触发的续期不能缩回 30 天。
+	h.clock.Advance(SessionTTL + 24*time.Hour)
+	recorder = h.do(http.MethodGet, "/api/session", "", map[string]string{"Cookie": CookieName + "=" + token})
+	if recorder.Code != 200 {
+		t.Fatalf("长期会话在 30 天后应仍然 200，实际 %d", recorder.Code)
+	}
+	var sessionBody map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &sessionBody); err != nil {
+		t.Fatal(err)
+	}
+	if ttl, _ := jsonNumber(sessionBody["ttl"]); int64(ttl) != int64(LongSessionTTL/time.Second) {
+		t.Fatalf("/api/session 报的 ttl = %v，期望 %d（长期）", sessionBody["ttl"], int64(LongSessionTTL/time.Second))
+	}
+}

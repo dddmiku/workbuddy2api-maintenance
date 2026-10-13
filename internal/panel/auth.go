@@ -36,10 +36,25 @@ const CookieName = "wb2a_admin"
 // 换密钥让所有旧令牌一次性失效，比继续无限增长更省事也更安全。
 const maxRevokedSessions = 4096
 
-// renewThreshold 是滑动续期的触发线：剩余不足 TTL 的 1/3 时续期。
+// renewThreshold 是**默认** TTL 下的滑动续期触发线：剩余不足 TTL 的 1/3 时续期。
 // 令牌本身不换新（nonce 沿用），只延长过期时间——换 nonce 会让「同一会话的旧副本」
 // 重新变成有效令牌（见 authLogout 的注释）。
+//
+// 运行时判据用的是 sessionTTL()/3（TTL 可被 Options 覆盖，见 sessionTTL），
+// 这个常量只给测试当默认值的参照点。
 const renewThreshold = SessionTTL / 3
+
+// sessionTTL 本次运行的会话有效期：Options.SessionTTL 优先，未设则用默认 30 天。
+//
+// 走方法而不是直接用常量，是为了让「同一个部署里所有签发/续期/判过期的地方」
+// 都取到同一个值——散落的常量引用正是「登录时给了长期令牌、续期时又缩回 30 天」
+// 这类不一致的来源。
+func (s *Server) sessionTTL() time.Duration {
+	if s.opts.SessionTTL > 0 {
+		return s.opts.SessionTTL
+	}
+	return SessionTTL
+}
 
 var (
 	usernameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{3,32}$`)
@@ -66,11 +81,12 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request, renew bool) *Se
 	if payload == nil {
 		return nil
 	}
+	ttl := s.sessionTTL()
 	remaining := time.Duration(payload.Expires-s.now().Unix()) * time.Second
-	if renew && remaining < renewThreshold {
-		renewed, err := IssueSessionAt(creds, payload.Nonce, SessionTTL, s.now())
+	if renew && remaining < ttl/3 {
+		renewed, err := IssueSessionAt(creds, payload.Nonce, ttl, s.now())
 		if err == nil {
-			s.setSessionCookie(w, r, renewed, SessionTTL)
+			s.setSessionCookie(w, r, renewed, ttl)
 		}
 	}
 	return payload
@@ -173,20 +189,21 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request, body map[stri
 		return
 	}
 	s.throttle.OK(ip)
-	token, err := IssueSessionAt(fresh, "", SessionTTL, s.now())
+	ttl := s.sessionTTL()
+	token, err := IssueSessionAt(fresh, "", ttl, s.now())
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
 		return
 	}
 	payload := ReadSessionAt(fresh, token, s.now())
-	expires := s.now().Add(SessionTTL).Unix()
+	expires := s.now().Add(ttl).Unix()
 	if payload != nil {
 		expires = payload.Expires
 	}
-	s.setSessionCookie(w, r, token, SessionTTL)
+	s.setSessionCookie(w, r, token, ttl)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "username": fresh.Username(), "expiresAt": expires,
-		"ttl": int64(SessionTTL / time.Second),
+		"ttl": int64(ttl / time.Second),
 	})
 }
 
@@ -216,7 +233,7 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 			// 撤销记录的存活期取「令牌过期」与「现在 + TTL」的较大者：
 			// 取小了会出现「撤销记录先过期、令牌后过期」的窗口，那段时间旧令牌复活。
 			expiry := payload.Expires
-			if fallback := now.Add(SessionTTL).Unix(); fallback > expiry {
+			if fallback := now.Add(s.sessionTTL()).Unix(); fallback > expiry {
 				expiry = fallback
 			}
 			revoked[payload.Nonce] = expiry
@@ -312,14 +329,15 @@ func (s *Server) authPassword(w http.ResponseWriter, r *http.Request, body map[s
 			"message": "写入失败：" + err.Error()})
 		return
 	}
-	token, err := IssueSessionAt(next, "", SessionTTL, s.now())
+	ttl := s.sessionTTL()
+	token, err := IssueSessionAt(next, "", ttl, s.now())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
 		return
 	}
-	s.setSessionCookie(w, r, token, SessionTTL)
+	s.setSessionCookie(w, r, token, ttl)
 	payload := ReadSessionAt(next, token, s.now())
-	expires := s.now().Add(SessionTTL).Unix()
+	expires := s.now().Add(ttl).Unix()
 	if payload != nil {
 		expires = payload.Expires
 	}
