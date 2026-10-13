@@ -198,8 +198,12 @@ func (n *NativeRunner) Run(ctx context.Context, args []string, timeout time.Dura
 		if n.Admin == nil || !n.Admin.ManagementEnabled() {
 			return ExecResult{Code: 1, Stderr: "管理通道不可用"}
 		}
-		code, payload := n.Admin.Request(ctx, "GET", "/healthz", nil)
-		running := code == 200 && jsonString(payload["service"]) == "workbuddy2api"
+		// **不能要求 code == 200**：/healthz 在一个账号都没有时返回 503，而那正是
+		// 「网关活着、只是池里还没有可服务的号」——刚装好、还没加号时的正常状态。
+		// 只认 200 会让面板把「运行中」判成「已停止」（2026-10-13 真机实测）。
+		// 判据是响应体里的 service 字段：它是网关的身份标识。
+		_, payload := n.Admin.Request(ctx, "GET", "/healthz", nil)
+		running := jsonString(payload["service"]) == "workbuddy2api"
 		if running {
 			return ExecResult{Code: 0, Stdout: "true"}
 		}

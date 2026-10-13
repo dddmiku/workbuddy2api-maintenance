@@ -45,11 +45,29 @@ func (g *GatewayClient) httpClient() *http.Client {
 //
 // 与 Python 版一致：读接口的失败对面板来说是「这个卡片暂时没数据」，
 // 而不是错误——返回 nil 让调用方走各自的空态展示。
+//
+// ═══ 为什么 4xx/5xx 的 JSON 响应体也要交出来 ═══
+//
+// 曾经这里在 code >= 400 时直接返回 nil，理由是「失败对面板就是没数据」。那条
+// 判断把**响应体**一起丢了，而有些接口正是靠响应体表达「服务是活的、只是暂时没
+// 有可服务的东西」——`/healthz` 就是：一个账号都没有时它返回 503 且
+// `{"service":"workbuddy2api","healthy":0,...}`。丢掉响应体之后，判据
+// `jsonString(health["service"]) == "workbuddy2api"` 永远拿不到 service 字段，
+// 于是面板把「网关运行正常、只是还没加号」显示成「网关容器未运行 / 服务当前不可用」
+// ——2026-10-13 用户刚装完 App 就撞上这个（安卓上首次启动必然零账号）。
+//
+// Python 版没有这个问题：native 模式下它直接读 socket 返回的 (status, value)，
+// 从不按状态码丢弃 value。现在两边口径一致：**能不能解析出对象**才是判据，
+// 状态码交给调用方自己看。
 func (g *GatewayClient) Get(ctx context.Context, path string) map[string]any {
 	if g.Management != nil && g.Management.ManagementEnabled() {
-		if code, payload := g.Management.Request(ctx, http.MethodGet, path, nil); code < 400 {
+		code, payload := g.Management.Request(ctx, http.MethodGet, path, nil)
+		// 只要解析出了对象就返回；状态码非 2xx 时 payload 里通常带着 error 信封，
+		// 调用方按自己的需要读（例如 /healthz 读 service，其它接口读 error）。
+		if payload != nil {
 			return payload
 		}
+		_ = code
 		return nil
 	}
 	if g.BaseURL == "" {

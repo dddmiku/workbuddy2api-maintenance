@@ -1812,3 +1812,34 @@ func TestLongSessionTTLIsHonored(t *testing.T) {
 		t.Fatalf("/api/session 报的 ttl = %v，期望 %d（长期）", sessionBody["ttl"], int64(LongSessionTTL/time.Second))
 	}
 }
+
+// TestContainerRunningAccepts503FromHealthz 零账号时 /healthz 返回 503，但那必须
+// 判成「网关运行中」。
+//
+// 真机事故（2026-10-13）：用户刚装好安卓 App、还没加任何账号，面板首屏就显示
+// 「网关容器未运行 / 服务当前不可用」。根因是读 /healthz 的路径把 HTTP 状态码当
+// 成了前置闸——code >= 400 直接丢掉响应体，而判据恰恰要读响应体里的 service 字段。
+// 一个账号都没有时 /healthz 正是 503 + {"service":"workbuddy2api","healthy":0}，
+// 于是「网关活着、只是池里还没号」被显示成「网关没运行」。
+//
+// 注意：/healthz 的 503 是**设计如此**（池里没有可服务的号），不是错误。
+func TestContainerRunningAccepts503FromHealthz(t *testing.T) {
+	h := newHarness(t)
+	h.transport.replies["GET /healthz"] = stubReply{Code: 503,
+		Body: `{"commit":"x","healthy":0,"service":"workbuddy2api","total":0,"version":"v2.16.0"}`}
+	payload := h.server.state.Build(context.Background(), false)
+	if !payload.ContainerRun {
+		t.Fatal("零账号时 /healthz 返回 503，仍须判为网关运行中（否则面板显示「网关容器未运行」）")
+	}
+}
+
+// TestContainerRunningFalseWhenHealthzIsNotGateway /healthz 回了对象但不是本网关
+// 时（同端口上跑着别的东西），必须判成未运行——否则面板会对着别人的服务操作。
+func TestContainerRunningFalseWhenHealthzIsNotGateway(t *testing.T) {
+	h := newHarness(t)
+	h.transport.replies["GET /healthz"] = stubReply{Code: 200, Body: `{"service":"something-else"}`}
+	payload := h.server.state.Build(context.Background(), false)
+	if payload.ContainerRun {
+		t.Fatal("service 字段不是 workbuddy2api 时必须判为未运行")
+	}
+}
