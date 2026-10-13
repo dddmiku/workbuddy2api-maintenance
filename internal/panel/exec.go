@@ -15,10 +15,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -70,14 +72,16 @@ type NativeRunner struct {
 	HelperPaths map[string]string
 	// Admin 是管理 socket 客户端，用于把 inspect/restart 映射成网关内部接口。
 	Admin *ManagementClient
+	// LogPath 是网关日志文件（runlog 写的那份），原生模式下日志页读它。
+	LogPath string
 }
 
 // NewRunner 按运行形态选择执行器。
 //
 // 判据是环境变量 WB2API_RUNTIME=native（由网关在拉起面板时注入），与 Python 版同源。
-func NewRunner(runtime, container, runtimeDir, authDir, adminDir, gatewayDir string, admin *ManagementClient, helperPaths map[string]string) Runner {
+func NewRunner(runtime, container, runtimeDir, authDir, adminDir, gatewayDir, logPath string, admin *ManagementClient, helperPaths map[string]string) Runner {
 	if runtime == "native" {
-		return &NativeRunner{RuntimeDir: runtimeDir, AuthDir: authDir, AdminDir: adminDir,
+		return &NativeRunner{RuntimeDir: runtimeDir, AuthDir: authDir, AdminDir: adminDir, LogPath: logPath,
 			GatewayDir: gatewayDir, Admin: admin, HelperPaths: helperPaths}
 	}
 	if container == "" {
@@ -220,7 +224,13 @@ func (n *NativeRunner) Run(ctx context.Context, args []string, timeout time.Dura
 		return ExecResult{Code: 1, Stderr: gatewayEnvelopeError(payload)}
 	}
 	if len(args) == 4 && args[0] == "logs" && args[1] == "--tail" && args[3] == n.containerName() {
-		return ExecResult{Code: 1, Stderr: "原生模式下日志请直接查看运行日志文件"}
+		// 原生模式没有 docker logs 可用，日志就在本机文件里——直接读它。
+		//
+		// 这里原本返回「请直接查看运行日志文件」，等于**面板的日志页在桌面/安卓上是
+		// 空白的**（2026-10-13 实测：/api/logs 返回 rc=1、rows=[]）。Python 版的
+		// native_runtime 实现了同一件事（按 runlog 的轮转顺序读 .2 → .1 → 当前，
+		// 且封顶 8MB），Go 版漏了，于是同一个面板在两个引擎下表现不一致。
+		return tailLogFile(n.LogPath, args[2])
 	}
 	name, argv, allowed := n.nativeAllowed(args)
 	if !allowed {
@@ -360,4 +370,84 @@ func DecodeExecJSON(stdout string) (map[string]any, string) {
 		return nil, truncateText(stdout, 400)
 	}
 	return result, ""
+}
+
+// logTailLimit 单次读取的日志字节上限。
+//
+// 与 Python 版同值（8MB）。运维可能用一个大得多的诊断文件替换掉日志文件，
+// 没有上限就会把它整个读进内存。
+const logTailLimit = 8 << 20
+
+// tailLogFile 从网关日志文件里取最后 count 行（按 runlog 的轮转顺序）。
+//
+// 顺序是 .2 → .1 → 当前：runlog 轮转时把当前改名成 .1、旧 .1 变成 .2，所以时间上
+// 最早的是 .2。倒过来读会让「最近的日志」里混进更早的内容。
+//
+// 每个文件从**尾部**最多读 8MB：日志可能有几百 MB，而这里只要最后几百行。
+// 截断处可能落在行中间，所以跳掉第一个不完整的行（Python 版同此处理）。
+func tailLogFile(logPath, rawCount string) ExecResult {
+	count, err := strconv.Atoi(strings.TrimSpace(rawCount))
+	if err != nil || count < 1 {
+		return ExecResult{Code: 1, Stderr: "无效日志范围"}
+	}
+	if count > 5000 {
+		count = 5000
+	}
+	if logPath == "" {
+		return ExecResult{Code: 1, Stderr: "未配置日志文件路径"}
+	}
+	lines := make([]string, 0, count)
+	for _, path := range []string{logPath + ".2", logPath + ".1", logPath} {
+		chunk, err := readTailLines(path, logTailLimit)
+		if err != nil {
+			continue // 文件不存在是正常情况（轮转档还没生成）
+		}
+		lines = append(lines, chunk...)
+	}
+	if len(lines) > count {
+		lines = lines[len(lines)-count:]
+	}
+	return ExecResult{Code: 0, Stdout: strings.Join(lines, "")}
+}
+
+// readTailLines 读一个文件尾部至多 limit 字节，按行切分返回（每行含换行符）。
+func readTailLines(path string, limit int64) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	offset := int64(0)
+	if size > limit {
+		offset = size - limit
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	text := string(raw)
+	if offset > 0 {
+		// 截断处多半落在某行中间：丢掉第一个不完整的片段。
+		if idx := strings.IndexByte(text, '\n'); idx >= 0 {
+			text = text[idx+1:]
+		} else {
+			text = ""
+		}
+	}
+	if text == "" {
+		return nil, nil
+	}
+	parts := strings.SplitAfter(text, "\n")
+	if last := parts[len(parts)-1]; last == "" {
+		parts = parts[:len(parts)-1]
+	}
+	return parts, nil
 }

@@ -158,7 +158,7 @@ func New(opts Options) (*Server, error) {
 		socket = ""
 	}
 	management := &ManagementClient{Handler: opts.AdminHandler, SocketPath: socket, BaseDir: opts.BaseDir}
-	runner := NewRunner(opts.Runtime, opts.Container, opts.RuntimeDir, opts.AuthDir, opts.AdminDir, opts.BaseDir, management, opts.HelperPaths)
+	runner := NewRunner(opts.Runtime, opts.Container, opts.RuntimeDir, opts.AuthDir, opts.AdminDir, opts.BaseDir, opts.LogPath, management, opts.HelperPaths)
 
 	server := &Server{
 		opts:      opts,
