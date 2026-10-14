@@ -83,6 +83,9 @@ class RealmCapabilityTest(unittest.TestCase):
         from unittest import mock
         summary = {"uid": "u1", "realm": realm, "nickname": "n", "disabled": False,
                    "expiresAt": 0, "domain": "", "enterpriseId": "", "parsable": True}
+        # socket_path 读的是 CONFIG_PATH（部署机上才存在的绝对路径）。测试不该依赖
+        # 真实文件系统——不 mock 它的话，在 CI / 开发机上会 FileNotFoundError，
+        # 表现为「账号页积分测试莫名报错」而非断言失败（2026-10-14 定位）。
         with mock.patch.object(panel_app, "list_auth_files",
                                return_value=[{"uid": "u1", "file": "f.json",
                                               "disabled": False, "path": "p"}]), \
@@ -91,7 +94,8 @@ class RealmCapabilityTest(unittest.TestCase):
              mock.patch.object(panel_app, "credits_by_uid",
                                return_value=({}, {"accounts": []})), \
              mock.patch.object(panel_app, "container_running", return_value=True), \
-             mock.patch.object(panel_app, "_expiring_soon_env", return_value=""):
+             mock.patch.object(panel_app, "_expiring_soon_env", return_value=""), \
+             mock.patch.object(panel_app.key_management, "socket_path", return_value=None):
             return panel_app.build_state()
 
     def test_trae_account_reports_its_own_credits(self):
