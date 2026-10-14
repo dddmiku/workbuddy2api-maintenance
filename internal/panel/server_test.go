@@ -204,9 +204,16 @@ func (h *harness) writeCredentials() Credentials {
 }
 
 // token 签一个有效会话令牌。
+//
+// 必须用**假时钟**（IssueSessionAt + h.clock.Now()），不能用 IssueSession：
+// 后者读 time.Now()，令牌的 Expires 会以真实时间为基准，而服务器校验走的是
+// h.clock。两个基准错位时，「推进假时钟」算出来的剩余量与令牌真实剩余量无关，
+// 续期判据永远对不上——表现为「临近过期时必须滑动续期」这类断言必然失败，
+// 而产品代码其实是对的（2026-10-13 支持行空板时跑全量测试发现，该失败在
+// HEAD 上已存在）。
 func (h *harness) token(doc Credentials) string {
 	h.t.Helper()
-	token, err := IssueSession(doc, "", SessionTTL)
+	token, err := IssueSessionAt(doc, "", SessionTTL, h.clock.Now())
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -629,6 +636,15 @@ func TestRenewedSessionRevokedByLogout(t *testing.T) {
 		t.Fatal("令牌应有效")
 	}
 	// 把时钟推到期临界，触发一次滑动续期。
+	//
+	// 令牌 Expires = 签发时刻 + ttl（由假时钟签发，见 h.token）。续期判据是
+	// 剩余 < ttl/3，所以推进量必须**大于** ttl - ttl/3；这里多推 1 小时留出余量，
+	// 得到剩余 ttl/3 - 1h。
+	//
+	// 这条断言长期失败过，原因不在算术而在时钟基准：h.token 原先用 IssueSession
+	// （真实 time.Now()）签发，而服务器校验走 h.clock，两个基准错位让推进量算不出
+	// 正确剩余。修好基准后这里就正常了（2026-10-13 支持行空板时跑全量测试发现，
+	// 该失败在 HEAD 上已存在，与本次改动无关）。
 	h.clock.Advance(SessionTTL - renewThreshold + time.Hour)
 	recorder := h.do(http.MethodGet, "/api/session", "", map[string]string{"Cookie": CookieName + "=" + token})
 	if recorder.Code != 200 {

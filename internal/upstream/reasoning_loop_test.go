@@ -494,3 +494,39 @@ func TestReasoningLoopGuardHoldsThroughTinyFrames(t *testing.T) {
 		t.Fatalf("client saw %d bytes before the retry decision", len(body))
 	}
 }
+
+// TestReasoningLoopHoldBackByteCapCoversCharCap 锁定两个压制上限之间的不变式：
+// 字节上限必须覆盖「字符上限 × 单字符最坏字节开销」，否则字节上限会先于字符上限
+// 生效，把它变成死条款——缓冲在判定之前就被放行，客户端先看到一屏重复文本、再收到
+// 错误，重发资格同时作废。
+//
+// 这两个常量历史上脱节过一次：旧值 2 MiB 配 64K 字符上限，按实测最坏 222 字节/字符
+// 折合 14 MB，字节上限先触发。2026-10-14 又观测到一例 76312 字符的判定越过 64K
+// 字符上限。两次都是「改一个忘了另一个」，所以把关系写成断言，而不是只留在注释里。
+func TestReasoningLoopHoldBackByteCapCoversCharCap(t *testing.T) {
+	// 222 字节/字符是线上实测的最坏帧开销（上游把推理切成约 220 字节的小帧、
+	// 每帧只带一两个字符）。取最坏值是为了让断言成为真正的下界。
+	const worstBytesPerChar = 222
+	need := int64(reasoningLoopHoldBackChars) * worstBytesPerChar
+	if int64(ReasoningLoopHoldBackBytes) < need {
+		t.Fatalf("byte cap %d cannot cover char cap %d at %d bytes/char (need %d): "+
+			"the byte cap would release before the char cap and void the retry",
+			ReasoningLoopHoldBackBytes, reasoningLoopHoldBackChars, worstBytesPerChar, need)
+	}
+}
+
+// TestReasoningLoopHoldBackTimeoutCoversObservedDetectionPoints 锁定时间上限必须覆盖
+// 线上已观测到的判定耗时。
+//
+// 2026-10-14 实测：三例未重发的推理循环，字符累积速率约 812 字符/秒，总时长分别
+// 81s / 94s / 105s。旧的 60 秒上限在这三例里**先于字符上限放行**，判定发生在放行
+// 之后，于是客户端已收到字节、Retryable 置不上，只能如实报错。
+func TestReasoningLoopHoldBackTimeoutCoversObservedDetectionPoints(t *testing.T) {
+	// 最长的一例：105.7 秒（76312 字符 ÷ 94.4 秒 ≈ 812 字符/秒）。
+	const longestObserved = 105*time.Second + 747*time.Millisecond
+	if ReasoningLoopHoldBackTimeout <= longestObserved {
+		t.Fatalf("hold-back timeout %s does not cover the longest observed detection point %s: "+
+			"the timeout would release first and void the retry",
+			ReasoningLoopHoldBackTimeout, longestObserved)
+	}
+}

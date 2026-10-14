@@ -209,9 +209,37 @@ func assetNameFor(goos, goarch string) (string, error) {
 		return "wb2api-linux-amd64", nil
 	case "arm64":
 		return "wb2api-linux-arm64", nil
+	case "arm":
+		// 32 位 ARM（armv7）。行空板 M10（DFRobot UNIHIKER）是四核 Cortex-A7、
+		// 423 MB 内存，用户 2026-10-13 要求支持它。
+		//
+		// 资产名**必须带 GOARM 版本**，不能只叫 "wb2api-linux-arm"：Go 的 arm
+		// 目标有三个 ABI 变体（v5/v6/v7），软浮点与硬浮点的指令集不同，拿 v5 的
+		// 二进制到 v7 板上跑会 SIGILL。带上版本号，发布端与自更新端才可能对得上。
+		return armAssetName(goarmVersion()), nil
 	default:
 		return "", fmt.Errorf("unsupported architecture %q for self-update", goarch)
 	}
+}
+
+// goarmVersion 本次构建的 GOARM 版本（"5"/"6"/"7"），非 arm 目标返回空串。
+//
+// 读环境变量而不是 runtime 常量：Go 在**编译期**就把 GOARM 烧进二进制了，
+// 运行期没有导出这个值（`runtime.GOARCH` 只给 "arm"）。发布与自更新两端都靠
+// 构建脚本传 GOARM=7，所以这里读的是「构建时约定的那个值」——它必须与
+// build 脚本传给编译器的完全一致，否则会去找一个不存在的资产名。
+func goarmVersion() string {
+	if v := strings.TrimSpace(os.Getenv("GOARM")); v != "" {
+		return v
+	}
+	// 没设时回落 v7：这是本项目的部署形态（行空板 M10 / 各类 Cortex-A7 板子
+	// 都是 armv7 硬浮点）。宁可指向 v7 也不要指向一个不存在的通用名。
+	return "7"
+}
+
+// armAssetName 32 位 ARM 的资产名。
+func armAssetName(goarm string) string {
+	return "wb2api-linux-armv" + goarm
 }
 
 // Latest 查询最新发布版本（含本机架构的二进制资产）。
@@ -440,7 +468,19 @@ func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize i
 // 安卓的程序在 APK 的 nativeLibraryDir 里，完整包那套「解压到目录再整体替换」
 // 的前提不成立。
 func runtimeAssetName() string {
-	return "wb2api-runtime-linux-" + runtime.GOARCH + ".tar.gz"
+	return "wb2api-runtime-linux-" + runtimeArchName() + ".tar.gz"
+}
+
+// runtimeArchName 运行包名里用的架构标识。
+//
+// 与裸二进制的命名规则**一致**（armv7 而不是 arm）：两边必须能互相推导，
+// 否则「按平台找资产」的代码会在 arm 上找到裸二进制却找不到运行包，
+// 表现为「下载成功但解包时找不到本机架构的资产」。
+func runtimeArchName() string {
+	if runtime.GOARCH == "arm" {
+		return "armv" + goarmVersion()
+	}
+	return runtime.GOARCH
 }
 
 // bundleSupported 本平台是否支持「完整运行包」形式的更新。

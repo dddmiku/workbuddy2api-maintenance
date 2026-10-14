@@ -19,8 +19,13 @@ FILES = ('wb2api', 'login', 'credit', 'signin_bin', 'trial_bin', 'activity_bin',
 
 def package(stage, version, arch, archive=None):
     stage = Path(stage)
-    arch = {'aarch64': 'arm64', 'x86_64': 'amd64'}.get(arch, arch)
-    if arch not in ('amd64', 'arm64'):
+    arch = {'aarch64': 'arm64', 'x86_64': 'amd64', 'armv7l': 'armv7', 'armv7': 'armv7',
+            'armv6l': 'armv6', 'armv6': 'armv6', 'armv5': 'armv5'}.get(arch, arch)
+    # armv7 是行空板 M10（DFour UNIHIKER，四核 Cortex-A7）用的 32 位 ARM 目标，
+    # 用户 2026-10-13 要求支持。**名字里必须带版本**：arm 的 v5/v6/v7 ABI 不同，
+    # 只写 "arm" 会让发布端与自更新端对不上（详见 internal/hotupdate/release.go
+    # 的 armAssetName 注释）。
+    if arch not in ('amd64', 'arm64', 'armv7', 'armv6', 'armv5'):
         raise ValueError('unsupported runtime architecture')
     files = {}
     for name in FILES:
