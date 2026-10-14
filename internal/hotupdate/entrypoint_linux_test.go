@@ -30,6 +30,10 @@ func startEntrypointFixture(t *testing.T) entrypointProcess {
 
 func startConfiguredEntrypoint(t *testing.T, mode string) entrypointProcess {
 	t.Helper()
+	// 监督循环靠 /proc/<pid>/task/<tid>/children 判断被收养的后继是否还活着；
+	// 内核没暴露这个文件时（实测老内核 4.4.143）它读不到子进程、误判后继已退出，
+	// 用例必然全挂。先探测能力，缺了就跳过并说明原因（见 requireListenerInheritance）。
+	requireListenerInheritance(t)
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("Python is required to establish an isolated Linux subreaper")

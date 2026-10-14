@@ -109,10 +109,28 @@ func startHandover(t *testing.T, ln net.Listener, adminLn net.Listener) func() {
 
 // requireListenerInheritance fd 传递只在 Unix 上成立（Windows 的 ExtraFiles 不支持
 // 监听套接字）。正式部署是 Linux 容器，本地 Windows 开发跳过即可。
+//
+// 2026-10-14 补能力探测：这三条 entrypoint 用例依赖 docker-entrypoint.sh 的监督循环，
+// 而那个循环用 `/proc/<pid>/task/<tid>/children` 判断「被收养的后继是否还活着」。
+// 该文件由内核 CONFIG_PROC_CHILDREN 提供，但**老内核（实测 4.4.143）即使编了这个
+// 选项也可能不暴露它**——此时 supervisor 读不到子进程、误判「updated instance exited
+// unexpectedly」并以 1 退出，用例全挂。那不是被测算法的缺陷，是宿主能力缺失。
+//
+// 所以这里探测**实际能力**而不是只看 GOOS：读不到就跳过，并在跳过理由里说清原因，
+// 避免「在能跑的环境里静默不测」。
 func requireListenerInheritance(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("监听套接字继承是 Unix 语义；在 Linux 容器里跑这条用例")
+	}
+	// 探测 supervisor 依赖的 children 文件是否可读（内核提供 CONFIG_PROC_CHILDREN）。
+	matches, err := filepath.Glob(fmt.Sprintf("/proc/%d/task/%d/children", os.Getpid(), os.Getpid()))
+	if err != nil || len(matches) == 0 {
+		t.Skip("内核未暴露 /proc/<pid>/task/<tid>/children（CONFIG_PROC_CHILDREN），" +
+			"entrypoint 监督循环无法判断被收养的后继，本用例跳过")
+	}
+	if _, err := os.ReadFile(matches[0]); err != nil {
+		t.Skip("读不到 /proc/<pid>/task/<tid>/children：" + err.Error())
 	}
 }
 
