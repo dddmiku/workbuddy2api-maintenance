@@ -38,6 +38,46 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.2.7 — 2026-10-14
+
+修掉成长中心**任务段一个奖都领不到**的根因（VPS 日志里任务段永远只有「任务列表与接单接口不同源…本段跳过」）。
+
+### 根因：任务列表走错了路径
+
+`GET /activity/growth/tasks` 与 `GET /v2/activity/growth/tasks` **都返回 200，但内容完全不同**（同一账号同一时刻逐条比对）：
+
+| 路径 | 返回 |
+|---|---|
+| `/activity/growth/tasks` | 「养虾」任务 5 条：`first_chat` / `skill_installed` / `wechat_linked` / `expert_summoned` / `template_used`。字段 `code`/`status`/`level_name`，**无 `accept_status`、无 `reward_credit`、无 `progress`** |
+| `/v2/activity/growth/tasks` | **真任务 17 条**（客户端做的那批）。字段 `task_code`/`accept_status`/`locked`/`progress`/`reward_credit`/`reward_energy` |
+
+accept/claim 认的是 `task_code` 那套。两份列表的 code 命名空间不交叉：`accept first_chat` 两个前缀都返回 `task not found`。所以不带 `/v2` 的那份是**看着像任务、其实喂不进接单接口**的假列表——照它跑就是静默空转。
+
+此前只验证了「两种前缀都返回 200」就断定等价，**没有验证内容**，这是误判的来源。既有 Python 实现（`task_common.py` 的 `PATH_LIST_TASKS`）用的本来就是 `/v2`，只有新写的 Go 层走错了。
+
+其余 growth 路径（`streak`/`heatmap`/`redeem/summary`/`buddy/quota`/`travel/config`/`energy`/`lottery/chances`）两前缀返回**逐字节相同**（仅 `requestId` 不同），维持原写法不动。
+
+### 任务段改为列表驱动
+
+`/v2` 的列表自带 `accept_status` 与 `progress`，客户端就是照它决定领哪些奖的。现在按状态分流：
+
+- `not_accepted` → 批量 accept（每批 20）
+- `completed` → claim
+- `accepted` / `in_progress` → 不动作（进度在计）；若 `progress.current >= target` 但状态没翻，仍试一次 claim
+- `claimed` → 跳过
+- `locked` → 完全不动作
+
+硬编码的 `growthClaimCodes` 只保留为**列表拉取失败时的兜底**，并补上实测存在的 `wb_wechat_oa_subscribe_task` 与 `first_buddy`。
+
+### 顺带修正
+
+- `growthTail` 写入的 `o.Energy` 是**能量余额**（绝对值），各段领奖拿到的能量只在日志里逐条列出，不再累加进同一字段——否则查询失败时会显示成「增量」，面板数字会飘。
+- 测试锁住 `growthTasksPath` 必须带 `/v2`：这个坑靠状态码测不出来（两条路径都 200），只能靠路径断言守住。
+
+### 实测（板子 + 真实 CN 上游）
+
+修正后对两个 CN 账号跑真实上游：正确识别 2 条 `not_accepted`（`Expert_lighthouse`、`wb_wechat_oa_subscribe_task`）→ accept 成功；识别 2 条 `completed`（`Model_chat_GLM5.2`、`chat_5`）→ 各领到 **+100 积分 +5 能量**（`already_claimed=false`）。此前这两笔正是日志里「漏掉」的那部分。
+
 ## v3.2.2 — 2026-10-14
 
 补完 v3.2.1 的 CI 修复：`go test ./...` 在 Linux 上仍会挂。

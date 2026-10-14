@@ -91,7 +91,8 @@ func (s *growthStub) handler() http.Handler {
 		case "/activity/growth/buddy/travel/depart":
 			w.Write([]byte(`{"code":0,"data":{"location":{"id":4,"name":"古镇客栈","duration_hours":3},"duration_hours":3}}`))
 		// ── 任务 ──
-		case "/activity/growth/tasks":
+		// 列表走 /v2（真任务形态）；不带 /v2 是另一套「养虾」任务，见 growth.go 头注释。
+		case "/v2/activity/growth/tasks":
 			tasks := s.tasks
 			if tasks == nil {
 				tasks = []map[string]any{}
@@ -100,11 +101,20 @@ func (s *growthStub) handler() http.Handler {
 			w.Write(body)
 		case "/activity/growth/tasks/accept":
 			s.acceptCalls.Add(1)
+			var req struct {
+				TaskCodes []string `json:"task_codes"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
 			if s.acceptStatus == "error" {
 				w.Write([]byte(`{"code":0,"data":{"results":[{"task_code":"t1","status":"error","message":"prerequisite not met"}]}}`))
 				return
 			}
-			w.Write([]byte(`{"code":0,"data":{"results":[{"task_code":"t1","status":"ok"}]}}`))
+			res := make([]map[string]any, 0, len(req.TaskCodes))
+			for _, c := range req.TaskCodes {
+				res = append(res, map[string]any{"task_code": c, "status": "ok"})
+			}
+			body, _ := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"results": res}})
+			w.Write(body)
 		// ── 补登 ──
 		case "/activity/growth/streak":
 			fmt.Fprintf(w, `{"code":0,"data":{"launch_date":"2026-09-01","streak":{"days":%d,"makeup_dates":[]},"makeup_cards":{"balance":%d}}}`,
@@ -275,28 +285,44 @@ func TestGrowthCenterTravelDailyLimitSkipsDepart(t *testing.T) {
 	// 更精确的断言是 stub 未记录 depart——用一个专门的计数器）
 }
 
-// TestGrowthCenterAcceptsAndClaimsTasks 任务段用**已知 code 清单**接单 + 逐个领奖。
+// TestGrowthCenterAcceptsAndClaimsTasks 任务段**列表驱动**：按 /v2 列表里的
+// accept_status 接单与领奖，不硬编码 code 清单。
 //
-// 2026-10-14 实测（VPS 容器内逐个 code 打真实上游）：`/tasks` 列表返回的 code
-// （first_chat 等）不被 accept 识别（task not found），而 accept/claim 认的是
-// task_runner.py 那套（chat_5 / Model_chat_GLM5.2 / ...）。所以任务段必须遍历
-// 已知清单，不能照列表走——照列表走的表现是「一个奖都领不到」。
+// 2026-10-14 修正（此前的实现与用例都是错的，会导致一个奖都领不到）：
+// 此前用 `GET /activity/growth/tasks`（不带 /v2）拿列表，那份返回的是另一套
+// 「养虾」任务（first_chat 等 5 条，code/status 字段），**与 accept/claim 的
+// 命名空间不匹配**，于是任务段永远空转。带 /v2 的才是真任务 17 条
+// （task_code/accept_status/progress），也是 88lin 与 task_runner.py 用的那份。
 func TestGrowthCenterAcceptsAndClaimsTasks(t *testing.T) {
 	fastGrowth(t)
 	stub := newGrowthStub()
 	stub.claimCredit = 10
+	stub.tasks = []map[string]any{
+		// 待接单：应被 accept，不该被 claim（未完成）。
+		{"task_code": "pending_one", "title": "待接单任务", "accept_status": "not_accepted",
+			"progress": map[string]any{"current": 0, "target": 1}},
+		// 已完成：应被 claim。
+		{"task_code": "done_one", "title": "已完成任务", "accept_status": "completed",
+			"progress": map[string]any{"current": 1, "target": 1}},
+		// 已领：既不 accept 也不 claim。
+		{"task_code": "claimed_one", "title": "已领任务", "accept_status": "claimed",
+			"progress": map[string]any{"current": 1, "target": 1}},
+		// 锁定：完全不动作。
+		{"task_code": "locked_one", "title": "锁定任务", "accept_status": "not_accepted",
+			"locked": true, "progress": map[string]any{"current": 0, "target": 1}},
+	}
 	srv := stub.server(t)
 	s, _ := growthScheduler(t, srv, "u1")
 
 	s.RunGrowthNow()
 
-	// accept 只发一次（整份清单批量），不是按列表逐条。
+	// accept 只发一次（一个批次），且只含待接单那条。
 	if n := stub.acceptCalls.Load(); n != 1 {
-		t.Errorf("accept calls=%d want 1（整份已知清单批量接单）", n)
+		t.Errorf("accept calls=%d want 1（只接 not_accepted 的那条）", n)
 	}
-	// claim 会遍历整份清单，次数应等于清单长度。
-	if n := stub.claimCalls.Load(); int(n) != len(growthClaimCodes) {
-		t.Errorf("claim calls=%d want %d（逐个尝试领奖）", n, len(growthClaimCodes))
+	// claim 只打已完成那条——不是遍历整份清单。
+	if n := stub.claimCalls.Load(); n != 1 {
+		t.Errorf("claim calls=%d want 1（只领 completed 的那条）", n)
 	}
 }
 
@@ -305,12 +331,33 @@ func TestGrowthCenterTaskClaimAlreadyClaimed(t *testing.T) {
 	fastGrowth(t)
 	stub := newGrowthStub()
 	stub.claimAlready = true
+	stub.tasks = []map[string]any{
+		{"task_code": "done_one", "title": "已完成任务", "accept_status": "completed",
+			"progress": map[string]any{"current": 1, "target": 1}},
+	}
 	srv := stub.server(t)
 	s, _ := growthScheduler(t, srv, "u1")
 
 	s.RunGrowthNow()
-	if n := stub.claimCalls.Load(); int(n) != len(growthClaimCodes) {
-		t.Errorf("claim calls=%d want %d", n, len(growthClaimCodes))
+	if n := stub.claimCalls.Load(); n != 1 {
+		t.Errorf("claim calls=%d want 1", n)
+	}
+}
+
+// TestGrowthCenterTaskListEmptyNoCalls 列表为空（本期无任务）时不发 accept/claim。
+func TestGrowthCenterTaskListEmptyNoCalls(t *testing.T) {
+	fastGrowth(t)
+	stub := newGrowthStub()
+	stub.tasks = []map[string]any{}
+	srv := stub.server(t)
+	s, _ := growthScheduler(t, srv, "u1")
+
+	s.RunGrowthNow()
+	if n := stub.acceptCalls.Load(); n != 0 {
+		t.Errorf("accept calls=%d want 0（无任务不该接单）", n)
+	}
+	if n := stub.claimCalls.Load(); n != 0 {
+		t.Errorf("claim calls=%d want 0（无任务不该领奖）", n)
 	}
 }
 

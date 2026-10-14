@@ -9,10 +9,28 @@
 // 把整条链路的接口契约、幂等语义、正常态判定都验证透了，直接移植比在 Go 里重新
 // 试错稳。
 //
-// 路径前缀：88lin 用 /v2/activity/growth/*，本仓库既有代码用 /activity/growth/*
-// （不带 /v2）。2026-10-14 对真实 CN 上游逐路径实测：两种前缀**都返回 200**，
-// 服务端两者等价。这里沿用本仓库既有写法（不带 /v2），与 travel.go/growth_reward.go
-// 保持一致，避免同一个域出现两套路径风格。
+// 路径前缀：88lin 用 /v2/activity/growth/*，本仓库既有代码用 /activity/growth/*。
+//
+// ⚠️ 2026-10-14 修正——此前只测了「两种前缀都返回 200」就断定等价，**这是错的**：
+// 两条路径都 200，但 GET /tasks 返回的**内容完全不同**（同账号同刻实测）：
+//
+//	GET /activity/growth/tasks     → 新版「养虾」任务 5 条：first_chat /
+//	                                 skill_installed / wechat_linked /
+//	                                 expert_summoned / template_used
+//	                                 字段 code/status/level_name，无 accept_status、
+//	                                 无 reward_credit、无 progress
+//	GET /v2/activity/growth/tasks  → **真任务 17 条**（就是客户端做的那批）：
+//	                                 create_canvas / chat_5 / Model_chat_GLM5.2 /
+//	                                 wb_wechat_oa_subscribe_task / first_buddy / ...
+//	                                 字段 task_code/accept_status/locked/progress/
+//	                                 reward_credit/reward_energy
+//
+// 只有 /v2 那份能喂给 accept/claim（accept 不认 first_chat，两前缀都返回
+// task not found；而 task_code 那套两前缀都认）。所以 /tasks 必须走 /v2。
+//
+// 其余 growth 路径（streak/heatmap/redeem/summary/buddy/quota/travel/config/
+// energy/lottery/chances）两前缀返回**逐字节相同**（仅 requestId 不同），
+// 沿用本仓库既有写法即可，不必改。
 package upstream
 
 import (
@@ -25,15 +43,20 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// 成长中心路径（88lin signin.py 的 base + suffix，实测等价）。
+// 成长中心路径。**只有任务列表那条必须带 /v2**，其余沿用既有写法即可。
 const (
 	// checkinStatusPath 查询签到状态（只读，可重试）。
 	checkinStatusPath = "/v2/billing/meter/checkin-activity-status"
 	// checkinStatusPathNoV2 global 域首选（与 dailyCheckinPath 同构：国际版无 /v2 前缀）。
 	checkinStatusPathNoV2 = "/billing/meter/checkin-activity-status"
-	// growthTasksPath 任务列表；growthTasksAcceptPath 批量接单（复数数组）。
-	growthTasksPath       = "/activity/growth/tasks"
+	// growthTasksPath 任务列表。**必须带 /v2**：不带时返回的是另一套「养虾」任务
+	// （first_chat 等 5 条，code/status 字段），与 accept/claim 的命名空间不匹配，
+	// 照它去领奖一个也领不到。详见文件头注释。
+	growthTasksPath = "/v2/activity/growth/tasks"
+	// growthTasksAcceptPath 批量接单（复数数组）。两前缀都认 task_code，沿用既有写法。
 	growthTasksAcceptPath = "/activity/growth/tasks/accept"
+	// growthTaskClaimPrefix 领奖路径前缀（后接 <task_code>/claim）。同 accept，前缀无关。
+	growthTaskClaimPrefix = "/activity/growth/tasks/"
 	// growthHeatmapPath 活跃日历（补登候选来源）。
 	growthHeatmapPath = "/activity/growth/heatmap"
 	// growthMakeupUsePath 使用补登卡。
@@ -106,29 +129,34 @@ func (c *Client) DailyCheckinCredit(a *auth.Auth) (int, error) {
 	return resp.Credit, nil
 }
 
-// GrowthTask 成长任务条目（GET /activity/growth/tasks 的 tasks[] 元素）。
+// GrowthTask 成长任务条目（GET /v2/activity/growth/tasks 的 tasks[] 元素）。
 //
 // ⚠️ 字段契约有**两代形态**，2026-10-14 对真实 CN 上游实测确认：
 //
-//	旧形态（88lin signin.py 记录，桌面端 growthSpace chunk 读出）：
-//	  {"task_code":"...","title":"...","locked":false,
-//	   "accept_status":"not_accepted|accepted|in_progress|completed|claimed",
-//	   "reward_credit":N,"reward_energy":N}
-//	新形态（2026-10-14 实测 5 个账号，返回 5 条任务）：
+//	真任务形态（GET /v2/activity/growth/tasks，17 条，accept/claim 认的就是这套）：
+//	  {"task_code":"create_canvas","title":"体验「无限画布」模式",
+//	   "accept_status":"accepted|not_accepted|in_progress|completed|claimed",
+//	   "locked":false,"progress":{"current":0,"target":1},
+//	   "reward_credit":300,"reward_energy":5,"task_type":"...","jump_url":"..."}
+//
+//	「养虾」形态（GET /activity/growth/tasks，不带 /v2，5 条，**与 accept 不匹配**）：
 //	  {"task_id":1,"code":"first_chat","title":"完成一次对话","description":"...",
 //	   "level_name":"养虾尝试","status":"available","url":"","icon_url":""}
 //
-// 服务端已切换到新形态（字段名 code/status，无 accept_status/reward_*）。
-// 解析必须两种都认，否则任务段静默空转——这正是「看起来在跑其实什么都没做」
-// 的典型形态。Code()/State() 是归一化读取入口，调用方不要直接读字段。
+// 两条路径都返回 200，但内容不同——见文件头注释。本结构两种都认，因为上游随时
+// 可能改回单一路径；Code()/State() 是归一化读取入口，调用方不要直接读字段。
 type GrowthTask struct {
-	// 旧形态
+	// 真任务形态
 	TaskCode     string `json:"task_code"`
 	Locked       bool   `json:"locked"`
 	AcceptStatus string `json:"accept_status"`
 	RewardCredit int    `json:"reward_credit"`
 	RewardEnergy int    `json:"reward_energy"`
-	// 新形态
+	Progress     struct {
+		Current int `json:"current"`
+		Target  int `json:"target"`
+	} `json:"progress"`
+	// 「养虾」形态
 	Code        string `json:"code"`
 	Status      string `json:"status"`
 	Description string `json:"description"`
@@ -137,18 +165,18 @@ type GrowthTask struct {
 	Title string `json:"title"`
 }
 
-// TaskID 归一化任务标识（新形态 code / 旧形态 task_code）。
+// TaskID 归一化任务标识（真形态 task_code / 养虾形态 code）。
 func (t GrowthTask) TaskID() string {
-	if t.Code != "" {
-		return t.Code
+	if t.TaskCode != "" {
+		return t.TaskCode
 	}
-	return t.TaskCode
+	return t.Code
 }
 
 // State 归一化任务状态。
 //
-// 新形态 status 取值：available / completed / claimed（实测 available）；
-// 旧形态 accept_status 取值：not_accepted / accepted / in_progress / completed / claimed。
+// 真形态 accept_status 取值：not_accepted / accepted / in_progress / completed / claimed；
+// 养虾形态 status 取值：available / completed / claimed。
 // 两者映射到同一套内部状态：可接单 / 已完成可领 / 已领 / 其它（进行中或锁定）。
 func (t GrowthTask) State() string {
 	if t.AcceptStatus != "" {
@@ -156,7 +184,7 @@ func (t GrowthTask) State() string {
 	}
 	switch t.Status {
 	case "available":
-		// 新形态的 available = 可参与（等价旧形态 not_accepted，需要先 accept）。
+		// 养虾形态的 available = 可参与（等价真形态 not_accepted，需要先 accept）。
 		return "not_accepted"
 	case "completed":
 		return "completed"
@@ -229,7 +257,7 @@ type GrowthTaskClaimResult struct {
 // GrowthTaskClaim 领取单个任务奖励（路径含 task_code、body 空对象）。
 // already_claimed=true 是幂等正常态，调用方不应记为失败。
 func (c *Client) GrowthTaskClaim(a *auth.Auth, taskCode string) (*GrowthTaskClaimResult, error) {
-	data, err := c.growthJSON(a, http.MethodPost, growthTasksPath+"/"+taskCode+"/claim", map[string]any{})
+	data, err := c.growthJSON(a, http.MethodPost, growthTaskClaimPrefix+taskCode+"/claim", map[string]any{})
 	if err != nil {
 		return nil, err
 	}
