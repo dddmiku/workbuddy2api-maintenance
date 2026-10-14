@@ -329,7 +329,17 @@ func (s *Scheduler) growthTravel(ctx context.Context, a *auth.Auth, o *growthOut
 			}
 			return false
 		}
-		o.note("派 Buddy 去 %d 号地点（%d 小时后回）", loc.ID, loc.DurationHours)
+		// 时长用 DurationText()：服务端给的是区间（duration_hours_min/max），
+		// 此前读的 duration_hours 字段不存在、恒为 0（日志里出现「0 小时后回」）。
+		place := loc.Name
+		if place == "" {
+			place = fmt.Sprintf("%d 号地点", loc.ID)
+		}
+		if dur := loc.DurationText(); dur != "" {
+			o.note("派 Buddy 去「%s」（%s 后回）", place, dur)
+		} else {
+			o.note("派 Buddy 去「%s」", place)
+		}
 		o.Successes++
 	case state == travelStateTraveling:
 		o.note("Buddy 旅行中")
@@ -339,134 +349,77 @@ func (s *Scheduler) growthTravel(ctx context.Context, a *auth.Auth, o *growthOut
 	return false
 }
 
-// claimGrowthTasks 第 2 段：任务 accept → 已完成任务 claim。
+// claimGrowthTasks 第 2 段：任务接单与领奖。
 //
-// ⚠️ 2026-10-14 对真实上游实测确认：`GET /activity/growth/tasks` 返回的任务
-// **与 accept/claim 不是同一套命名空间**——
+// ⚠️ 2026-10-14 对真实上游（VPS 容器内实测）确认：`GET /activity/growth/tasks`
+// 返回的任务列表**与 accept/claim 不是同一套命名空间**——
 //
 //	列表返回（新版「养虾」任务）：first_chat / skill_installed / wechat_linked /
 //	                              expert_summoned / template_used
-//	accept/claim 认的（task_runner.py 那套）：chat_5 / create_canvas / template_5 / ...
+//	accept/claim 认的（task_runner.py 的 MAPPING）：chat_5 / create_canvas /
+//	                              template_5 / Model_chat_GLM5.2 / black_cat / ...
 //
-// 证据：用列表里的 code 去 accept → `task not found`；用 chat_5 去 accept →
-// `task already completed` / `already_accepted`，去 claim → 成功 +100 积分 +5 能量。
+// 证据（逐个 code 实测）：
 //
-// 因此本段的正确行为是：**只 accept 服务端认的 code**，而列表并不公布它们。
-// 现在做法是把 `task not found` 识别为良性命名空间不匹配（不刷失败、不重试），
-// 真正的任务点亮与领奖仍由 task_runner.py 承担（taskSchool/taskCat 排程）——
-// 那是本仓库已验证可用的实现（能 accept、能 claim 到积分），88lin 不做伪造点亮，
-// 它假设列表与 accept 同源，在这个上游版本上不成立。
+//	accept first_chat      → task not found          （列表 code 不被识别）
+//	accept chat_5          → task already completed  （认，且已完成）
+//	claim  Model_chat_GLM5.2 → 200 credit=100 energy=5 already_claimed=false
+//	claim  chat_5 / black_cat → 200 already_claimed=true
+//	claim  其余 14 个 code   → 400 task not completed（未完成，属正常）
+//
+// 所以**照列表去领奖一个也领不到**——列表里根本没有那些 code。正确做法是遍历
+// 已知的 code 清单逐个尝试 claim：`task not completed` 是「还没做完」的正常态，
+// `already_claimed` 是「已领过」的正常态，只有这两种之外的错误才算失败。
+//
+// 任务点亮（把未完成的做成 completed）仍由 scripts/task_runner.py 承担——
+// 那需要伪造桌面/web 事件，是本仓库已验证可用的实现，88lin 不做这件事。
 func (s *Scheduler) claimGrowthTasks(ctx context.Context, a *auth.Auth, o *growthOutcome, isHard func(error) bool) bool {
-	tasks, err := s.cfg.Upstream.GrowthTasks(a)
+	// 先接单：accept 能把 not_accepted 的任务推进到 accepted（进度开始计）。
+	// 列表里的 code 不被 accept 识别，所以这里也走已知清单。
+	acceptResults, err := s.cfg.Upstream.GrowthTasksAccept(a, growthClaimCodes)
 	if err != nil {
 		if isAuthErr(err) {
 			return true
 		}
-		o.note("查任务列表失败：%v", err)
+		o.note("任务接单失败：%v", err)
 		o.Failures++
 		if isHard(err) {
 			o.HardFailures++
 		}
-		return false
+	} else {
+		accepted := 0
+		for _, r := range acceptResults {
+			// already_accepted / task already completed 都是「已经是接单态」，正常。
+			if r.Status == "error" && !isTaskAlreadyProgressed(r.Message) {
+				continue // task not found 等：该 code 在本期活动不存在，静默跳过
+			}
+			accepted++
+		}
+		if accepted > 0 {
+			o.Successes++ // 只记一条汇总，不逐条刷屏
+		}
 	}
 	if ctx.Err() != nil {
 		return false
 	}
 
-	// 归一化读取：服务端有新旧两代字段名（见 upstream.GrowthTask 注释）。
-	titles := map[string]string{}
-	pending := []string{}
-	for _, t := range tasks {
-		code := t.TaskID()
-		if code == "" {
-			continue
-		}
-		title := t.Title
-		if title == "" {
-			title = code
-		}
-		titles[code] = title
-		if !t.Locked && t.State() == "not_accepted" {
-			pending = append(pending, code)
-		}
-	}
-
-	// 分批接单；逐条读 results。`task not found` 是命名空间不匹配（见函数头注释），
-	// 按良性处理——否则每个账号每轮都会刷一屏假失败。
-	namespaceMismatch := false
-	for i := 0; i < len(pending); i += growthTaskAcceptBatch {
+	// 逐个尝试领奖。能领到的会返回 credit/energy；未完成的返回 400 task not completed。
+	gained := 0
+	for _, code := range growthClaimCodes {
 		if ctx.Err() != nil {
 			return false
 		}
-		end := i + growthTaskAcceptBatch
-		if end > len(pending) {
-			end = len(pending)
-		}
-		results, err := s.cfg.Upstream.GrowthTasksAccept(a, pending[i:end])
-		if err != nil {
-			if isAuthErr(err) {
-				return true
-			}
-			o.note("接单失败：%v", err)
-			o.Failures++
-			if isHard(err) {
-				o.HardFailures++
-			}
-			continue
-		}
-		for _, r := range results {
-			if r.Status != "error" {
-				title := titles[r.TaskCode]
-				if title == "" {
-					title = r.TaskCode
-				}
-				o.note("领取任务「%s」（进度开始计）", title)
-				o.Successes++
-				continue
-			}
-			if isTaskNotFound(r.Message) {
-				namespaceMismatch = true
-				continue
-			}
-			title := titles[r.TaskCode]
-			if title == "" {
-				title = r.TaskCode
-			}
-			msg := r.Message
-			if msg == "" {
-				msg = "服务端未给原因"
-			}
-			o.note("领取任务「%s」失败：%s", title, msg)
-			o.Failures++
-		}
-	}
-	if namespaceMismatch {
-		// 一整批都 not found：说明这个上游版本的列表与 accept 不同源，本段无可用任务。
-		// 记一条而不是 N 条，且不计失败——它不是故障，是接口形态差异。
-		o.note("任务列表与接单接口不同源（列表 code 不被 accept 识别），本段跳过")
-	}
-
-	// 领已完成任务的奖励（completed 且未锁）。
-	for _, t := range tasks {
-		if ctx.Err() != nil {
-			return false
-		}
-		if t.Locked || t.State() != "completed" || t.TaskID() == "" {
-			continue
-		}
-		code := t.TaskID()
-		title := titles[code]
 		res, err := s.cfg.Upstream.GrowthTaskClaim(a, code)
 		if err != nil {
 			if isAuthErr(err) {
 				return true
 			}
-			// 「task not completed」与「task not found」同理：列表状态与服务端
-			// 状态机不同源，不是失败。
+			// task not completed = 还没做完；task not found = 本期无此任务。
+			// 两者都是正常态，不是失败，不刷日志。
 			if isTaskNotCompleted(err) || isTaskNotFound(err.Error()) {
 				continue
 			}
-			o.note("领任务奖「%s」失败：%v", title, err)
+			o.note("领任务奖「%s」失败：%v", code, err)
 			o.Failures++
 			if isHard(err) {
 				o.HardFailures++
@@ -474,23 +427,40 @@ func (s *Scheduler) claimGrowthTasks(ctx context.Context, a *auth.Auth, o *growt
 			continue
 		}
 		if res.AlreadyClaimed {
-			o.note("任务奖「%s」已领过", title)
-			continue
+			continue // 已领过：正常态
 		}
-		// 优先用服务端实发值；列表里的 reward_credit 只是活动配置，改版会对不上。
-		credit := res.Credit
-		if credit == 0 {
-			credit = t.RewardCredit
-		}
-		energy := res.Energy
-		if energy == 0 {
-			energy = t.RewardEnergy
-		}
-		o.CreditsGained += credit
-		o.note("领任务奖「%s」+%d 积分 +%d 能量", title, credit, energy)
+		gained += res.Credit
+		o.CreditsGained += res.Credit
+		o.note("领任务奖「%s」+%d 积分 +%d 能量", code, res.Credit, res.Energy)
 		o.Successes++
 	}
+	if gained == 0 {
+		// 一条都没领到（全部未完成或已领）：如实说明，不伪装成有进展。
+		o.note("任务奖：无可领取项（未完成或已领过）")
+	}
 	return false
+}
+
+// growthClaimCodes 是 accept/claim 接口认识的 task_code 清单。
+//
+// 来源：scripts/task_runner.py 的 MAPPING（本仓库三账号实测沉淀，见该文件头注释）。
+// 服务端不提供「这些 code 的完成状态」查询端点（/tasks 是另一套），所以只能逐个
+// 尝试 claim，用返回的 `task not completed` / `already_claimed` 判断状态。
+//
+// 维护提示：新增任务时同步 task_runner.py 的 MAPPING——两边分叉的表现是
+// 「脚本点亮了某个任务，但网关这边永远不去领它的奖」。
+var growthClaimCodes = []string{
+	"create_canvas", "template_5", "expert_5", "Expert_team_use_3",
+	"skill_1", "automation_1", "playbook_prompt", "Expert_lighthouse",
+	"Buddy_App", "Buddy_App_QQ", "Hp_Appearance",
+	"chat_5", "Model_chat_GLM5.2", "black_cat",
+	"RichMeow_Chat", "Library_read",
+}
+
+// isTaskAlreadyProgressed 报告接单结果是否为「已是接单/已完成态」的正常回应。
+func isTaskAlreadyProgressed(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "already") || strings.Contains(lower, "completed")
 }
 
 // isTaskNotFound 报告错误文案是否为「任务不存在」（命名空间不匹配的良性信号）。

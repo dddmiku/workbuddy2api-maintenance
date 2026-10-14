@@ -18,6 +18,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -437,12 +438,42 @@ func (c *Client) GrowthEnergy(a *auth.Auth) (int, error) {
 	return resp.Balance, nil
 }
 
+// GrowthTravelLocation 一个旅行地点。
+//
+// ⚠️ 2026-10-14 实测修正：**没有 `duration_hours` 字段**。服务端返回的是区间：
+//
+//	{"id":1,"code":"coffee","name":"咖啡馆","duration_hours_min":1,
+//	 "duration_hours_max":4,"reward_credit_min":5,"reward_credit_max":10}
+//
+// 此前只读 `duration_hours`（不存在）→ 恒为 0，日志里出现「派 Buddy 去 1 号地点
+// （0 小时后回）」这种明显不对的文案。派出去时也不需要指定时长（服务端在区间内
+// 自行决定），所以时长只用于**展示**。
+type GrowthTravelLocation struct {
+	ID               int    `json:"id"`
+	Code             string `json:"code"`
+	Name             string `json:"name"`
+	DurationHoursMin int    `json:"duration_hours_min"`
+	DurationHoursMax int    `json:"duration_hours_max"`
+	RewardCreditMin  int    `json:"reward_credit_min"`
+	RewardCreditMax  int    `json:"reward_credit_max"`
+}
+
+// DurationText 地点时长的展示文案（区间 "1–4 小时"；单值 "3 小时"；都缺时空串）。
+func (l GrowthTravelLocation) DurationText() string {
+	switch {
+	case l.DurationHoursMin > 0 && l.DurationHoursMax > 0 && l.DurationHoursMin != l.DurationHoursMax:
+		return fmt.Sprintf("%d–%d 小时", l.DurationHoursMin, l.DurationHoursMax)
+	case l.DurationHoursMax > 0:
+		return fmt.Sprintf("%d 小时", l.DurationHoursMax)
+	case l.DurationHoursMin > 0:
+		return fmt.Sprintf("%d 小时", l.DurationHoursMin)
+	}
+	return ""
+}
+
 // GrowthTravelConfig 旅行地点列表；取 locations[0].id 供 depart。
 type GrowthTravelConfig struct {
-	Locations []struct {
-		ID            int `json:"id"`
-		DurationHours int `json:"duration_hours"`
-	} `json:"locations"`
+	Locations []GrowthTravelLocation `json:"locations"`
 }
 
 // GrowthTravelConfigOf 查询旅行地点配置。

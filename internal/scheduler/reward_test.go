@@ -105,16 +105,6 @@ func (s *growthStub) handler() http.Handler {
 				return
 			}
 			w.Write([]byte(`{"code":0,"data":{"results":[{"task_code":"t1","status":"ok"}]}}`))
-		case "/activity/growth/tasks/t1/claim", "/activity/growth/tasks/t2/claim":
-			s.claimCalls.Add(1)
-			switch s.claimStatus {
-			case "500":
-				w.WriteHeader(500)
-				w.Write([]byte(`boom`))
-			default:
-				fmt.Fprintf(w, `{"code":0,"data":{"credit":%d,"energy":1,"already_claimed":%t}}`,
-					s.claimCredit, s.claimAlready)
-			}
 		// ── 补登 ──
 		case "/activity/growth/streak":
 			fmt.Fprintf(w, `{"code":0,"data":{"launch_date":"2026-09-01","streak":{"days":%d,"makeup_dates":[]},"makeup_cards":{"balance":%d}}}`,
@@ -187,11 +177,24 @@ func (s *growthStub) handler() http.Handler {
 				return
 			}
 			w.Write([]byte(`{"code":0,"data":{"buddy":"新伙伴"}}`))
+		// 领任务奖：路径形如 /activity/growth/tasks/<code>/claim（code 来自已知清单）。
+		default:
+			if strings.HasPrefix(r.URL.Path, "/activity/growth/tasks/") && strings.HasSuffix(r.URL.Path, "/claim") {
+				s.claimCalls.Add(1)
+				switch s.claimStatus {
+				case "500":
+					w.WriteHeader(500)
+					w.Write([]byte(`boom`))
+				default:
+					fmt.Fprintf(w, `{"code":0,"data":{"credit":%d,"energy":1,"already_claimed":%t}}`,
+						s.claimCredit, s.claimAlready)
+				}
+				return
+			}
+			http.Error(w, "not found", 404)
 		// ── 能量 ──
 		case "/activity/growth/energy":
 			fmt.Fprintf(w, `{"code":0,"data":{"balance":%d}}`, s.energy)
-		default:
-			http.Error(w, "not found", 404)
 		}
 	})
 }
@@ -272,42 +275,42 @@ func TestGrowthCenterTravelDailyLimitSkipsDepart(t *testing.T) {
 	// 更精确的断言是 stub 未记录 depart——用一个专门的计数器）
 }
 
-// TestGrowthCenterAcceptsAndClaimsTasks 任务：not_accepted → accept；completed → claim。
+// TestGrowthCenterAcceptsAndClaimsTasks 任务段用**已知 code 清单**接单 + 逐个领奖。
+//
+// 2026-10-14 实测（VPS 容器内逐个 code 打真实上游）：`/tasks` 列表返回的 code
+// （first_chat 等）不被 accept 识别（task not found），而 accept/claim 认的是
+// task_runner.py 那套（chat_5 / Model_chat_GLM5.2 / ...）。所以任务段必须遍历
+// 已知清单，不能照列表走——照列表走的表现是「一个奖都领不到」。
 func TestGrowthCenterAcceptsAndClaimsTasks(t *testing.T) {
 	fastGrowth(t)
 	stub := newGrowthStub()
-	stub.tasks = []map[string]any{
-		{"task_code": "t1", "title": "每日对话", "locked": false, "accept_status": "not_accepted"},
-		{"task_code": "t2", "title": "完成任务", "locked": false, "accept_status": "completed", "reward_credit": 10},
-	}
 	stub.claimCredit = 10
 	srv := stub.server(t)
 	s, _ := growthScheduler(t, srv, "u1")
 
 	s.RunGrowthNow()
 
+	// accept 只发一次（整份清单批量），不是按列表逐条。
 	if n := stub.acceptCalls.Load(); n != 1 {
-		t.Errorf("accept calls=%d want 1（有一条待接单）", n)
+		t.Errorf("accept calls=%d want 1（整份已知清单批量接单）", n)
 	}
-	if n := stub.claimCalls.Load(); n != 1 {
-		t.Errorf("claim calls=%d want 1（有一条已完成）", n)
+	// claim 会遍历整份清单，次数应等于清单长度。
+	if n := stub.claimCalls.Load(); int(n) != len(growthClaimCodes) {
+		t.Errorf("claim calls=%d want %d（逐个尝试领奖）", n, len(growthClaimCodes))
 	}
 }
 
-// TestGrowthCenterTaskClaimAlreadyClaimed 已领过是幂等正常态，不算失败。
+// TestGrowthCenterTaskClaimAlreadyClaimed 已领过是幂等正常态，不算失败、不刷日志。
 func TestGrowthCenterTaskClaimAlreadyClaimed(t *testing.T) {
 	fastGrowth(t)
 	stub := newGrowthStub()
-	stub.tasks = []map[string]any{
-		{"task_code": "t2", "title": "已完成", "locked": false, "accept_status": "completed"},
-	}
 	stub.claimAlready = true
 	srv := stub.server(t)
 	s, _ := growthScheduler(t, srv, "u1")
 
 	s.RunGrowthNow()
-	if n := stub.claimCalls.Load(); n != 1 {
-		t.Errorf("claim calls=%d want 1", n)
+	if n := stub.claimCalls.Load(); int(n) != len(growthClaimCodes) {
+		t.Errorf("claim calls=%d want %d", n, len(growthClaimCodes))
 	}
 }
 
