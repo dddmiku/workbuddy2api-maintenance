@@ -45,7 +45,7 @@ func runtimeDisabledScheduler() *Scheduler {
 	return New(Config{
 		CheckinDisabled: true, TravelDisabled: true, ActivityDisabled: true,
 		KeepaliveDisabled: true, SchoolDisabled: true, CatDisabled: true,
-		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true,
+		GrowthDisabled: true,
 	})
 }
 

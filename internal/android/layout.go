@@ -103,16 +103,17 @@ func DefaultConfig() string {
     "activity_hours": [10],
     "keepalive_hours": [22],
     "trae_check_hours": [10],
+    "growth_hours": [9, 21],
+    "balance_hours": [9, 21],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "trae_check_enabled": true,
+    "balance_enabled": true,
     "school_enabled": false,
     "cat_enabled": false,
-    "redeem_enabled": false,
-    "lottery_enabled": false,
-    "makeup_enabled": false
+    "growth_enabled": true
   }
 }
 `

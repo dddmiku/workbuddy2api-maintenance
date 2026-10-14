@@ -3,8 +3,10 @@ package trae
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // collect 驱动 translateReader，返回下游会看到的完整 OpenAI SSE 文本。
@@ -613,5 +615,66 @@ func TestTranslateNativeToolUsageMapping(t *testing.T) {
 		if !strings.Contains(sse, want) {
 			t.Errorf("usage field %s missing from %q", want, sse)
 		}
+	}
+}
+
+// idleBody 模拟「支持读截止、且会长时间静默」的 resp.Body：SetReadDeadline
+// 转给可替换的闭包，测试用它把 15s 的截止短路成 300ms，静默期就能在测试里走完。
+// Read 语义与 net/http 的 resp.Body 一致：截止到期返回包装 os.ErrDeadlineExceeded
+// 的错误（net.Pipe 的 Conn 行为），正好覆盖 run() 的空闲心跳分支。
+type idleBody struct {
+	r    io.Reader
+	set  func(time.Time) error
+}
+
+func (b *idleBody) Read(p []byte) (int, error)        { return b.r.Read(p) }
+func (b *idleBody) Close() error {
+	if c, ok := b.r.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+func (b *idleBody) SetReadDeadline(t time.Time) error { return b.set(t) }
+
+// TestTranslateIdleHeartbeat 静默期心跳回归：上游停顿超过读截止时，下游必须
+// 收到 keepalive 注释行并且流不中断——deadline 超时是「该发心跳」而不是错误
+// （2026-10-14 trae 三连 502 的组合缓解之二）。
+func TestTranslateIdleHeartbeat(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	body := &idleBody{r: server, set: server.SetReadDeadline}
+	// 短路截止：run() 每次设 15s，这里改成 300ms——静默 1.2s 足够触发 3 次心跳。
+	body.set = func(t time.Time) error {
+		if !t.IsZero() {
+			t = time.Now().Add(300 * time.Millisecond)
+		}
+		return server.SetReadDeadline(t)
+	}
+
+	go func() {
+		_, _ = client.Write([]byte("event: output\ndata: {\"response\":\"hi\"}\n\n"))
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = client.Write([]byte("event: done\ndata: {}\n\n"))
+		_ = client.Close()
+	}()
+
+	tr := newTranslator("glm-5.3")
+	r := newTranslateReader(body, tr)
+	defer r.Close()
+	start := time.Now()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	sse := string(data)
+	if got := contentOf(t, sse); got != "hi" {
+		t.Errorf("content=%q want hi", got)
+	}
+	if n := strings.Count(sse, ": relay-keepalive"); n < 2 {
+		t.Errorf("expected >=2 keepalive comments during 1.2s silence (beat 300ms), got %d: %q", n, sse)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Errorf("test finished too fast (%v) — idle silence was not actually exercised", elapsed)
 	}
 }

@@ -675,9 +675,11 @@ TASK_ENABLE_KEY = {
     "keepalive": "keepalive_enabled",
     "school": "school_enabled",
     "cat": "cat_enabled",
-    "redeem": "redeem_enabled",
-    "lottery": "lottery_enabled",
-    "makeup": "makeup_enabled",
+    # growth：成长中心（2026-10-14 由原 redeem/lottery/makeup 三条合并为一条七段流水线）。
+    "growth": "growth_enabled",
+    # 余额刷新（纯读）：关掉签到后仍要保留它，否则池里的快过期分桶不再更新，
+    # 「优先消耗快过期积分」静默失效。
+    "balance": "balance_enabled",
 }
 
 
@@ -1192,6 +1194,11 @@ def build_state(force_credit=False):
             "reason": p.get("reason") or "",
             "successCount": p.get("success_count") or 0,
             "errTotal": p.get("err_total") or 0,
+            # 模型级限流台账（6004/11102）：网关 /status 早就有，此前面板整段丢弃，
+            # 用户只能看到"这个号行为不对"却不知道是哪个模型被限流、其他模型不受
+            # 影响（2026-10-14 用户反馈）。透传原始行（model/until/reason/reset_at），
+            # 前端负责渲染成中文文案。
+            "rateLimitedModels": p.get("rate_limited_models") or [],
         }
         # 域能力：积分/签到/连登等是 WorkBuddy 端点族的概念，trae 域没有。
         # 面板据此显示「不适用」而不是把 ./credit 的跳过说明当成查询失败——

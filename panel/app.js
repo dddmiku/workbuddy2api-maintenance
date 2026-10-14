@@ -166,6 +166,18 @@ function coolReason(p){
   if (r.indexOf('余额') >= 0) return '余额不足';
   return r;
 }
+// modelLimitTitle 模型级限流行的悬停说明：把 reason 翻译成中文，并透出上游原始的
+// 重置墙钟（reset_at 可能晚于 until——网关把冷却截到 soft_rate_max 封顶，真实
+// 恢复时刻以 reset_at 为准；两者相同则只显示一个）。
+function modelLimitTitle(m){
+  var why = String(m.reason || '');
+  if (why.indexOf('6004') >= 0) why = '该模型用量已达上限（6004），其他模型不受影响';
+  else if (why.indexOf('11102') >= 0) why = '上游确认该模型不可用（11102）';
+  var reset = m.resetAt ? String(m.resetAt).replace('T', ' ').replace(/Z$/, '').replace(/\+08:00$/, '') : '';
+  var until = String(m.until).replace('T', ' ').replace(/Z$/, '').replace(/\+08:00$/, '');
+  var when = (reset && reset !== until) ? ('上游重置 ' + reset + '，网关先避让到 ' + until) : ('恢复时刻 ' + until);
+  return why + '；' + when;
+}
 function svg(inner, size){
   return '<svg width="' + (size||16) + '" height="' + (size||16) + '" viewBox="0 0 24 24" fill="none" ' +
     'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
@@ -852,14 +864,28 @@ function renderAccounts(){
       ? '<span class="sub" data-cool-end="' + coolEnd +
         '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
         esc(coolLeft(p.coolRemaining) + (coolReasonTxt ? ' · ' + coolReasonTxt : '')) + '</span>'
-      : (left != null
-        ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
-        : '');
+      : '';
+    // 模型级限流台账（6004/11102）：账号本身健康（其他模型不受影响），只是个别
+    // 模型被限流到指定时刻。此前面板完全不显示，用户只看到「这个号行为不对」；
+    // 单独一行按模型点名 + 剩余时间，与账号级冷却（coolSub）互斥不叠——同时
+    // 出现时账号级冷却已涵盖整号，模型行不再重复。
+    var rlm = (p.rateLimitedModels || []).filter(function(m){ return m && m.until; });
+    var rlmSub = (!p.cooling && rlm.length)
+      ? rlm.map(function(m){
+          var sec = Math.max(0, Math.ceil((new Date(m.until).getTime() - Date.now()) / 1000));
+          return '<span class="sub rlm" title="' +
+            esc(modelLimitTitle(m)) + '">' +
+            esc('模型限流 ' + (m.model || '?') + ' · ' + coolLeft(sec)) + '</span>';
+        }).join('')
+      : '';
+    var credSub = (!p.cooling && !rlm.length && left != null)
+      ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
+      : '';
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
       '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + realmTag(a.realm) + '</div></td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
-      coolSub +
+      coolSub + rlmSub + credSub +
       '</span></td>' +
       '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
       '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +

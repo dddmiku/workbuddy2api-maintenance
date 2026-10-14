@@ -24,9 +24,8 @@ const (
 	TaskKeyKeepalive TaskKey = "keepalive"  // token 保活
 	TaskKeySchool    TaskKey = "school"     // 开学季任务
 	TaskKeyCat       TaskKey = "cat"        // 夜猫子任务
-	TaskKeyRedeem    TaskKey = "redeem"     // 连登档位兑换
-	TaskKeyLottery   TaskKey = "lottery"    // 成长中心抽奖
-	TaskKeyMakeup    TaskKey = "makeup"     // 补签（补最近一次漏签）
+	TaskKeyGrowth    TaskKey = "growth"     // 成长中心流水线（旅行/任务奖/补登/兑换/抽奖/Buddy盲盒）
+	TaskKeyBalance   TaskKey = "balance"    // 余额刷新（纯读；快过期优先消耗的数据来源）
 )
 
 // ErrUnknownTask 未知任务 key；ErrTaskBusy 该任务当前正在执行。
@@ -74,12 +73,10 @@ func (k taskKind) key() TaskKey {
 		return TaskKeySchool
 	case taskCat:
 		return TaskKeyCat
-	case taskRedeem:
-		return TaskKeyRedeem
-	case taskLottery:
-		return TaskKeyLottery
-	case taskMakeup:
-		return TaskKeyMakeup
+	case taskGrowth:
+		return TaskKeyGrowth
+	case taskBalance:
+		return TaskKeyBalance
 	}
 	return ""
 }
@@ -101,12 +98,10 @@ func kindOf(key string) (taskKind, bool) {
 		return taskSchool, true
 	case TaskKeyCat:
 		return taskCat, true
-	case TaskKeyRedeem:
-		return taskRedeem, true
-	case TaskKeyLottery:
-		return taskLottery, true
-	case TaskKeyMakeup:
-		return taskMakeup, true
+	case TaskKeyGrowth:
+		return taskGrowth, true
+	case TaskKeyBalance:
+		return taskBalance, true
 	}
 	return 0, false
 }
@@ -129,12 +124,10 @@ func describe(k TaskKey) (string, string) {
 		return "开学季任务", "任务点亮 + claim + 自动抽空抽奖余额；活动下线时自动跳过"
 	case TaskKeyCat:
 		return "夜猫子任务", "夜猫窗口（23:00–08:00 CST）内补一次 black_cat 任务"
-	case TaskKeyRedeem:
-		return "连登兑换", "按连登档位自动兑换（7 / 14 / 28 天）；已兑换与天数不足都安全跳过"
-	case TaskKeyLottery:
-		return "成长抽奖", "成长中心抽奖，清空当日可用次数；一次失败即停，不硬撞频控"
-	case TaskKeyMakeup:
-		return "补签", "用补签卡补最近一次漏签；今天不算漏签，上线日之前的空格不碰"
+	case TaskKeyGrowth:
+		return "成长中心", "一轮跑完七段：领旅行礼物/派 Buddy → 任务接单与领奖 → 补登卡自动补 → 连登兑换 → 盲盒抽奖 → 能量开 Buddy 盲盒 → 能量与连签展示"
+	case TaskKeyBalance:
+		return "余额刷新", "只读查询各账号积分余额与快过期分桶，驱动「优先消耗快过期积分」选号；关掉签到也建议保留本任务"
 	}
 	return string(k), ""
 }
@@ -142,22 +135,28 @@ func describe(k TaskKey) (string, string) {
 // realmsOf 返回该任务实际作用的账号域（面板按此分组展示）。
 //
 // 这份表是**任务实现的事实描述**，不是愿望：写错会让面板把任务归到不存在的域下。
-// 对应关系（与各任务的实现一一对应）：
-//   - checkin：cn/global 走 WorkBuddy 的 billing/meter；trae 走 Trae 自己的 UG API
-//     （见 scheduler.go 的 isWorkBuddy 分支）——三个域都覆盖。
-//   - 其余：只对 WorkBuddy 端点有意义，trae 账号在调度里整条跳过。
+//
+// 2026-10-14 重大变更：**国际版（global）不再参与任何任务**。用户明确要求删掉
+// 国际版任务（「国际版没有任务」）——global 的积分体系与 CN 是两套账，端点虽同构
+// 但大量接口对 global 新号返回 500，而这批号占池子大头（23/34）。现在各任务的
+// realm 门控按 realm 精确排除 global（见 travel.go / scheduler.go 的 RealmGlobal 判断）。
+//
+// 唯一的例外是 checkin 与 balance：global 号仍查余额（纯读，驱动「优先消耗快过期
+// 积分」选号，不触发风控），但不发签到/上报等任何写调用。所以这两个任务的 Realms
+// 标 cn+global，其余任务只标 cn。
 func realmsOf(k TaskKey) []string {
 	switch k {
 	case TaskKeyCheckin:
-		// WorkBuddy 两域。trae 已剥离为独立任务（TaskKeyTraeCheck）——两个站点
-		// 端点、风控、排程都不同，混在一个任务里会让面板把 trae 归到「签到」下，
-		// 也让人无法单独关掉其中一个。
+		// cn 走完整签到 + 余额；global 只查余额（实现里 RealmGlobal 分支跳过签到）。
 		return []string{"cn", "global"}
 	case TaskKeyTraeCheck:
 		return []string{"trae"}
+	case TaskKeyBalance:
+		// 纯读余额查询，cn 与 global 都跑（trae 在实现里整条跳过）。
+		return []string{"cn", "global"}
 	}
-	// 其余任务只服务 WorkBuddy 两域。
-	return []string{"cn", "global"}
+	// 其余任务只服务 CN：global 在实现里被精确排除。
+	return []string{"cn"}
 }
 
 // scheduleOf 单类任务的排程小时与开关状态（来自 Config，即 config.json 的 schedule 段）。
@@ -177,25 +176,26 @@ func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 		return s.cfg.SchoolHours, !s.cfg.SchoolDisabled
 	case TaskKeyCat:
 		return s.cfg.CatHours, !s.cfg.CatDisabled
-	case TaskKeyRedeem:
-		return s.cfg.RedeemHours, !s.cfg.RedeemDisabled
-	case TaskKeyLottery:
-		return s.cfg.LotteryHours, !s.cfg.LotteryDisabled
-	case TaskKeyMakeup:
-		return s.cfg.MakeupHours, !s.cfg.MakeupDisabled
+	case TaskKeyGrowth:
+		return s.cfg.GrowthHours, !s.cfg.GrowthDisabled
+	case TaskKeyBalance:
+		return s.cfg.BalanceHours, !s.cfg.BalanceDisabled
 	}
 	return nil, false
 }
 
 // TaskSnapshot 返回全部任务的当前快照，顺序固定为
-// 签到 / 猫猫旅行 / 活跃上报 / token 保活 / 开学季 / 夜猫子 / 连登兑换 / 成长抽奖 / 补签。
-// 新增的两类追加在尾部：既有顺序不动，面板与既有断言都不受影响。
+// 签到（WorkBuddy）/ 签到（Trae）/ 猫猫旅行 / 活跃上报 / token 保活 / 开学季 /
+// 夜猫子 / 成长中心 / 余额刷新。
+//
+// 2026-10-14：原 redeem/lottery/makeup 三条独立任务合并为 growth（成长中心）一条
+// ——它们本是一条有依赖的流水线，拆开跑既丢顺序又白等半天（详见 growth_center.go）。
 func (s *Scheduler) TaskSnapshot() []TaskInfo {
 	now := time.Now()
 	keys := []TaskKey{
 		TaskKeyCheckin, TaskKeyTraeCheck, TaskKeyTravel, TaskKeyActivity,
 		TaskKeyKeepalive, TaskKeySchool, TaskKeyCat,
-		TaskKeyRedeem, TaskKeyLottery, TaskKeyMakeup,
+		TaskKeyGrowth, TaskKeyBalance,
 	}
 	out := make([]TaskInfo, 0, len(keys))
 	for _, key := range keys {

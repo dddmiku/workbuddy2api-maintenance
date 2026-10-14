@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -41,9 +42,31 @@ func main() {
 		rawModelsMain(authPath, want)
 		return
 	}
+	// credits：打印账号积分包明细与到期时间。
+	//
+	// 存在的理由：trae 的积分包自带到期时间（Credits.Packs[].EndTime），而
+	// 「优先消耗快过期积分」依赖池里的 credits_expiring。签到路径用的是不带分桶的
+	// SetCredits，所以要看真实数据只能直接问上游。
+	if model == "credits" {
+		creditsMain(authPath)
+		return
+	}
+	if model == "rawcredits" {
+		rawcreditsMain(authPath)
+		return
+	}
 	prompt := "Say exactly: PONG"
 	if len(os.Args) > 3 {
 		prompt = os.Args[3]
+	}
+	// --prompt-file：从文件读 prompt。板子 /bin/sh 的 argv 上限装不下复现 Claude Code
+	// 全量上下文（>300KB）的命令行，只能走文件（2026-10-14 复现 trae 502 时发现）。
+	if strings.HasPrefix(prompt, "--prompt-file=") {
+		data, err := os.ReadFile(strings.TrimPrefix(prompt, "--prompt-file="))
+		if err != nil {
+			fail("read prompt file: %v", err)
+		}
+		prompt = string(data)
 	}
 
 	raw, err := os.ReadFile(authPath)
@@ -112,6 +135,37 @@ func main() {
 		defer rawRC.Close()
 		data, _ := io.ReadAll(rawRC)
 		fmt.Println(truncate(string(data), 6000))
+		return
+	}
+
+	// --timeline：逐行读原始上游流并打墙钟时间戳。回答「上游是迟迟不吐首字节，
+	// 还是吐了首字节后中途断流」——两者对应完全不同的修复方向（前者要等得起，
+	// 后者是连接被掐）。此前 printFrames 在整段读完后才解析，「110 秒零字节」
+	// 无法区分这两种形态（2026-10-14 trae 502 排查时发现）。
+	if hasFlag("--timeline") {
+		rawRC, status, respBody, err := trae.RawChatStream(context.Background(), a, body, "")
+		if err != nil {
+			fail("trae raw stream: %v", err)
+		}
+		if rawRC == nil {
+			fmt.Printf("upstream rejected: HTTP %d\n%s\n", status, truncate(string(respBody), 800))
+			os.Exit(1)
+		}
+		defer rawRC.Close()
+		t0 := time.Now()
+		fmt.Printf("t=%s headers arrived\n", time.Since(t0).Round(time.Millisecond))
+		br := bufio.NewReaderSize(rawRC, 64*1024)
+		for {
+			line, rerr := br.ReadString('\n')
+			if line != "" {
+				fmt.Printf("t=%s %s\n", time.Since(t0).Round(time.Millisecond),
+					truncate(strings.TrimRight(line, "\r\n"), 100))
+			}
+			if rerr != nil {
+				fmt.Printf("t=%s read end: %v\n", time.Since(t0).Round(time.Millisecond), rerr)
+				break
+			}
+		}
 		return
 	}
 
@@ -230,3 +284,64 @@ func fail(format string, args ...any) {
 }
 
 var _ = bytes.MinRead
+
+// creditsMain 打印账号积分包明细与到期时间，用于判断「快过期优先消耗」是否有数据。
+func creditsMain(authPath string) {
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		fail("read auth: %v", err)
+	}
+	a, err := auth.Parse(raw)
+	if err != nil {
+		fail("parse auth: %v", err)
+	}
+	fmt.Printf("account: uid=%s realm=%s\n", a.UID, a.Realm())
+
+	credits, err := trae.FetchCredits(context.Background(), a)
+	if err != nil {
+		fail("fetch credits: %v", err)
+	}
+	fmt.Printf("Total=%.0f Consumed=%.0f Remaining=%.0f Packs=%d\n",
+		credits.Total, credits.Consumed, credits.Remaining, len(credits.Packs))
+
+	now := time.Now()
+	var expiring float64
+	for i, p := range credits.Packs {
+		if i >= 15 {
+			fmt.Printf("  … 还有 %d 个包未列出\n", len(credits.Packs)-i)
+			break
+		}
+		desc := "无到期时间"
+		if p.EndTime > 0 {
+			end := time.Unix(p.EndTime, 0)
+			desc = fmt.Sprintf("%s（还有 %.1f 天）", end.Format("2006-01-02 15:04"), end.Sub(now).Hours()/24)
+		}
+		fmt.Printf("  pack %2d: name=%-22s limit=%-9.0f remaining=%-9.0f end=%s\n",
+			i, truncate(p.Name, 22), p.Limit, p.Remaining, desc)
+		// 与 upstream.expiringWithin 同口径：7 天窗口内的剩余额度。
+		if p.EndTime > 0 && p.Remaining > 0 {
+			if time.Unix(p.EndTime, 0).Before(now.Add(7 * 24 * time.Hour)) {
+				expiring += p.Remaining
+			}
+		}
+	}
+	fmt.Printf("7 天内到期（expiring_soon 口径）: %.0f\n", expiring)
+}
+
+// rawcreditsMain 打印 ent_usage 的**原始** JSON，用于核对字段路径。
+func rawcreditsMain(authPath string) {
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		fail("read auth: %v", err)
+	}
+	a, err := auth.Parse(raw)
+	if err != nil {
+		fail("parse auth: %v", err)
+	}
+	data, err := trae.RawEntUsage(context.Background(), a)
+	if err != nil {
+		fail("raw ent usage: %v", err)
+	}
+	encoded, _ := json.MarshalIndent(data, "", " ")
+	fmt.Println(string(encoded))
+}

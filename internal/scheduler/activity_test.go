@@ -175,10 +175,10 @@ func TestRunActivityNowSelfCheckDaysNormal(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
-	// streak 命中 2 次 = streak 自检 1 次 + 连登奖励读取（GrowthRewardState）1 次
-	// （days=3 未达 7d 档，奖励链停在无达标档，不再发 redeem）。
-	if stub.reportCalls.Load() != 1 || stub.streakHits.Load() != 2 {
-		t.Errorf("report_calls=%d streak_hits=%d want 1/2（上报 + 自检 + 奖励状态读取）", stub.reportCalls.Load(), stub.streakHits.Load())
+	// 2026-10-14：连登奖励/抽奖已迁出 activity，归独立成长中心任务（taskGrowth）。
+	// 本任务只做「上报 + streak 自检」，故 streak 命中 1 次。
+	if stub.reportCalls.Load() != 1 || stub.streakHits.Load() != 1 {
+		t.Errorf("report_calls=%d streak_hits=%d want 1/1（上报 + 自检）", stub.reportCalls.Load(), stub.streakHits.Load())
 	}
 	// days>=1：checkActivityStreak 返回 false（无可疑）。
 	if s.checkActivityStreak(p.AuthByUID("u1")) {
@@ -482,9 +482,8 @@ func TestNextWakeTravelIndependent(t *testing.T) {
 		TravelHours:     []int{9},
 		ActivityHours:   []int{10},
 		KeepaliveHours:  []int{22},
-		RedeemDisabled:  true,
-		LotteryDisabled: true,
-		MakeupDisabled:  true,
+		GrowthDisabled: true,
+		BalanceDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -588,9 +587,8 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		RedeemDisabled:    true,
-		LotteryDisabled:   true,
-		MakeupDisabled:    true,
+		GrowthDisabled:   true,
+		BalanceDisabled:   true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},

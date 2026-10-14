@@ -85,7 +85,14 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			continue
 		}
 		if !a.IsWorkBuddy() {
-			continue // D4 门控：非 WorkBuddy 域（global/trae）无猫猫旅行体系，不发起任何上游调用
+			continue // trae 域没有猫猫旅行体系
+		}
+		// global 门控（2026-10-14）：国际版不做任何任务。此前这里只判 !IsWorkBuddy()，
+		// 而 global 账号 IsWorkBuddy()==true，于是 23 个 global 号每轮都被送去打
+		// buddy/info——注释写的是「非 WorkBuddy 域（global/trae）」，实现却只排除了 trae。
+		// 用户 2026-10-14 明确要求删掉国际版任务，这里改为按 realm 精确排除。
+		if a.Realm() == auth.RealmGlobal {
+			continue
 		}
 		if !first {
 			if !sleepCtx(ctx, travelAccountDelay) {

@@ -206,6 +206,28 @@ func IsRedeemNotEnoughDays(err error) bool {
 	return isErrMarker(err, http.StatusForbidden, "连续登录天数不足")
 }
 
+// IsUnknownTier 报告兑换档位标识被判为未知（HTTP 400 + tier 相关 unknown/unsupported/invalid）。
+//
+// 移植自 88lin signin.py 的 _is_unknown_tier。用途：档位标识口径变更时（例如服务端
+// 只认天数不认 "7d"），调用方可以退回天数再试一次——这类 400 是参数校验阶段的拒绝，
+// 服务端没兑换任何东西，重试不会重复领取。
+func IsUnknownTier(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(ue.Msg)
+	if !strings.Contains(lower, "tier") {
+		return false
+	}
+	return strings.Contains(lower, "unknown") ||
+		strings.Contains(lower, "unsupported") ||
+		strings.Contains(lower, "invalid")
+}
+
 // IsLotteryNoChance 报告是否「无抽奖次数」（HTTP 400 + insufficient lottery chance balance）。
 // 属正常态：无次数不消耗、不刷 WARN（实体测试实测 400：chances=0 调 draw）。
 func IsLotteryNoChance(err error) bool {

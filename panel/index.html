@@ -368,6 +368,9 @@ code,pre,.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .cred .expiring{color:var(--warn);font-size:11.5px;cursor:help}
 /* 总览页与积分卡片里的同款提示（不在 .cred 作用域内）。 */
 .expiring{color:var(--warn);cursor:help}
+/* 模型级限流台账行（状态列）：只限个别模型、账号本身可用，与整号冷却不同——
+   用警示色 + 悬停说明区分，避免被当成普通灰副行忽略（看不出为何换号/换模型）。 */
+.sub.rlm{color:var(--warn);cursor:help;display:block}
 .search{display:flex;align-items:center;gap:8px;height:32px;padding:0 11px;border:1px solid var(--line-2);
   border-radius:var(--r2);background:var(--surface);color:var(--ink-3);min-width:230px;
   transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}

@@ -24,9 +24,27 @@ type Schedule struct {
 	KeepaliveHours []int `json:"keepalive_hours"`  // [22]
 	SchoolHours    []int `json:"school_hours"`     // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
 	CatHours       []int `json:"cat_hours"`        // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
-	RedeemHours    []int `json:"redeem_hours"`     // [9] 连登档位兑换（7d/14d/28d，需签到后跑）
-	LotteryHours   []int `json:"lottery_hours"`    // [21] 成长中心抽奖（清空当日抽奖次数）
-	MakeupHours    []int `json:"makeup_hours"`     // [9] 补签（只补最近一次漏签，需补签卡余量）
+	// GrowthHours 是**成长中心**的排程（2026-10-14 新增，合并原 redeem/lottery/makeup）。
+	//
+	// 为什么合并成一组：成长中心是一条有依赖的流水线——领任务奖送的抽奖次数当场就能抽，
+	// 连登兑换送的补登卡当场就能补，补登又会改变连登天数进而影响兑换资格。原来拆成
+	// redeem(9 点)/lottery(21 点)/makeup(9 点) 三条独立排程，补登与兑换撞在同一小时靠
+	// 先后顺序碰运气，抽奖要等到 21 点而任务奖可能 9 点就发了（次数空放半天）。
+	// 合并后一次跑完全部七段，顺序由代码保证（88lin 的 run_growth 同款）。
+	//
+	// 只服务 CN：国际版（global）不参与任何成长中心调用。
+	GrowthHours []int `json:"growth_hours"` // [9,21]
+	// BalanceHours 是**余额刷新**的独立排程（2026-10-14 新增）。
+	//
+	// 为什么必须独立：积分余额与快过期分桶原本只在签到任务里刷新（checkinAll 调
+	// SetCreditsDetailed），而多客户端共用同一批账号的用户**必须关掉签到**（否则
+	// 两个实例同时签到会触发上游风控）。关掉签到的副作用是池里 credits 恒为 0、
+	// credits_expiring 恒为 0，于是「优先消耗快过期积分」这条选号规则静默失效——
+	// 用户看到面板有数据（面板直查上游），却不知道网关选号时两眼一抹黑。
+	//
+	// 余额查询是**纯读**接口（不写上游状态、不消耗账号），单独跑不引入风控风险，
+	// 所以把它从签到里解耦出来，各自可开关。
+	BalanceHours []int `json:"balance_hours"` // [9,21]
 	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
 	// 显式禁用开关（缺省 true）。
 	//
@@ -43,9 +61,13 @@ type Schedule struct {
 	KeepaliveEnabled bool `json:"keepalive_enabled"`  // 缺省 true；false = 关 token 保活
 	SchoolEnabled    bool `json:"school_enabled"`     // 缺省 true；false = 停开学季任务
 	CatEnabled       bool `json:"cat_enabled"`        // 缺省 true；false = 停夜猫子任务
-	RedeemEnabled    bool `json:"redeem_enabled"`     // 缺省 true；false = 停连登兑换
-	LotteryEnabled   bool `json:"lottery_enabled"`    // 缺省 true；false = 停成长抽奖
-	MakeupEnabled    bool `json:"makeup_enabled"`     // 缺省 true；false = 停补签
+	// GrowthEnabled 成长中心开关（缺省 true）。false = 完全停成长中心流水线。
+	GrowthEnabled bool `json:"growth_enabled"`
+	// BalanceEnabled 余额刷新开关（缺省 true）。
+	//
+	// 默认开：它只读上游、不改任何状态，是「快过期积分优先消耗」的数据来源。
+	// 关掉它的唯一合理场景是彻底不想让网关周期性访问上游。
+	BalanceEnabled bool `json:"balance_enabled"` // 缺省 true；false = 停余额刷新
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -67,9 +89,8 @@ func DefaultSchedule() Schedule {
 		KeepaliveHours:      []int{22},
 		SchoolHours:         []int{12},
 		CatHours:            []int{1},
-		RedeemHours:         []int{9},
-		LotteryHours:        []int{21},
-		MakeupHours:         []int{9},
+		GrowthHours:         []int{9, 21},
+		BalanceHours:        []int{9, 21},
 		CheckinEnabled:      true,
 		TraeCheckEnabled:    true,
 		TravelEnabled:       true,
@@ -77,9 +98,8 @@ func DefaultSchedule() Schedule {
 		KeepaliveEnabled:    true,
 		SchoolEnabled:       true,
 		CatEnabled:          true,
-		RedeemEnabled:       true,
-		LotteryEnabled:      true,
-		MakeupEnabled:       true,
+		GrowthEnabled:       true,
+		BalanceEnabled:      true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
 	}
 }
@@ -114,14 +134,11 @@ func (s *Schedule) Normalize() error {
 	if len(s.CatHours) == 0 {
 		s.CatHours = []int{1}
 	}
-	if len(s.RedeemHours) == 0 {
-		s.RedeemHours = []int{9}
+	if len(s.GrowthHours) == 0 {
+		s.GrowthHours = []int{9, 21}
 	}
-	if len(s.LotteryHours) == 0 {
-		s.LotteryHours = []int{21}
-	}
-	if len(s.MakeupHours) == 0 {
-		s.MakeupHours = []int{9}
+	if len(s.BalanceHours) == 0 {
+		s.BalanceHours = []int{9, 21}
 	}
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
@@ -157,13 +174,10 @@ func (s *Schedule) validateHours() error {
 	if err := checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours); err != nil {
 		return err
 	}
-	if err := checkHourRange("schedule.redeem_hours", "redeem_enabled", s.RedeemHours); err != nil {
+	if err := checkHourRange("schedule.growth_hours", "growth_enabled", s.GrowthHours); err != nil {
 		return err
 	}
-	if err := checkHourRange("schedule.lottery_hours", "lottery_enabled", s.LotteryHours); err != nil {
-		return err
-	}
-	return checkHourRange("schedule.makeup_hours", "makeup_enabled", s.MakeupHours)
+	return checkHourRange("schedule.balance_hours", "balance_enabled", s.BalanceHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

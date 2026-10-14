@@ -129,9 +129,9 @@ func TestGlobalAndCNMixedPoolServed(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
 
 	s.RunActivityNow()
-	// CN + global 各上报一次（global 不再跳过）。
-	if n := stub.calls.Load(); n != 2 {
-		t.Errorf("activity report calls=%d want 2（CN + global 各 1）", n)
+	// 2026-10-14：国际版不做任何任务，只有 CN 账号上报。
+	if n := stub.calls.Load(); n != 1 {
+		t.Errorf("activity report calls=%d want 1（只有 CN，global 已排除）", n)
 	}
 	// activity 阶段会顺带领猫（travelAdoptForce），把 buddy/info 计数打进快照；
 	// 旅行检验只数 RunTravelNow 这段的增量（global 被 travel 跳过，只有 CN 走）。
@@ -144,9 +144,9 @@ func TestGlobalAndCNMixedPoolServed(t *testing.T) {
 	}
 }
 
-// TestRunActivityNowReportsGlobalAccounts 核心验收：global 账号的 report 上报**不再跳过**
-// （PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK）。fake upstream 断言
-// global 账号真的发出 /v2/report 请求；且按 realm 路由到 global billing base。
+// TestRunActivityNowReportsGlobalAccounts 2026-10-14 语义反转：国际版不做任何任务，
+// global 账号的 report 上报**必须跳过**。此前 PR #45 让 global 也上报（实测 code=0 OK），
+// 但用户明确要求删掉国际版任务——23 个 global 号每轮 5 条写请求纯属给上游送无意义流量。
 func TestRunActivityNowReportsGlobalAccounts(t *testing.T) {
 	fastActivity(t)
 
@@ -178,8 +178,8 @@ func TestRunActivityNowReportsGlobalAccounts(t *testing.T) {
 
 	s.RunActivityNow()
 
-	if n := globalCalls.Load(); n != 1 {
-		t.Errorf("global account report calls=%d want 1（global 上报不再跳过）", n)
+	if n := globalCalls.Load(); n != 0 {
+		t.Errorf("global account report calls=%d want 0（国际版不做任务）", n)
 	}
 	if n := cnCalls.Load(); n != 0 {
 		t.Errorf("global account 不应打到 CN base: cn_calls=%d", n)

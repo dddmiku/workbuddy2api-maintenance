@@ -85,15 +85,20 @@ func TestDefaultConfigBindsLoopbackOnly(t *testing.T) {
 	}
 	// 脚本类任务默认关闭：APK 里既没有 scripts/*.py 也没有 Python，开着只会在
 	// 每个时点各报一次 WARN（用户看到的是「定时任务一直失败」）。
-	for _, key := range []string{"school_enabled", "cat_enabled", "redeem_enabled",
-		"lottery_enabled", "makeup_enabled"} {
+	//
+	// 2026-10-14：成长中心（growth）由 redeem/lottery/makeup 三条**脚本**任务合并而来，
+	// 并已改为**原生 Go 实现**（见 internal/scheduler/growth_center.go）——不再依赖
+	// Python，所以它从这组移出、进入下面的「Go 任务默认开启」组。school/cat 仍是脚本。
+	for _, key := range []string{"school_enabled", "cat_enabled"} {
 		if !strings.Contains(config, `"`+key+`": false`) {
 			t.Fatalf("脚本类任务 %s 在安卓上必须默认关闭：%s", key, config)
 		}
 	}
-	// Go 实现的任务必须保持开启（它们不依赖 Python）。
+	// Go 实现的任务默认开启（不依赖 Python）。
+	// 默认模板面向所有部署者，一律开启；只在**特定部署的 config.json** 里按需关
+	// （例如行空板这类只做转发、不做任务的实例）。
 	for _, key := range []string{"checkin_enabled", "travel_enabled", "activity_enabled",
-		"keepalive_enabled", "trae_check_enabled"} {
+		"keepalive_enabled", "trae_check_enabled", "balance_enabled", "growth_enabled"} {
 		if !strings.Contains(config, `"`+key+`": true`) {
 			t.Fatalf("Go 实现的任务 %s 必须默认开启：%s", key, config)
 		}

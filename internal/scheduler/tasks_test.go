@@ -11,10 +11,11 @@ import (
 )
 
 func TestTaskSnapshotOrderAndSwitches(t *testing.T) {
-	s := New(Config{}) // 零值 Config = 六类全启用、小时回落默认
+	s := New(Config{}) // 零值 Config = 全启用、小时回落默认
 	snap := s.TaskSnapshot()
+	// 2026-10-14：redeem/lottery/makeup 合并为 growth，故 11 → 9 类。
 	wantKeys := []string{"checkin", "trae_check", "travel", "activity", "keepalive", "school", "cat",
-		"redeem", "lottery", "makeup"}
+		"growth", "balance"}
 	if len(snap) != len(wantKeys) {
 		t.Fatalf("应返回 %d 类任务，实际 %d", len(wantKeys), len(snap))
 	}
@@ -102,8 +103,8 @@ func TestTriggerTaskUnknownKey(t *testing.T) {
 }
 
 func TestTaskKeyRoundTrip(t *testing.T) {
-	for _, key := range []string{"checkin", "travel", "activity", "keepalive", "school", "cat",
-		"redeem", "lottery", "makeup"} {
+	for _, key := range []string{"checkin", "trae_check", "travel", "activity", "keepalive", "school",
+		"cat", "growth", "balance"} {
 		k, ok := kindOf(key)
 		if !ok {
 			t.Fatalf("%s 应可解析", key)
@@ -215,48 +216,83 @@ func TestTaskLogRing(t *testing.T) {
 	}
 }
 
-func TestNewTasksRedeemLottery(t *testing.T) {
+// TestNewTasksGrowth 成长中心任务注册与开关（2026-10-14：原 redeem/lottery/makeup
+// 三条合并为 growth 一条）。
+func TestNewTasksGrowth(t *testing.T) {
 	s := New(Config{})
 	byKey := map[string]TaskInfo{}
 	for _, ti := range s.TaskSnapshot() {
 		byKey[ti.Key] = ti
 	}
-	for _, k := range []string{"redeem", "lottery", "makeup"} {
-		ti, ok := byKey[k]
-		if !ok {
-			t.Fatalf("快照缺少任务 %s", k)
-		}
-		if !ti.Enabled {
-			t.Fatalf("%s 零值配置下应默认启用", k)
-		}
-		if ti.NextRun == nil {
-			t.Fatalf("%s 启用时应有下次运行时间", k)
-		}
-		if ti.Name == "" || ti.Detail == "" {
-			t.Fatalf("%s 名称/说明为空", k)
-		}
+	ti, ok := byKey["growth"]
+	if !ok {
+		t.Fatalf("快照缺少任务 growth")
 	}
-	if byKey["redeem"].Hours[0] != 9 || byKey["lottery"].Hours[0] != 21 || byKey["makeup"].Hours[0] != 9 {
-		t.Fatalf("默认小时不对：redeem=%v lottery=%v makeup=%v",
-			byKey["redeem"].Hours, byKey["lottery"].Hours, byKey["makeup"].Hours)
+	if !ti.Enabled {
+		t.Fatalf("growth 零值配置下应默认启用")
+	}
+	if ti.NextRun == nil {
+		t.Fatalf("growth 启用时应有下次运行时间")
+	}
+	if ti.Name == "" || ti.Detail == "" {
+		t.Fatalf("growth 名称/说明为空")
+	}
+	// 默认小时 [9,21]（早晚各一轮完整七段）。
+	if len(ti.Hours) != 2 || ti.Hours[0] != 9 || ti.Hours[1] != 21 {
+		t.Fatalf("growth 默认小时=%v want [9 21]", ti.Hours)
+	}
+	// 只服务 CN（global 已被排除）。
+	if len(ti.Realms) != 1 || ti.Realms[0] != "cn" {
+		t.Fatalf("growth realms=%v want [cn]", ti.Realms)
+	}
+	// 旧的三个 key 不该再出现（合并后只留 growth）。
+	for _, gone := range []string{"redeem", "lottery", "makeup"} {
+		if _, still := byKey[gone]; still {
+			t.Fatalf("合并后不该再有 %s 任务", gone)
+		}
 	}
 
-	// 显式禁用后：停用 + 不再给下次时点（与其余六类同口径）。
-	s2 := New(Config{RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
+	// 显式禁用后：停用 + 不再给下次时点。
+	s2 := New(Config{GrowthDisabled: true})
 	for _, ti := range s2.TaskSnapshot() {
-		if ti.Key != "redeem" && ti.Key != "lottery" && ti.Key != "makeup" {
+		if ti.Key != "growth" {
 			continue
 		}
 		if ti.Enabled {
-			t.Fatalf("%s 显式禁用后仍报启用", ti.Key)
+			t.Fatalf("growth 显式禁用后仍报启用")
 		}
 		if ti.NextRun != nil {
-			t.Fatalf("%s 停用后不应给出下次运行时间", ti.Key)
+			t.Fatalf("growth 停用后不应给出下次运行时间")
 		}
 	}
 
-	// 未知 key 仍报错（新增两类不能把 kindOf 的兜底弄坏）。
+	// 未知 key 仍报错（改任务种类不能把 kindOf 的兜底弄坏）。
 	if _, err := s2.TaskLog("nosuchtask"); err != ErrUnknownTask {
 		t.Fatalf("未知 key 应报 ErrUnknownTask，实际 %v", err)
+	}
+}
+
+// TestTaskRealmsExcludeGlobalForNonBalance 国际版不参与任何任务（2026-10-14 用户要求）：
+// 除 checkin / balance（只读余额）外，其余任务的 realms 不该含 global。
+func TestTaskRealmsExcludeGlobalForNonBalance(t *testing.T) {
+	s := New(Config{})
+	for _, ti := range s.TaskSnapshot() {
+		hasGlobal := false
+		for _, r := range ti.Realms {
+			if r == "global" {
+				hasGlobal = true
+			}
+		}
+		switch ti.Key {
+		case "checkin", "balance":
+			// 这两个含 global 是刻意的：global 号仍查余额（纯读，驱动快过期优先消耗）。
+			if !hasGlobal {
+				t.Errorf("%s 应含 global（只读余额）", ti.Key)
+			}
+		default:
+			if hasGlobal {
+				t.Errorf("%s 不该含 global（国际版不做任务），realms=%v", ti.Key, ti.Realms)
+			}
+		}
 	}
 }

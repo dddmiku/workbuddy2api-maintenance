@@ -21,9 +21,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -147,6 +149,11 @@ func TranslateStream(upstream io.ReadCloser, model string) io.ReadCloser {
 
 // chatTransport 是 SSE 专用 Transport：首字节有超时、流中空闲交给上游事件心跳，
 // 不设总时长（长回答不能因为整体耗时被砍断）。
+//
+// ResponseHeaderTimeout 300s（2026-10-14 从 120s 调大）：实测 trae 上游对大输入
+// （53K token）的处理期会先发 progress_notice 帧再吐正文，头部 26s 内就到；但更大
+// 请求（Claude Code 全量 283K token）的头部可能显著更晚。120s 的头部窗在长上下文
+// 场景没有余量，先放宽到 300s，让「等得起」成为默认（流中空闲不受此参数约束）。
 func chatTransport() http.RoundTripper {
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -155,7 +162,7 @@ func chatTransport() http.RoundTripper {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 120 * time.Second,
+		ResponseHeaderTimeout: 300 * time.Second,
 	}
 }
 
@@ -832,6 +839,28 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 		_ = upstream.Close()
 		_ = r.pw.CloseWithError(err)
 	}()
+	// 空闲心跳：上游长时间不吐帧时（大输入的处理期只有 progress_notice，正文
+	// 要等模型开写），向下游发 SSE 注释行保活，防止中间层（nginx/CDN/客户端
+	// 自身的读超时）在 17-60 秒量级把整条流判死（2026-10-14 trae 502 排查：
+	// 客户端等不到任何字节是三连 502 的共同形态）。注释行按 SSE 规范会被
+	// 客户端忽略，不污染内容流。
+	//
+	// 实现走 SetReadDeadline 轮询而非额外 goroutine：resp.Body 的 Read 阻塞
+	// 在 deadline 上，超时返回 os.ErrDeadlineExceeded——这里把它当「该发心跳
+	// 了」而不是错误，发完续期再读。真断连仍以 EOF/RST 呈现，不会被掩盖。
+	deadlineAware, hasDeadline := upstream.(interface{ SetReadDeadline(time.Time) error })
+	const idleBeat = 15 * time.Second
+	beatDeadline := func() {
+		if hasDeadline {
+			_ = deadlineAware.SetReadDeadline(time.Now().Add(idleBeat))
+		}
+	}
+	beatDeadline()
+	defer func() {
+		if hasDeadline {
+			_ = deadlineAware.SetReadDeadline(time.Time{})
+		}
+	}()
 	reader := bufio.NewReaderSize(upstream, 64*1024)
 	var (
 		out         bytes.Buffer
@@ -872,6 +901,16 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 	}
 	for {
 		line, rerr := reader.ReadString('\n')
+		if rerr != nil && errors.Is(rerr, os.ErrDeadlineExceeded) {
+			// 读截止到期 = 上游空闲超过 idleBeat：向下游补一个心跳注释行，
+			// 然后续期再读。不 break、不置 err——空闲不是流错误（见 run 头部注释）。
+			if _, werr := r.pw.Write([]byte(": relay-keepalive\n\n")); werr != nil {
+				err = werr
+				break
+			}
+			beatDeadline()
+			continue
+		}
 		if line != "" {
 			trimmed := strings.TrimRight(line, "\r\n")
 			switch {

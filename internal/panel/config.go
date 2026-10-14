@@ -34,16 +34,18 @@ var taskEnableKey = map[string]string{
 	"keepalive":  "keepalive_enabled",
 	"school":     "school_enabled",
 	"cat":        "cat_enabled",
-	"redeem":     "redeem_enabled",
-	"lottery":    "lottery_enabled",
-	"makeup":     "makeup_enabled",
+	// growth：成长中心（2026-10-14 由原 redeem/lottery/makeup 三条合并）。漏登记会让
+	// 面板「跑一次 / 开关」报「任务标识不正确」——网关侧任务已存在，只是白名单挡在门外。
+	"growth": "growth_enabled",
+	// balance：余额刷新（纯读）。漏登记会让面板「跑一次/开关」报「任务标识不正确」。
+	"balance": "balance_enabled",
 }
 
 // TaskKeys 返回面板接受的任务标识（顺序固定，便于测试与日志）。
 func TaskKeys() []string {
 	// 顺序与 app.py 的 TASK_ENABLE_KEY 字面量一致；Go 的 map 无序，所以显式列出。
 	return []string{"checkin", "trae_check", "travel", "activity", "keepalive",
-		"school", "cat", "redeem", "lottery", "makeup"}
+		"school", "cat", "growth", "balance"}
 }
 
 // KnownTask 判断任务标识是否在白名单内。

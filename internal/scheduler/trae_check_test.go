@@ -56,9 +56,7 @@ func TestTraeCheckScheduleIndependent(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		RedeemDisabled:    true,
-		LotteryDisabled:   true,
-		MakeupDisabled:    true,
+		GrowthDisabled:    true,
 	})
 	at, kinds := s2.nextWake(time.Date(2026, 9, 11, 6, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 7, 0, 0, 0, time.Local); !at.Equal(want) {

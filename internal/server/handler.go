@@ -2161,6 +2161,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
 			return
 		}
+		// 6004 但没解析出重置时间（文案变体没被正则覆盖）：仍是模型级信号——账号
+		// 对其他模型健康，冷却整号会让选号池白白少一个号。走 BlockModelBackoff
+		// 的模型级有界退避（6h 基数、不写账号级 until）。此前这里无差别落进
+		// CooldownSoftRate 账号级冷却，正是「模型限流却在号上标冷却」的来源
+		// （2026-10-14 用户反馈）。已知后果：该模型 6h 内不再选这个号（宁可保守，
+		// 也不把 resetAt 臆造成零值——上游没给时间就不猜）。
+		if upstream.IsModelRateLimit(body) {
+			h.cfg.Pool.BlockModelBackoff(uid, model, "6004 model rate limit (no reset time)")
+			return
+		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
 		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")

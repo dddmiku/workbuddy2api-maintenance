@@ -1085,8 +1085,12 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
-// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
-// （现状不变）。
+// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 模型级有界退避，
+// 不再把整个账号打进冷却（2026-10-14 改）：6004 是模型级信号，账号对其他模型
+// 健康；此前落进 CooldownSoftRate 账号级冷却，选号池白白少一个号，且面板上
+// 呈现为「号被限流」而非「某个模型被限流」（用户反馈原话：「如果某个模型被
+// 限流了，应该指出来，而不是在号里标记冷却，毕竟其他模型没有冷却」）。
+// 新语义：BlockModelBackoff 写 modelCooldowns（6h 基数），账号级 Cooling=false。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1110,12 +1114,16 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
+	// 模型限流不冷却账号：其他模型照常可选这个号。
+	if st.Cooling {
+		t.Fatalf("model 6004 must not cool the whole account: %+v", st)
 	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	// 模型级台账在 /status 里按模型点名（面板据此显示「模型限流 glm-5.3」）。
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want glm-5.3 model cooldown row, got %+v", st.RateLimitedModels)
+	}
+	if !strings.Contains(st.RateLimitedModels[0].Reason, "6004") {
+		t.Fatalf("reason should name 6004: %+v", st.RateLimitedModels[0])
 	}
 }
 

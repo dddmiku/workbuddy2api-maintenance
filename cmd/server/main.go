@@ -231,9 +231,8 @@ func main() {
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		CatHours:            cfg.Schedule.CatHours,
-		RedeemHours:         cfg.Schedule.RedeemHours,
-		LotteryHours:        cfg.Schedule.LotteryHours,
-		MakeupHours:         cfg.Schedule.MakeupHours,
+		GrowthHours:         cfg.Schedule.GrowthHours,
+		BalanceHours:        cfg.Schedule.BalanceHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
@@ -243,9 +242,8 @@ func main() {
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
-		RedeemDisabled:      !cfg.Schedule.RedeemEnabled,
-		LotteryDisabled:     !cfg.Schedule.LotteryEnabled,
-		MakeupDisabled:      !cfg.Schedule.MakeupEnabled,
+		GrowthDisabled:      !cfg.Schedule.GrowthEnabled,
+		BalanceDisabled:     !cfg.Schedule.BalanceEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -287,20 +285,18 @@ func main() {
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
-	if !cfg.Schedule.RedeemEnabled {
-		log.Printf("连登兑换已禁用（schedule.redeem_enabled=false）")
+	if !cfg.Schedule.GrowthEnabled {
+		log.Printf("成长中心已禁用（schedule.growth_enabled=false）")
 	} else {
-		log.Printf("连登兑换已启用：%v 点（growth_center.py ALL --redeem-only --yes）", cfg.Schedule.RedeemHours)
+		log.Printf("成长中心已启用：%v 点（原生七段：旅行/任务奖/补登/兑换/抽奖/Buddy盲盒/展示；仅 CN）", cfg.Schedule.GrowthHours)
 	}
-	if !cfg.Schedule.LotteryEnabled {
-		log.Printf("成长抽奖已禁用（schedule.lottery_enabled=false）")
+	// 余额刷新：与签到解耦的纯读任务，是「优先消耗快过期积分」的数据来源。
+	// 关掉它会让池里 credits_expiring 停止更新，选号失去快过期偏好。
+	if !cfg.Schedule.BalanceEnabled {
+		log.Printf("余额刷新已禁用（schedule.balance_enabled=false）——池内积分与快过期分桶将不再更新，" +
+			"「优先消耗快过期积分」选号随之失效")
 	} else {
-		log.Printf("成长抽奖已启用：%v 点（growth_center.py ALL --lottery-only --yes）", cfg.Schedule.LotteryHours)
-	}
-	if !cfg.Schedule.MakeupEnabled {
-		log.Printf("补签已禁用（schedule.makeup_enabled=false）")
-	} else {
-		log.Printf("补签已启用：%v 点（growth_center.py ALL --makeup-only --yes）", cfg.Schedule.MakeupHours)
+		log.Printf("余额刷新已启用：%v 点（纯读查余额，驱动快过期积分优先消耗）", cfg.Schedule.BalanceHours)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -325,3 +325,14 @@ func parseCreditPack(pack map[string]any) CreditPack {
 func IsTraeRealm(a *auth.Auth) bool {
 	return a != nil && strings.EqualFold(strings.TrimSpace(a.RealmStored()), Realm)
 }
+
+// RawEntUsage 返回 ent_usage 接口的原始解析结果。
+//
+// 只用于排障：积分包的字段层级较深且上游会调整，`Credits` 只挑出网关需要的
+// 那几个字段，字段改名时「解析出来是 0」和「上游真的返回 0」在结构化结果里
+// 长得一样。看原始 JSON 才能确定是哪一种（2026-10-14 排查 trae 积分包
+// remaining 恒为 0 时正是这个用途）。
+func RawEntUsage(ctx context.Context, a *auth.Auth) (map[string]any, error) {
+	return postTraeAPI(ctx, a, entUsagePath,
+		map[string]any{"require_usage": true, "req_source": 1}, 0)
+}

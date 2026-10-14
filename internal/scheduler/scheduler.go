@@ -46,9 +46,14 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
-	RedeemHours    []int // 默认 [9]：连登档位兑换（7d/14d/28d）
-	LotteryHours   []int // 默认 [21]：成长中心抽奖（清空当日次数）
-	MakeupHours    []int // 默认 [9]：补签（补最近一次漏签）
+	// GrowthHours 成长中心流水线排程（原 redeem/lottery/makeup 三条合并为一条）。
+	// 默认 [9,21]：早晚各跑一轮完整七段（旅行/任务奖/补登/兑换/抽奖/Buddy盲盒/展示）。
+	// 合并的理由见 internal/config/schedule.go 的 GrowthHours 注释。
+	GrowthHours []int
+	// BalanceHours 余额刷新的独立排程。默认与签到同小时，但**独立开关**：
+	// 多客户端共用账号的用户要关签到，却仍需要余额数据来驱动「快过期优先消耗」。
+	// 详见 internal/config/schedule.go 的 BalanceHours 注释。
+	BalanceHours []int // 默认 [9,21]
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -73,12 +78,11 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
-	// RedeemDisabled 显式关闭连登兑换排程（schedule.redeem_enabled=false）。
-	RedeemDisabled bool
-	// LotteryDisabled 显式关闭成长抽奖排程（schedule.lottery_enabled=false）。
-	LotteryDisabled bool
-	// MakeupDisabled 显式关闭补签排程（schedule.makeup_enabled=false）。
-	MakeupDisabled bool
+	// GrowthDisabled 显式关闭成长中心流水线（schedule.growth_enabled=false）。
+	GrowthDisabled bool
+	// BalanceDisabled 显式关闭余额刷新排程（schedule.balance_enabled=false）。
+	// 关掉后池里的 credits / credits_expiring 不再更新，「快过期优先消耗」随之失效。
+	BalanceDisabled bool
 }
 
 // Scheduler 调度器。
@@ -89,12 +93,6 @@ type Scheduler struct {
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
-
-	// rewardClaimed 连登奖励按自然日（CST）领取标记：uid → 当日日期。已领/已尝试的账号
-	// 当日不再重打 redeem（领取类写操作按天幂等，避免对上游重复写请求）；自然日 00:00
-	// CST 重置（上游增长体系按 CST 自然日刷新，见 travelDay/cstZone）。进程重启即清零
-	// （服务端幂等兜底：重启后当日重复 redeem 会拿 409 正常态，无副作用）。
-	rewardClaimed map[string]string
 
 	// traeDeviceGen Trae 签到的设备号代数：uid → gen。9074 是设备维度限流，
 	// 换新派生的设备号即可绕过（实测第 0 代 9074、第 1 代立刻成功）。命中后
@@ -155,14 +153,14 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
 	}
-	if len(cfg.RedeemHours) == 0 {
-		cfg.RedeemHours = []int{9}
+	if len(cfg.GrowthHours) == 0 {
+		cfg.GrowthHours = []int{9, 21}
 	}
-	if len(cfg.LotteryHours) == 0 {
-		cfg.LotteryHours = []int{21}
-	}
-	if len(cfg.MakeupHours) == 0 {
-		cfg.MakeupHours = []int{9}
+	// 与 config.Normalize 保持同一份默认（两处都要有：前者给 config.json 路径，
+	// 这里给直接构造 Config 的调用方与测试——漏了会让 nextFire 拿到空切片、
+	// 返回零时点，任务在面板上「启用但没有下次运行时间」）。
+	if len(cfg.BalanceHours) == 0 {
+		cfg.BalanceHours = []int{9, 21}
 	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
@@ -175,7 +173,6 @@ func New(cfg Config) *Scheduler {
 		lifecycle:     lifecycle,
 		cancel:        cancel,
 		adoptTried:    make(map[string]string),
-		rewardClaimed: make(map[string]string),
 		taskLast:      make(map[TaskKey]time.Time),
 		taskBusy:      make(map[TaskKey]bool),
 	}
@@ -233,9 +230,8 @@ const (
 	taskKeepalive
 	taskSchool
 	taskCat
-	taskRedeem
-	taskLottery
-	taskMakeup
+	taskGrowth
+	taskBalance
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -268,14 +264,11 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if !s.cfg.CatDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
-	if !s.cfg.RedeemDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.RedeemHours), taskRedeem})
+	if !s.cfg.GrowthDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.GrowthHours), taskGrowth})
 	}
-	if !s.cfg.LotteryDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.LotteryHours), taskLottery})
-	}
-	if !s.cfg.MakeupDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.MakeupHours), taskMakeup})
+	if !s.cfg.BalanceDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.BalanceHours), taskBalance})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -421,12 +414,10 @@ func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 		s.runSchool(ctx)
 	case taskCat:
 		s.runCat(ctx)
-	case taskRedeem:
-		s.runRedeem(ctx)
-	case taskLottery:
-		s.runLottery(ctx)
-	case taskMakeup:
-		s.runMakeup(ctx)
+	case taskGrowth:
+		s.runGrowthCenter(ctx)
+	case taskBalance:
+		s.runBalance(ctx)
 	}
 }
 
@@ -867,6 +858,129 @@ func joinDetail(existing, add string) string {
 	return existing + "; " + add
 }
 
+// ── 余额刷新（独立任务，2026-10-14）────────────────────────────────────────
+//
+// 把「查余额 → 写池」从签到任务里解耦出来。原来这件事只发生在 checkinAll 内部，
+// 于是关掉签到（多客户端共用账号的用户必须这么做）就顺带把池里的 credits 与
+// credits_expiring 也冻住了，而「付费模型优先消耗快过期积分」正依赖后者
+// （见 pool/pick.go 的 paid_expiring 硬过滤）——表现为该特性静默失效：
+// 面板有数据（面板直查上游），选号却完全没有快过期偏好。
+//
+// 与签到的分工：
+//   - 签到（taskCheckin）：写操作（DailyCheckin），按 checkin_hours 排程；
+//   - 余额（taskBalance）：**纯读**（UserResourceDetailed），按 balance_hours 排程。
+//
+// 两者都保留自己的余额查询，是刻意的：签到后立刻查一次能让刚签到的积分马上
+// 参与选号，而独立任务负责在「没签到」时也保持数据新鲜。重复查询的代价是每个
+// 账号多一次只读请求，可忽略；漏查的代价是选号偏好静默失效，不可接受。
+
+// RunBalanceNow 定时触发的立即余额刷新。
+func (s *Scheduler) RunBalanceNow() {
+	s.runBalance(context.Background())
+}
+
+func (s *Scheduler) runBalance(ctx context.Context) {
+	if _, err := s.balanceAll(ctx); err != nil {
+		log.Printf("scheduled balance refresh skipped: %v", err)
+	}
+}
+
+// BalanceAll 供管理面板手动触发。
+func (s *Scheduler) BalanceAll() ([]CheckinOutcome, error) {
+	return s.balanceAll(context.Background())
+}
+
+// balanceAll 逐账号查余额并写进池子（不签到、不刷新 token 之外无任何写操作）。
+//
+// 与 checkinAll 共用 checkinMu：两者都要改池子里的 credits，且都打同一族上游接口，
+// 并发跑没有收益、只会让日志与限速口径变复杂。
+func (s *Scheduler) balanceAll(ctx context.Context) ([]CheckinOutcome, error) {
+	if !s.checkinMu.TryLock() {
+		return nil, ErrBusy
+	}
+	defer s.checkinMu.Unlock()
+
+	statuses := s.cfg.Pool.List()
+	out := make([]CheckinOutcome, 0, len(statuses))
+	var okN, failN, skipN int
+	for _, st := range statuses {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
+		if st.Disabled {
+			oc.Status, oc.Detail = CheckinSkipped, "disabled"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.Snapshot().RefreshToken == "" {
+			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		// 只处理 WorkBuddy 端点族（cn/global）。trae 走完全不同的 API，余额查询
+		// 不适用——拿 Trae 的 JWT 打 codebuddy.cn 只会 401，还会白刷一遍日志。
+		if !a.IsWorkBuddy() {
+			oc.Status, oc.Detail = CheckinSkipped, a.Realm()+" (separate task)"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
+		// token 过期时先补一次刷新，否则余额查询必然 401。这里与 checkinAll 的
+		// 处理一致：刷新失败但 token 仍未过期就继续（接口抖动不该让本可成功的
+		// 查询被跳过）；真正过期才判失败。
+		if a.NeedsRefresh(checkinRefreshSkew) {
+			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				log.Printf("balance %s refresh: %v", logfmt.UID8(st.UID), err)
+				var ue *upstream.Error
+				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+					if s.cfg.Pool.NoteSessionDead(st.UID) {
+						log.Printf("WARN: balance %s: 连续 %d 次 12153 session dead — 禁用",
+							logfmt.UID8(st.UID), pool.SessionDeadThreshold())
+					}
+				}
+				if a.NeedsRefresh(0) {
+					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
+					failN++
+					out = append(out, oc)
+					continue
+				}
+			} else {
+				s.cfg.Pool.ClearSessionDead(st.UID)
+				a.BackfillRealm()
+				if err := a.SaveAtomic(); err != nil {
+					log.Printf("balance %s save: %v", logfmt.UID8(st.UID), err)
+				}
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		if err != nil {
+			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			oc.Status, oc.Detail = CheckinFail, "resource: "+err.Error()
+			failN++
+			out = append(out, oc)
+			continue
+		}
+		// ReenableIfCredits 会在余额恢复时解冻冷却中的账号——这是签到任务里
+		// 「余额查询解冻」的同一件事，独立任务也必须做，否则关了签到就再没有
+		// 任何路径能把账号解冻回来。
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		oc.Status = CheckinOK
+		oc.Credits = &remain
+		okN++
+		out = append(out, oc)
+	}
+	log.Printf("balance done: total=%d ok=%d fail=%d skipped=%d", len(statuses), okN, failN, skipN)
+	return out, nil
+}
+
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
 // CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 可用）；单账号失败
@@ -911,9 +1025,12 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if !a.IsWorkBuddy() {
 			continue
 		}
-		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
-		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
-		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
+		// global 门控（2026-10-14）：国际版不做任何任务。此前这里放行 global
+		// （PR #45 实测国际版 /v2/report 返回 code=0），但用户明确要求删掉国际版
+		// 任务——23 个 global 号每轮上报 5 条，纯属给上游送无意义的写流量。
+		if a.Realm() == auth.RealmGlobal {
+			continue
+		}
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
@@ -952,7 +1069,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			return
 		}
 		s.travelAdoptForce(ctx, a)
-		s.claimGrowthRewardsContext(ctx, a)
+		// 连登兑换/抽奖已迁到独立的成长中心任务（taskGrowth，见 growth_center.go）：
+		// 那是完整七段流水线，本任务只负责「上报 → 自检 → 领养前置」。
+		// 原来这里内联调用 claimGrowthRewardsContext，与流水线重复打同一批接口。
 	}
 }
 
@@ -975,131 +1094,6 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	}
 	log.Printf("activity %s: streak days=%d", logfmt.UID8(a.UID), days)
 	return false
-}
-
-// claimGrowthRewards 领取连登奖励（里程碑兑换）+ 执行连登抽奖。
-// 在 runActivity 上报成功 + streak 自检之后调用：连登达标（days>=某档）才能领奖，
-// 领奖送的 chances 才是抽奖次数来源，故先领奖后抽奖。
-//
-// 幂等/风控语义（与现有 travel/travel 同口径：单号失败只该号 WARN，不影响其他账号）：
-//   - 按天幂等：每日每号最多领一轮（rewardClaimedToday 闸；自然日 CST 重置，进程重启清零——
-//     重启后当日重复 redeem 由上游 409 duplicate 正常态兜底，不刷 WARN）。
-//   - 服务端正常态识别为静默跳过：redeem 409 duplicate/403 天数不足；lottery 400 无次数/未开启——
-//     这些不是失败，不刷 WARN（见 upstream.IsRedeemAlreadyClaimed 等）。
-//   - 领奖只领「本次新达标」的档位：状态非 claimed 且 days>=档位天数。跨档连领（14d 未领而
-//     days 已到 28）是官方正常态（spa 按 byTier 逐档可兑），但每日一轮限一档，避免同日多写。
-//
-// 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
-func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
-	s.claimGrowthRewardsContext(context.Background(), a)
-}
-
-func (s *Scheduler) claimGrowthRewardsContext(ctx context.Context, a *auth.Auth) {
-	if ctx.Err() != nil {
-		return
-	}
-	if a == nil || a.Snapshot().AccessToken == "" {
-		return
-	}
-	// global 门控：连登奖励/抽奖链只服务 CN。国际版 /activity/growth/* 端点虽同构存在
-	// （/tmp/analysis-global-credit.md §1.1：lottery/streak/redeem 在国际版上线），但真实
-	// global 新账号 GET /activity/growth/streak 返回 500（实测 sliverkiss）——链上第一步就
-	// 拿不到 days，无法挑档；且 streak 500 会每趟刷 WARN 污染日志。结论：证据不足，跳过
-	// global（不发起任何领取类调用）。CN 账号无此问题（CN streak 200 days=N）。
-	if !a.IsWorkBuddy() {
-		return
-	}
-	if s.rewardClaimedToday(a.UID) {
-		return // 当日已领过一轮，跳过（按天幂等）
-	}
-	state, err := s.cfg.Upstream.GrowthRewardState(a)
-	if err != nil {
-		log.Printf("WARN: activity %s: reward-state: %v", logfmt.UID8(a.UID), err)
-		return
-	}
-	days := state.Days()
-	tier := growthEligibleTier(days, &state.Redemption)
-	if tier == "" {
-		// 无新达标档位：不动写接口（不刷 WARN，这是正常态——很多天没到 7d）。
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	res, err := s.cfg.Upstream.GrowthRedeem(a, tier, "")
-	switch {
-	case err == nil:
-		log.Printf("activity %s: redeem tier=%s ok (+%d credit, +%d energy, +%d chances)",
-			logfmt.UID8(a.UID), tier, res.CreditGranted, res.EnergyGranted, res.ChancesGranted)
-	case upstream.IsRedeemAlreadyClaimed(err) || upstream.IsRedeemNotEnoughDays(err):
-		log.Printf("activity %s: redeem tier=%s skip (already claimed or days not enough)", logfmt.UID8(a.UID), tier)
-	default:
-		log.Printf("activity %s: redeem tier=%s: %v", logfmt.UID8(a.UID), tier, err)
-	}
-	// 标记当日已处理（无论 redeem 是否成功都记一次：领取类各状态当日不再重试，
-	// 避免对上游重复写；成功→无需再领，失败→当日不轰炸，次日自然日重置/上游幂等兜底）。
-	s.markRewardClaimed(a.UID)
-	s.claimGrowthLotteryContext(ctx, a)
-}
-
-// growthEligibleTier 按当前连登天数挑选「尚未领取且达标」的最高档位。
-// 返回 "" 表示无可领档（未达标或全部已领），调用方据此跳过 redeem（正常态）。
-func growthEligibleTier(days int, rs *upstream.GrowthRedemptionStatus) string {
-	if rs == nil {
-		return ""
-	}
-	// 档位按 days 升序，从高到低挑最高的已达标未领档（一次领一份，每日一轮）。
-	for i := len(rs.Tiers) - 1; i >= 0; i-- {
-		sp := rs.Tiers[i]
-		if days >= sp.Days && !rs.Claimed(sp.Tier) {
-			return sp.Tier
-		}
-	}
-	return ""
-}
-
-// claimGrowthLotteryContext 消耗连登奖励赠与的抽奖次数。仅抽 balance>0 的次数；无次数跳过
-// （400 insufficient 正常态静默）；抽奖未开启（400 lottery disabled）静默。
-// client_token 每次 draw 必须新键（security-relevant，见 upstream.GrowthLotteryDraw）。
-func (s *Scheduler) claimGrowthLotteryContext(ctx context.Context, a *auth.Auth) {
-	if ctx.Err() != nil {
-		return
-	}
-	chances, err := s.cfg.Upstream.GrowthLotteryChances(a)
-	if err != nil {
-		log.Printf("WARN: activity %s: lottery-chances: %v", logfmt.UID8(a.UID), err)
-		return
-	}
-	if chances <= 0 {
-		log.Printf("activity %s: lottery skip (no chances)", logfmt.UID8(a.UID))
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	res, err := s.cfg.Upstream.GrowthLotteryDraw(a, "") // 每次自动新 client_token
-	switch {
-	case err == nil:
-		log.Printf("activity %s: lottery drawn prize=%s (%s)", logfmt.UID8(a.UID), res.PrizeName, res.PrizeType)
-	case upstream.IsLotteryNoChance(err) || upstream.IsLotteryDisabled(err):
-		log.Printf("activity %s: lottery skip (no chances or disabled)", logfmt.UID8(a.UID))
-	default:
-		log.Printf("activity %s: lottery draw: %v", logfmt.UID8(a.UID), err)
-	}
-}
-
-// rewardClaimedToday 该账号当日是否已处理过连登奖励领取（自然日 CST）。
-func (s *Scheduler) rewardClaimedToday(uid string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.rewardClaimed[uid] == travelDay(time.Now())
-}
-
-// markRewardClaimed 记录该账号当日已处理连登奖励领取。
-func (s *Scheduler) markRewardClaimed(uid string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rewardClaimed[uid] = travelDay(time.Now())
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。

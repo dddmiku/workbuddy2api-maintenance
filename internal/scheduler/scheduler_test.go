@@ -49,7 +49,7 @@ func TestNextFireMergesSchedules(t *testing.T) {
 func TestNextWakeKeepaliveOnly(t *testing.T) {
 	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
 		TravelDisabled: true, ActivityDisabled: true,
-		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
+		GrowthDisabled: true, BalanceDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
@@ -70,9 +70,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		ActivityDisabled: true,
 		SchoolDisabled:   true,
 		CatDisabled:      true,
-		RedeemDisabled:   true,
-		LotteryDisabled:  true,
-		MakeupDisabled:   true,
+		GrowthDisabled:   true,
+		BalanceDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -105,7 +104,7 @@ func TestNextWakeNothingScheduled(t *testing.T) {
 func TestNextWakeCheckinDisabled(t *testing.T) {
 	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
 		TravelDisabled: true, ActivityDisabled: true,
-		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
+		GrowthDisabled: true, BalanceDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 21 点签到）", at, want)
@@ -119,7 +118,7 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
 func TestNextWakeKeepaliveDisabled(t *testing.T) {
 	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
 		TravelDisabled: true, ActivityDisabled: true,
-		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
+		GrowthDisabled: true, BalanceDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 22 点保活）", at, want)
@@ -139,9 +138,8 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		RedeemDisabled:    true,
-		LotteryDisabled:   true,
-		MakeupDisabled:    true,
+		GrowthDisabled:    true,
+		BalanceDisabled:   true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -211,6 +209,9 @@ type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	// cycleEndTime 非空时，get-user-resource 会带上该到期时间，供
+	// UserResourceDetailed 把余额分进「快过期」桶（ExpiringSoonWindow 内）。
+	cycleEndTime string
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -220,8 +221,12 @@ func (f *fakeUpstream) server() *httptest.Server {
 			f.checkinCalls.Add(1)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			end := ""
+			if f.cycleEndTime != "" {
+				end = `,"CycleEndTime":"` + f.cycleEndTime + `"`
+			}
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":` +
-				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0}]}}}}`))
+				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))

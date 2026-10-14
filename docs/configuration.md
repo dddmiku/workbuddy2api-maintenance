@@ -280,7 +280,11 @@ required`，在 `/status` 的 `disabled` + `disabled_reason` 可见。请求内�
 
 每个任务使用 `schedule.<key>_enabled` 开关和 `schedule.<key>_hours` 小时列表，小时按服务时区解释。Compose 默认时区为 `Asia/Shanghai`。
 
-任务包括 `checkin`、`travel`、`activity`、`keepalive`、`school`、`cat`、`redeem`、`lottery`、`makeup`。关闭任务应设置对应开关为 `false`，空小时列表不会表示禁用。
+任务包括 `checkin`、`trae_check`、`travel`、`activity`、`keepalive`、`school`、`cat`、`growth`、`balance`。关闭任务应设置对应开关为 `false`，空小时列表不会表示禁用。
+
+`growth`（成长中心）在 2026-10-14 由原 `redeem` / `lottery` / `makeup` 三条独立任务合并而来：它们本是一条有依赖的流水线（领任务奖送的抽奖次数当场就能抽、连登兑换送的补登卡当场就能补、补登又改变连登天数），拆开跑既丢顺序又要等到下一个时点。合并后一轮跑完七段：领旅行礼物/派 Buddy → 任务接单与领奖 → 补登卡自动补 → 连登兑换 → 盲盒抽奖 → 能量开 Buddy 盲盒 → 能量与连签展示。旧配置里的 `redeem_hours` / `lottery_hours` / `makeup_hours` 作为未知键被忽略（不报错），改用 `growth_hours` / `growth_enabled`。
+
+**国际版（global）不参与任何任务**：只有 `checkin` 与 `balance` 会为 global 账号发起调用，且仅限只读余额查询（驱动「优先消耗快过期积分」选号）；签到、上报、成长中心等写操作对 global 账号一律跳过。
 
 同一实例中的任务执行使用互斥以隔离各自日志，同时到期的任务会排队执行。
 
