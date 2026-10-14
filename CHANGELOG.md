@@ -38,6 +38,37 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.2.1 — 2026-10-14
+
+修掉持续多版本的红叉：CI 门禁从 v3.0.2 起一直失败，与代码质量无关，是两条
+「本地过、CI 挂」的缺口。
+
+### 内嵌面板与源不同步
+
+`panel/index.html` 是 `panel/app.js` + `panel/src/*.css` 的**构建产物**，由
+`panel/build.py` 生成；CI 跑完构建后要求 `git diff --exit-code`（产物必须与源一致）。
+
+上一批改动（切页拉实时积分、模型限流渲染）改了 `app.js` 却漏跑构建，`index.html`
+落后于源，CI 判失败。另外 `.sub.rlm` 的 CSS 只存在于生成物里、没进
+`panel/src/css_c.css`，重跑构建会把它丢掉——两处一起修，并验证构建幂等（连跑两次
+结果一致）。
+
+### 测试读了部署机才有的路径
+
+`test_account_display` 的两个用例调 `build_state()`，后者读
+`key_management.socket_path(CONFIG_PATH, BASE)`，而 `CONFIG_PATH` 是部署机上的
+绝对路径 `/opt/workbuddy2api/config.json`。测试 mock 了其它依赖却漏了它，于是去读
+一个不存在的文件——**在任何非部署环境（CI、开发机）都抛 `FileNotFoundError`**。
+
+它没有断言失败、而是直接抛异常，所以看起来像「环境问题」而非测试缺陷。补上
+`socket_path` 的 mock：测试不该依赖真实文件系统。
+
+### 验证
+
+CI 六步本地逐条复跑全过：`go mod verify` / `go test ./...` / `go vet ./...` /
+内嵌面板同步 / `panel` 344 个测试 / `scripts` 20 个测试。两个原失败用例在
+**Linux** 上也单独复跑确认通过（避免「Windows 过、Linux 挂」的平台侥幸）。
+
 ## v3.2.0 — 2026-10-14
 
 管理台体验修复：账号池卡片不再卡在「正在读取」，日志改中文，切页拉实时积分。
