@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/version"
@@ -37,9 +38,26 @@ const (
 	defaultAPIBase = "https://api.github.com"
 	// maxReleaseBytes 单个下载对象上限，防超大文件把磁盘写满。
 	maxReleaseBytes = 128 << 20
-	// httpTimeout 查版本/下载的超时。
-	httpTimeout = 60 * time.Second
+	// apiTimeout 元数据请求（查版本 / 查仓库可见性）的超时。这类响应只有几 KB，
+	// 60s 足够，超时即说明链路不通。
+	apiTimeout = 60 * time.Second
+	// assetTotalTimeout 单个资产下载的**总**超时上限。
+	//
+	// 为什么不能只用一个 60s：那是整段下载的墙钟上限，与体积无关。运行包 ~19MB，
+	// 60s 内要下完需要 ≥320KB/s——板子这类慢链路上 346KB/s 刚好卡在边缘，直连
+	// （实测 15KB/s）必然失败。2026-10-15 实测：板子热更新报
+	// `download asset: context deadline exceeded`，只下了 652KB/18.9MB。
+	//
+	// 现在改为「总上限放宽到 15 分钟 + 空闲（无字节）30s 即判死」：慢但活着的链路
+	// 能跑完，真正卡死的链路 30s 就退出，不必等满 15 分钟。
+	assetTotalTimeout = 15 * time.Minute
 )
+
+// assetIdleTimeout 资产下载的**空闲**超时：连续这么久没有新字节才判失败。
+// 这才是「链路断了」的判据——按总时长判会把慢链路误杀。
+//
+// 是 var 而不是 const：测试要把它压到毫秒级，否则每个用例都得真等 30 秒。
+var assetIdleTimeout = 30 * time.Second
 
 // Release 一个候选版本。
 type Release struct {
@@ -106,7 +124,7 @@ type Client struct {
 	Token  string // 私有仓库时用；公开仓库留空即可
 	// APIBase 覆盖 GitHub API 根地址（测试用）；空 = 官方地址。
 	APIBase string
-	// ProxyBase 是下载加速代理的前缀（如 https://gh-proxy.com）。
+	// ProxyBase 是下载加速代理的前缀（如 https://v4.gh-proxy.org）。
 	//
 	// 空 = 直连 GitHub。设置后，**资产下载**改走 <ProxyBase>/<原始 GitHub 地址>。
 	//
@@ -115,6 +133,13 @@ type Client struct {
 	// 签名校验**才会被安装（见 manager.go 的验签步骤），所以经过代理不降低信任级别
 	// ——代理能改字节，但改不过签名。
 	ProxyBase string
+
+	// ProxyMirrors 是代理候选列表（依次尝试）。仅当 ProxyBase 取自**默认值**时
+	// 非空——用户显式配置的代理不会被这一串覆盖（见 manager.go NewManager）。
+	//
+	// 非空时资产下载按 ProxyMirrors 顺序逐个试，最后再回落直连。任一节点返回
+	// 403/超时都不致命，换下一个即可。
+	ProxyMirrors []string
 }
 
 // DefaultProxyBase 默认的下载加速代理。
@@ -122,35 +147,73 @@ type Client struct {
 // 国内直连 GitHub 的 releases 经常超时或极慢，热更新因此形同虚设。用户
 // 2026-10-13 明确要求「更新都走 gh-proxy 加速」。
 //
-// 仍可用 config update.proxy 覆盖（设为空串即恢复直连）。
-const DefaultProxyBase = "https://gh-proxy.com"
+// ⚠️ 2026-10-15 修正域名：原值是 `https://gh-proxy.com`，该域名的**下载转发已
+// 整体失效**——实测它自己的下载路径与文档里的示例 URL（连 `torvalds/linux` 的
+// 归档）**全部返回 403**（只有站点首页 HTML 是 200），于是每次热更新都白等一次
+// 403 再回落直连。站点本身还在，但当前可用的加速节点在 **`gh-proxy.org`** 系列：
+// 站点首页「转换链接」给出的线路是 `v4.gh-proxy.org`（cloudflare，主站加速），
+// 另有 `gh-proxy.org` / `v6.gh-proxy.org` / `cdn.gh-proxy.org` / `axisnow.gh-proxy.org`。
+//
+// 选 `v4.gh-proxy.org` 作默认：板子（行空板 M10）实测 1.02 MB/s，19MB 运行包
+// 18.6s 下完；`gh-proxy.org` 346KB/s、`v6` 203KB/s 都更慢，`cdn` 直接超时。
+//
+// 仍可用 config update.proxy 覆盖（传 "-" 即恢复直连）。
+const DefaultProxyBase = "https://v4.gh-proxy.org"
+
+// defaultProxyMirrors 是代理不可用时依次尝试的**同源备选节点**（都属 gh-proxy）。
+//
+// 为什么要有这一串：2026-10-15 实测 `gh-proxy.com` 整站下载转发 403 时，热更新
+// 只能回落直连，而直连在板子上只有 15KB/s——一个镜像失效就等于热更新在慢链路上
+// 全废。多个节点互为备份，单点故障不再致命。
+//
+// 顺序按板子实测速度排（v4 1.02MB/s > gh-proxy.org 346KB/s > v6 203KB/s）。
+// 只在**用户没有显式配置**代理时启用；显式配了 `update.proxy` 就只认那一个，
+// 不擅自替用户改主意。
+var defaultProxyMirrors = []string{
+	"https://v4.gh-proxy.org",
+	"https://gh-proxy.org",
+	"https://v6.gh-proxy.org",
+	"https://ghfast.top",
+}
 
 // NewClient 构造取件客户端；repo 为空回落默认仓库。
 func NewClient(repo, token string) *Client {
 	if strings.TrimSpace(repo) == "" {
 		repo = DefaultRepo
 	}
-	return &Client{Repo: repo, Token: token, HTTP: &http.Client{Timeout: httpTimeout}}
+	return &Client{Repo: repo, Token: token, HTTP: &http.Client{Timeout: apiTimeout}}
 }
 
-// proxied 把 GitHub 地址改写成经加速代理的地址；未配置代理时原样返回。
+// proxied 把 GitHub 地址改写成经**生效代理**的地址；未配置代理时原样返回。
+func (c *Client) proxied(raw string) string {
+	bases := c.proxyBases()
+	if len(bases) == 0 {
+		return raw
+	}
+	if u := c.proxiedVia(bases[0], raw); u != "" {
+		return u
+	}
+	return raw
+}
+
+// proxiedVia 用指定代理前缀改写 GitHub 地址；该地址不属于可代理范围时返回空串。
 //
 // 只对 github.com / *.githubusercontent.com 生效：这条改写会把目标地址拼进 URL，
 // 若不加限制，一个被篡改的 browser_download_url 就能让网关去请求任意主机
 // （SSRF 面）。release.go 里的资产 URL 来自 GitHub API，但纵深防御不依赖上游可信。
-func (c *Client) proxied(raw string) string {
-	base := strings.TrimRight(strings.TrimSpace(c.ProxyBase), "/")
+func (c *Client) proxiedVia(base, raw string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" || raw == "" {
-		return raw
+		return ""
 	}
 	target, err := url.Parse(raw)
 	if err != nil || target.Scheme != "https" {
-		return raw
+		return ""
 	}
 	host := strings.ToLower(target.Hostname())
 	if host != "github.com" && host != "api.github.com" && host != "objects.githubusercontent.com" &&
 		!strings.HasSuffix(host, ".githubusercontent.com") {
-		return raw
+		return ""
 	}
 	return base + "/" + raw
 }
@@ -371,7 +434,7 @@ func (c *Client) DownloadWithProgress(ctx context.Context, release Release, dir 
 		sum, err := c.fetchAsset(ctx, candidate, target, release.AssetSize, want, onProgress)
 		if err == nil {
 			if index > 0 {
-				log.Printf("[update] 加速代理不可用，已回落到直连：%s", candidate)
+				log.Printf("[update] 前序地址不可用，已改用：%s", candidate)
 			}
 			return target, sum, nil
 		}
@@ -384,28 +447,75 @@ func (c *Client) DownloadWithProgress(ctx context.Context, release Release, dir 
 	return "", "", lastErr
 }
 
-// downloadURLs 返回本次下载要依次尝试的地址：代理优先、直连兜底。
+// downloadURLs 返回本次下载要依次尝试的地址：代理候选（按序）→ 直连兜底。
 //
-// 未配置代理时只有一个（直连）；配置了但代理前缀恰好与直连相同（不该发生）也去重，
+// 未配置代理时只有一个（直连）。配置了则把 ProxyMirrors 里每个节点都展开成
+// 一条候选，最后接直连。去重：与直连相同的、以及重复出现的节点只保留一次，
 // 避免把同一个地址试两遍、白等一次超时。
 func (c *Client) downloadURLs(assetURL string) []string {
 	direct := assetURL
-	if c.ProxyBase == "" {
+	bases := c.proxyBases()
+	if len(bases) == 0 {
 		return []string{direct}
 	}
-	proxied := c.proxied(assetURL)
-	if proxied == direct {
+	seen := map[string]bool{direct: true}
+	out := make([]string, 0, len(bases)+1)
+	for _, base := range bases {
+		u := c.proxiedVia(base, assetURL)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	if len(out) == 0 {
 		return []string{direct}
 	}
-	return []string{proxied, direct}
+	return append(out, direct)
+}
+
+// proxyBases 返回本次要尝试的代理前缀列表。
+//
+// ProxyMirrors 非空时以它为准（默认值场景）；否则只认单个 ProxyBase
+// （用户显式配置的场景，不替他加节点）。
+func (c *Client) proxyBases() []string {
+	if len(c.ProxyMirrors) > 0 {
+		out := make([]string, 0, len(c.ProxyMirrors))
+		for _, m := range c.ProxyMirrors {
+			if s := strings.TrimRight(strings.TrimSpace(m), "/"); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if base := strings.TrimRight(strings.TrimSpace(c.ProxyBase), "/"); base != "" {
+		return []string{base}
+	}
+	return nil
 }
 
 // fetchAsset 从 url 下载到 target，校验大小与 sha256 后原子落盘；返回实测摘要。
 //
 // 校验失败**不**回落：那说明拿到的字节是错的（代理篡改、传输损坏），换一条路重来
 // 也应当是同样的内容；真出问题要让它显式报错，而不是靠重试掩盖。
+//
+// 超时口径（2026-10-15 修）：下载用**空闲超时**而不是总时长——连续
+// assetIdleTimeout 没有新字节才判死，整段另设 assetTotalTimeout 上限。此前用的是
+// 60s 总超时（HTTP client 的 Timeout 是墙钟），19MB 的包要 ≥320KB/s 才下得完，
+// 慢链路必然失败（实测板子只下了 652KB/18.9MB 就报 context deadline exceeded）。
 func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize int64, want string, onProgress func(written, total int64)) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// 总时长上限：ctx 由调用方传，这里再叠一层，避免上游给一个无上限的 ctx。
+	ctx, cancelTotal := context.WithTimeout(ctx, assetTotalTimeout)
+	defer cancelTotal()
+
+	// 空闲看门狗必须在**建请求之前**创建，并用它派生的 ctx 建请求。
+	// 否则取消的是子 ctx、而请求挂在父 ctx 上，取消对在途读取毫无影响——
+	// 写这条时实测：看门狗按时触发了，io.Copy 却仍然卡在 Read 上不返回
+	// （测试挂满 120s 超时才发现）。
+	watchdog := newIdleWatchdog(ctx, assetIdleTimeout)
+	defer watchdog.stop()
+
+	req, err := http.NewRequestWithContext(watchdog.ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
@@ -413,6 +523,9 @@ func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize i
 	req.Header.Set("Accept", "application/octet-stream")
 	resp, err := c.do(req)
 	if err != nil {
+		if watchdog.fired() {
+			return "", fmt.Errorf("download asset: 连接后 %v 无数据，链路疑似中断", assetIdleTimeout)
+		}
 		return "", fmt.Errorf("download asset: %w", err)
 	}
 	defer resp.Body.Close()
@@ -432,9 +545,20 @@ func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize i
 	if onProgress != nil {
 		body = &progressReader{reader: body, total: assetSize, report: onProgress}
 	}
+	// 每次读到字节就把看门狗推后；连续 assetIdleTimeout 无进展则取消请求。
+	body = watchdog.wrap(body)
+
 	written, copyErr := io.Copy(io.MultiWriter(file, hasher), body)
 	if copyErr != nil {
+		if watchdog.fired() {
+			return "", fmt.Errorf("download asset: 连续 %v 无数据（已下载 %d/%d 字节），链路疑似中断",
+				assetIdleTimeout, written, assetSize)
+		}
 		return "", fmt.Errorf("download asset: %w", copyErr)
+	}
+	if watchdog.fired() {
+		return "", fmt.Errorf("download asset: 连续 %v 无数据（已下载 %d/%d 字节）",
+			assetIdleTimeout, written, assetSize)
 	}
 	if written > maxReleaseBytes {
 		return "", fmt.Errorf("asset exceeds %d bytes", maxReleaseBytes)
@@ -530,7 +654,7 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	}
 	client := c.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: httpTimeout}
+		client = &http.Client{Timeout: apiTimeout}
 	}
 	copy := *client
 	previous := copy.CheckRedirect
@@ -646,4 +770,96 @@ func (p *progressReader) Read(buffer []byte) (int, error) {
 		p.report(p.read, p.total)
 	}
 	return n, err
+}
+
+// idleWatchdog 是下载的「无进展」看门狗：每次读到字节就把计时器推后，连续
+// timeout 没有任何字节则取消下载上下文。
+//
+// 为什么需要它：HTTP client 的 Timeout 是**整段墙钟**，对十几 MB 的资产下载
+// 等于给了一个与体积挂钩的最低速率要求（19MB/60s = 320KB/s），慢链路必然被误杀。
+// 真正该判死的是「链路断了」——表现为长时间收不到任何字节。两者分开之后，慢但
+// 活着的链路能跑完，卡死的链路不用等满总超时。
+type idleWatchdog struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	timeout time.Duration
+	mu      sync.Mutex
+	timer   *time.Timer
+	firedAt bool
+	stopped bool
+}
+
+// newIdleWatchdog 基于 parent 派生一个可取消的上下文，并启动看门狗。
+//
+// 调用方必须用返回的 w.ctx 去建请求——看门狗取消的就是它。
+func newIdleWatchdog(parent context.Context, timeout time.Duration) *idleWatchdog {
+	ctx, cancel := context.WithCancel(parent)
+	w := &idleWatchdog{ctx: ctx, cancel: cancel, timeout: timeout}
+	w.timer = time.AfterFunc(timeout, func() {
+		w.mu.Lock()
+		// 已完成（stop 过）的下载不该被这次迟到触发标成失败，用 firedAt 区分。
+		if w.stopped {
+			w.mu.Unlock()
+			return
+		}
+		w.firedAt = true
+		w.mu.Unlock()
+		cancel()
+	})
+	// parent 先取消时（用户中断/总超时）一并释放计时器，避免泄漏。
+	go func() {
+		<-ctx.Done()
+		w.stop()
+	}()
+	return w
+}
+
+// wrap 返回一个每读到字节就重置计时器的 Reader。
+func (w *idleWatchdog) wrap(r io.Reader) io.Reader {
+	return &idleReader{reader: r, watchdog: w}
+}
+
+// fired 报告是否因无进展而触发过取消。
+func (w *idleWatchdog) fired() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.firedAt
+}
+
+// stop 停止看门狗；重复调用安全。
+func (w *idleWatchdog) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
+	w.stopped = true
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.cancel()
+}
+
+// idleReader 每次成功读到字节就重置看门狗的计时器。
+type idleReader struct {
+	reader   io.Reader
+	watchdog *idleWatchdog
+}
+
+func (r *idleReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		r.watchdog.reset()
+	}
+	return n, err
+}
+
+// reset 把看门狗的截止时间推后一个 timeout。
+func (w *idleWatchdog) reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped || w.timer == nil {
+		return
+	}
+	w.timer.Reset(w.timeout)
 }

@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestProxiedRewritesGitHubURLs 代理只改写 GitHub 的地址。
@@ -193,5 +195,162 @@ func TestHandoverSupportedMatchesPlatform(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && !HandoverSupported {
 		t.Fatalf("%s 上应当支持运行中交接", runtime.GOOS)
+	}
+}
+
+// ═══ 2026-10-15：镜像链 + 空闲超时 ═══════════════════════════════════════════
+
+// TestDefaultProxyMirrorsExcludeDeadHost 默认镜像链里不能出现已失效的域名。
+//
+// 实测背景：`gh-proxy.com` 的下载转发整体 403（连它自己文档的示例 URL 都 403），
+// 而它当时正是 DefaultProxyBase。留在这里的后果是每次热更新都白等一次 403，
+// 在慢链路上（板子直连 15KB/s）回落直连等于热更新直接不可用。
+func TestDefaultProxyMirrorsExcludeDeadHost(t *testing.T) {
+	for _, m := range defaultProxyMirrors {
+		if strings.Contains(m, "gh-proxy.com") {
+			t.Errorf("镜像链里不该有已失效的 gh-proxy.com：%s", m)
+		}
+		if !strings.HasPrefix(m, "https://") {
+			t.Errorf("镜像必须走 https：%s", m)
+		}
+	}
+	if strings.Contains(DefaultProxyBase, "gh-proxy.com") {
+		t.Errorf("默认代理不该指向 gh-proxy.com（下载转发已 403）：%s", DefaultProxyBase)
+	}
+	if len(defaultProxyMirrors) < 2 {
+		t.Errorf("镜像链至少要两个节点，否则单点故障等于没有备份：%v", defaultProxyMirrors)
+	}
+}
+
+// TestDownloadURLsIncludesMirrors 默认场景下候选应覆盖全部镜像，且直连在最后。
+func TestDownloadURLsIncludesMirrors(t *testing.T) {
+	const asset = "https://github.com/o/r/releases/download/v1/a"
+	c := &Client{ProxyMirrors: append([]string(nil), defaultProxyMirrors...)}
+	got := c.downloadURLs(asset)
+	if len(got) != len(defaultProxyMirrors)+1 {
+		t.Fatalf("候选数 = %d，期望 %d（镜像 + 直连）: %v", len(got), len(defaultProxyMirrors)+1, got)
+	}
+	if got[len(got)-1] != asset {
+		t.Errorf("直连必须是最后一条兜底，实际末条 = %s", got[len(got)-1])
+	}
+	for i, m := range defaultProxyMirrors {
+		if got[i] != m+"/"+asset {
+			t.Errorf("第 %d 条 = %s，期望 %s", i, got[i], m+"/"+asset)
+		}
+	}
+}
+
+// TestDownloadURLsDedupes 重复的镜像与「与直连相同」的条目都要去掉，
+// 否则会把同一个地址试两遍、白等一次超时。
+func TestDownloadURLsDedupes(t *testing.T) {
+	const asset = "https://github.com/o/r/releases/download/v1/a"
+	c := &Client{ProxyMirrors: []string{"https://a.example", "https://a.example/", "https://b.example"}}
+	got := c.downloadURLs(asset)
+	if len(got) != 3 {
+		t.Fatalf("去重后候选数 = %d，期望 3: %v", len(got), got)
+	}
+	if got[0] != "https://a.example/"+asset || got[1] != "https://b.example/"+asset {
+		t.Fatalf("去重结果不对: %v", got)
+	}
+}
+
+// TestExplicitProxyHasNoMirrors 用户显式配了代理就只认那一个，不擅自加节点。
+func TestExplicitProxyHasNoMirrors(t *testing.T) {
+	const asset = "https://github.com/o/r/releases/download/v1/a"
+	m := NewManager(Options{Proxy: "https://my-proxy.example"})
+	if len(m.client.ProxyMirrors) != 0 {
+		t.Fatalf("显式代理不该带镜像链: %v", m.client.ProxyMirrors)
+	}
+	if got := m.client.downloadURLs(asset); len(got) != 2 || got[0] != "https://my-proxy.example/"+asset {
+		t.Fatalf("显式代理候选 = %v", got)
+	}
+	// 默认（空）时才装镜像链。
+	if dm := NewManager(Options{Proxy: ""}); len(dm.client.ProxyMirrors) != len(defaultProxyMirrors) {
+		t.Fatalf("默认应装镜像链，实际 %v", dm.client.ProxyMirrors)
+	}
+	// 显式直连也不该装。
+	if off := NewManager(Options{Proxy: "-"}); len(off.client.ProxyMirrors) != 0 {
+		t.Fatalf(`"-" 直连不该带镜像链: %v`, off.client.ProxyMirrors)
+	}
+}
+
+// TestIdleWatchdogFiresOnStall 卡住的读（永不返回）应在空闲超时后被取消，
+// 而不是一直挂着。这是板子「慢链路被 60s 总超时误杀」的反面：真正该判死的是
+// **长时间收不到字节**，看门狗正是这个判据。
+func TestIdleWatchdogFiresOnStall(t *testing.T) {
+	// handler 必须随请求上下文退出，否则 httptest.Close() 会一直等在途请求
+	// （Close 会等所有 handler 返回，而 handler 卡住就成了死锁——写这条用例时
+	// 实测挂满 600s 才被发现）。
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x")) // 先给一个字节，之后卡住
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done() // 客户端取消（看门狗触发）时才返回
+	}))
+	defer stalled.Close()
+
+	c := NewClient("", "")
+	c.HTTP = &http.Client{} // 去掉 client 级 Timeout，只留看门狗在起作用
+	// 把看门狗超时压到很短，避免测试真的等 30s。
+	old := assetIdleTimeout
+	assetIdleTimeout = 300 * time.Millisecond
+	defer func() { assetIdleTimeout = old }()
+
+	start := time.Now()
+	_, err := c.fetchAsset(context.Background(), stalled.URL, filepath.Join(t.TempDir(), "a"), 1024, "", nil)
+	if err == nil {
+		t.Fatal("卡住的下载应当失败，实际成功了")
+	}
+	if !strings.Contains(err.Error(), "无数据") {
+		t.Fatalf("错误应说明是无进展，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("看门狗没生效，等了 %v", elapsed)
+	}
+}
+
+// TestIdleWatchdogAllowsSlowButAlive 慢但**持续有字节**的下载不该被误杀。
+//
+// 这正是原实现的问题：60s 总超时对 19MB 资产等于要求 ≥320KB/s，板子这类慢链路
+// 必然失败（实测只下了 652KB 就报 context deadline exceeded）。分块慢发时，
+// 只要每块间隔小于空闲超时，就该完整下完。
+func TestIdleWatchdogAllowsSlowButAlive(t *testing.T) {
+	content := []byte(strings.Repeat("payload!", 4096)) // 32KB
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		chunk := len(content) / 8
+		for off := 0; off < len(content); off += chunk {
+			end := off + chunk
+			if end > len(content) {
+				end = len(content)
+			}
+			_, _ = w.Write(content[off:end])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(50 * time.Millisecond) // 远小于空闲超时
+		}
+	}))
+	defer slow.Close()
+
+	old := assetIdleTimeout
+	assetIdleTimeout = 2 * time.Second
+	defer func() { assetIdleTimeout = old }()
+
+	c := NewClient("", "")
+	target := filepath.Join(t.TempDir(), "slow")
+	got, err := c.fetchAsset(context.Background(), slow.URL, target, int64(len(content)), digest, nil)
+	if err != nil {
+		t.Fatalf("慢但活着下载应当成功: %v", err)
+	}
+	if got != digest {
+		t.Fatalf("摘要 = %s，期望 %s", got, digest)
 	}
 }

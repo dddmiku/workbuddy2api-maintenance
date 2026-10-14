@@ -209,7 +209,7 @@ func TestNewClientDefaultsRepoAndTimeout(t *testing.T) {
 	if client.Repo != DefaultRepo {
 		t.Fatalf("repo = %q want default", client.Repo)
 	}
-	if client.Token != "token" || client.HTTP == nil || client.HTTP.Timeout != httpTimeout {
+	if client.Token != "token" || client.HTTP == nil || client.HTTP.Timeout != apiTimeout {
 		t.Fatalf("client = %+v", client)
 	}
 	if client.apiBase() != defaultAPIBase {

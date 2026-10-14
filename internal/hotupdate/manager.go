@@ -134,11 +134,15 @@ func NewManager(opts Options) *Manager {
 	// 下载加速：默认走代理（国内直连 releases 经常超时，热更新等于没有）。
 	// 传 "-" 表示显式关闭（直连 GitHub）——留空与「不想要代理」无法区分，
 	// 所以用一个不可能与真实地址冲突的哨兵值。
+	//
+	// 默认（空）时同时装上备选节点列表：单个镜像失效（实测 gh-proxy.com 整站
+	// 下载 403）不该让慢链路上的热更新直接不可用。用户显式配了地址就只认那一个。
 	switch strings.TrimSpace(opts.Proxy) {
 	case "-":
 		manager.client.ProxyBase = ""
 	case "":
 		manager.client.ProxyBase = DefaultProxyBase
+		manager.client.ProxyMirrors = append([]string(nil), defaultProxyMirrors...)
 	default:
 		manager.client.ProxyBase = strings.TrimSpace(opts.Proxy)
 	}
