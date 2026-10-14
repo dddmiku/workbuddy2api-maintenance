@@ -188,14 +188,22 @@ func TestPaidModelFilterRecordsDecision(t *testing.T) {
 //
 // 关掉 minPickGap：它默认 100ms，紧循环里会把上一个号挤出候选、强制严格轮换，
 // 分布断言就测不出权重了（这是防惊群在起作用，不是权重失效）。
+//
+// ⚠️ 2026-10-14 修偶发失败（CI 实测 rich=199 poor=201，约 3% 概率翻盘）：
+// 原参数下两者权重只差约 12%，抽签容易翻。注意**快过期加成是占比口径**
+// （creditsExpiring/credits × expiringWeight），不是绝对量——原来给两个号
+// 同样 100 的快过期积分，而 poor 的 credits 只有 100（占比 100%），rich 的
+// credits 是 10000（占比 1%），于是 poor 在这一项上反超 rich 近 8 分，几乎抹平
+// 了余额差。现在给 rich 的快过期积分也按比例放大（同样占比），让余额优势成为
+// 唯一显著变量，断言才有确定性。
 func TestPaidModelFilterKeepsOtherFactors(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "rich"})
 	p.Add(&auth.Auth{UID: "poor"})
-	// 两者都有快过期积分（都过过滤），但 rich 余额高得多 → 权重应显著更高。
+	// 两者快过期占比相同（都是 1%），余额差 100 倍 → credits 项应显著偏向 rich。
 	p.SetCreditsDetailed("rich", 10000, 100)
-	p.SetCreditsDetailed("poor", 100, 100)
+	p.SetCreditsDetailed("poor", 100, 1)
 	p.SetPaidModels(map[string]bool{"paid-model": true})
 	rich, poor := 0, 0
 	for i := 0; i < 400; i++ {
@@ -208,6 +216,8 @@ func TestPaidModelFilterKeepsOtherFactors(t *testing.T) {
 			poor++
 		}
 	}
+	// credits 项 rich 11.0 vs poor 1.1，其余项相同 → 权重比约 2:1，
+	// 400 次抽签下 rich 应稳定占多数（P(翻盘) 远低于 1e-6）。
 	if rich <= poor {
 		t.Errorf("过滤后仍应按原权重（余额高的更多被选）：rich=%d poor=%d", rich, poor)
 	}
