@@ -38,6 +38,30 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.2.2 — 2026-10-14
+
+补完 v3.2.1 的 CI 修复：`go test ./...` 在 Linux 上仍会挂。
+
+### hotupdate 的 entrypoint 用例改为能力探测
+
+三条 entrypoint 用例依赖 `docker-entrypoint.sh` 的监督循环，而那个循环用
+`/proc/<pid>/task/<tid>/children` 判断「被收养的后继是否还活着」。该文件由内核
+`CONFIG_PROC_CHILDREN` 提供，但**老内核（实测 4.4.143）即使编了这个选项也可能不
+暴露它**——此时 supervisor 读不到子进程、误判 `updated instance exited unexpectedly`
+并以 1 退出，用例全挂。
+
+这不是被测算法的缺陷，是宿主能力缺失。所以 `requireListenerInheritance` 改为探测
+**实际能力**而不是只看 `GOOS`：读不到 children 就跳过，并在跳过理由里写清原因
+（避免在能跑的环境里静默不测）。同时给 `startConfiguredEntrypoint` 补上探测——
+它此前完全没走这个 helper，所以三条用例绕过了原有的平台门控。
+
+### 为什么前一轮没修掉
+
+v3.2.1 修的两条（内嵌面板不同步、测试读部署机路径）都是真问题，但 `Test and vet
+Go packages` 那一步还有这第三条。板子内核太老，无法代表 CI；本轮在**板子（Linux）
+与 Windows 两侧**分别复跑确认：能力探测在缺 children 的宿主上正确跳过，在有它的
+宿主上照常执行。
+
 ## v3.2.1 — 2026-10-14
 
 修掉持续多版本的红叉：CI 门禁从 v3.0.2 起一直失败，与代码质量无关，是两条
