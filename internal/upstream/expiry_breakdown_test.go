@@ -100,7 +100,14 @@ func TestScheduleSortsAndMerges(t *testing.T) {
 	// 基准时刻先截到整分：本用例靠「相差 5 秒应合并」验证同刻合并，而合并粒度是
 	// 分钟。若直接用 time.Now()，当基准秒数 >= :55 时 +5s 会跨过分钟边界，
 	// 两条就不再同刻、合并断言随机失败（2026-10-10 在整套测试里复现过一次）。
-	now := time.Now().Truncate(time.Minute)
+	//
+	// 2026-10-14 修时区：时间戳用 packageEndLayout 生成、解析时按 softRateResetLoc
+	// （固定 UTC+8）还原。两者时区必须一致——此前这里用 time.Now()（本地时区），
+	// 在 UTC 的 CI runner 上生成 "2026-10-14 14:33:00" 会被当成 CST 解析，
+	// 结果比 now 早 8 小时，`End == now+20h` 断言必挂（本地 CST 机器上恰好相等，
+	// 所以只有 CI 红）。改用 SoftRateResetLoc() 生成，与解析口径对齐。
+	loc := SoftRateResetLoc()
+	now := time.Now().In(loc).Truncate(time.Minute)
 	mk := func(d time.Duration) string { return now.Add(d).Format(packageEndLayout) }
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		// 故意乱序，且前两条相差 5 秒（应合并）。
