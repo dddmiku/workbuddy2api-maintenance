@@ -244,7 +244,7 @@ func (s *Scheduler) growthOne(ctx context.Context, a *auth.Auth) {
 	}
 	s.growthTail(ctx, a, o, streakSnap, streakStale)
 
-	log.Printf("growth %s: %s", uid8, o.report())
+	log.Printf("成长中心 %s：%s", uid8, o.report())
 }
 
 // ── 各段实现 ───────────────────────────────────────────────────────────────

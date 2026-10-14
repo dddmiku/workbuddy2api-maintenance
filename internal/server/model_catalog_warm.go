@@ -43,7 +43,7 @@ func (h *Handler) WarmModelCatalogs(ctx context.Context) {
 			// 失败退避（1 分钟起翻倍，最长 30 分钟），避免上游目录接口故障期间每分钟告警。
 			next = retry
 			retry = min(retry*2, modelCatalogWarmInterval)
-			log.Printf("WARN: [server] model catalog warm-up incomplete (models=%d); retrying in %s", models, next)
+			log.Printf("WARN: [服务] 模型目录预热未完成（已取 %d 个），%s 后重试", models, next)
 		}
 		timer.Reset(next)
 	}

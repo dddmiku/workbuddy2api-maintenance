@@ -345,7 +345,7 @@ func loadConfigOrEnv(path string) (*Config, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	log.Printf("config %s not found, using defaults+env", path)
+	log.Printf("未找到配置文件 %s，改用默认值 + 环境变量", path)
 	return Load("")
 }
 

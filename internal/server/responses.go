@@ -2152,7 +2152,7 @@ func (req *responsesRequest) limitParallelToolCalls(chat map[string]any) {
 }
 
 func logDroppedParallelCalls(count int) {
-	log.Printf("WARN: [server] upstream returned %d tool calls despite parallel_tool_calls=false; delivering the first only", count)
+	log.Printf("WARN: [服务] 上游在 parallel_tool_calls=false 下仍返回 %d 个工具调用，只交付第一个", count)
 }
 
 func legacyResponseFunction(message map[string]any) map[string]any {

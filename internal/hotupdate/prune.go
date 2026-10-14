@@ -85,12 +85,12 @@ func pruneUpdateDir(dir, current string) {
 
 func removeAndLog(path string) {
 	if err := os.Remove(path); err == nil {
-		log.Printf("[update] removed %s", path)
+		log.Printf("[热更新] 已删除 %s", path)
 	}
 }
 
 func removeAllAndLog(path string) {
 	if err := os.RemoveAll(path); err == nil {
-		log.Printf("[update] removed %s", path)
+		log.Printf("[热更新] 已删除 %s", path)
 	}
 }

@@ -236,16 +236,31 @@ func creditStateFrom(credit, pool map[string]any) CreditState {
 	}
 }
 
+// poolTotalsFrom 从网关 /status 的响应里取「账号池」汇总。
+//
+// ⚠️ 2026-10-14 修：此前取的是 pool["pool"]（一个**嵌套**对象），但 /status 实际
+// 返回的是**顶层扁平**结构——total / healthy / cooling / disabled / in_flight_full /
+// realm_totals / sticky_sessions 全在最外层，根本没有 "pool" 键。于是这里全部取到
+// nil，前端判据 `pool.total != null` 不成立，账号池卡片永远停在「正在读取…」。
+//
+// 兼容两种形态：优先读嵌套（旧 Python 面板 / 未来若改成嵌套），缺失时回落顶层。
+// 不假设只有一种，是因为面板与网关可以各自独立升级。
 func poolTotalsFrom(pool map[string]any) PoolTotals {
 	section := jsonObject(pool["pool"])
+	pick := func(key string) any {
+		if v, ok := section[key]; ok && v != nil {
+			return v
+		}
+		return pool[key]
+	}
 	return PoolTotals{
-		Total:          section["total"],
-		Healthy:        section["healthy"],
-		Cooling:        section["cooling"],
-		Disabled:       section["disabled"],
-		InFlightFull:   section["in_flight_full"],
-		RealmTotals:    section["realm_totals"],
-		StickySessions: section["sticky_sessions"],
+		Total:          pick("total"),
+		Healthy:        pick("healthy"),
+		Cooling:        pick("cooling"),
+		Disabled:       pick("disabled"),
+		InFlightFull:   pick("in_flight_full"),
+		RealmTotals:    pick("realm_totals"),
+		StickySessions: pick("sticky_sessions"),
 	}
 }
 

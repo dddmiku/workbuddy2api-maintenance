@@ -368,7 +368,7 @@ func (p *Pool) pickEarliestExpiryWithDecisionLocked(tried map[string]bool, now t
 		mc, known := best.modelCostOf(reqModel, now)
 		d.selected(best, decisionCostOf(best, reqModel, now, mc, known), false)
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [账号池] 回落最早到期号 uid=%s 截止=%s 类型=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	return best.a
 }

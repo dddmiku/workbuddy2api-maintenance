@@ -1063,7 +1063,7 @@ func (s *Store) loop() {
 			return
 		case <-ticker.C:
 			if err := s.Flush(); err != nil {
-				log.Printf("WARN: [usage] ledger flush failed: %v", err)
+				log.Printf("WARN: [用量] 账本落盘失败：%v", err)
 			}
 		}
 	}

@@ -302,7 +302,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
+			log.Printf("[Redis] 调试：写绑定 %s：%v", key, err)
 		}
 	})
 }
@@ -313,7 +313,7 @@ func (u *Upstash) DelBind(key string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
+			log.Printf("[Redis] 调试：删绑定 %s：%v", key, err)
 		}
 	})
 }
@@ -324,7 +324,7 @@ func (u *Upstash) SaveState(data []byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
-			log.Printf("[redisstore] debug: SaveState: %v", err)
+			log.Printf("[Redis] 调试：保存状态：%v", err)
 		}
 	})
 }

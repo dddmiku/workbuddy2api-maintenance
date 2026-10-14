@@ -32,10 +32,10 @@ const (
 func chownApp(path string) {
 	if os.Geteuid() == 0 {
 		if err := os.Chown(path, gatewayUID, gatewayGID); err != nil {
-			log.Printf("chown %s failed: %v", path, err)
+			log.Printf("修改属主失败 %s：%v", path, err)
 		}
 	}
 	if err := os.Chmod(path, 0600); err != nil {
-		log.Printf("chmod %s failed: %v", path, err)
+		log.Printf("修改权限失败 %s：%v", path, err)
 	}
 }

@@ -17,6 +17,6 @@ import (
 // 「文件被别的进程锁住/权限模型异常」这类问题仍然留痕。
 func chownApp(path string) {
 	if err := os.Chmod(path, 0600); err != nil {
-		log.Printf("chmod %s failed: %v", path, err)
+		log.Printf("修改权限失败 %s：%v", path, err)
 	}
 }

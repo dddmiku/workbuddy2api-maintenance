@@ -60,7 +60,7 @@ func (h *Handler) withGeneration(protocol requestlog.Protocol, next http.Handler
 				case r.Context().Err() != nil:
 					return
 				default:
-					log.Printf("WARN: [key-limits] admission unavailable: %v", err)
+					log.Printf("WARN: [密钥限额] 准入检查不可用：%v", err)
 					writeOpenAIError(w, 503, "key_limits_unavailable", "key admission is temporarily unavailable; retry later")
 				}
 				return

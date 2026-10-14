@@ -115,10 +115,10 @@ func runScriptContext(ctx context.Context, name, root string, commands [][]strin
 			err = c.Run()
 		}
 		if err != nil {
-			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
+			log.Printf("WARN: %s（%s）执行失败：%v", name, cmdArgs[1], err)
 			continue
 		}
-		log.Printf("%s: ok (%s)", name, cmdArgs[1])
+		log.Printf("%s 执行成功（%s）", name, cmdArgs[1])
 	}
 }
 

@@ -446,7 +446,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+					log.Printf("WARN: 凭据 %s 补写 realm 落盘失败：%v", logfmt.UID8(a.UID), err)
 				} else if r == "global" {
 					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
 				}

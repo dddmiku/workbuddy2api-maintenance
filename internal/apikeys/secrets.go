@@ -226,7 +226,7 @@ func (s *Store) captureSecretLocked(id, secret string, authenticated Info) (Info
 			}
 		}
 		s.copyRetryAfter = time.Now().Add(time.Minute)
-		log.Printf("WARN: [api-keys] encrypted copy could not be saved; digest authentication remains available")
+		log.Printf("WARN: [密钥管理] 加密副本保存失败，摘要认证仍可用")
 		return info, true
 	}
 	return Info{}, false

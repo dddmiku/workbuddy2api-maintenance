@@ -621,7 +621,7 @@ func (s *streamState) observe(obj map[string]any) error {
 			if mapped {
 				// 上游自造的终止值：保留正文并按正常结束收尾，同时留一条 WARN。
 				// 这是可观测性的关键——静默映射会让上游行为变化无从发现。
-				log.Printf("WARN: [upstream] unknown finish_reason %q mapped to %q model=%s", reason, normalized, s.model)
+				log.Printf("WARN: [上游] 未知 finish_reason %q 已映射为 %q 模型=%s", reason, normalized, s.model)
 			}
 			state.finishReason = normalized
 			// WorkBuddy may send a finish marker before the final argument delta or

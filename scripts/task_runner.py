@@ -700,18 +700,18 @@ def _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=False):
     tag = " web" if via_web else ""
     if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
         msg = r.get("msg") if isinstance(r, dict) else r
-        print(f"[task_runner] {uid8} {code}: claim{tag} {st} {msg} -> ERR")
+        print(f"[task_runner] {uid8} {code}: 领奖{tag} 失败 {st} {msg}")
         stats["fail"] += 1
         return 0
     data = r.get("data") or {}
     credit = data.get("credit") or 0
     energy = data.get("energy") or 0
     if data.get("already_claimed"):
-        print(f"[task_runner] {uid8} {code}: claim{tag} 200 already_claimed(credit=+{credit} energy=+{energy})")
+        print(f"[task_runner] {uid8} {code}: 领奖{tag} 已领过（积分 +{credit} 能量 +{energy}）")
         stats["already"] += 1
         time.sleep(gap)
         return 2
-    print(f"[task_runner] {uid8} {code}: claim{tag} 200 ok(credit=+{credit} energy=+{energy})")
+    print(f"[task_runner] {uid8} {code}: 领奖{tag} 成功（积分 +{credit} 能量 +{energy}）")
     stats["ok"] += 1
     stats["credit"] += credit
     stats["energy"] += energy
@@ -741,7 +741,7 @@ def claim_one(auth, code, uid8, stats, gap):
         if st == 400:
             print(f"[task_runner] {uid8} {code}: claim 400 {msg} -> 降级 web 域")
             return _claim_via_web(auth, code, uid8, stats, gap)
-        print(f"[task_runner] {uid8} {code}: claim {st} {msg} -> ERR")
+        print(f"[task_runner] {uid8} {code}: 领奖失败 {st} {msg}")
         stats["fail"] += 1
         return 0
     return _claim_parse(auth, code, uid8, stats, gap, st, r)
@@ -843,7 +843,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
     if ast == "not_accepted":
         st_a, r_a = tc.accept_tasks(auth, [code])
         msg = r_a.get("msg") if isinstance(r_a, dict) else r_a
-        print(f"[task_runner] {uid8} {code}: accept {st_a} {msg}")
+        print(f"[task_runner] {uid8} {code}: 接单 {st_a} {msg}")
         time.sleep(opts.gap)
         if st_a != 200:
             stats["fail"] += 1
@@ -867,8 +867,8 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
             msg = f"req-{ms}-{i}-user"
             events = desktop_chat_sequence(auth, conv, req, msg, "fast-model", "fast-model")
             st_r, sc = report_desktop_events(auth, events)
-            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
-                  f"deskchain conv={conv}")
+            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
+                  f"桌面对话链 conv={conv}")
             if i < need - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
@@ -886,10 +886,10 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                           "elementName": buddy_name, "position": 1,
                           "isFirstPage": "0", "userId": auth["uid"]}
                 st2, sc2 = report_desktop_events(auth, [single])
-                print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
+                print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
                       f"buddy5 失败 -> 降级单发 {st2} code={sc2}")
             else:
-                print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
+                print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
                       f"buddy5 id={buddy_id}")
             if i < need - 1:
                 time.sleep(opts.gap)
@@ -899,8 +899,8 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
         for i in range(need):
             st_r, sc = report_web_event(auth, "web_element_click", LIBRARY_DOC_URL,
                                         "library_doc_intro_click", "WorkBuddy资料库介绍")
-            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
-                  f"web_element_click")
+            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
+                  f"web 元素点击")
             if i < need - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
@@ -914,7 +914,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
             ev = build_event(auth, spec["kind"], obj_id, m, i)
             st_r, r_r = tc.do_post(auth, tc.billing_base(auth), tc.PATH_REPORT, [ev])
             sc = r_r.get("code") if isinstance(r_r, dict) else r_r
-            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} id={obj_id}")
+            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} id={obj_id}")
             if i < len(ids) - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
@@ -924,7 +924,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
     prog2 = (t2.get("progress") or {}) if t2 else {}
     cur2 = prog2.get("current", 0)
     ast2 = t2.get("accept_status") if t2 else "?"
-    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', tgt)} accept_status={ast2}")
+    print(f"[task_runner] {uid8} {code}: 回读进度 {cur2}/{prog2.get('target', tgt)} 接单状态={ast2}")
     if ast2 != "claimed" and cur2 >= prog2.get("target", tgt):
         claim_one(auth, code, uid8, stats, opts.gap)
     elif ast2 != "claimed":
@@ -937,13 +937,13 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
 # --------------------------------------------------------------------------
 def process_account(auth, opts, stats):
     uid8 = auth["uid"][:8]
-    print(f"== {uid8} ({auth['nick']}) ==")
+    print(f"== 账号 {uid8}（{auth['nick']}）==")
     # 只读 oracle：能量余额（上下文参考，dry-run/REAL 都显示）
     try:
         st_e, r_e = tc.do_get(auth, tc.chat_base(auth), PATH_ENERGY)
         if st_e == 200 and isinstance(r_e, dict) and r_e.get("code") == 0:
             bal = (r_e.get("data") or {}).get("balance", "?")
-            print(f"[task_runner] {uid8} query energy balance={bal}")
+            print(f"[task_runner] {uid8} 查能量 余额={bal}")
     except Exception:
         pass
     try:
@@ -986,7 +986,7 @@ def process_account(auth, opts, stats):
 # 汇总
 # --------------------------------------------------------------------------
 def print_summary(stats):
-    print(f"task_runner done: accounts={stats['accounts']} total={stats['total']} "
+    print(f"task_runner 执行完成：账号={stats['accounts']} 总计={stats['total']} "
           f"ok={stats['ok']} already={stats['already']} skipped={stats['skip']} "
           f"pending={stats['pending']} fail={stats['fail']} "
           f"credit=+{stats['credit']} energy=+{stats['energy']}")
@@ -1025,8 +1025,8 @@ def main():
             prefixes2.append(p)
 
     mode = "REAL" if a.yes else "DRY-RUN"
-    print(f"mode={mode} accounts={prefixes2} only={a.only_codes or 'all'} "
-          f"only_claim={a.only_claim} gap={a.gap}")
+    print(f"模式={mode} 账号={prefixes2} 仅指定={a.only_codes or 'all'} "
+          f"仅领奖={a.only_claim} 间隔={a.gap}")
     if a.yes and len(prefixes2) > 2 and not a.only_codes and not a.only_claim:
         print("WARN: 全量批量 + --yes 未限定 --only，注意 54 号批量——请确认 Hermes 决策后再跑")
 
@@ -1034,7 +1034,7 @@ def main():
         try:
             c = tc.load_auth(p)
         except SystemExit as e:
-            print(f"ERR: {e}")
+            print(f"错误：{e}")
             stats["fail"] += 1
             continue
         stats["accounts"] += 1

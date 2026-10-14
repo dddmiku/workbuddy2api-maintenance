@@ -209,7 +209,7 @@ def fetch_profile(token, which):
 def list_account(auth, stats):
     """只读盘点单个账号。"""
     uid8 = (auth.get("uid") or "")[:8] or "?"
-    print(f"== {uid8} ({auth.get('nick') or '-'}) ==")
+    print(f"== 账号 {uid8}（{auth.get('nick') or '-'}）==")
     try:
         tasks, in_period = fetch_school_tasks(auth["token"])
     except (AuthError, RuntimeError) as e:
@@ -217,7 +217,7 @@ def list_account(auth, stats):
         stats["fail"] += 1
         tasks, in_period = [], False
 
-    print(f"[school2026] {uid8} school/tasks in_period={in_period} tasks={len(tasks)}")
+    print(f"[school2026] {uid8} 开学季任务 活动期内={in_period} 任务数={len(tasks)}")
     for t in tasks:
         code = t.get("task_code") or "?"
         status = t.get("status") or "?"
@@ -228,13 +228,13 @@ def list_account(auth, stats):
         mode = spec.get("mode", "unknown")
         reward = t.get("reward_credit") or 0
         title = t.get("title") or ""
-        print(f"  - {code:<20} status={status:<10} {prog}/{target} reward={reward:>3} "
+        print(f"  - {code:<20} 状态={status:<10} {prog}/{target} 奖励={reward:>3} "
               f"[{kinds}/{mode}] {title}")
         desc = (t.get("description") or "").strip()
         if desc:
-            print(f"      desc: {desc}")
+            print(f"      说明: {desc}")
         if spec.get("note"):
-            print(f"      note: {spec['note']}")
+            print(f"      备注: {spec['note']}")
     if not tasks:
         print("  (无任务 / 未登录或活动未开启)")
 
@@ -248,8 +248,8 @@ def list_account(auth, stats):
         if d is None:
             print(f"[school2026] {uid8} {which}/profile -> 空")
             continue
-        print(f"[school2026] {uid8} {which}/profile claimed={d.get('claimed')} "
-              f"enabled={d.get('enabled')}")
+        print(f"[school2026] {uid8} {which}/档案 已领={d.get('claimed')} "
+              f"启用={d.get('enabled')}")
     stats["accounts"] += 1
 
 
@@ -608,12 +608,12 @@ def run_account(auth, opts, stats):
                 try:
                     if mode == "share":
                         st, r = post_share_complete(auth["token"])
-                        print(f"[school2026] {uid8} {code}: share-complete {st} "
+                        print(f"[school2026] {uid8} {code}: 分享完成 {st} "
                               f"code={r.get('code') if isinstance(r, dict) else r}")
                     else:
                         events, host, extra_h = make_report_events(auth, spec.get("report_kind"))
                         st, r = report_events(auth, events, host=host, extra_headers=extra_h)
-                        print(f"[school2026] {uid8} {code}: report #{ri+1}/{rounds} "
+                        print(f"[school2026] {uid8} {code}: 上报 第 {ri+1}/{rounds} 轮 "
                               f"{len(events)} 事件 -> http={st} "
                               f"code={r.get('code') if isinstance(r, dict) else r}")
                 except (AuthError, RuntimeError) as e:
@@ -655,7 +655,7 @@ def run_account(auth, opts, stats):
             if after == "completed":
                 try:
                     stc, rc = post_claim(auth["token"], code)
-                    print(f"[school2026] {uid8} {code}: claim {stc} "
+                    print(f"[school2026] {uid8} {code}: 领奖 {stc} "
                           f"code={rc.get('code') if isinstance(rc, dict) else rc}")
                     time.sleep(opts.gap)
                 except (AuthError, RuntimeError) as e:
@@ -719,8 +719,8 @@ def lottery_account(auth, opts, stats, count_account=True):
         print(f"[school2026] {uid8} lottery balance=0（累计获得 {total_earned} 次），无需抽奖")
         return
 
-    print(f"[school2026] {uid8} lottery balance={bal} total_earned={total_earned} "
-          f"lottery_limit={lottery_limit}（开始抽奖，抽到空为止）")
+    print(f"[school2026] {uid8} 抽奖 余额={bal} 累计获得={total_earned} "
+          f"抽奖上限={lottery_limit}（开始抽奖，抽到空为止）")
 
     results = []
     total_credit = 0
@@ -763,7 +763,7 @@ def lottery_account(auth, opts, stats, count_account=True):
         label = lottery_prize_text(prize_code, credit)
         results.append({"prize_code": prize_code, "credit": credit, "label": label})
         total_credit += credit
-        print(f"[school2026] {uid8} draw -> {label}（balance {bal}）")
+        print(f"[school2026] {uid8} 抽奖 -> {label}（余额 {bal}）")
         if bal > 0:
             time.sleep(opts.gap)
 
@@ -813,7 +813,7 @@ def main():
     if run_mode and not a.yes:
         print(f"mode={mode} dry-run（写操作需 --yes 放行；{mode} 不带 --yes 只打印将发送的动作）")
     else:
-        print(f"mode={mode} {'REAL' if a.yes else ''} gap={a.gap}")
+        print(f"模式={mode} {'真实执行' if a.yes else '试运行'} 间隔={a.gap}")
 
     auths = []
     if a.token:
@@ -835,7 +835,7 @@ def main():
             try:
                 auths.append(tc.load_auth(p))
             except SystemExit as e:
-                print(f"ERR: {e}")
+                print(f"错误：{e}")
 
     if not auths:
         print("ERR: 无可用账号（检查 auths/ 或 --token）")
@@ -860,7 +860,7 @@ def main():
             print(f"ERR: [school2026] {uid8} 处理失败: {e}")
             stats["fail"] += 1
 
-    print(f"school2026 done: accounts={stats['accounts']} ok={stats['ok']} "
+    print(f"school2026 执行完成：账号={stats['accounts']} 成功={stats['ok']} "
           f"already={stats['already']} skipped={stats['skip']} pending={stats['pending']} "
           f"fail={stats['fail']}")
     print_notes()

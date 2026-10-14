@@ -131,5 +131,5 @@ func warnIgnoredBuiltinTools(w http.ResponseWriter, r *http.Request, tools []any
 	w.Header().Set("X-WB2API-Ignored-Tools", value)
 	w.Header().Set("X-Gateway-Capabilities", "/v1/capabilities")
 	w.Header().Add("Warning", `299 workbuddy2api "Unsupported built-in tool declarations were ignored: `+value+`"`)
-	log.Printf("WARN: [server] rid=%s ignored_builtin_tools=%s; see /v1/capabilities", requestID(r), strings.Join(names, ","))
+	log.Printf("WARN: [服务] rid=%s 已忽略内置工具=%s；详见 /v1/capabilities", requestID(r), strings.Join(names, ","))
 }

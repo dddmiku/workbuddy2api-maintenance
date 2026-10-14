@@ -87,7 +87,7 @@ func main() {
 			a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			// #nosec G706 -- UID 由本机 auth 文件给出，非网络输入
 			if err := a.SaveAtomic(); err != nil {
-				log.Printf("signin %s save: %v", a.UID, err)
+				log.Printf("签到 %s 落盘凭据失败：%v", a.UID, err)
 			}
 		}
 

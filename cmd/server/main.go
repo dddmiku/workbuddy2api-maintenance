@@ -81,7 +81,7 @@ func main() {
 			log.Fatalf("load usage ledger: %v", err)
 		}
 		defer usageStore.Close()
-		log.Printf("usage ledger enabled: %s", cfg.UsageFile)
+		log.Printf("用量账本已启用：%s", cfg.UsageFile)
 	}
 	var keyLimits *keylimit.Manager
 	var requestStore *requestlog.Store
@@ -94,7 +94,7 @@ func main() {
 	if cfg.UsageFile != "" {
 		requestStore, err = requestlog.Open(filepath.Join(filepath.Dir(cfg.UsageFile), "requests.jsonl"), requestlog.Options{})
 		if err != nil {
-			log.Printf("WARN: [requests] detail storage unavailable; cumulative usage remains enabled: %v", err)
+			log.Printf("WARN: [请求明细] 存储不可用，累计用量仍正常记录：%v", err)
 		}
 	}
 	// 任务日志落盘：面板的「最近一次日志」原本是纯内存的，容器一重启就没了，
@@ -123,7 +123,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	log.Printf("已加载 %d 个账号（来自 %s）", len(auths), cfg.AuthDir)
 
 	// global realm 路由开关（config global.enabled，缺省 true）：注入 auth 包全局闸。
 	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
@@ -313,7 +313,7 @@ func main() {
 	defer mainLn.Close()
 	if inherited {
 		// #nosec G706 -- fd 号来自本进程继承的监听套接字环境变量，不是外部输入
-		log.Printf("[update] inherited listening socket from the previous instance (fd=%s)",
+		log.Printf("[热更新] 已从上一个实例接管监听套接字（fd=%s）",
 			os.Getenv(hotupdate.EnvListenFD))
 	}
 
@@ -328,7 +328,7 @@ func main() {
 				log.Fatalf("inherit API key admin socket: %v", err)
 			}
 			// #nosec G706 -- 同上：管理 socket 的 fd 号
-			log.Printf("[update] inherited admin socket from the previous instance (fd=%s)", os.Getenv(hotupdate.EnvAdminFD))
+			log.Printf("[热更新] 已从上一个实例接管管理套接字（fd=%s）", os.Getenv(hotupdate.EnvAdminFD))
 		} else {
 			adminLn, err = apikeys.ListenUnix(cfg.APIKeysSocket)
 			switch {
@@ -337,7 +337,7 @@ func main() {
 				// 旧实例（v1.3.1 及更早）不会把管理 socket 交出来，而它要等本实例报告
 				// 就绪才开始收尾，没法同步等；改成后台重试，等它关掉监听后接手。
 				adminPending = true
-				log.Printf("WARN: [api-keys] admin socket busy; will rebind once the previous instance releases %s", cfg.APIKeysSocket)
+				log.Printf("WARN: [密钥管理] 管理套接字被占用，待上一个实例释放 %s 后重新绑定", cfg.APIKeysSocket)
 			default:
 				log.Fatalf("listen API key admin socket: %v", err)
 			}
@@ -474,7 +474,7 @@ func main() {
 		adminMu.Unlock()
 		go func() {
 			if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-				log.Printf("[api-keys] admin server: %v", err)
+				log.Printf("[密钥管理] 管理服务：%v", err)
 			}
 		}()
 		// 库里 0 把密钥是全新部署的正常起点：库文件已建好，用户在管理台创建第一把
@@ -487,11 +487,11 @@ func main() {
 		}
 		infos, err := keyStore.ListChecked()
 		if err != nil {
-			log.Printf("ERROR: API key management enabled but the key store is unreadable: %v", err)
+			log.Printf("ERROR: 密钥管理已启用，但密钥库无法读取：%v", err)
 		} else if len(infos) == 0 {
-			log.Printf("API key management enabled (0 keys); create the first key in the admin console")
+			log.Printf("密钥管理已启用（0 个密钥），请在管理台创建第一个密钥")
 		} else {
-			log.Printf("API key management enabled (%d keys)", len(infos))
+			log.Printf("密钥管理已启用（%d 个密钥）", len(infos))
 		}
 	}
 	shutdownAdmin := func(ctx context.Context) error {
@@ -509,10 +509,10 @@ func main() {
 		go func() {
 			listener, waitErr := apikeys.WaitUnix(cfg.APIKeysSocket, 5*time.Minute, 500*time.Millisecond)
 			if waitErr != nil {
-				log.Printf("ERROR: [api-keys] %v", waitErr)
+				log.Printf("ERROR: [密钥管理] %v", waitErr)
 				return
 			}
-			log.Printf("[api-keys] took over the admin socket after the previous instance exited")
+			log.Printf("[密钥管理] 上一个实例退出后已接管管理套接字")
 			serveAdmin(listener)
 		}()
 	}
@@ -544,7 +544,7 @@ func main() {
 				if panel == nil {
 					log.Fatalf("start embedded panel: %v", err)
 				}
-				log.Printf("ERROR: embedded panel failed to start (%v); API keeps serving and the panel retries in the background", err)
+				log.Printf("ERROR: 内嵌面板启动失败（%v）；API 继续服务，面板会在后台重试", err)
 			}
 			publicHandler = withPanel(h, panel)
 		}
@@ -575,7 +575,7 @@ func main() {
 			// 热更新：新实例已接管监听，这里只等在途请求收尾；等待上限放宽到能覆盖
 			// 长 SSE（上游 idle_timeout 默认 300s + 收尾）。不设上限会在更新时掐断
 			// 正在进行的对话。
-			log.Printf("[update] draining in-flight requests before exit (%s)", reason)
+			log.Printf("[热更新] 退出前等待在途请求跑完（%s）", reason)
 		}
 		wait := hotupdate.ShutdownTimeout()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
@@ -601,7 +601,7 @@ func main() {
 				return errors.Join(err, closeOps())
 			},
 		}); err != nil {
-			log.Printf("WARN: [server] shutdown: %v", err)
+			log.Printf("WARN: [服务] 关停时出错：%v", err)
 		}
 		if panel != nil {
 			panel.Close()
@@ -609,7 +609,7 @@ func main() {
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），
 			// 但保持容器存活。
-			log.Printf("[update] handover complete, exiting %d", hotupdate.ExitHandover)
+			log.Printf("[热更新] 交接完成，以退出码 %d 结束", hotupdate.ExitHandover)
 			os.Exit(hotupdate.ExitHandover)
 		}
 		close(drainDone)
@@ -621,7 +621,7 @@ func main() {
 	} else {
 		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
 	}
-	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("workbuddy2api 已开始监听 %s（密钥鉴权=%v）", cfg.Listen, cfg.APIKey != "")
 	// 先起 accept 循环再通知就绪：父进程收到通知后会立刻停止接受新连接，
 	// 如果这时本进程还没开始 accept，连接会压在队列里直到本进程接管（不影响正确性，
 	// 但排队越短越好）。
@@ -629,7 +629,7 @@ func main() {
 	go func() { serveErr <- srv.Serve(mainLn) }()
 	// 交接就绪通知：父进程据此确认新实例已开始服务，然后才停旧实例。
 	if err := hotupdate.NotifyReady(); err != nil {
-		log.Printf("WARN: [update] notify ready: %v", err)
+		log.Printf("WARN: [热更新] 通知就绪失败：%v", err)
 	}
 	if err := <-serveErr; err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
@@ -638,5 +638,5 @@ func main() {
 	// 提前 return 会让进程以 0 退出，容器 PID 1 会认为可以结束而销毁容器，
 	// 正在流式输出的请求连同新实例一起被杀掉（实测过）。
 	<-drainDone
-	log.Printf("bye")
+	log.Printf("再见")
 }

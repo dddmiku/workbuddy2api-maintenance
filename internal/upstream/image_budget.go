@@ -184,7 +184,7 @@ func ShrinkOutboundImages(body []byte, maxBytes int) []byte {
 		}
 	}
 
-	log.Printf("[upstream] outbound image budget: %d -> %d bytes (dropped %d/%d oldest images, budget=%d)",
+	log.Printf("[上游] 出站图片预算：%d -> %d 字节（丢弃最旧 %d/%d 张，预算=%d）",
 		len(body), len(out), dropped, len(parts), maxBytes)
 	return out
 }

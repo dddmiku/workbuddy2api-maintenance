@@ -154,7 +154,7 @@ func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
 				}
 				continue
 			}
-			log.Printf("[panel] restart failed: %v", err)
+			log.Printf("[面板] 重启失败：%v", err)
 			if !wait(ctx, time.Second) {
 				return
 			}
@@ -208,7 +208,7 @@ func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
 			// A Python request thread may have started a helper before the
 			// panel crashed. Reap that private group before starting its successor.
 			killProcess(cmd)
-			log.Printf("[panel] process exited (%v); restarting embedded panel", err)
+			log.Printf("[面板] 进程已退出（%v），正在重启内嵌面板", err)
 		}
 		if !wait(ctx, time.Second) {
 			return
@@ -322,7 +322,7 @@ func (r *Runtime) newProxy() *httputil.ReverseProxy {
 		}
 		p.Out.Header.Set("X-Forwarded-Proto", proto)
 	}, ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-		log.Printf("[panel] local proxy unavailable: %v", err)
+		log.Printf("[面板] 本地代理不可用：%v", err)
 		http.Error(w, "administration temporarily unavailable", http.StatusBadGateway)
 	}}
 }

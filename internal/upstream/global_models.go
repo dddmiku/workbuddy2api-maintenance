@@ -238,11 +238,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		log.Printf("WARN: [上游] 国际版模型：v3/config 探测失败，降级到企业端点：%v", v3.err)
 		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, nil
 	}
 	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		log.Printf("WARN: [上游] 国际版模型：企业端点失败，仅剩 v3/config：%v", enterprise.err)
 		return v3.names, v3.infos, v3.efforts, v3.defaults, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并。

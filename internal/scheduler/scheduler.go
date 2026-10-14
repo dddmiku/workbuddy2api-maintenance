@@ -428,7 +428,7 @@ func (s *Scheduler) RunCheckinNow() {
 
 func (s *Scheduler) runCheckin(ctx context.Context) {
 	if _, err := s.checkinAll(ctx); err != nil {
-		log.Printf("scheduled checkin skipped: %v", err)
+		log.Printf("定时签到已跳过：%v", err)
 	}
 }
 
@@ -450,7 +450,7 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 // runTraeCheck 定时入口：撞车时记日志跳过，不重复打上游。
 func (s *Scheduler) runTraeCheck(ctx context.Context) {
 	if _, err := s.traeCheckAll(ctx); err != nil {
-		log.Printf("scheduled trae checkin skipped: %v", err)
+		log.Printf("定时 Trae 签到已跳过：%v", err)
 	}
 }
 
@@ -507,7 +507,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 		// 与通用签到一致：停机跨过 token 有效期时先补一次刷新。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("trae checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("trae 签到 %s 刷新凭据：%v", logfmt.UID8(st.UID), err)
 				if a.NeedsRefresh(0) {
 					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
 					failN++
@@ -515,7 +515,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 					continue
 				}
 			} else if err := a.SaveAtomic(); err != nil {
-				log.Printf("trae checkin %s save: %v", logfmt.UID8(st.UID), err)
+				log.Printf("trae 签到 %s 落盘凭据：%v", logfmt.UID8(st.UID), err)
 			}
 		}
 
@@ -524,7 +524,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 		case traeErr != nil:
 			oc.Status, oc.Detail = CheckinFail, "trae: "+traeErr.Error()
 			failN++
-			log.Printf("trae checkin %s: status: %v", logfmt.UID8(st.UID), traeErr)
+			log.Printf("trae 签到 %s 查状态失败：%v", logfmt.UID8(st.UID), traeErr)
 		case !traeStatus.Enabled:
 			oc.Status, oc.Detail = CheckinSkipped, "trae: checkin disabled"
 			skipN++
@@ -547,7 +547,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 					return out, werr
 				}
 				gen++
-				log.Printf("trae checkin %s: 9074 on device gen %d, rotating to gen %d",
+				log.Printf("trae 签到 %s：设备号第 %d 代遇 9074 限流，换到第 %d 代重试",
 					logfmt.UID8(st.UID), gen-1, gen)
 				claimed, claimErr = trae.ClaimCheckin(ctx, a, gen)
 				s.traeNoteClaim()
@@ -565,7 +565,7 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 					d := s.noteTraeBackoff(st.UID)
 					oc.Detail += fmt.Sprintf("（退避 %s）", d.Round(time.Second))
 				}
-				log.Printf("trae checkin %s: claim: %v", logfmt.UID8(st.UID), claimErr)
+				log.Printf("trae 签到 %s 领奖失败：%v", logfmt.UID8(st.UID), claimErr)
 			} else {
 				oc.Status = CheckinOK
 				gained := claimed.Credits + claimed.ExtraCredits
@@ -583,11 +583,11 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			s.cfg.Pool.SetCredits(st.UID, remain)
 			oc.Credits = &remain
 		} else {
-			log.Printf("user-resource %s: trae: %v", logfmt.UID8(st.UID), cerr)
+			log.Printf("查余额 %s（trae）：%v", logfmt.UID8(st.UID), cerr)
 		}
 		out = append(out, oc)
 	}
-	log.Printf("trae checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
+	log.Printf("trae 签到完成：共 %d，成功 %d，已签 %d，失败 %d，跳过 %d",
 		len(out), okN, alreadyN, failN, skipN)
 	return out, nil
 }
@@ -767,7 +767,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("签到 %s 刷新凭据：%v", logfmt.UID8(st.UID), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -787,7 +787,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+					log.Printf("签到 %s 落盘凭据：%v", logfmt.UID8(st.UID), err)
 				}
 			}
 		}
@@ -806,7 +806,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 				} else {
 					oc.Status = CheckinFail
 					oc.Detail = err.Error()
-					log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+					log.Printf("签到 %s 失败：%v", logfmt.UID8(st.UID), err)
 				}
 			} else {
 				oc.Status = CheckinOK
@@ -823,7 +823,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		}
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("查余额 %s 失败：%v", logfmt.UID8(st.UID), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
 			failN++
@@ -845,7 +845,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		}
 		out = append(out, oc)
 	}
-	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
+	log.Printf("签到完成：共 %d，成功 %d，已签 %d，失败 %d，跳过 %d",
 		len(statuses), okN, alreadyN, failN, skipN)
 	return out, nil
 }
@@ -881,7 +881,7 @@ func (s *Scheduler) RunBalanceNow() {
 
 func (s *Scheduler) runBalance(ctx context.Context) {
 	if _, err := s.balanceAll(ctx); err != nil {
-		log.Printf("scheduled balance refresh skipped: %v", err)
+		log.Printf("定时余额刷新已跳过：%v", err)
 	}
 }
 
@@ -934,7 +934,7 @@ func (s *Scheduler) balanceAll(ctx context.Context) ([]CheckinOutcome, error) {
 		// 查询被跳过）；真正过期才判失败。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("balance %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("余额刷新 %s 刷新凭据：%v", logfmt.UID8(st.UID), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -952,7 +952,7 @@ func (s *Scheduler) balanceAll(ctx context.Context) ([]CheckinOutcome, error) {
 				s.cfg.Pool.ClearSessionDead(st.UID)
 				a.BackfillRealm()
 				if err := a.SaveAtomic(); err != nil {
-					log.Printf("balance %s save: %v", logfmt.UID8(st.UID), err)
+					log.Printf("余额刷新 %s 落盘凭据：%v", logfmt.UID8(st.UID), err)
 				}
 			}
 		}
@@ -961,7 +961,7 @@ func (s *Scheduler) balanceAll(ctx context.Context) ([]CheckinOutcome, error) {
 		}
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("查余额 %s 失败：%v", logfmt.UID8(st.UID), err)
 			oc.Status, oc.Detail = CheckinFail, "resource: "+err.Error()
 			failN++
 			out = append(out, oc)
@@ -977,7 +977,7 @@ func (s *Scheduler) balanceAll(ctx context.Context) ([]CheckinOutcome, error) {
 		okN++
 		out = append(out, oc)
 	}
-	log.Printf("balance done: total=%d ok=%d fail=%d skipped=%d", len(statuses), okN, failN, skipN)
+	log.Printf("余额刷新完成：共 %d，成功 %d，失败 %d，跳过 %d", len(statuses), okN, failN, skipN)
 	return out, nil
 }
 
@@ -1046,10 +1046,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			}
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
-				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
+				log.Printf("活跃上报 %s：第 %d/%d 条失败：%v", logfmt.UID8(a.UID), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
 			}
-			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
+			log.Printf("活跃上报 %s：第 %d/%d 条成功", logfmt.UID8(a.UID), i, count)
 			ok++
 			if i < count {
 				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
@@ -1085,14 +1085,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: 活跃上报 %s 已成功，但回读连登天数失败：%v", logfmt.UID8(a.UID), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.UID8(a.UID))
+		log.Printf("WARN: 活跃上报 %s 返回成功但连登天数仍为 0（疑似被服务端静默丢弃）", logfmt.UID8(a.UID))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.UID8(a.UID), days)
+	log.Printf("活跃上报 %s：连登 %d 天", logfmt.UID8(a.UID), days)
 	return false
 }
 
@@ -1145,7 +1145,7 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			failCnt++
-			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("token 保活 %s 刷新失败：%v", logfmt.UID8(st.UID), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -1157,7 +1157,7 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
+			log.Printf("token 保活 %s 落盘凭据：%v", logfmt.UID8(st.UID), err)
 		}
 		okCnt++
 		// 国际版注册地补全：账号没在官方登录流程里确认国家/地区时，chat 会被上游以
@@ -1168,10 +1168,10 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 			area, rerr := s.cfg.Upstream.CompleteRegion(a)
 			switch {
 			case rerr != nil:
-				log.Printf("WARN: keepalive %s: region repair failed: %v", logfmt.UID8(st.UID), rerr)
+				log.Printf("WARN: token 保活 %s 补注册地失败：%v", logfmt.UID8(st.UID), rerr)
 			case area.IOS2 != "":
 				repairCnt++
-				log.Printf("INFO: keepalive %s: region completed country=%s (%s)", logfmt.UID8(st.UID), area.IOS2, area.EnName)
+				log.Printf("INFO: token 保活 %s 已补注册地：%s（%s）", logfmt.UID8(st.UID), area.IOS2, area.EnName)
 			}
 		}
 	}

@@ -149,7 +149,7 @@ func logEffortAdjust(verb, model, from, to string) {
 	if _, loaded := effortAdjustOnce.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	log.Printf("WARN: [upstream] reasoning_effort %s model=%s %s -> %s (logged once per model and level)",
+	log.Printf("WARN: [上游] 推理档位 %s 模型=%s %s -> %s（同一模型同一档位只记一次）",
 		verb, model, from, to)
 }
 
@@ -242,7 +242,7 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("[upstream] role normalized developer->system idx=%d", i)
+			log.Printf("[上游] 角色已归一化 developer->system 下标=%d", i)
 		}
 	}
 }

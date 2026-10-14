@@ -243,7 +243,7 @@ func messagesToChat(body []byte) ([]byte, string, bool, error) {
 					systemParts = append(systemParts, part)
 				}
 			}
-			log.Printf("INFO: [server] merged %s (role=%s) into the system prompt", path, role)
+			log.Printf("INFO: [服务] 已把 %s（角色=%s）合并进系统提示", path, role)
 			continue
 		case "tool", "function":
 			// Chat 协议用 tool/function 角色承载工具结果；Anthropic 语义里工具结果属于

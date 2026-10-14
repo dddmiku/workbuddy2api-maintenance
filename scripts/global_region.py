@@ -261,7 +261,7 @@ def main(argv=None):
             print("已取消")
             return 1
     ok, msg = complete_flow(token, a.uid, pick=pick, call_register=True)
-    print("complete:", msg)
+    print("完成：", msg)
     return 0 if ok else 1
 
 

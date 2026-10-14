@@ -263,7 +263,7 @@ def collect_accounts(accounts):
         try:
             out.append(tc.load_auth(p))
         except SystemExit as e:
-            print("ERR: " + str(e))
+            print("错误：" + str(e))
     return out
 
 
@@ -351,7 +351,7 @@ def main():
             stats["won"] += won
             stats["draw_fail"] += fail
 
-    print("summary: accounts=" + str(stats["accounts"])
+    print("汇总：账号=" + str(stats["accounts"])
           + " redeem_ok=" + str(stats["redeem_ok"])
           + " already=" + str(stats["redeem_already"])
           + " redeem_skip=" + str(stats["redeem_skip"])

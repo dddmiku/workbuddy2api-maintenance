@@ -347,7 +347,7 @@ func (h *Handler) finishTrace(t *requestTrace, wire *traceResponseWriter, ctx co
 	defer func() {
 		if t.permit != nil {
 			if err := t.permit.Release(); err != nil && !errors.Is(err, keylimit.ErrClosed) {
-				log.Printf("WARN: [key-limits] request lease release failed: %v", err)
+				log.Printf("WARN: [密钥限额] 释放请求租约失败：%v", err)
 			}
 		}
 	}()
@@ -408,7 +408,7 @@ func (h *Handler) finishTrace(t *requestTrace, wire *traceResponseWriter, ctx co
 	if h.cfg.Requests != nil {
 		if err := h.cfg.Requests.Append(t.record); err != nil {
 			h.requestLogErrors.Add(1)
-			log.Printf("WARN: [requests] could not persist request detail rid=%s: %v", t.record.RequestID, err)
+			log.Printf("WARN: [请求明细] 落盘失败 rid=%s：%v", t.record.RequestID, err)
 		}
 	}
 }

@@ -55,7 +55,7 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 	mux.HandleFunc("GET /keys", func(w http.ResponseWriter, r *http.Request) {
 		keys, err := s.ListChecked()
 		if err != nil {
-			log.Printf("ERROR: [api-keys] key store unreadable: %v", err)
+			log.Printf("ERROR: [密钥管理] 密钥库无法读取：%v", err)
 			reply(w, 503, map[string]any{"ok": false, "message": "密钥库文件不可读，请检查 data/api_keys.json 及其加密密钥（密钥没有被删除）"})
 			return
 		}
@@ -219,7 +219,7 @@ func replyError(w http.ResponseWriter, err error) {
 		code = 409
 		message = err.Error()
 	default:
-		log.Printf("[api-keys] operation failed: %v", err)
+		log.Printf("[密钥管理] 操作失败：%v", err)
 	}
 	reply(w, code, map[string]any{"ok": false, "message": message})
 }

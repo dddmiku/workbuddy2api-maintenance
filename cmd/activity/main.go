@@ -113,12 +113,12 @@ func main() {
 	// 与 cmd/server 的 Load 同路——缺省 activity_report_count=5 而非 Go 零值 0。
 	c := cfgFile{Schedule: config.DefaultSchedule()}
 	if raw == nil {
-		log.Printf("config not found (tried %s), using defaults+env",
+		log.Printf("未找到配置文件（已尝试 %s），改用默认值 + 环境变量",
 			strings.Join(configCandidates(*cfgPath), ", "))
 	} else if err := json.Unmarshal(raw, &c); err != nil {
 		log.Fatalf("parse config: %v", err)
 	} else {
-		log.Printf("config loaded: %s", path)
+		log.Printf("配置已加载：%s", path)
 	}
 	if err := applyEnv(&c); err != nil {
 		log.Fatalf("apply env: %v", err)
@@ -132,13 +132,13 @@ func main() {
 	if c.StateFile == "" {
 		c.StateFile = "data/state.json"
 	}
-	log.Printf("activity count=%d", c.Schedule.ActivityReportCount)
+	log.Printf("活跃上报条数=%d", c.Schedule.ActivityReportCount)
 
 	auths, err := auth.LoadDir(c.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s)", len(auths))
+	log.Printf("已加载 %d 个账号", len(auths))
 
 	p := pool.New(c.StateFile)
 	p.SyncToDir(auths)
@@ -153,7 +153,7 @@ func main() {
 		ActivityReportCount: c.Schedule.ActivityReportCount,
 	})
 	sch.RunActivityNow()
-	log.Printf("activity run complete")
+	log.Printf("活跃上报执行完成")
 }
 
 // newUpstream 构造上游客户端并显式接线 global realm 路由。

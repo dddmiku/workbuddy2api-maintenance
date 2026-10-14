@@ -134,9 +134,9 @@ func (p *Pool) load() {
 		// （2026-09-30 审计发现）。重命名保留证据，让下一次保存从干净状态重建。
 		quarantine := p.stateFp + ".corrupt"
 		if renameErr := os.Rename(p.stateFp, quarantine); renameErr != nil {
-			log.Printf("WARN: [pool] state file is corrupt and cannot be quarantined: %v", renameErr)
+			log.Printf("WARN: [账号池] 状态文件损坏且无法隔离：%v", renameErr)
 		} else {
-			log.Printf("WARN: [pool] state file is corrupt; moved to %s and starting from empty state", quarantine)
+			log.Printf("WARN: [账号池] 状态文件损坏，已移到 %s，从空状态启动", quarantine)
 		}
 		return
 	}

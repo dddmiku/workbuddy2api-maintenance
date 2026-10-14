@@ -478,7 +478,7 @@ func (h *Handler) setReasoningLoopFeature(w http.ResponseWriter, r *http.Request
 		return
 	}
 	h.SetReasoningLoopStopOnly(*body.StopOnly)
-	log.Printf("INFO: [server] reasoning loop stop-only set to %t via admin channel", *body.StopOnly)
+	log.Printf("INFO: [服务] 重复推理保护已切换为「只停不重发」= %t（管理通道）", *body.StopOnly)
 	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stop_only": *body.StopOnly})
 }
 
@@ -529,7 +529,7 @@ func (h *Handler) reviveAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	h.cfg.Pool.ReviveDisabled(uid)
 	after, _ := h.cfg.Pool.Status(uid)
-	log.Printf("INFO: [server] account revived uid=%s (was disabled=%v reason=%q)",
+	log.Printf("INFO: [服务] 账号已复活 uid=%s（原停用=%v，原因=%q）",
 		logfmt.UID8(uid), before.Disabled, before.DisabledReason)
 	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "disabled": after.Disabled, "was_disabled": before.Disabled})
 }
@@ -610,7 +610,7 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		if _, err := h.cfg.Update.Apply(ctx, target); err != nil {
-			log.Printf("ERROR: [update] apply failed: %v", err)
+			log.Printf("ERROR: [热更新] 应用失败：%v", err)
 		}
 	}()
 	// 提示语按平台区分：Linux 上是「新实例接管、本实例跑完在途请求再退出」，
@@ -1189,7 +1189,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只落"大请求"（超过上限一半）：小探针（{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
 	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body)*2 >= int(limit) {
 		if err := os.WriteFile("/app/data/last_request.json", body, 0o600); err != nil {
-			log.Printf("ERR: [server] dump req: %v", err)
+			log.Printf("ERR: [服务] 落盘请求失败：%v", err)
 		}
 	}
 	var peek struct {
@@ -1215,7 +1215,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 原样发出来（cc-switch 的「声明支持 1M」开关就会产生它），而本网关的模型目录与
 	// 密钥白名单只有裸名。按同一模型处理：去掉后缀，并把请求体里的模型名一并归一。
 	if clean, stripped := stripContextMarker(peek.Model); stripped {
-		log.Printf("INFO: [server] model context marker stripped: %q -> %q", peek.Model, clean)
+		log.Printf("INFO: [服务] 已剥离模型名上下文标记：%q -> %q", peek.Model, clean)
 		peek.Model = clean
 		body = rewriteModel(body, clean)
 	}
@@ -1296,7 +1296,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						log.Printf("INFO: [server] 不回落 cn：global:%s 是免费模型而 cn:%s 付费，回落会产生计划外扣费",
 							bareModel, bareModel)
 					} else {
-						log.Printf("INFO: [server] global realm rate limited for model=%s — falling back to cn by key request", bareModel)
+						log.Printf("INFO: [服务] 国际版模型 %s 被限流，按密钥请求回落 CN", bareModel)
 						realm = "cn"
 					}
 				}
@@ -1627,7 +1627,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+				log.Printf("ERR: [服务] 聊天前刷新凭据 uid=%s 落盘失败：%v", logfmt.UID8(acct.UID), err)
 			}
 		}
 
@@ -1674,10 +1674,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			area, rerr := repair(acct)
 			if rerr != nil {
-				log.Printf("WARN: [server] region repair failed uid=%s: %v", logfmt.UID8(acct.UID), rerr)
+				log.Printf("WARN: [服务] 补注册地失败 uid=%s：%v", logfmt.UID8(acct.UID), rerr)
 				break
 			}
-			log.Printf("INFO: [server] region repair uid=%s country=%s (%s) — retrying same account",
+			log.Printf("INFO: [服务] 已补注册地 uid=%s 国家=%s（%s），在同账号上重试",
 				logfmt.UID8(acct.UID), area.IOS2, area.EnName)
 			st.absorbJSONUsage(respBody)
 			regionRepaired = true
@@ -1728,7 +1728,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 与这个账号无关，解绑只会让下一轮无谓地重新选号。在途租约由函数出口的
 			// defer 释放，不依赖 fail。
 			if kind == upstream.ErrUpstreamGateway {
-				log.Printf("WARN: [server] upstream gateway page uid=%s status=%d — upstream proxy rejected the request; account untouched",
+				log.Printf("WARN: [服务] 上游返回网关页 uid=%s 状态=%d — upstream proxy rejected the request; account untouched",
 					logfmt.UID8(acct.UID), status)
 				st.status = http.StatusServiceUnavailable
 				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_gateway_unavailable",
@@ -1740,7 +1740,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 本次拒绝先按连续计数记账（达到阈值即停用）；同时记下这个号，
 				// 一旦本轮请求另有账号成功，就把它升级为「账号被标记」并立即停用。
 				if h.cfg.Pool.NoteContentBlocked(acct.UID) {
-					log.Printf("WARN: [server] content review rejection — disabling account "+
+					log.Printf("WARN: [服务] 内容审核拒绝 — disabling account "+
 						"uid=%s reason=flagged-by-review (hit the %d-rejection threshold with no success in between) model=%s",
 						logfmt.UID8(acct.UID), pool.ReviewFailThreshold(), bareModel)
 				}
@@ -1749,7 +1749,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 被拒请求不计费），试满才把上游原文交给调用方。
 				if softRotate < h.cfg.MaxSoftRotations {
 					softRotate++
-					log.Printf("INFO: [server] content review rejection — trying another account (%d/%d) uid=%s model=%s",
+					log.Printf("INFO: [服务] 内容审核拒绝 — trying another account (%d/%d) uid=%s model=%s",
 						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel)
 					// fail 而不是 releaseHeld：必须解绑会话粘性，否则下一轮又会选中同一个
 					// 账号（实测：被风控标记的号在粘性会话里被反复选中，换号形同虚设）。
@@ -1786,7 +1786,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 请求体本身有问题（ErrBadParams）换号无意义，维持原行为。
 				if kind == upstream.ErrClient && h.cfg.RotateOnClientError && softRotate < h.cfg.MaxSoftRotations {
 					softRotate++
-					log.Printf("INFO: [server] upstream client error — trying another account (%d/%d) uid=%s model=%s status=%d",
+					log.Printf("INFO: [服务] 上游客户端错误 — trying another account (%d/%d) uid=%s model=%s status=%d",
 						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel, status)
 					fail(acct.UID) // 同上：解绑粘性才能真正换号
 					continue
@@ -1810,7 +1810,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 是客户端没带推理项、转换层丢了文本，还是字段缺失。不含任何正文。
 				if strings.Contains(detail, "reasoning_content_missing") || strings.Contains(detail, `"code":11155`) {
 					stats, hasStats := reasoningStatsFrom(r.Context())
-					log.Printf("WARN: [server] upstream 11155 shape uid=%s key=%s %s",
+					log.Printf("WARN: [服务] 上游 11155 形态 uid=%s key=%s %s",
 						logfmt.UID8(acct.UID), st.keyName, chatShapeSummary(body, stats, hasStats))
 				}
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_invalid_request", "upstream rejected request params: "+detail)
@@ -1824,7 +1824,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrSoftRate {
 				if _, hasReset := upstream.ParseRateReset(string(respBody)); !hasReset {
 					if h.cfg.Pool.NoteSourceRateLimit(realm, acct.UID) {
-						log.Printf("WARN: [server] source-level rate limit detected uid=%s realm=%s — pausing selection for this realm",
+						log.Printf("WARN: [服务] 检测到来源级限流 uid=%s 域=%s — pausing selection for this realm",
 							logfmt.UID8(acct.UID), realm)
 					}
 				}
@@ -1872,7 +1872,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
 				_ = rc.Close()
 				loopRetries++
-				log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
+				log.Printf("INFO: [服务] %s uid=%s 模型=%s，在同账号上重试（第 %d/%d 次）",
 					loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
 				// 重发前重建读取器：上一轮已知用量已经入账，不能随本轮丢失或重复累加。
 				// 重发若被上下文预检拒绝，返回这次真实错误，不能用上一轮循环错误覆盖它。
@@ -1921,7 +1921,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						st.status = 499
 					}
 					if errors.As(streamErr, &loopErr) {
-						log.Printf("WARN: [server] %s", loopErr.Message)
+						log.Printf("WARN: [服务] %s", loopErr.Message)
 					}
 					return
 				}
@@ -1941,7 +1941,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 客户端会看到重复输出，只能如实报错。
 				if upstream.IsUpstreamReadError(streamErr) && !deliveredContent(w) && readRotate < maxReadRotations {
 					readRotate++
-					log.Printf("WARN: [server] upstream stream cut before any content uid=%s model=%s — rotating to another account (attempt %d/%d)",
+					log.Printf("WARN: [服务] 上游在任何内容前掐流 uid=%s 模型=%s — rotating to another account (attempt %d/%d)",
 						logfmt.UID8(acct.UID), bareModel, readRotate, maxReadRotations)
 					// fail 而非 releaseHeld：必须解绑会话粘性，否则下一轮又选中同一个号。
 					fail(acct.UID)
@@ -1956,7 +1956,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				st.status = http.StatusBadGateway
-				log.Printf("WARN: [server] stream incomplete uid=%s model=%s error=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
+				log.Printf("WARN: [服务] 流不完整 uid=%s 模型=%s 错误=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
 				fail(acct.UID)
 				return
 			}
@@ -1974,7 +1974,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else if _, hasCredit := stats.Credit(); !hasCredit && stats.hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
-				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [服务] 上游返回用量但无扣费 uid=%s 模型=%s（本次无成本观测）", logfmt.UID8(acct.UID), bareModel)
 			}
 			st.failed = false
 			// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
@@ -2000,7 +2000,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上一轮的流已经读完或已放弃，关闭失败不改变本轮结论。
 			_ = rc.Close()
 			loopRetries++
-			log.Printf("INFO: [server] %s uid=%s model=%s — retrying same account (attempt %d/%d)",
+			log.Printf("INFO: [服务] %s uid=%s 模型=%s，在同账号上重试（第 %d/%d 次）",
 				loopErr.Message, logfmt.UID8(acct.UID), bareModel, loopRetries, maxReasoningLoopRetries)
 			// 与流式一致：保留重发时才出现的上下文错误与它实际报告的用量。
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
@@ -2402,7 +2402,7 @@ func flagReviewRejectedPeers(p *pool.Pool, rejected []string, succeededUID, mode
 			continue
 		}
 		if p.FlagReviewAccount(uid) {
-			log.Printf("WARN: [server] content review rejection — disabling account "+
+			log.Printf("WARN: [服务] 内容审核拒绝 — disabling account "+
 				"uid=%s reason=peer-succeeded (account-level flag) model=%s", logfmt.UID8(uid), model)
 		}
 	}

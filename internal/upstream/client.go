@@ -874,7 +874,7 @@ func (c *Client) prepareBodyWithBudget(body []byte, realm, uid, conversationID s
 	// 计费头提前断词：这类串对模型没有语义价值，却会被上游当渠道特征拒掉，而且几乎每个
 	// 请求都带着它。提前处理省掉「先被拒一次再重试」的往返（实测 76/79 的请求都白撞一次）。
 	if neutralized, changed := NeutralizeBillingHeaders(body); changed {
-		log.Printf("INFO: [upstream] billing header pre-neutralized uid=%s", logfmt.UID8(uid))
+		log.Printf("INFO: [上游] 计费头已预先中和 uid=%s", logfmt.UID8(uid))
 		body = neutralized
 	}
 	// 出站图片预算（最后一环）：前面所有改写都可能让体积膨胀，这里统一按字节收口。
@@ -1116,7 +1116,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 主动预算：长会话按上一轮真实输入推算本轮，发送前就收缩网关自选预算。
 	if tokens, ok := c.proactiveOutputBudget(budgetSession(ctx), a.Realm(), budget, body); ok {
 		if candidate, ok := withOutputBudget(prepared, tokens); ok {
-			log.Printf("INFO: [upstream] output budget fitted from session usage uid=%s model=%s max_tokens %d -> %d",
+			log.Printf("INFO: [上游] 已按会话用量调整输出预算 uid=%s 模型=%s max_tokens %d -> %d",
 				logfmt.UID8(a.UID), budget.model, budget.tokens, tokens)
 			prepared, budget.tokens = candidate, tokens
 		}
@@ -1127,7 +1127,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if !ok {
 			return false
 		}
-		log.Printf("WARN: [upstream] output budget %s uid=%s model=%s max_tokens %d -> %d (history unchanged)",
+		log.Printf("WARN: [上游] 输出预算 %s uid=%s 模型=%s max_tokens %d -> %d（历史未改动）",
 			reason, logfmt.UID8(a.UID), budget.model, budget.tokens, tokens)
 		prepared, budget.tokens = candidate, tokens
 		budgetRetries++
@@ -1168,7 +1168,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			resp, err := c.chatHTTP().Do(req)
 			if err != nil {
 				cancel()
-				log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+				log.Printf("ERR: [上游] 流式对话 uid=%s 传输错误：%v", logfmt.UID8(a.UID), err)
 				return nil, 0, nil, err
 			}
 			observeChatAttempt(ctx, "headers", resp.StatusCode)
@@ -1181,11 +1181,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 				// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 				if rerr != nil {
-					log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+					log.Printf("ERR: [上游] 流式对话 uid=%s 读取响应体失败：%v", logfmt.UID8(a.UID), rerr)
 					return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 				}
 				kind := Classify(resp.StatusCode, string(raw))
-				log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+				log.Printf("WARN: [上游] 流式对话 uid=%s 上游返回 %d %s body=%s",
 					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
 				// 上下文超限：上游计的是「输入 + max_tokens」。预算由网关自选时，按上游报告的
 				// 精确计数收缩到刚好放得下再同号重发一次；客户端显式预算、计数缺失或剩余空间
@@ -1222,7 +1222,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 							beyond = stillBeyondWindow(prepared, budget, sessionPrompt)
 						}
 						if beyond {
-							log.Printf("WARN: [upstream] chat_stream uid=%s: 11133 at context window boundary (input~%d max_tokens=%d window=%d) -> context_length_exceeded",
+							log.Printf("WARN: [上游] 流式对话 uid=%s：11133 命中上下文窗口边界（输入约 %d，max_tokens=%d，窗口=%d）-> context_length_exceeded",
 								logfmt.UID8(a.UID), estimateInputTokens(prepared, sessionPrompt), budget.tokens, budget.context)
 							return nil, resp.StatusCode, boundaryContextFailure(raw, budget, requestID), nil
 						}
@@ -1250,7 +1250,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 							continue
 						}
 						prepared = candidate
-						log.Printf("WARN: [upstream] waf neutralized level=%d for retry uid=%s path=%s", wafLevel, logfmt.UID8(a.UID), path)
+						log.Printf("WARN: [上游] 已中和 WAF 拦截（第 %d 级）以便重试 uid=%s 路径=%s", wafLevel, logfmt.UID8(a.UID), path)
 						break
 					}
 					if wafLevel > 0 && !bytes.Equal(prepared, lastSent) {
@@ -1274,7 +1274,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 					}
 					if applied {
 						lastSent = prepared
-						log.Printf("WARN: [upstream] channel trigger neutralized level=%d for retry uid=%s path=%s",
+						log.Printf("WARN: [上游] 已中和渠道触发词（第 %d 级）以便重试 uid=%s 路径=%s",
 							channelNeutralized-1, logfmt.UID8(a.UID), path)
 						observeChatRetry(ctx, raw)
 						continue retry
@@ -1466,10 +1466,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		log.Printf("WARN: [上游] 拉模型列表：v3/config 探测失败，降级到企业端点：%v", v3.err)
 	}
 	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		log.Printf("WARN: [上游] 拉模型列表：企业端点失败，仅剩 v3/config：%v", enterprise.err)
 	}
 	out := mergeModelInfos(v3.infos, enterprise.infos)
 	if len(out) == 0 {

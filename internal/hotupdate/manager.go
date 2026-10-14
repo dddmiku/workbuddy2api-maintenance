@@ -330,9 +330,9 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 	if verified {
-		log.Printf("[update] release %s signature verified (sha256:%s)", release.Tag, signedDigest[:12])
+		log.Printf("[热更新] 版本 %s 签名校验通过（sha256:%s）", release.Tag, signedDigest[:12])
 	} else {
-		log.Printf("WARN: [update] this build has no release signing key; skipping signature verification for %s", release.Tag)
+		log.Printf("WARN: [热更新] 本构建未内置发布签名公钥，跳过 %s 的签名校验", release.Tag)
 	}
 
 	m.mu.Lock()
@@ -352,7 +352,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.fail(err)
 		return m.Status(), err
 	}
-	log.Printf("[update] downloaded %s (%s, sha256=%s)", release.Tag, path, sum[:12])
+	log.Printf("[热更新] 已下载 %s（%s，sha256=%s）", release.Tag, path, sum[:12])
 	// 已验签时，落盘摘要必须与签名清单一致（Download 校验的是 GitHub 的 digest）。
 	if verified && !strings.EqualFold(sum, signedDigest) {
 		_ = os.Remove(path)
@@ -432,7 +432,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.fail(err)
 		return m.Status(), err
 	}
-	log.Printf("[update] handover to %s done; draining in-flight requests", release.Tag)
+	log.Printf("[热更新] 已交接给 %s，正在等待在途请求跑完", release.Tag)
 	committed = true
 	// 交接已提交：清理旧运行目录与下载包（保留当前与上一个）。
 	pruneUpdateDir(m.opts.Dir, path)
@@ -560,7 +560,7 @@ func (m *Manager) fail(err error) {
 	m.state = StateFailed
 	m.lastError = err.Error()
 	m.mu.Unlock()
-	log.Printf("ERROR: [update] %v", err)
+	log.Printf("ERROR: [热更新] %v", err)
 }
 
 // progressOf 把「已下载 / 总大小」折成 0~1。

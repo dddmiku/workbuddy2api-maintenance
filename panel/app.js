@@ -310,6 +310,10 @@ function go(v){
   closeNav();
   // 进入页面立即用已有数据渲染一次：否则从别的页切回来会先看到上一次的旧内容。
   renderView(v);
+  // 积分实时刷新（2026-10-14 用户要求）：概览 / 账号 / 积分有效期三页都显示积分，
+  // 每次切进去都拉一次实时值，而不是只显示首屏那份最多 60 秒前的缓存。
+  // 走 refresh_credit=1 让网关等一次真查询（冷查约 8 秒，有缓存则很快返回）。
+  if (v === 'overview' || v === 'accounts' || v === 'credits') refreshCreditView();
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
   if (v === 'requests' && typeof loadRequests === 'function') loadRequests();
@@ -384,6 +388,26 @@ function scheduleCreditRetry(data){
     // 不传 force：走后端缓存优先路径，拿到后台线程写好的结果就渲染。
     loadAll();
   }, 3000);
+}
+
+// CREDIT_VIEW_MIN_INTERVAL 两次「进入积分页触发的实时刷新」之间的最小间隔。
+//
+// 为什么需要节流：概览 / 账号 / 积分有效期三页共用同一份积分数据，用户在这三页之间
+// 来回切是常见操作；不节流的话每次点击都强制一次上游查询（冷查 8 秒、打全账号），
+// 既拖慢界面又会被上游当异常流量。30 秒覆盖「切过去看一眼再切回来」的典型间隔，
+// 而真正的数据新鲜度由网关侧 60 秒缓存兜底——两边叠加后最坏滞后约 30 秒。
+var CREDIT_VIEW_MIN_INTERVAL = 30000;
+var creditViewAt = 0;
+
+// refreshCreditView 进入积分相关页面时拉一次实时积分。
+//
+// 复用 loadAll(forceCredit=true)：它已经处理了并发去重（S.loadRevision）、
+// 失败提示与 creditPending 的后续补取，不必另写一条加载路径。
+function refreshCreditView(){
+  var now = Date.now();
+  if (now - creditViewAt < CREDIT_VIEW_MIN_INTERVAL) return;  // 节流窗口内：用现有数据渲染
+  creditViewAt = now;
+  loadAll(true);
 }
 function svc(up){
   var b = $('#svcBadge'), t = $('#svcText');
