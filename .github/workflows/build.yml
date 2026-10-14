@@ -113,14 +113,19 @@ jobs:
             stage="$RUNNER_TEMP/runtime-$arch"
             mkdir -p "$stage/scripts"
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$stage/wb2api" ./cmd/server
-            for helper in login credit signin trial activity; do
+            # helper 清单必须与 scripts/runtime_bundle.py 的必需文件表逐项对齐——
+            # 漏一个就在打包阶段报 `missing regular runtime file: <name>`，
+            # 而且是**构建到一半**才失败（2026-10-14 实测：这里漏了 fission，
+            # CI 从引入 fission 起就一直红，本地发布工具走另一条构建路径所以没暴露）。
+            for helper in login credit signin trial activity fission; do
               output="$helper"
               case "$helper" in
                 signin|trial|activity) output="${helper}_bin" ;;
+                fission) output="fission_bin" ;;
               esac
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags '-s -w' -o "$stage/$output" "./cmd/$helper"
             done
-            cp login.sh credit.sh signin.sh trial.sh "$stage/"
+            cp login.sh credit.sh signin.sh trial.sh fission.sh "$stage/"
             cp scripts/global_region.py scripts/task_common.py scripts/task_runner.py scripts/school_open_day_2026.py scripts/growth_center.py "$stage/scripts/"
             sed -i 's/\r$//' "$stage/"*.sh "$stage/scripts/"*.py
             python3 scripts/runtime_bundle.py --stage "$stage" --version "$version" --arch "$arch" --archive "dist/wb2api-runtime-linux-$arch.tar.gz"
