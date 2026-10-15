@@ -235,6 +235,24 @@ func TestDeclaredToolCallAllowed(t *testing.T) {
 	}
 }
 
+// TestImageRequestDoesNotFallBackToRemote 带图请求在 3004 时也不回落 Remote。
+//
+// 回落会把图片悄悄丢掉（Remote 读不到内联图），用户拿到「没看图」的回答却无从
+// 察觉——比如实报 3004 更糟。所以回落路径同样要过 requestHasImages 这道闸。
+func TestImageRequestDoesNotFallBackToRemote(t *testing.T) {
+	// 这条规则由 chatStreamLegacy 里的条件保证；这里断言判据本身在带图请求上为真，
+	// 与 ChatStream 的入口判据共用同一函数（两处必须一致）。
+	withImage, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{
+				"url": "data:image/png;base64,QUJD"}}}}},
+	})
+	if !requestHasImages(withImage) {
+		t.Fatal("带图请求必须被识别，否则会回落 Remote 并丢图")
+	}
+}
+
 // TestImageRequestRoutesToLegacy 带图请求必须走 llm_utils_chat，不能走 Remote。
 //
 // 2026-10-16 三组对照实验的结论：Remote 端点读不到内联图片（媒体放 query、

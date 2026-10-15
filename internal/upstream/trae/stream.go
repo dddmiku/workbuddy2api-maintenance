@@ -193,7 +193,11 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
-	if RemoteEnabled() {
+	//
+	// 带图请求**不回落**：Remote 端点读不到内联图片（见 ChatStream 注释的实测），
+	// 回落等于把图悄悄丢掉，用户会拿到一个「没看图」的回答而无从察觉。宁可如实
+	// 把 3004 报给客户端（它可以选择压缩历史后重试），也不交付一个缺图的结果。
+	if RemoteEnabled() && !requestHasImages(prepared) {
 		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
 	}
 	return stream, resp.StatusCode, nil, nil
