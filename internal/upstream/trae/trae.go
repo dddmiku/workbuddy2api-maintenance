@@ -38,7 +38,8 @@ const (
 	GatewayBase = "https://trae-api-cn.mchost.guru"
 
 	// ChatPath llm_utils_chat 端点。工具能力最完整（Trae2api-cn 实测 glm-5.3 7/7、
-	// deepseek-v4-pro 7/7），失败时上层可回落 remote 会话端点（暂未实现）。
+	// deepseek-v4-pro 7/7），但对**工具交互轮次**有硬限制——超限返回 code 3004。
+	// 那种情况下由 ChatStream 透明回落到 Remote 会话端点（见 remote.go 文件头）。
 	ChatPath = "/api/agent/v3/llm_utils_chat"
 
 	// exchangePath Cloud-IDE-JWT 刷新端点（api.trae.cn，非模型网关）。

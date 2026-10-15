@@ -257,7 +257,10 @@ func main() {
 	case !cfg.Schedule.TraeCheckEnabled:
 		log.Printf("Trae 签到已禁用（schedule.trae_check_enabled=false）")
 	default:
-		log.Printf("Trae 签到已启用：%v 点（独立站点，上游 9074 限流时当天不再重试）", cfg.Schedule.TraeCheckHours)
+		// 文案要与实现一致：9074 是**设备维度**的时段性限流，撞上后会换设备号重试一次，
+		// 仍失败则记有界退避并由后台重试循环（60s 一轮）在退避到期后继续试到当天签上。
+		// 旧的「当天不再重试」是早期误判留下的文案，早已不成立。
+		log.Printf("Trae 签到已启用：%v 点（独立站点，9074 限流时换设备号重试 + 后台自动重试）", cfg.Schedule.TraeCheckHours)
 	}
 	switch {
 	case !cfg.Schedule.TravelEnabled:

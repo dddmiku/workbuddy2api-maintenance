@@ -4,9 +4,11 @@
 // claude-sonnet-4-5）必须先映射到 Trae 的真实模型名，否则请求会被上游拒掉。
 // 这张表来自 Trae2api-cn 的 MODEL_ALIASES（实测整理），保留其映射方向。
 //
-// 目录是静态的：Trae 没有公开的模型列表端点可查（参考实现也只在 web 通道做动态
-// 探测，llm_utils_chat 这条路径一直是静态表）。静态表的好处是 /v1/models 与
-// 出站映射永远一致，不会出现"列表里有、发过去被拒"的裂缝。
+// 本文件是**静态别名表**：客户端写的宽松名（gpt-4o、claude-sonnet-4-5）在这里
+// 映射到 Trae 的真实 config_name。它是**回落**路径——生产实际优先用动态目录
+// （catalog.go 的 /api/ide/v1/get_detail_param，见 ChatStream 的 ResolveFromCatalog），
+// 只有目录不可用时才走这张表。静态表的好处是 /v1/models 与出站映射永远一致，
+// 不会出现"列表里有、发过去被拒"的裂缝。
 package trae
 
 import "strings"
