@@ -159,7 +159,7 @@ func TestTaskLogKeepsLastRunWhileIdle(t *testing.T) {
 // 只会让「人多」的窗口更长，所以要退，但退太久会白白错过当天可签的时机。
 func TestTraeBackoffEscalatesAndCaps(t *testing.T) {
 	s := New(Config{})
-	if _, waiting := s.traeInBackoff("u1"); waiting {
+	if d := traeBackoffRemaining(s.traeState("u1"), time.Now()); d > 0 {
 		t.Fatal("初始不该在退避中")
 	}
 	// 前四次：60s / 120s / 240s / 480s。
@@ -176,16 +176,16 @@ func TestTraeBackoffEscalatesAndCaps(t *testing.T) {
 		}
 	}
 	// 退避窗口内应被判定为等待中。
-	if d, waiting := s.traeInBackoff("u1"); !waiting || d <= 0 {
-		t.Fatalf("应处于退避中，实际 waiting=%v d=%s", waiting, d)
+	if d := traeBackoffRemaining(s.traeState("u1"), time.Now()); d <= 0 {
+		t.Fatalf("应处于退避中，实际 d=%s", d)
 	}
 	// 别的账号不受影响。
-	if _, waiting := s.traeInBackoff("u2"); waiting {
+	if d := traeBackoffRemaining(s.traeState("u2"), time.Now()); d > 0 {
 		t.Fatal("退避按账号维度，不该波及其它号")
 	}
 	// 成功后清零，下次从基数重来。
 	s.clearTraeBackoff("u1")
-	if _, waiting := s.traeInBackoff("u1"); waiting {
+	if d := traeBackoffRemaining(s.traeState("u1"), time.Now()); d > 0 {
 		t.Fatal("清退避后不该再判为等待中")
 	}
 	if got := s.noteTraeBackoff("u1"); got != 60*time.Second {

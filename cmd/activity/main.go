@@ -151,6 +151,9 @@ func main() {
 		ActivityHours:       c.Schedule.ActivityHours,
 		KeepaliveHours:      c.Schedule.KeepaliveHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
+		// 一次性触发器（RunActivityNow）不跑签到排程，但 Config 里带上状态目录：
+		// New 会据此加载 trae-checkin.json，避免将来在此进程里加签到任务时漏接线。
+		StateDir: filepath.Dir(c.StateFile),
 	})
 	sch.RunActivityNow()
 	log.Printf("活跃上报执行完成")

@@ -27,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/upstreamerr"
 )
 
 // StreamError 表示上游数据或传输失败；与客户端写出失败区分，供 handler 记录真实结果。
@@ -154,6 +156,30 @@ func readSSEWithLimit(r io.Reader, consume func(sseEvent) (bool, error), comment
 			return consumeErr
 		}
 		if err != nil {
+			// 上游自己发来的错误事件（如 trae 的 code 3004）**必须原样带出去**：
+			// 它带着业务码，上层据此分流（可重试 / 不可重试 / 要不要冷却账号）。
+			// 包装成 upstream_read_error 会让上层只看到「流读失败了」，把确定性
+			// 拒绝误判成偶发掐流——2026-10-15 trae 三连 502 的根因就是这个。
+			//
+			// 判据是 errors.As 而不是类型断言：错误经 io.Pipe 传出来时可能被
+			// 包了一层（转译层 fmt.Errorf %w 之类）。
+			var upstreamErr *upstreamerr.Error
+			if errors.As(err, &upstreamErr) {
+				return &StreamError{
+					Code:    "upstream_error",
+					Message: upstreamErr.Error(),
+					Cause:   err,
+					// Upstream 带上原始码，供 handler 判定处置方式。
+					Upstream: map[string]any{"code": upstreamErr.Code, "message": upstreamErr.Message},
+				}
+			}
+			// Message 面向客户端（不泄漏内部细节），Cause 保留真实原因供排障。
+			//
+			// 2026-10-15：排查 trae 大输入三连 502 时，日志只显示 "upstream stream
+			// read failed"，看不出到底是超时、RST 还是对端主动关闭——StreamError.Error()
+			// 只返回 Message，Cause 在往上传递的路上被丢掉了。这里把原因写进日志。
+			log.Printf("WARN: [上游] SSE 流读取失败：%v（已收 %d 字节，事件名=%q）",
+				err, data.Len(), eventName)
 			return &StreamError{Code: "upstream_read_error", Message: "upstream stream read failed", Cause: err}
 		}
 	}

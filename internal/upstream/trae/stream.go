@@ -24,13 +24,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstreamerr"
 )
 
 // 上游事件名（Trae llm_utils_chat）。
@@ -42,6 +45,14 @@ const (
 	// 远程/CLI 通道会用这些名字发心跳，保持连接不静默。
 	evHeartbeat = "heartbeat"
 )
+
+// UpstreamError 来自叶子包 upstreamerr——定义在本包会与 upstream 包形成循环依赖
+// （upstream import trae）。别名让 trae 包内的构造点读起来自然。
+//
+// 注意**不要**在本包再导出 RateLimitCode：credits.go 已有同名的 9074 常量
+// （签到限流），两者是不同上游接口的不同码，同名会让调用点看不出用的是哪个。
+// 流内 3004 一律走 upstreamerr.RateLimitCode。
+type UpstreamError = upstreamerr.Error
 
 // thinkOpen/thinkClose 是网关侧把 reasoning 包回正文的标记（对齐 Trae2api-cn）。
 const (
@@ -96,7 +107,262 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return TranslateStream(resp.Body, modelFromPrepared(prepared)), resp.StatusCode, nil, nil
+	stream := TranslateStream(resp.Body, modelFromPrepared(prepared))
+	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
+	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
+	// 触发条件与代价见 remote.go 文件头。
+	if RemoteEnabled() {
+		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
+	}
+	return stream, resp.StatusCode, nil, nil
+}
+
+// remoteFallbackReader 在 llm_utils_chat 因工具轮次超限被拒时，透明切到 Remote 端点。
+//
+// 为什么在这一层做而不是在 handler：3004 是 trae 域自己的端点限制，与网关的
+// 选号/冷却/轮转逻辑无关（换号改不了请求体）。放在本包内，上层完全无感。
+type remoteFallbackReader struct {
+	ctx       context.Context
+	auth      *auth.Auth
+	prepared  []byte
+	clientIP  string
+	primary   io.ReadCloser
+	secondary io.ReadCloser
+	// sawContent 是否已向下游交付过**实质内容**（正文/思考/工具帧）。
+	//
+	// 判据刻意不含开头的 role 帧：translator 在开始转译时就发一帧
+	// `{"delta":{"role":"assistant"}}`，上游在**首个事件**就发 error（3004）时，
+	// 下游收到的唯一内容就是这一帧。它不携带任何正文，丢掉后由 Remote 重新开场
+	// 完全无害（客户端只是多看到一个 role 标记）。
+	// 反过来，一旦交付过正文就绝不能回落——那会让用户看到重复或断裂的输出。
+	sawContent bool
+	// buffered 尚未交给下游的字节（判定阶段先扣住，见 Read 的说明）。
+	buffered []byte
+	// released 判定已结束、进入「原样透传」模式。
+	released bool
+	switched bool
+	done     bool
+}
+
+func newRemoteFallbackReader(ctx context.Context, a *auth.Auth, prepared []byte,
+	clientIP string, primary io.ReadCloser) *remoteFallbackReader {
+	return &remoteFallbackReader{ctx: ctx, auth: a, prepared: prepared,
+		clientIP: clientIP, primary: primary}
+}
+
+// Read 的实现要点：**先攒够判定依据再下发**。
+//
+// 上游在首个事件就发 3004 时，translator 会先发一帧 role（不含正文），紧接着把错误
+// 传给下游。若那一帧直接下发，回落就会晚一步、客户端会先看到一个孤立开场帧。
+// 所以这里把「不含实质内容」的字节先扣在 buffered 里，直到出现下列任一情况才放行：
+//   - 读到实质内容 → 连同已扣的一起交出（正常路径，回落不再可能）；
+//   - 读到错误     → 3004 且未交付过内容则回落；否则把扣住的帧交出并报错。
+//
+// 用循环而不是递归：递归会重新进入「buffered 非空就下发」的分支，等于立刻放行，
+// 判定形同虚设（2026-10-15 首版就是这么漏的，被 TestRemoteFallbackSwitchesOn3004 抓住）。
+func (r *remoteFallbackReader) Read(p []byte) (int, error) {
+	for {
+		// 已切换：之后全部读自 Remote。
+		if r.secondary != nil {
+			n, err := r.secondary.Read(p)
+			if n > 0 {
+				r.sawContent = true
+			}
+			return n, err
+		}
+		// 已决定放行：先把扣住的字节吐完。
+		if r.released {
+			if len(r.buffered) > 0 {
+				n := copy(p, r.buffered)
+				r.buffered = r.buffered[n:]
+				return n, nil
+			}
+			if r.done {
+				return 0, io.EOF
+			}
+			n, err := r.primary.Read(p)
+			if n > 0 {
+				r.sawContent = true
+			}
+			if err != nil {
+				r.done = true
+			}
+			return n, err
+		}
+		if r.done {
+			return 0, io.EOF
+		}
+		// 判定阶段：从 primary 读，不含实质内容的字节先扣住。
+		n, err := r.primary.Read(p)
+		if n > 0 {
+			if containsSubstantiveDelta(p[:n]) {
+				r.sawContent = true
+				r.released = true
+				// 扣住的字节先交出去，本次读到的留给下一次。
+				r.buffered = append(r.buffered, p[:n]...)
+				n = copy(p, r.buffered)
+				r.buffered = r.buffered[n:]
+				return n, nil
+			}
+			r.buffered = append(r.buffered, p[:n]...)
+			continue
+		}
+		if err == nil {
+			continue
+		}
+		// 尚未交付实质内容 + 上游明确因工具轮次超限拒绝 → 切 Remote 重来一次。
+		if !r.sawContent && isToolTurnLimitError(err) {
+			secondary, ferr := ChatStreamRemote(r.ctx, r.auth, r.prepared, r.clientIP)
+			if ferr == nil {
+				log.Printf("INFO: [trae] llm_utils_chat 因工具轮次超限被拒（3004），已回落到 Remote 会话端点")
+				_ = r.primary.Close()
+				r.secondary = secondary
+				r.buffered = nil
+				r.switched = true
+				continue
+			}
+			// 回落也失败：如实报告两边的原因，别只丢一个。
+			log.Printf("WARN: [trae] Remote 回落失败：%v（原始错误：%v）", ferr, err)
+			return 0, fmt.Errorf("trae: llm_utils_chat 被拒（%v），Remote 回落也失败：%w", err, ferr)
+		}
+		// 不回落：把扣住的开场帧交出去，然后正常报错。
+		r.done = true
+		if len(r.buffered) > 0 {
+			n := copy(p, r.buffered)
+			r.buffered = r.buffered[n:]
+			if n > 0 {
+				return n, nil
+			}
+		}
+		return 0, err
+	}
+}
+
+func (r *remoteFallbackReader) Close() error {
+	err := r.primary.Close()
+	if r.secondary != nil {
+		if serr := r.secondary.Close(); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	return err
+}
+
+// containsSubstantiveDelta 报告这批 OpenAI SSE 字节里是否含**实质内容**。
+//
+// 只认正文 / 思考 / 工具帧；role 帧与空 delta 不算（见 sawContent 注释）。
+// 解析失败时保守地当作「有内容」——宁可放弃回落，也不能冒重复输出的风险。
+func containsSubstantiveDelta(chunk []byte) bool {
+	text := string(chunk)
+	for {
+		idx := strings.Index(text, "data: ")
+		if idx < 0 {
+			return false
+		}
+		text = text[idx+len("data: "):]
+		end := strings.IndexByte(text, '\n')
+		line := text
+		if end >= 0 {
+			line = text[:end]
+			text = text[end+1:]
+		} else {
+			text = ""
+		}
+		line = strings.TrimSpace(line)
+		if line == "" || line == "[DONE]" {
+			if text == "" {
+				return false
+			}
+			continue
+		}
+		var frame struct {
+			Choices []struct {
+				Delta map[string]any `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(line), &frame) != nil {
+			// 解析不了（可能被截断）：保守当作有内容，不回落。
+			return true
+		}
+		for _, choice := range frame.Choices {
+			if len(choice.Delta) == 0 {
+				continue
+			}
+			if content, ok := choice.Delta["content"].(string); ok && content != "" {
+				return true
+			}
+			if reasoning, ok := choice.Delta["reasoning_content"].(string); ok && reasoning != "" {
+				return true
+			}
+			if calls, ok := choice.Delta["tool_calls"].([]any); ok && len(calls) > 0 {
+				return true
+			}
+		}
+		if text == "" {
+			return false
+		}
+	}
+}
+
+// isToolTurnLimitError 报告错误是否为「工具轮次超限」的 3004 拒绝。
+//
+// 判据用**业务码**而不是文案：文案是英文提示「exceeded the rate limit」，会随
+// 上游改版漂移，且容易与真正的限流混淆（真正的限流是换号能解决的，这个是请求
+// 结构问题——换号无效，只有换端点）。
+func isToolTurnLimitError(err error) bool {
+	var upstreamErr *upstreamerr.Error
+	if !errors.As(err, &upstreamErr) {
+		return false
+	}
+	return upstreamErr.Code == upstreamerr.RateLimitCode
+}
+
+// ChatStreamRemote 走 Remote 会话端点（两步协议），返回**已转译成 OpenAI SSE** 的流。
+//
+// 由上层在 llm_utils_chat 返回 3004（工具轮次超限）时回落调用——为什么需要它、
+// 以及实测的触发条件与代价，见 remote.go 文件头。
+//
+// 与 ChatStream 的差别：这里**不返回上游状态码**给上层做错误分类，而是把两步协议
+// 里的失败就地转成 error（建会话失败时上游给的是业务码，不是可分类的 HTTP 状态）。
+func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestID := newRequestID()
+	body, _, _, err := buildRemoteBody(prepared, requestID)
+	if err != nil {
+		return nil, err
+	}
+	session, err := createRemoteSession(ctx, a, body)
+	if err != nil {
+		return nil, err
+	}
+	events, err := openRemoteEvents(ctx, a, session)
+	if err != nil {
+		stopRemoteSession(context.WithoutCancel(ctx), a, session.id)
+		return nil, err
+	}
+	// 收流结束/客户端断开后主动停会话：上游对会话有并发槽位，不结束会占着。
+	return &remoteStreamCloser{
+		ReadCloser: TranslateStream(translateRemoteEvents(events, modelFromPrepared(prepared)),
+			modelFromPrepared(prepared)),
+		auth:    a,
+		session: session,
+	}, nil
+}
+
+// remoteStreamCloser 在流关闭时顺带结束上游会话。
+type remoteStreamCloser struct {
+	io.ReadCloser
+	auth    *auth.Auth
+	session remoteSession
+}
+
+func (c *remoteStreamCloser) Close() error {
+	err := c.ReadCloser.Close()
+	// 用不带取消的 ctx：客户端断开时 ctx 已取消，但停会话的请求仍要发出去。
+	stopRemoteSession(context.WithoutCancel(context.Background()), c.auth, c.session.id)
+	return err
 }
 
 // RawChatStream 与 ChatStream 相同，但**不做转译**，直接返回上游原始 SSE。
@@ -526,10 +792,22 @@ func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (b
 	switch name {
 	case evError:
 		message, _ := obj["message"].(string)
-		if message == "" {
-			message = "Trae upstream returned an error event"
+		// 上游把业务码放在 code 字段（实测 3004 = 限流/规模超限）。带类型返回，
+		// 让上层能按码分流；丢了码就只能看到一句英文文案（见 UpstreamError 注释）。
+		code := 0
+		switch raw := obj["code"].(type) {
+		case float64:
+			code = int(raw)
+		case json.Number:
+			if n, err := raw.Int64(); err == nil {
+				code = int(n)
+			}
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+				code = n
+			}
 		}
-		return false, fmt.Errorf("%s", message)
+		return false, &UpstreamError{Code: code, Message: message}
 	case evHeartbeat:
 		// 心跳：保持连接活着，不产生内容。
 		out.WriteString(": relay-keepalive\n\n")

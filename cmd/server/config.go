@@ -663,3 +663,17 @@ func (c *Config) normalizePrompt() error {
 	}
 	return nil
 }
+
+// stateDirOf 返回 state.json 所在目录（Trae 签到状态 trae-checkin.json 与它同放）。
+//
+// 与 updateDir 同样的理由走绝对化：安卓上进程 cwd 是 "/"，桌面版数据根由启动器
+// 指定；相对路径会让状态落到 App 看不到的地方（表现为每次重启签到进度都归零）。
+func stateDirOf(stateFile string) string {
+	if abs, err := filepath.Abs(stateFile); err == nil && abs != "" {
+		return filepath.Dir(abs)
+	}
+	if dir, err := os.Getwd(); err == nil && dir != "" {
+		return filepath.Join(dir, "data")
+	}
+	return "data"
+}

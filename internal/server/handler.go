@@ -1986,6 +1986,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					resetForRetry(w)
 					continue
 				}
+				// 上游在流内**明确拒绝**了这次请求（如 trae 的 3004 规模超限）。
+				// 这类错误不可重试、也不该冷却账号：换号改变不了请求体本身，
+				// 重试三次必然全败，只会把确定性拒绝伪装成偶发故障后报 502。
+				// 如实回报上游原文，让调用方看到真正的原因。
+				if rejection := upstream.StreamUpstreamRejection(streamErr); rejection != nil {
+					st.status = http.StatusBadRequest
+					log.Printf("WARN: [服务] 上游拒绝本次请求（不可重试，账号不冷却）uid=%s 模型=%s code=%d 原文=%s",
+						logfmt.UID8(acct.UID), bareModel, rejection.Code, logfmt.Truncate(rejection.Message, 200))
+					releaseHeld()
+					writeOpenAIError(w, st.status, "upstream_rejected_request", rejection.Detail())
+					return
+				}
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [服务] 流不完整 uid=%s 模型=%s 错误=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
 				fail(acct.UID)

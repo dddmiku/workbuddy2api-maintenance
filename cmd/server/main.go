@@ -224,6 +224,7 @@ func main() {
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
+		StateDir:            stateDirOf(cfg.StateFile),
 		CheckinHours:        cfg.Schedule.CheckinHours,
 		TraeCheckHours:      cfg.Schedule.TraeCheckHours,
 		TravelHours:         cfg.Schedule.TravelHours,

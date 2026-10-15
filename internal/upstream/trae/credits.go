@@ -172,7 +172,56 @@ func postTraeAPI(ctx context.Context, a *auth.Auth, path string, payload any, ge
 	return out, nil
 }
 
+// AuthFailedCode 上游在 HTTP 200 的业务码里表达「这枚 token 不认了」。
+//
+// 与 HTTP 401 不同：401 是传输层的鉴权失败（头族/签名问题，重试无意义），
+// 1001 是**服务端主动作废了这枚 JWT**——换一枚新签发的 token 就能继续。
+// 参考实现（autumnsentiment/Trae2api-cn 的 _checkin_auth_failed）同样只在
+// 业务码层面判 1001，并配一句文案兜底 "not able to authenticate"。
+const AuthFailedCode = 1001
+
+// AuthError 是 1001 的具名错误，调用方据此触发「刷新凭据后重试一次」。
+//
+// 为什么必须具名而不是匹配文案：上游 message 是中文文案会随改版漂移，拿它做分支
+// 判断是脆的（同 RateLimitError 的理由）。
+type AuthError struct {
+	Message string
+}
+
+func (e *AuthError) Error() string {
+	return fmt.Sprintf("trae: token rejected by upstream (%d): %s", AuthFailedCode, e.Message)
+}
+
+// IsAuthFailure 报告错误是否为上游作废 token（1001 / 文案兜底）。
+func IsAuthFailure(err error) bool {
+	var target *AuthError
+	if errors.As(err, &target) {
+		return true
+	}
+	// 文案兜底：上游偶发只给 message 不给 code（实测形态见参考实现
+	// _checkin_auth_failed 的同一处理）。判据限定为这句英文原文，不用宽泛的
+	// "auth" 之类——宽判据会把正常错误误判成鉴权失败，触发无谓的刷新。
+	return err != nil && strings.Contains(err.Error(), "not able to authenticate")
+}
+
+// businessCodeError 把非 0 业务码转成具名错误（1001/9074 有专用类型，其余保持通用）。
+func businessCodeError(code float64, message, scope string) error {
+	switch code {
+	case RateLimitCode:
+		return &RateLimitError{Message: message}
+	case AuthFailedCode:
+		return &AuthError{Message: message}
+	}
+	return fmt.Errorf("trae %s: code %g: %s", scope, code, message)
+}
+
 // CheckinStatusOf 查询签到状态。
+//
+// 字段校验对齐参考实现（_post_checkin 的 status 分支）：
+//   - enable / checked_in **必须是布尔**。上游给 {"enable":1} 这类数字时直接报错，
+//     不能靠 Go 的类型断言静默取到 false——那会让「签到开着」被误判成「签到关了」，
+//     任务整轮跳过而用户毫无察觉。
+//   - credits 是可选字段：非数值/非有限/<= 0 一律视为「本次没有可领积分」，置 0。
 func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 	data, err := postTraeAPI(ctx, a, checkinStatusPath, nil, 0)
 	if err != nil {
@@ -180,16 +229,22 @@ func CheckinStatusOf(ctx context.Context, a *auth.Auth) (CheckinStatus, error) {
 	}
 	if code, ok := asFloat(data["code"]); ok && code != 0 {
 		message, _ := data["message"].(string)
-		return CheckinStatus{}, fmt.Errorf("trae checkin status: code %g: %s", code, message)
+		return CheckinStatus{}, businessCodeError(code, message, "checkin status")
 	}
-	status := CheckinStatus{}
-	status.Enabled, _ = data["enable"].(bool)
-	status.CheckedIn, _ = data["checked_in"].(bool)
+	enabled, ok := data["enable"].(bool)
+	if !ok {
+		return CheckinStatus{}, fmt.Errorf("trae checkin status: enable 字段缺失或非布尔（上游响应形态变了）")
+	}
+	checkedIn, ok := data["checked_in"].(bool)
+	if !ok {
+		return CheckinStatus{}, fmt.Errorf("trae checkin status: checked_in 字段缺失或非布尔（上游响应形态变了）")
+	}
+	status := CheckinStatus{Enabled: enabled, CheckedIn: checkedIn}
 	status.Message, _ = data["message"].(string)
-	if v, ok := asFloat(data["credits"]); ok {
+	if v, ok := asFloat(data["credits"]); ok && v > 0 {
 		status.Credits = v
 	}
-	if v, ok := asFloat(data["extra_credits"]); ok {
+	if v, ok := asFloat(data["extra_credits"]); ok && v > 0 {
 		status.ExtraCredits = v
 	}
 	return status, nil
@@ -221,13 +276,29 @@ func IsRateLimited(err error) bool {
 	return errors.As(err, &target)
 }
 
+// DeviceAlreadyCheckedCode 该设备号已被用于今日签到（**设备维度**，不是账号维度）。
+//
+// 语义要看清：文案是「该设备已签到」，但说的是**这个设备号**今天签过——可能是这个
+// 账号签的，也可能是别的账号用同一设备号签的。所以**绝不能**据此判定本账号今天
+// 已签到（参考实现 trae_client.py 的注释明确写了这一点，并有测试固化：
+// `_checkin_claim_ok({"code": 9095, ...}) == False`）。
+//
+// 正确处置：当作「本次 claim 没有为这个账号拿到积分」，但**不冷却、不重试**——
+// 换个设备号重试才是有效动作（换号会换掉 x-device-id）。
+const DeviceAlreadyCheckedCode = 9095
+
 // ClaimCheckin 领取今天的签到积分。
 //
 // 上游用业务码表达结果，不都是 HTTP 错误：
-//   - code 0     成功；
+//   - code 0     成功。**实测（2026-10-15）claim 是幂等的**：今天已经签过的账号
+//     再调返回的也是 code 0 + "success"，不是 9095。所以重复调用不会浪费当天机会，
+//     重试是安全的（这是「自动重试循环」成立的前提）。
 //   - code 9074  设备维度的限流。调用方应换一个**新派生**的设备号重试一次
 //     （传 gen+1 再调本函数）；仍失败才退回有界退避。参考实现
 //     （autumnsentiment/Trae2api-cn）的做法就是「轮换一次再重试」；
+//   - code 9095  该设备号今日已签（设备维度，不证明本账号签过）→ DeviceCheckedError，
+//     调用方应换设备号而不是判定「已签到」；
+//   - code 1001  token 被上游作废 → AuthError，调用方刷新凭据后重试一次；
 //   - 其它非 0   如实上报，不做"当成已签到"的猜测。
 func ClaimCheckin(ctx context.Context, a *auth.Auth, gen int) (CheckinStatus, error) {
 	data, err := postTraeAPI(ctx, a, checkinClaimPath, nil, gen)
@@ -236,19 +307,39 @@ func ClaimCheckin(ctx context.Context, a *auth.Auth, gen int) (CheckinStatus, er
 	}
 	message, _ := data["message"].(string)
 	if code, ok := asFloat(data["code"]); ok && code != 0 {
-		if code == RateLimitCode {
+		switch code {
+		case RateLimitCode:
 			return CheckinStatus{}, &RateLimitError{Message: message}
+		case DeviceAlreadyCheckedCode:
+			return CheckinStatus{}, &DeviceCheckedError{Message: message}
+		case AuthFailedCode:
+			return CheckinStatus{}, &AuthError{Message: message}
 		}
 		return CheckinStatus{}, fmt.Errorf("trae checkin: code %g: %s", code, message)
 	}
 	status := CheckinStatus{CheckedIn: true, Message: message}
-	if v, ok := asFloat(data["credits"]); ok {
+	if v, ok := asFloat(data["credits"]); ok && v > 0 {
 		status.Credits = v
 	}
-	if v, ok := asFloat(data["extra_credits"]); ok {
+	if v, ok := asFloat(data["extra_credits"]); ok && v > 0 {
 		status.ExtraCredits = v
 	}
 	return status, nil
+}
+
+// DeviceCheckedError 是 9095 的具名错误（该设备号今日已签，不代表本账号签过）。
+type DeviceCheckedError struct {
+	Message string
+}
+
+func (e *DeviceCheckedError) Error() string {
+	return fmt.Sprintf("trae checkin: device already checked today (%d): %s", DeviceAlreadyCheckedCode, e.Message)
+}
+
+// IsDeviceAlreadyChecked 报告错误是否为 9095（设备号今日已签）。
+func IsDeviceAlreadyChecked(err error) bool {
+	var target *DeviceCheckedError
+	return errors.As(err, &target)
 }
 
 // FetchCredits 查询账号积分与逐包明细。

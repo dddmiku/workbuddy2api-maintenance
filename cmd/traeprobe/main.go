@@ -68,6 +68,16 @@ func main() {
 		}
 		prompt = string(data)
 	}
+	// --body-file：直接重放一份**完整请求体**（抓到的真实失败请求）。
+	//
+	// 这是验证「长会话 3004 → Remote 回落」最确定的方式：body 就是线上失败的那一份，
+	// 不带任何构造。走的是生产同一条链路（ChatStream 含回落 → upstream.Stream）。
+	bodyFile := ""
+	for _, arg := range os.Args[2:] {
+		if strings.HasPrefix(arg, "--body-file=") {
+			bodyFile = strings.TrimPrefix(arg, "--body-file=")
+		}
+	}
 
 	raw, err := os.ReadFile(authPath)
 	if err != nil {
@@ -88,6 +98,14 @@ func main() {
 		"stream":     true,
 		"max_tokens": 256,
 	})
+	if bodyFile != "" {
+		raw, err := os.ReadFile(bodyFile)
+		if err != nil {
+			fail("read body file: %v", err)
+		}
+		body = raw
+		fmt.Printf("重放请求体：%s（%dKB）\n", bodyFile, len(raw)/1024)
+	}
 	// --tools：加一个简单工具并强制调用，覆盖工具链路（首片带 id/name、
 	// 后续只带参数片段的跨帧合并）。
 	if len(os.Args) > 4 && os.Args[4] == "--tools" {
