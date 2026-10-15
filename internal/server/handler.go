@@ -946,6 +946,9 @@ func (h *Handler) modelList() []map[string]any {
 				out = append(out, map[string]any{
 					"id": trae.Realm + ":" + id, "object": "model",
 					"created": 1753600000, "owned_by": "trae",
+					// 回落路径也要声明窗口，否则目录拉不到时客户端又按 200K 自我截断。
+					"context_length":    traeContextWindow,
+					"max_output_tokens": traeMaxOutputTokens,
 				})
 			}
 			return out
@@ -960,6 +963,18 @@ func (h *Handler) modelList() []map[string]any {
 			if m.DisplayName != "" {
 				entry["name"] = m.DisplayName
 			}
+			// 上下文窗口与输出上限：**必须声明**，否则客户端按自己的默认窗口
+			// （Claude Code 是 200K）自我截断，1M 能力根本用不上。
+			//
+			// 2026-10-15 实测（llm_utils_chat，真实上游）：
+			//   prompt_tokens 1,025,078 → 成功
+			//   prompt_tokens ~1.39M    → 4022 "prompt tokens have exceeded the maximum limit"
+			// 即该端点的输入上限就是模型窗口 1M（1048576），**默认即生效**——
+			// 加不加 Remote 的 max 字段完全一样（两条路线的 4022 边界逐字相同）。
+			// 所以这里声明的是实测边界，不是目录里的 context_window_tokens.dev
+			// （那个 200000 是 Trae 自家 UI 的默认档，不代表端点的真实上限）。
+			entry["context_length"] = traeContextWindow
+			entry["max_output_tokens"] = traeMaxOutputTokens
 			// 倍率透出为 credits 字段（与 CN/global 同口径，面板直接读）。
 			// 上游没给倍率时**不写**这个字段——缺失≠0，写成 0 会被当成免费模型。
 			if m.HasRate {
@@ -1180,6 +1195,20 @@ func stripContextMarker(name string) (string, bool) {
 // maxModelNameBytes 请求模型名长度上限（含 realm 前缀）。
 const maxModelNameBytes = 256
 
+// Trae 域的上下文窗口与输出上限（对外声明用）。
+//
+// 为什么写死而不是取目录的 context_window_tokens.dev：那个字段是 Trae 自家 UI 的
+// 默认档（实测所有模型都是 200000），**不代表端点的真实上限**。2026-10-15 对
+// llm_utils_chat 实测：1,025,078 prompt tokens 成功，约 1.39M 触发 4022，
+// 即真实输入上限就是 1M 窗口。声明成 200K 会让客户端白白自我截断。
+//
+// max_output_tokens 取目录里 max 档的 64000：它是同一批实测响应里
+// token_usage.max_tokens 在 max 模式下报的值。
+const (
+	traeContextWindow   = 1_000_000
+	traeMaxOutputTokens = 64_000
+)
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
 	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
@@ -1226,6 +1255,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Anthropic 的 1M 上下文别名（`model[1m]`／`[1M]`）：Claude Code 会把带后缀的模型名
 	// 原样发出来（cc-switch 的「声明支持 1M」开关就会产生它），而本网关的模型目录与
 	// 密钥白名单只有裸名。按同一模型处理：去掉后缀，并把请求体里的模型名一并归一。
+	//
+	// 2026-10-15 实测确认这**就是全部需要做的事**：Trae 的 llm_utils_chat 端点默认
+	// 就吃 1M 上下文（prompt_tokens 1,025,078 成功，约 1.39M 才触发 4022），
+	// 加不加 Remote 的 max 字段边界逐字相同——即该端点没有 200K 限制需要「开启」。
+	// 客户端之所以觉得只有 200K，是因为我们此前**没在 /v1/models 里声明窗口**，
+	// 客户端按自己的默认值（Claude Code 是 200K）自我截断。声明见 modelsList 的
+	// traeContextWindow。所以这里剥掉后缀后按裸名路由即可，无需额外注入字段。
 	if clean, stripped := stripContextMarker(peek.Model); stripped {
 		log.Printf("INFO: [服务] 已剥离模型名上下文标记：%q -> %q", peek.Model, clean)
 		peek.Model = clean

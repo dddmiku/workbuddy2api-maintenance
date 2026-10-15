@@ -20,6 +20,14 @@ import (
 	"workbuddy2api/internal/upstreamerr"
 )
 
+// PromptTooLongCode 是上游对「输入超过上下文窗口」的拒绝码。
+//
+// 与 11115 / context_length_exceeded（另一套口径，见 context_error.go）不同：
+// 4022 是 Trae 模型网关在**流内**发的，文案是
+// "We're sorry, your prompt tokens have exceeded the maximum limit."。
+// 实测边界就是模型窗口本身（llm_utils_chat 上约 1M token）。
+const PromptTooLongCode = 4022
+
 // UpstreamRejection 是上游对本次请求的确定性拒绝。
 type UpstreamRejection struct {
 	// Code 上游业务码；0 表示上游只给了文案没给码。
@@ -33,8 +41,20 @@ func (r *UpstreamRejection) Detail() string {
 	if r == nil {
 		return ""
 	}
-	// 3004 的文案是「超出速率限制」，但实测触发条件是**单次请求体的字节规模**
-	// （约 1MB 为分界：1621KB 全失败、695KB 及以下全成功），不是调用频次。
+	// 4022 是「prompt tokens 超过上限」——确定性拒绝，且**换号/重试都无效**
+	// （窗口是模型属性，与账号无关）。实测（2026-10-15，llm_utils_chat）：
+	// prompt_tokens 1,025,078 成功、约 1.39M 触发 4022，边界即 1M 上下文窗口。
+	// 照原文回「exceeded the maximum limit」看不出该做什么，所以补上真正的处置。
+	if r.Code == PromptTooLongCode {
+		detail := r.Message
+		if detail != "" {
+			detail += "；"
+		}
+		return detail + "本次输入已超过模型上下文窗口（约 1M token），请压缩会话历史或减少工具定义后重试；换账号无效"
+	}
+	// 3004 的文案是「超出速率限制」，但实测触发条件是**工具交互轮次**（不是体积，
+	// 也不是调用频次）：2 条消息/1600KB 纯文本成功，而 120 条工具密集消息/311KB 被拒；
+	// 只丢 tool_calls 或只丢 tool_call_id 仍被拒，两者都转成纯文本才通过。
 	// 照原文回「稍后再试」会把调用方引向错误的自救方向（等一会、换个号都没用），
 	// 所以这里补一句真正的处置方式。
 	if r.Code == upstreamerr.RateLimitCode {
@@ -42,7 +62,8 @@ func (r *UpstreamRejection) Detail() string {
 		if detail != "" {
 			detail += "；"
 		}
-		return detail + "上游对单次请求体规模有限制（实测约 1MB 为分界），请减少会话历史或工具定义后重试；换账号无效"
+		return detail + "上游对单次请求的工具交互轮次有限制（与体积无关），本网关已自动回落 Remote 端点；" +
+			"若仍看到本条，说明回落也失败，请减少会话历史后重试"
 	}
 	if r.Message != "" {
 		return r.Message
