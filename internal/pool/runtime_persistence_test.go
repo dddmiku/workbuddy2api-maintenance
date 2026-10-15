@@ -77,8 +77,10 @@ func TestRuntimeFallbackDoesNotBypassModelCooldown(t *testing.T) {
 			if got := p.PickExcludingForRealm(nil, "blocked-model", "cn"); got != nil {
 				t.Fatal("all-cooled fallback selected an account whose requested model is still blocked")
 			}
-			if got := p.PickExcludingForRealm(nil, "other-model", "cn"); got == nil {
-				t.Fatal("model guard disabled the existing breaker fallback for unrelated models")
+			// 2026-10-15 起熔断期号不参与兜底（上游对熔断号挂着不回，实测 60s×N 的
+			// 503）；唯一的号在熔断里，即使模型不受限也选不出。
+			if got := p.PickExcludingForRealm(nil, "other-model", "cn"); got != nil {
+				t.Fatal("breaker-cooled account must not be selected by the all-cooled fallback")
 			}
 		})
 	}

@@ -308,9 +308,12 @@ func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d
 	return e.a
 }
 
-// pickEarliestExpiryWithDecisionLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
+// pickEarliestExpiryWithDecisionLocked 全冷却兜底：在非禁用的软冷却账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// 熔断期（breakerUntil 未到）**同样排除**（2026-10-15 修正）：熔断是「连续 3 次 5xx」
+// 的强故障信号，上游对这种号往往挂着不回（实测 VPS：熔断中的 8ef5d5ac 被兜底选中，
+// 每次都等满 60s 才回 500 invoke model error，客户端拿到一串 total=60s 的 503）。
+// 保留 CoolSoft 参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryWithDecisionLocked(tried map[string]bool, now time.Time, reqModel, realm string, d *Decision) *auth.Auth {
 	var best *entry
@@ -338,6 +341,10 @@ func (p *Pool) pickEarliestExpiryWithDecisionLocked(tried map[string]bool, now t
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			d.exclude("fallback_account_limit")
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			d.exclude("fallback_circuit_breaker")
+			continue // 熔断期号不参与兜底：连续 5xx 的强故障信号，调了大概率再挂一轮
 		}
 		if p.inFlightFull(e) {
 			d.exclude("fallback_in_flight_full")

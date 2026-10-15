@@ -1603,20 +1603,23 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 }
 
 func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
-	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
+	// 2026-10-15 语义修订：软冷却号参与兜底，**熔断期号不再参与**。
+	// 实测依据（VPS 事故）：上游对熔断中的号挂着不回——熔断号 8ef5d5ac 被兜底
+	// 选中后每次都等满 60s 才回 500，客户端拿到一串 total=60s 的 503。熔断是
+	// 连续 3 次 5xx 的强故障信号，「可能已恢复」的赌注不该押在它身上。
 	p := New("")
 	p.Add(&auth.Auth{UID: "soft"})
 	p.Add(&auth.Auth{UID: "brk"})
-	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m（重构后 Cooldown 不喂熔断）
-	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)       // 阈值 2：soft 的 1 次失败不熔断
-	p.NoteError("brk")                                  // brk: fails=1
-	p.NoteError("brk")                                  // brk: 熔断，breakerUntil=5m
+	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429")
+	p.SetBreaker(2, 5*time.Minute, 5*time.Minute) // 阈值 2：两次 NoteError 即熔断
+	p.NoteError("brk")                           // brk: fails=1
+	p.NoteError("brk")                           // brk: 熔断，breakerUntil=5m（早于 soft 的 10m）
 	got := p.Pick("")
 	if got == nil {
-		t.Fatal("fallback should pick breaker (earliest) account")
+		t.Fatal("软冷却号仍在兜底池里，应该能选出 soft")
 	}
-	if got.UID != "brk" {
-		t.Fatalf("fallback should pick earliest expiry brk (5m < soft 10m), got %+v", got)
+	if got.UID != "soft" {
+		t.Fatalf("熔断号 brk 不该参与兜底，应选 soft，got %+v", got)
 	}
 }
 

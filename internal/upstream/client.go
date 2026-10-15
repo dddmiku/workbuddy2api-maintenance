@@ -389,6 +389,16 @@ const (
 	// （code 6004 的英文形态）。此前只认中文，英文形态解析不出重置时间，于是被
 	// 当成「无重置时间的 429」喂给来源级闸门，把模型级限额误判成来源限流。
 	softRateResetPatternEN = `(?i)reset at ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?: UTC\+8)?)`
+	// softRateResetPatternKH 上游第三种文案（2026-10-15 实测，VPS 日志原文）：
+	//
+	//	「免费使用量已超出频率限制，可在 2026-10-15 15:18:22 UTC+8 后使用，您也可以切换其他模型继续使用。」
+	//	「您在Deepseek-V4.1-Free模型的免费使用量已超出频率限制，可在2026-10-15 16:21:36重置后使用。…」
+	//
+	// 特征是「可在 <时间>( UTC+8)? 后使用」或「可在 <时间>重置后使用」（空格与
+	// UTC+8 后缀都可有可无）。前两个模式都匹配不到它——后果是该形态走「无重置
+	// 时间的 429」分支：模型级限流被喂给来源级闸门（误判成来源限流）、冷却用有界
+	// 退避而不是对齐上游重置墙钟（本来能精确等到 16:21 恢复，却按 6h 基数退避）。
+	softRateResetPatternKH = `可在\s*([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})(?:\s*UTC\+8)?\s*(?:后使用|重置后)`
 )
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
@@ -399,6 +409,7 @@ var (
 	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateReset   = regexp.MustCompile(softRateResetPattern)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
+	reSoftRateResetKH = regexp.MustCompile(softRateResetPatternKH)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
@@ -477,6 +488,9 @@ func ParseRateReset(body string) (time.Time, bool) {
 	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
 		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
+	if len(m) < 2 {
+		m = reSoftRateResetKH.FindStringSubmatch(body)
 	}
 	if len(m) < 2 {
 		return time.Time{}, false

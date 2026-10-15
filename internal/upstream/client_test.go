@@ -196,6 +196,11 @@ func TestParseRateReset(t *testing.T) {
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
 		{"11140 rate-limiting 带时间(账号级也应对齐)", `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
+		// 「可在 … 后使用」是 2026-10-15 实测到的第三种文案（VPS 日志原文）：
+		// 此前两个正则都不认它，导致该形态被当成「无重置时间的 429」——模型级限流
+		// 被喂给来源级闸门、冷却走 6h BlockModelBackoff 而不是对齐上游重置墙钟。
+		{"6004 可在..后使用(带空格带UTC+8)", `{"code":6004,"msg":"免费使用量已超出频率限制，可在 ` + ts + ` UTC+8 后使用，您也可以切换其他模型继续使用。"}`, true},
+		{"6004 可在..重置后使用(无空格无后缀)", `{"code":6004,"msg":"您在Deepseek-V4.1-Free模型的免费使用量已超出频率限制，可在` + ts + `重置后使用。您可消耗积分继续使用该模型或切换至其他模型。"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}

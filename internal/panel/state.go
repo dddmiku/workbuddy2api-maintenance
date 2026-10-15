@@ -35,6 +35,23 @@ type PoolState struct {
 	Reason        string `json:"reason"`
 	SuccessCount  any    `json:"successCount"`
 	ErrTotal      any    `json:"errTotal"`
+	// RateLimitedModels 模型级限流台账（6004/11102）：每模型一行（模型、until、
+	// 上游原始 reset_at、原因）。
+	//
+	// 2026-10-15 补：网关 /status 早就有这个字段（pool.RateLimitedModel），但面板的
+	// PoolState 没有它——组装 StatePayload 时被丢掉，前端账号页永远看不到「哪个模型
+	// 被限流、到几点解除」。用户实测截图反馈：15 个号同时在模型级冷却里，账号页却
+	// 一个都不显示，看起来像「随机 503」。
+	RateLimitedModels []RateLimitedModel `json:"rateLimitedModels,omitempty"`
+}
+
+// RateLimitedModel 与网关 /status 的 accounts[].rate_limited_models[] 同构
+// （internal/pool.RateLimitedModel 的 JSON 形态）。
+type RateLimitedModel struct {
+	Model   string `json:"model"`
+	Until   any    `json:"until,omitempty"`
+	ResetAt any    `json:"reset_at,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // CreditState 是账号的积分信息。
@@ -205,6 +222,26 @@ func poolStateFrom(entry map[string]any) PoolState {
 		Reason:         jsonString(entry["reason"]),
 		SuccessCount:   orZero(entry["success_count"]),
 		ErrTotal:       orZero(entry["err_total"]),
+	}
+	// 模型级限流台账（6004/11102）：原样透传每模型的 until / reset_at / reason。
+	// 网关侧已过滤掉到期条目，这里不再判有效期（少一层口径分叉）。
+	if raw, ok := entry["rate_limited_models"].([]any); ok && len(raw) > 0 {
+		models := make([]RateLimitedModel, 0, len(raw))
+		for _, item := range raw {
+			row, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			models = append(models, RateLimitedModel{
+				Model:   jsonString(row["model"]),
+				Until:   row["until"],
+				ResetAt: row["reset_at"],
+				Reason:  jsonString(row["reason"]),
+			})
+		}
+		if len(models) > 0 {
+			state.RateLimitedModels = models
+		}
 	}
 	// healthy = 在池里 且 没冷却 且 没被池级停用。三个条件都要看：只看 inPool
 	// 会把「上游封禁但还在池里」显示成健康，只看 cooling 会漏掉停用。

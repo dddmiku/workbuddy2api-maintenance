@@ -105,10 +105,15 @@ func TestDecisionRecordsSeparateNormalAndFallbackFilters(t *testing.T) {
 	}
 	defer p.Release("busy")
 	tried := map[string]bool{"tried": true}
+	// 2026-10-15 起熔断期号不参与兜底（实测：上游对熔断号挂着不回 60s）。
+	// 兜底应落在唯一的软冷却号 soft 上，且 fallback_* 计数把熔断号记为 fallback_circuit_breaker。
 	a, d := p.PickExcludingForRealmWithDecision(tried, "m", "cn")
-	if a == nil || a.UID != "breaker" || d.ReasonCode != "cooldown_fallback" || d.FallbackKind != "breaker" ||
-		d.FallbackUntil == nil || !d.FallbackUntil.Equal(p.byUID["breaker"].breakerUntil) ||
-		d.StageCounts["available"] != 0 || d.StageCounts["healthy"] != 1 || d.StageCounts["fallback_eligible"] != 2 ||
+	// 熔断号 breaker 在兜底扫描里被 fallback_circuit_breaker 排除（2026-10-15 起
+	// 熔断期不参与兜底），唯一可兜底的是软冷却号 soft。
+	if a == nil || a.UID != "soft" || d.ReasonCode != "cooldown_fallback" || d.FallbackKind != "soft" ||
+		d.FallbackUntil == nil || !d.FallbackUntil.Equal(p.byUID["soft"].until) ||
+		d.StageCounts["available"] != 0 || d.StageCounts["healthy"] != 1 || d.StageCounts["fallback_eligible"] != 1 ||
+		d.ExcludedCounts["fallback_circuit_breaker"] != 1 ||
 		d.CostUsedForSelection || d.Weight != nil || d.WeightTotal != nil {
 		t.Fatalf("wrong cooldown fallback facts: %+v", d)
 	}
@@ -121,6 +126,8 @@ func TestDecisionRecordsSeparateNormalAndFallbackFilters(t *testing.T) {
 		p.CooldownSoftForModel(uid, time.Hour, time.Now().Add(time.Hour), "m", "model still unavailable")
 	}
 	a, d = p.PickExcludingForRealmWithDecision(tried, "m", "cn")
+	// soft/breaker 也进了模型冷却后：model/soft/breaker 三个都被 fallback_model_cooldown
+	// 排除（排除顺序上模型冷却先于熔断判定，breaker 计入 model_cooldown）。
 	if a != nil || d.ReasonCode != "no_available_account" || d.AccountID != "" || d.StageCounts["fallback_eligible"] != 0 ||
 		d.ExcludedCounts["fallback_model_cooldown"] != 3 || d.StageCounts["fallback_evaluated"] != 8 {
 		t.Fatalf("fallback blockers were inferred from the wrong scan: %+v", d)

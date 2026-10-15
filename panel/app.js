@@ -178,6 +178,20 @@ function modelLimitTitle(m){
   var when = (reset && reset !== until) ? ('上游重置 ' + reset + '，网关先避让到 ' + until) : ('恢复时刻 ' + until);
   return why + '；' + when;
 }
+// fmtLimitWhen 把限流解除时刻格式化成本地「HH:MM」（跨天才带日期）。
+// 时间串来自后端（RFC3339）；浏览器按本地时区解释，面板用户看的就是本机时间。
+function fmtLimitWhen(raw){
+  var t = new Date(raw);
+  if (isNaN(t.getTime())) return String(raw || '');
+  function two(n){ return (n < 10 ? '0' : '') + n; }
+  var today = new Date(); today.setHours(0,0,0,0);
+  var day = new Date(t); day.setHours(0,0,0,0);
+  var clock = two(t.getHours()) + ':' + two(t.getMinutes());
+  var days = Math.round((day - today) / 86400000);
+  if (days === 0) return clock;
+  if (days === 1) return '明天 ' + clock;
+  return (t.getMonth() + 1) + '/' + t.getDate() + ' ' + clock;
+}
 function svg(inner, size){
   return '<svg width="' + (size||16) + '" height="' + (size||16) + '" viewBox="0 0 24 24" fill="none" ' +
     'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
@@ -891,15 +905,24 @@ function renderAccounts(){
       : '';
     // 模型级限流台账（6004/11102）：账号本身健康（其他模型不受影响），只是个别
     // 模型被限流到指定时刻。此前面板完全不显示，用户只看到「这个号行为不对」；
-    // 单独一行按模型点名 + 剩余时间，与账号级冷却（coolSub）互斥不叠——同时
-    // 出现时账号级冷却已涵盖整号，模型行不再重复。
+    // 单独一行按模型点名 + 实际解除时刻（用户 2026-10-15 要求：显示「模型+实际
+    // 限流解除时间」而不是只有剩余秒——剩余秒每秒都在变，绝对时刻才能一眼判断
+    // 「等到几点」）。reset_at 是上游权威重置墙钟；until 是网关避让截止（被
+    // soft_rate_max 截断时更早）。展示优先 reset_at，截断场景两者都给。
+    // 与账号级冷却（coolSub）互斥不叠——同时出现时账号级冷却已涵盖整号，模型行
+    // 不再重复。
     var rlm = (p.rateLimitedModels || []).filter(function(m){ return m && m.until; });
     var rlmSub = (!p.cooling && rlm.length)
       ? rlm.map(function(m){
+          var untilTxt = fmtLimitWhen(m.until);
+          var resetTxt = m.resetAt ? fmtLimitWhen(m.resetAt) : '';
+          var when = (resetTxt && resetTxt !== untilTxt)
+            ? (resetTxt + '（先避让到 ' + untilTxt + '）')
+            : untilTxt;
           var sec = Math.max(0, Math.ceil((new Date(m.until).getTime() - Date.now()) / 1000));
           return '<span class="sub rlm" title="' +
             esc(modelLimitTitle(m)) + '">' +
-            esc('模型限流 ' + (m.model || '?') + ' · ' + coolLeft(sec)) + '</span>';
+            esc('模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）') + '</span>';
         }).join('')
       : '';
     var credSub = (!p.cooling && !rlm.length && left != null)
