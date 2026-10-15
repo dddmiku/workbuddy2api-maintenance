@@ -189,6 +189,18 @@ func (s *AccountStore) Toggle(uid string, disabled bool) error {
 var ErrNoChange = errors.New("状态未变化")
 
 // Delete 把账号移入回收目录（可手动恢复），不直接删除。
+//
+// ⚠️ 必须容忍**跨文件系统**的搬运：容器里 auths 与 auths-trash 是两个**独立的 bind
+// mount**（/app/auths、/app/auths-trash），rename(2) 跨挂载点必然返回 EXDEV
+// （"invalid cross-device link"）。2026-10-15 用户实测删号报的就是这个错。
+//
+// 判据用 os.Rename 的真实错误（errors.Is(err, syscall.EXDEV)）而不是「先比较 device
+// 号」：device 号比较要额外 stat 两次且在某些网络文件系统上不可靠，而 rename 本来
+// 就是我们要的语义——成功即最优路径（原子、零拷贝），失败再回落。
+//
+// 回落路径是「复制 + fsync + 删除源」：复制到回收目录里的临时名，落盘后再改名成
+// 最终名，最后才删源文件。顺序很重要——先删源会让中途失败变成「账号凭空消失」，
+// 而先落地目标则最坏情况是「两份都在」，用户核对后自行删一份即可（能移不删）。
 func (s *AccountStore) Delete(uid string) (string, error) {
 	entry := s.Find(uid)
 	if entry == nil {
@@ -204,10 +216,56 @@ func (s *AccountStore) Delete(uid string) (string, error) {
 	}
 	dst := filepath.Join(s.TrashDir, fmt.Sprintf("%s.%s.%s", entry.File, stamp, suffix))
 	if err := os.Rename(entry.Path, dst); err != nil {
-		return "", err
+		if !isCrossDevice(err) {
+			return "", err
+		}
+		if err := copyFileAcross(entry.Path, dst); err != nil {
+			return "", err
+		}
+		// 目标已落盘（含 fsync），现在才删源。删不掉不算失败：目标已经在回收目录里，
+		// 账号「被删掉」的效果已达成，源文件残留只是多一份副本，下次删除会再处理。
+		_ = os.Remove(entry.Path)
 	}
 	chownApp(dst)
 	return filepath.Base(dst), nil
+}
+
+// isCrossDevice 报告错误是否为「跨文件系统重命名」（EXDEV）。
+//
+// 实现在 exdev_unix.go / exdev_windows.go 里按平台分文件：syscall.EXDEV 只存在于
+// Unix 平台（Windows 上引用它会编译失败），而 Windows 上的对应错误码是
+// ERROR_NOT_SAME_DEVICE(17)，同样要识别——桌面版把 auths 与 auths-trash 放在
+// 不同盘符/挂载点时是同一个故障。
+
+// copyFileAcross 跨文件系统搬运一个文件：复制到目标 → fsync → 关闭，保留权限。
+//
+// 用 0600 落盘：凭据文件含 access token，任何时刻都不该比原来更宽松。
+// 不用 io.Copy 的默认缓冲之外的花样——文件只有几 KB，一次读完即可。
+func copyFileAcross(src, dst string) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0600)
+	if info, statErr := os.Stat(src); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := out.Write(raw); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	// fsync 后再返回：回收件是「删号后的唯一副本」，不能只在页缓存里。
+	if err := out.Sync(); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
 
 // readAuthDoc 读账号文件；读不到或不是对象时返回空 map（调用方按「不可解析」处理）。

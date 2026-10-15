@@ -27,6 +27,10 @@ func (f *boundaryTasks) TaskLogDetail(string) (scheduler.TaskLogResult, error) {
 	return scheduler.TaskLogResult{Lines: []string{"private-management-log"}}, nil
 }
 
+// SetTaskEnabled 满足 TaskController；这个桩只关心「公开请求能不能碰到管理面」，
+// 开关本身的效果由 scheduler 包的测试覆盖。
+func (f *boundaryTasks) SetTaskEnabled(string, bool) bool { f.calls++; return true }
+
 func TestManagedKeysCannotAccessAccountAdministration(t *testing.T) {
 	store, err := apikeys.Open(filepath.Join(t.TempDir(), "keys.json"), "fixture-legacy")
 	if err != nil {

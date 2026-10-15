@@ -160,26 +160,38 @@ func realmsOf(k TaskKey) []string {
 }
 
 // scheduleOf 单类任务的排程小时与开关状态（来自 Config，即 config.json 的 schedule 段）。
+//
+// 开关状态**不是**直接读 cfg 的 Disabled 字段：面板改完 config.json 会经
+// SetTaskEnabled 写运行期覆盖，而 cfg 里的值只在启动时抄过一次。读 cfg 会让面板
+// 刚点的开关在任务页上不翻转（显示旧值），直到重启——2026-10-15 用户反馈的
+// 「任务启停都要重启」正是这个。
 func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
+	kind, ok := kindOf(string(k))
+	if !ok {
+		return nil, false
+	}
+	s.taskMu.Lock()
+	enabled := !s.taskDisabled(kind)
+	s.taskMu.Unlock()
 	switch k {
 	case TaskKeyCheckin:
-		return s.cfg.CheckinHours, !s.cfg.CheckinDisabled
+		return s.cfg.CheckinHours, enabled
 	case TaskKeyTraeCheck:
-		return s.cfg.TraeCheckHours, !s.cfg.TraeCheckDisabled
+		return s.cfg.TraeCheckHours, enabled
 	case TaskKeyTravel:
-		return s.cfg.TravelHours, !s.cfg.TravelDisabled
+		return s.cfg.TravelHours, enabled
 	case TaskKeyActivity:
-		return s.cfg.ActivityHours, !s.cfg.ActivityDisabled
+		return s.cfg.ActivityHours, enabled
 	case TaskKeyKeepalive:
-		return s.cfg.KeepaliveHours, !s.cfg.KeepaliveDisabled
+		return s.cfg.KeepaliveHours, enabled
 	case TaskKeySchool:
-		return s.cfg.SchoolHours, !s.cfg.SchoolDisabled
+		return s.cfg.SchoolHours, enabled
 	case TaskKeyCat:
-		return s.cfg.CatHours, !s.cfg.CatDisabled
+		return s.cfg.CatHours, enabled
 	case TaskKeyGrowth:
-		return s.cfg.GrowthHours, !s.cfg.GrowthDisabled
+		return s.cfg.GrowthHours, enabled
 	case TaskKeyBalance:
-		return s.cfg.BalanceHours, !s.cfg.BalanceDisabled
+		return s.cfg.BalanceHours, enabled
 	}
 	return nil, false
 }

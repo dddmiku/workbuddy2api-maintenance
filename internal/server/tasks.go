@@ -5,8 +5,11 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/scheduler"
@@ -22,6 +25,10 @@ type TaskController interface {
 	// 正在执行时给**当前**这一轮（实时刷新看的就是它），空闲时给**上一次**那一轮。
 	// 未知 key 返回 scheduler.ErrUnknownTask；跑过但无输出返回空切片。
 	TaskLogDetail(key string) (scheduler.TaskLogResult, error)
+	// SetTaskEnabled 原地改一个任务的启停，让面板改完 config.json 后**不用重启**
+	// 网关就生效（2026-10-15 用户反馈「任务启停都要重启，这合理吗」）。
+	// 返回 false 表示 key 未知（此时不写任何状态）。
+	SetTaskEnabled(key string, enabled bool) bool
 }
 
 // tasks 返回全部排程任务的快照。
@@ -96,5 +103,43 @@ func (h *Handler) taskRun(w http.ResponseWriter, r *http.Request) {
 		// 前端收到 ok 后会直接打开该任务的日志窗口（2026-10-15 起），文案不再把
 		// 用户引去翻容器日志——日志弹窗就是为看「正在跑什么」准备的。
 		"ok": true, "key": key, "message": "已触发",
+	})
+}
+
+// taskToggle 原地切换一类任务的启停，**不重启进程**。
+//
+// 为什么要有这个端点：面板改 config.json 里的 schedule.*_enabled 只写了文件，而排程器
+// 在启动时把开关抄进了自己的 Config——改完不重启，运行中的排程器仍按旧值派发。
+// 用户 2026-10-15 反馈「任务启停都要重启网关才行，这合理吗」。这里让面板改完文件后
+// 顺手调一次，网关原地改运行期覆盖，下一次 nextWake 就按新值算时点。
+//
+// 只走本机管理通道（requireInternal）：它改变的是排程行为，不能让任一调用密钥自己改。
+// 请求体 {"key":"checkin","enabled":false}。
+func (h *Handler) taskToggle(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Tasks == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tasks_unavailable",
+			"本进程未接入排程器，无法改任务开关")
+		return
+	}
+	var body struct {
+		Key     string `json:"key"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "请求体不是合法 JSON")
+		return
+	}
+	key := strings.TrimSpace(body.Key)
+	if key == "" || body.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "需要 key 与 enabled")
+		return
+	}
+	if !h.cfg.Tasks.SetTaskEnabled(key, *body.Enabled) {
+		writeOpenAIError(w, http.StatusBadRequest, "task_toggle_failed", "未知任务："+key)
+		return
+	}
+	_ = writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "key": key, "enabled": *body.Enabled,
+		"message": "已原地生效，无需重启",
 	})
 }

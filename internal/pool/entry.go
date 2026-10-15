@@ -50,6 +50,17 @@ type Status struct {
 	Until           time.Time `json:"until,omitempty"`
 	Reason          string    `json:"reason,omitempty"`
 	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	// FreeModelsUsable 为 true 表示「这个号的冷却只挡住扣积分的模型，免费模型照常可用」。
+	//
+	// 只对 CoolHard（余额耗尽）成立：余额耗尽的号调不了扣积分的模型，但免费模型
+	// （倍率 x0.00）不消耗积分，照样出结果（见 hardCreditBlocksModel）。旧口径下
+	// 面板只显示笼统的「冷却中」，用户看不出这些号其实还在服务免费模型——
+	// 2026-10-15 用户反馈：「这种积分不足的账号，是可以用免费模型的，但是你直接冷却了，
+	// 后续怎么进来这个号呢，怎么用他的免费额度呢」。
+	//
+	// 面板据此把这一行显示成「余额不足（免费模型可用）」，而不是与真正的 429 冷却
+	// 混为一谈。倍率表未注入时恒 false（此时余额不足确实拦全部模型，口径不变）。
+	FreeModelsUsable bool `json:"free_models_usable,omitempty"`
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。

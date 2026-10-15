@@ -33,8 +33,13 @@ type PoolState struct {
 	CoolRemaining any    `json:"coolRemaining"`
 	CoolKind      string `json:"coolKind"`
 	Reason        string `json:"reason"`
-	SuccessCount  any    `json:"successCount"`
-	ErrTotal      any    `json:"errTotal"`
+	// FreeModelsUsable：该号的冷却只挡扣积分的模型，免费模型照常可用（仅余额不足
+	// 成立）。面板据此把这一行显示成「余额不足（免费模型可用）」，而不是与真正的
+	// 429 冷却混为一谈——2026-10-15 用户反馈「积分不足的号可以用免费模型，但你直接
+	// 冷却了，后续怎么用他的免费额度」。
+	FreeModelsUsable bool `json:"freeModelsUsable"`
+	SuccessCount     any  `json:"successCount"`
+	ErrTotal         any  `json:"errTotal"`
 	// RateLimitedModels 模型级限流台账（6004/11102）：每模型一行（模型、until、
 	// 上游原始 reset_at、原因）。
 	//
@@ -252,8 +257,10 @@ func poolStateFrom(entry map[string]any) PoolState {
 		CoolRemaining:  orZero(entry["cool_remaining_sec"]),
 		CoolKind:       jsonString(entry["cool_kind"]),
 		Reason:         jsonString(entry["reason"]),
-		SuccessCount:   orZero(entry["success_count"]),
-		ErrTotal:       orZero(entry["err_total"]),
+		// 余额不足但免费模型可用（见 pool.Status.FreeModelsUsable）。
+		FreeModelsUsable: jsonBool(entry["free_models_usable"], false),
+		SuccessCount:     orZero(entry["success_count"]),
+		ErrTotal:         orZero(entry["err_total"]),
 	}
 	// 模型级限流台账（6004/11102）：原样透传每模型的 until / reset_at / reason。
 	// 网关侧已过滤掉到期条目，这里不再判有效期（少一层口径分叉）。

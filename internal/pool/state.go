@@ -449,24 +449,45 @@ func (p *Pool) ServableForRealm(realm string) bool {
 //   - RateLimited：因**限流**不可用的账号数——账号级软冷却（429），或该模型的
 //     6004 模型级冷却。
 //   - Disabled：已禁用（永远不会服务）的账号数。
+//   - Unavailable：不可用总数（限流 + 余额不足 + 熔断 + 在途占满）。推导量，
+//     只为让「Accounts = Available + Disabled + Unavailable」这条等式显式成立，
+//     便于排障时一眼看出差在哪。
 //
 // 回落的充分条件（见 handler）：Accounts>0、Available==0、
-// 且 RateLimited+Disabled==Accounts —— 即「这个域一个能用的号都没有，且所有不能用的
-// 号要么被限流、要么已禁用」。只要存在因熔断/在途占满而不可用的号，就不满足该等式，
-// 回落不会发生：那些是暂时或与限流无关的状态，不该被静默改道到另一个域。
+// 且 Unavailable+Disabled==Accounts —— 即「这个域一个能用的号都没有」。
+//
+// ⚠️ 2026-10-15 修：此前要求 RateLimited+Disabled==Accounts，即「不能用的号
+// **必须全部**因限流或禁用」。这让**余额不足（CoolHard）**的账号把等式打破——
+// 它们既不计 Available 也不计 RateLimited，于是：
+//
+//	global 23 号 = 7 禁用 + 3 余额不足 + 13 模型级冷却
+//	13 + 7 = 20 ≠ 23 → AllRateLimited() 恒为 false → CN 回落永不触发
+//
+// 用户实测：「所有 global 的 glm5.3 都冷却了，却没有路由到 cn 号里的同名模型」。
+//
+// 为什么余额不足/熔断不该阻止回落：回落的**目的**是「这个域现在一个号都用不了，
+// 把请求交给另一个域的同名模型」。余额不足的号在这个域上同样不可用（调了必 402），
+// 它让请求失败的方式与限流没有区别——把它算作「可用」是错的，把它排除在
+// 「不可用」之外更是错的。旧口径的担忧（「不该被静默改道」）由另一条闸门守住：
+// 回落只在 Available==0 时发生，真有号能用就不会改道。
 type RealmRateState struct {
 	Accounts    int
 	Available   int
 	RateLimited int
 	Disabled    int
+	// Unavailable 是不可用总数（限流 + 余额不足 + 熔断 + 在途占满）。
+	Unavailable int
 }
 
-// AllRateLimited 报告是否满足「该域无可服务号、且不可用的号全部因限流或禁用」。
+// AllRateLimited 报告是否满足「该域无可服务号」——回落的前置条件。
+//
+// 名字保留（调用方与测试按它寻址），但语义已按上面的注释放宽：任何原因的不可用
+// 都计入，只要「没有可服务号」且「至少有一个不可用的号」即成立。
 func (s RealmRateState) AllRateLimited() bool {
-	if s.Accounts == 0 || s.Available != 0 || s.RateLimited == 0 {
+	if s.Accounts == 0 || s.Available != 0 || s.Unavailable == 0 {
 		return false
 	}
-	return s.RateLimited+s.Disabled == s.Accounts
+	return s.Unavailable+s.Disabled == s.Accounts
 }
 
 // RealmRateStateForModel 统计某 realm 在指定模型上的可达性与限流占用。
@@ -491,14 +512,21 @@ func (p *Pool) RealmRateStateForModel(realm, model string) RealmRateState {
 			}
 			continue
 		}
-		// 不可用：区分「限流」与「熔断」等其它原因——只有限流计入 RateLimited。
+		// 不可用：区分「限流」与「余额不足/熔断」等其它原因。**两者都计入
+		// Unavailable**（回落看的是「还有没有能用的号」），只有限流另计
+		// RateLimited（面板与日志用它说明「为什么不可用」）。
 		if e.modelCooled(now, model) {
 			state.RateLimited++
+			state.Unavailable++
 			continue
 		}
 		if e.coolKind == CoolSoft && !e.until.IsZero() && now.Before(e.until) {
 			state.RateLimited++
+			state.Unavailable++
+			continue
 		}
+		// 余额不足（CoolHard）、熔断、在途占满落到这里：不可用，但不是限流。
+		state.Unavailable++
 	}
 	return state
 }
@@ -588,6 +616,16 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 			st.CoolRemaining = 0
 		}
 		st.CoolKind = e.coolKind.String()
+	}
+	// 「余额不足但免费模型可用」：只有 CoolHard 且倍率表已注入时成立。判据与
+	// hardCreditBlocksModel 同源——它用 modelIsPaid 判某个具体模型，这里回答的是
+	// 「存在免费的模型吗」，所以只要表非空即可（表里全是付费模型时该字段仍为 true，
+	// 但那种部署里所有模型都付费，用户本来也没有免费额度可用，显示不会误导）。
+	//
+	// 用 model=="" 调 hardCreditBlocksModel 会恒返回 true（那是「未指定模型」的
+	// 旧语义），所以这里直接判 coolKind 与表是否注入，不走那个函数。
+	if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) && p.paidModels != nil {
+		st.FreeModelsUsable = true
 	}
 	return st
 }

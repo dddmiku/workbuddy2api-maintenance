@@ -85,6 +85,15 @@ const maxReasoningLoopRetries = 1
 // maxReadRotations 上游掐流（且客户端未收到任何内容）时换号重试的上限。
 // 取 2：偶发故障换一次通常就好；连换两次仍失败说明上游整体不稳，
 // 继续重试只会拖长客户端等待，不如如实报错。
+//
+// 2026-10-15 实测补充：Trae 域大输入（48 万 token）下，上游**建流后立刻掐断**是
+// 每号都会发生的**规模相关**现象，不是单号故障——三次 502 的日志里，每次换到的
+// 新号同样在 ~13s 后报 upstream stream read failed，2 次轮换打满即 502。
+// 这类故障下换号没有收益（换谁都被掐），而每次尝试都要等满上游的超时才收手，
+// 于是客户端白等 40-52 秒。
+//
+// 保持 2 而不是调大：把上限调高只会让失败的请求拖更久，成功率并不会上升
+// （日志证据：三连失败）。真正该做的是让**失败更快**——见 readRotateBudget。
 const maxReadRotations = 2
 
 // 换号重试上限由 config 的 pool.max_soft_rotations 决定（0/未配置 = 保持既有契约：
@@ -270,6 +279,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /tasks", h.withAccountAdmin(h.tasks))
 	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAccountAdmin(h.taskRun))
 	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAccountAdmin(h.taskLog))
+	// 任务开关的原地生效入口：面板改完 config.json 后调它，运行中的排程器立刻按新值
+	// 走，不必重启进程（2026-10-15）。只走本机管理通道。
+	h.mux.HandleFunc("POST /tasks/toggle", h.requireInternal(h.taskToggle))
 	// 用量统计只走本机 Unix socket（管理台「用量统计」页）：普通调用密钥拿不到全量用量，
 	// 单密钥自己的用量在日志与面板里按 key 归属，不需要公开端点。
 	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
@@ -1275,29 +1287,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 静默改道到另一个域会让调用方看到与预期不符的模型行为。
 	// 回落只改选号域与出站路由：模型名（裸名）与请求体都不变，账本仍记在调用方请求的名字上。
 	//
-	// ═══ 免费模型不得被换成付费的同名模型 ═══
+	// ═══ 同名回落：价格可以不同，但账本必须说实话 ═══
 	//
 	// 「同名」不等于「同价」。实测两域倍率可以不同：
 	//	global:deepseek-v4.1-flash = x0.00（免费）   cn:deepseek-v4.1-flash = x0.11（付费）
-	// 调用方点名要免费模型，回落却把它送到 CN 的付费同名模型上，于是产生**调用方没有
-	// 要求的真实扣费**；而且这笔钱按「账本记调用方请求的名字」的既有约定，会记到
-	// global:deepseek-v4.1-flash 名下——面板上就出现「免费模型用了 260.89 积分」这种
-	// 自相矛盾的数字（2026-10-13 用户实测，单次最高 10.03）。
 	//
-	// 所以补一条价格判据：global 侧免费、cn 侧付费时**不回落**。宁可如实报「global
-	// 域当前无可用号」让调用方自己决定（换模型或等恢复），也不静默产生计划外扣费。
+	// 2026-10-13 曾因此加过一道硬闸门：global 免费 / cn 付费时**拒绝回落**。理由是
+	// 回落会产生调用方没要求的真实扣费，而用量账本按「调用方请求的名字」记账，
+	// 于是面板上出现「免费模型用了 260.89 积分」这种自相矛盾的数字。
 	//
-	// 反向（global 付费 / cn 免费）不受影响：那样回落只会更省，不违背调用方预期。
+	// ⚠️ 2026-10-15 改：那道闸门拦得太死——它让**整个模型在 global 全冷却时彻底不可用**
+	// （用户实测：「所有 global 4.1 冷却了，却无法回落到 cn 4.1」）。调用方开启回落
+	// 的意图是「global 没号时请换到 cn 的同一个模型」，而账本归错名是**记账问题**，
+	// 不该拿「拒绝服务」来治。
+	//
+	// 现在：回落照常发生，但把账本与日志的模型名换成**实际服务的域**
+	// （cn:deepseek-v4.1-flash）。这样：
+	//   - 面板不会再把 paid 名的扣费记到 free 名下（那笔钱确实花在 cn 的模型上）；
+	//   - 按模型查用量时，看到的就是「哪个域的模型花了多少」；
+	//   - 调用方拿到的是它点名的那个模型（同名即可用），符合回落开关的承诺。
+	//
+	// 用量归属走 fallbackModel：只在**真的换了域且两域价不同**时改写；同价回落
+	// 保持原样，避免老部署的账本口径漂移。
+	fallbackModel := ""
 	if realm == "global" && h.cfg.Pool != nil {
 		if info, ok := requestKeyInfo(r); ok && info.GlobalFallbackToCN != nil && *info.GlobalFallbackToCN {
 			if state := h.cfg.Pool.RealmRateStateForModel("global", bareModel); state.AllRateLimited() {
 				if cnState := h.cfg.Pool.RealmRateStateForModel("cn", bareModel); cnState.Available > 0 {
+					realm = "cn"
 					if h.cfg.Pool.ModelIsPaid("cn", bareModel) && !h.cfg.Pool.ModelIsPaid("global", bareModel) {
-						log.Printf("INFO: [server] 不回落 cn：global:%s 是免费模型而 cn:%s 付费，回落会产生计划外扣费",
+						// 免费 → 付费：账本记到 cn 的名下，这是这次服务真正花的钱。
+						fallbackModel = "cn:" + bareModel
+						log.Printf("INFO: [服务] 国际版模型 %s 无可用号，回落 CN 的同名模型（免费→付费，用量记 cn:%s）",
 							bareModel, bareModel)
 					} else {
 						log.Printf("INFO: [服务] 国际版模型 %s 被限流，按密钥请求回落 CN", bareModel)
-						realm = "cn"
 					}
 				}
 			}
@@ -1331,7 +1355,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = 499
 		}
 		if st.upstreamStarted {
-			h.recordUsage(st, peek.Model)
+			// 同名回落且两域价不同时，账本记**实际服务的域**（见 fallbackModel 注释）：
+			// 那笔积分确实花在 cn 的模型上，记到免费的 global 名下会造出
+			// 「免费模型用了 260 积分」的假账。
+			usageModel := peek.Model
+			if fallbackModel != "" {
+				usageModel = fallbackModel
+			}
+			h.recordUsage(st, usageModel)
 		}
 	}()
 	// 调用方密钥身份：请求行 key= 列与用量账本都按它归属（单密钥模式没有 Info）。

@@ -18,10 +18,34 @@ package panel
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 )
+
+// reloadAccounts 让网关**原地**重读 auths 目录，不重启进程。
+//
+// 为什么改文件层之后不该重启（2026-10-15 用户反馈「账号启停、删除都要重启网关，
+// 这合理吗」）：auth 文件是网关每次请求选号时按池里的索引用的，而池的索引可以
+// 原地换掉——`/runtime/reload` 就是干这个的（重读目录 + SyncToDir）。重启一次
+// 要几十秒、打断在途请求、容器里还会重建整个进程，代价远大于收益。
+//
+// 返回 (是否已生效, 失败原因)。失败原因只用于文案，**不**把整个操作判失败：
+// 文件已经改对了，那才是真值；原地重载失败时提示用户手动重启即可。
+//
+// 与 restartContainer 的分工：**只有改监听地址这类进程级配置**（局域网开关）才
+// 必须真重启，因为 reload 不重绑 listener（见 exec.go 的 native restart 映射）。
+func (s *Server) reloadAccounts(ctx context.Context) (bool, string) {
+	if s.gateway == nil || s.gateway.Management == nil || !s.gateway.Management.ManagementEnabled() {
+		return false, "管理通道不可用"
+	}
+	code, payload := s.gateway.Management.Request(ctx, "POST", "/runtime/reload", map[string]any{})
+	if code == http.StatusOK && jsonBool(payload["ok"], false) {
+		return true, ""
+	}
+	return false, firstNonEmpty(gatewayEnvelopeError(payload), "网关未接受重载")
+}
 
 // restartTimeout 是重启网关的超时。要覆盖容器停止宽限期（默认 10s）加上启动时间，
 // 所以给到 210 秒；健康检查另有一段自己的预算。
@@ -111,20 +135,20 @@ func (s *Server) accountToggle(ctx context.Context, body map[string]any) map[str
 		return map[string]any{"ok": false, "message": "重命名失败：" + err.Error()}
 	}
 	chownApp(dst)
-	ok, message, seconds := s.restartContainer(ctx)
 	action := "禁用"
 	if !wantDisabled {
 		action = "启用"
 	}
-	out := map[string]any{
-		"ok":      ok,
-		"restart": nil,
-		"message": formatMessage("已%s %s，%s", action, uidPrefix(entry.UID), message),
+	// 原地重载：auth 文件改名后网关必须重扫目录才生效，但那不需要重启进程。
+	if ok, detail := s.reloadAccounts(ctx); ok {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s %s，立即生效", action, uidPrefix(entry.UID))}
+	} else if detail != "" {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s %s（%s），重启网关后生效", action, uidPrefix(entry.UID), detail)}
 	}
-	if ok {
-		out["restart"] = seconds
-	}
-	return out
+	return map[string]any{"ok": true, "restart": nil,
+		"message": formatMessage("已%s %s，重启网关后生效", action, uidPrefix(entry.UID))}
 }
 
 // accountDelete 把账号移入回收目录（可手动恢复），不直接删除。
@@ -140,17 +164,16 @@ func (s *Server) accountDelete(ctx context.Context, body map[string]any) map[str
 	if err != nil {
 		return map[string]any{"ok": false, "message": err.Error()}
 	}
-	ok, message, seconds := s.restartContainer(ctx)
-	out := map[string]any{
-		"ok":      ok,
-		"restart": nil,
-		"trashed": trashed,
-		"message": formatMessage("已删除 %s(回收件 %s)，%s", uidPrefix(entry.UID), trashed, message),
+	// 与 accountToggle 同理：删号是文件层改动，原地重载即可，不必重启进程。
+	if ok, detail := s.reloadAccounts(ctx); ok {
+		return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+			"message": formatMessage("已删除 %s（回收件 %s），立即生效", uidPrefix(entry.UID), trashed)}
+	} else if detail != "" {
+		return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+			"message": formatMessage("已删除 %s（回收件 %s），%s；重启网关后生效", uidPrefix(entry.UID), trashed, detail)}
 	}
-	if ok {
-		out["restart"] = seconds
-	}
-	return out
+	return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+		"message": formatMessage("已删除 %s（回收件 %s），重启网关后生效", uidPrefix(entry.UID), trashed)}
 }
 
 // accountRevive 复活被网关停用的账号（清 disabled + reason，账号回到可选池）。
@@ -283,15 +306,38 @@ func (s *Server) taskToggle(ctx context.Context, body map[string]any) map[string
 	if message == "状态未变化" {
 		return map[string]any{"ok": true, "message": message}
 	}
-	restartOK, restartMessage, seconds := s.restartContainer(ctx)
-	out := map[string]any{"ok": restartOK, "restart": nil, "message": restartMessage}
-	if restartOK {
-		out["restart"] = seconds
-		out["message"] = formatMessage("已%s「%s」，%s", enabledLabel(enabled), key, restartMessage)
-	} else {
-		out["message"] = formatMessage("已%s「%s」的设置，但%s", enabledLabel(enabled), key, restartMessage)
+	// 文件写好了，还要让**运行中的**排程器跟上：它启动时把开关抄进了自己的 Config，
+	// 不告诉它的话新开关要等重启才生效（2026-10-15 用户反馈「任务启停都要重启」）。
+	//
+	// 走网关的 /tasks/toggle（原地改运行期覆盖 + 叫醒主循环重算下次时点），
+	// **不再重启容器**：任务开关是纯排程状态，重启一次几十秒还打断在途请求，
+	// 代价与收益完全不成比例。
+	if applied, detail := s.applyTaskToggle(ctx, key, enabled); applied {
+		return map[string]any{"ok": true, "message": formatMessage("已%s「%s」，立即生效", enabledLabel(enabled), key)}
+	} else if detail != "" {
+		// 原地生效失败（旧版网关没有这个端点、或管理通道不可用）：如实说明，并指出
+		// 文件已改对——重启后同样会生效，不让用户以为白改了。
+		return map[string]any{"ok": true,
+			"message": formatMessage("已%s「%s」的设置（%s），重启网关后生效", enabledLabel(enabled), key, detail)}
 	}
-	return out
+	return map[string]any{"ok": true,
+		"message": formatMessage("已%s「%s」的设置，重启网关后生效", enabledLabel(enabled), key)}
+}
+
+// applyTaskToggle 让运行中的排程器原地接受新开关。
+//
+// 返回 (是否已生效, 失败原因)。失败原因只用于文案，**不**把整个操作判失败——
+// config.json 已经写对了，那才是真值；原地生效是「让它立刻起作用」的加速器。
+func (s *Server) applyTaskToggle(ctx context.Context, key string, enabled bool) (bool, string) {
+	if s.gateway == nil || s.gateway.Management == nil || !s.gateway.Management.ManagementEnabled() {
+		return false, "管理通道不可用"
+	}
+	code, payload := s.gateway.Management.Request(ctx, "POST", "/tasks/toggle",
+		map[string]any{"key": key, "enabled": enabled})
+	if code == http.StatusOK && jsonBool(payload["ok"], false) {
+		return true, ""
+	}
+	return false, firstNonEmpty(gatewayEnvelopeError(payload), "网关未接受该开关")
 }
 
 func enabledLabel(enabled bool) string {

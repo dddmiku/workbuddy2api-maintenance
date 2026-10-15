@@ -898,6 +898,12 @@ function renderAccounts(){
     // 冷却中的行带 data-cool-end（截止毫秒时间戳），交给 tickCooldowns 每秒就地刷新，
     // 不必等下一次整页数据拉取。
     var coolReasonTxt = coolReason(p);
+    // 余额不足（CoolHard）的号：只挡住扣积分的模型，**免费模型照常可用**（网关选号
+    // 侧对它豁免，见 pool.hardCreditBlocksModel）。旧文案只写「冷却中 · 余额不足」，
+    // 用户会以为整个号废了、白占着名额——2026-10-15 反馈：「这种积分不足的账号，
+    // 是可以用免费模型的，但是你直接冷却了，后续怎么进来这个号呢」。
+    var freeUsable = p.freeModelsUsable === true;
+    if (freeUsable) coolReasonTxt = (coolReasonTxt || '余额不足') + '（免费模型仍可用）';
     var coolSub = p.cooling
       ? '<span class="sub" data-cool-end="' + coolEnd +
         '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
@@ -1620,8 +1626,10 @@ async function actTaskRun(key){
 }
 function actTaskToggle(key, nextEnabled){
   var t = taskList().filter(function(x){ return x.key === key; })[0] || {};
+  // 文案不再写「重启网关生效」：2026-10-15 起网关会原地改运行期开关并叫醒排程器
+  // （见 panel.actions.applyTaskToggle），保存后立刻生效，不必重启。
   ask((nextEnabled ? '启用' : '停用') + '任务',
-    '「' + (t.name || key) + '」' + (nextEnabled ? '将恢复按点执行' : '将不再自动执行') + '，保存后重启网关生效。',
+    '「' + (t.name || key) + '」' + (nextEnabled ? '将恢复按点执行' : '将不再自动执行') + '，保存后立即生效。',
     nextEnabled ? '启用' : '停用', !nextEnabled, async function(){
       busy(true);
       try{

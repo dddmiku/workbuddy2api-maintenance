@@ -108,6 +108,19 @@ func (s *stubTransport) recorded() []stubRequest {
 	return append([]stubRequest(nil), s.requests...)
 }
 
+// count 统计某个 "METHOD /path" 被调过几次（断言「必须触发重载」这类要求用）。
+func (s *stubTransport) count(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, req := range s.requests {
+		if req.Method+" "+req.Endpoint == key {
+			n++
+		}
+	}
+	return n
+}
+
 // ── 测试装置 ──────────────────────────────────────────────────────────
 
 // harness 是一套隔离的面板后端：临时目录 + 假时钟 + 假执行器 + 假管理通道。
@@ -779,11 +792,13 @@ func TestAccountToggleDetectsDuplicatePair(t *testing.T) {
 	}
 }
 
-func TestAccountToggleRenamesAndRestarts(t *testing.T) {
+func TestAccountToggleRenamesAndReloads(t *testing.T) {
 	h := newHarness(t)
 	doc := h.writeCredentials()
 	writeAuthFixture(t, h.server.opts.AuthDir, "workbuddy-abc12345.json", "abc12345")
-	h.runner.replies["restart workbuddy2api"] = ExecResult{Code: 0, Stdout: "restarted"}
+	// 2026-10-15 改：账号启停不再重启容器，改走进程内重载（POST /runtime/reload）。
+	// 重启一次几十秒还打断在途请求，而 auth 文件的改动只需网关重扫目录。
+	h.transport.replies["POST /runtime/reload"] = stubReply{Code: 200, Body: `{"ok":true}`}
 
 	recorder := h.postJSON(doc, "/api/account/toggle", map[string]any{"uid": "abc12345", "disabled": true})
 	body := decode(t, recorder)
@@ -793,16 +808,77 @@ func TestAccountToggleRenamesAndRestarts(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(h.server.opts.AuthDir, "workbuddy-abc12345.json.disabled")); err != nil {
 		t.Fatalf("停用应是改名加 .disabled：%v", err)
 	}
-	// 原生模式下 restart 就是一次运行时重载（网关自己确认完成），不再轮询容器健康。
-	calls := h.runner.recorded()
-	found := false
-	for _, call := range calls {
-		if strings.Join(call, " ") == "restart workbuddy2api" {
-			found = true
-		}
+	if len(h.runner.recorded()) != 0 {
+		t.Fatalf("账号启停不得重启容器（应走进程内重载）：%v", h.runner.recorded())
 	}
-	if !found {
-		t.Fatalf("改动账号后必须重启网关：%v", calls)
+	// 重载必须真的发出去，否则改动不生效（这正是用户抱怨的「要重启才生效」）。
+	if h.transport.count("POST /runtime/reload") == 0 {
+		t.Fatalf("改动账号后必须触发进程内重载：%v", h.transport.recorded())
+	}
+	if got := jsonString(body["message"]); !strings.Contains(got, "立即生效") {
+		t.Fatalf("文案应说明立即生效：%q", got)
+	}
+}
+
+// TestTaskToggleAppliesWithoutRestart 任务开关改完**立即生效**，不重启容器。
+//
+// 2026-10-15 用户反馈「任务启停都要重启网关才行，这合理吗」。旧实现只写
+// config.json，而排程器在启动时把开关抄进了自己的 Config——不重启就不生效。
+// 现在写完文件后调网关的 POST /tasks/toggle（原地改运行期覆盖 + 叫醒排程器）。
+//
+// 判据有两面：**必须**发出 /tasks/toggle（否则开关不生效），且**不得**重启容器
+// （重启一次几十秒还打断在途请求，与「改一个布尔值」的代价完全不成比例）。
+func TestTaskToggleAppliesWithoutRestart(t *testing.T) {
+	h := newHarness(t)
+	doc := h.writeCredentials()
+	h.transport.replies["POST /tasks/toggle"] = stubReply{Code: 200, Body: `{"ok":true}`}
+
+	recorder := h.postJSON(doc, "/api/task/toggle", map[string]any{"key": "checkin", "enabled": false})
+	body := decode(t, recorder)
+	if !jsonBool(body["ok"], false) {
+		t.Fatalf("应成功：%v", body)
+	}
+	if h.transport.count("POST /tasks/toggle") == 0 {
+		t.Fatalf("必须调网关原地生效：%v", h.transport.recorded())
+	}
+	if len(h.runner.recorded()) != 0 {
+		t.Fatalf("任务开关不得重启容器：%v", h.runner.recorded())
+	}
+	if got := jsonString(body["message"]); !strings.Contains(got, "立即生效") {
+		t.Fatalf("文案应说明立即生效：%q", got)
+	}
+	// config.json 也必须真的写对了——原地生效是加速器，文件才是真值。
+	raw, err := os.ReadFile(filepath.Join(h.dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"checkin_enabled": false`) {
+		t.Fatalf("config.json 应已写入新开关：%s", raw)
+	}
+}
+
+// TestTaskToggleFallsBackToNoticeWhenGatewayRejects 管理通道不可用时如实降级。
+//
+// 文件已经写对了（那才是真值），但原地生效没做成。此时**不能**谎报「立即生效」，
+// 也不能把整个操作判失败——要明说「重启后生效」，让用户知道文件改对了。
+func TestTaskToggleFallsBackToNoticeWhenGatewayRejects(t *testing.T) {
+	h := newHarness(t)
+	doc := h.writeCredentials()
+	h.transport.replies["POST /tasks/toggle"] = stubReply{
+		Code: 400, Body: `{"error":{"message":"未知任务：checkin"}}`}
+
+	recorder := h.postJSON(doc, "/api/task/toggle", map[string]any{"key": "checkin", "enabled": false})
+	body := decode(t, recorder)
+	// 文件改对了 → 操作本身成功；但文案必须如实说明要靠重启。
+	if !jsonBool(body["ok"], false) {
+		t.Fatalf("文件已改对，操作应成功：%v", body)
+	}
+	got := jsonString(body["message"])
+	if strings.Contains(got, "立即生效") {
+		t.Fatalf("原地生效失败时不得谎报立即生效：%q", got)
+	}
+	if !strings.Contains(got, "重启网关后生效") {
+		t.Fatalf("应提示重启后生效：%q", got)
 	}
 }
 

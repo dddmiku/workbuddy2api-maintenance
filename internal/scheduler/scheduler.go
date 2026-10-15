@@ -124,6 +124,24 @@ type Scheduler struct {
 	lifecycle context.Context
 	cancel    context.CancelFunc
 
+	// disabledOverride 是**运行期**的任务开关覆盖：TaskKey → 是否停用。
+	//
+	// 为什么需要它（2026-10-15 用户反馈「任务启停都要重启网关才行，这合理吗」）：
+	// 面板改 config.json 只写了文件，而排程器在启动时把 schedule.*_enabled 抄进了
+	// Config 的 CheckinDisabled 等字段——改完不重启，运行中的排程器仍按旧值派发。
+	// 用户点「停用」看到「已保存（重启后生效）」，实际要手动重启才生效。
+	//
+	// 有了覆盖表，SetTaskEnabled 之后网关可以**原地**改这一个键，下一次 nextWake
+	// 就按新值算时点（Run 主循环每轮重新调用 nextWake），无需重启进程。
+	// 只存内存：它是「当前生效值」，真值仍是 config.json，重启后从配置重建。
+	disabledOverride map[TaskKey]bool
+
+	// wake 是唤醒主循环的信号通道（容量 1，非阻塞投递）。
+	//
+	// 改了开关之后必须把正在 sleep 的 timer 叫醒：否则「启用」一个任务后，主循环
+	// 还在按旧时点（可能几小时后）睡着，用户看到「已启用」却半天不跑。
+	wake chan struct{}
+
 	// runMu 全局任务互斥：同一时刻只允许一类任务在跑。这些任务打的是同一批上游
 	// 账号，并发只会让风控更容易命中；顺带让任务日志有唯一归属者，
 	// taskLogSink.cur 因此不必处理多重归属。
@@ -169,13 +187,78 @@ func New(cfg Config) *Scheduler {
 	// #nosec G118 -- cancel 存进 Scheduler.cancel，由 Run 在退出时调用（见同文件 defer cancel()），不是漏调用
 	lifecycle, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
-		cfg:           cfg,
-		lifecycle:     lifecycle,
-		cancel:        cancel,
-		adoptTried:    make(map[string]string),
-		taskLast:      make(map[TaskKey]time.Time),
-		taskBusy:      make(map[TaskKey]bool),
+		cfg:              cfg,
+		lifecycle:        lifecycle,
+		cancel:           cancel,
+		adoptTried:       make(map[string]string),
+		taskLast:         make(map[TaskKey]time.Time),
+		taskBusy:         make(map[TaskKey]bool),
+		disabledOverride: make(map[TaskKey]bool),
+		wake:             make(chan struct{}, 1),
 	}
+}
+
+// taskDisabled 报告某类任务当前是否停用：运行期覆盖优先，其次看启动时的配置。
+//
+// 调用方必须已持有 taskMu（覆盖表由它保护）。
+func (s *Scheduler) taskDisabled(k taskKind) bool {
+	if disabled, ok := s.disabledOverride[k.key()]; ok {
+		return disabled
+	}
+	switch k {
+	case taskCheckin:
+		return s.cfg.CheckinDisabled
+	case taskTraeCheck:
+		return s.cfg.TraeCheckDisabled
+	case taskTravel:
+		return s.cfg.TravelDisabled
+	case taskActivity:
+		return s.cfg.ActivityDisabled
+	case taskKeepalive:
+		return s.cfg.KeepaliveDisabled
+	case taskSchool:
+		return s.cfg.SchoolDisabled
+	case taskCat:
+		return s.cfg.CatDisabled
+	case taskGrowth:
+		return s.cfg.GrowthDisabled
+	case taskBalance:
+		return s.cfg.BalanceDisabled
+	}
+	return false
+}
+
+// SetTaskEnabled 原地改一个任务的启停，并唤醒主循环重算下次运行时点。
+//
+// 返回 false 表示任务标识未知（调用方据此报错，不写任何状态）。
+// 这是「面板改开关不用重启网关」的落点：真值仍在 config.json（面板负责写文件），
+// 这里只把**当前生效值**跟上，让排程立即按新值走。
+func (s *Scheduler) SetTaskEnabled(key string, enabled bool) bool {
+	kind, ok := kindOf(key)
+	if !ok {
+		return false
+	}
+	s.taskMu.Lock()
+	s.disabledOverride[kind.key()] = !enabled
+	s.taskMu.Unlock()
+	// 叫醒主循环：它此刻可能正按旧时点睡着（可能是几小时后），不叫醒就要等到那时
+	// 才按新开关重算——用户会看到「已启用」却迟迟不跑。
+	select {
+	case s.wake <- struct{}{}:
+	default: // 已有待处理信号，无需重复投递
+	}
+	return true
+}
+
+// TaskEnabled 报告某任务当前是否启用（供面板回显与 /tasks 自省）。
+func (s *Scheduler) TaskEnabled(key string) (bool, bool) {
+	kind, ok := kindOf(key)
+	if !ok {
+		return false, false
+	}
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	return !s.taskDisabled(kind), true
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -242,32 +325,41 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		at   time.Time
 		kind taskKind
 	}
+	// 停用判定统一走 taskDisabled（运行期覆盖优先），否则面板刚改的开关要等重启
+	// 才在排程上生效——那正是用户抱怨的「任务启停都要重启」。
+	s.taskMu.Lock()
+	disabled := map[taskKind]bool{}
+	for _, k := range []taskKind{taskCheckin, taskTraeCheck, taskTravel, taskActivity,
+		taskKeepalive, taskSchool, taskCat, taskGrowth, taskBalance} {
+		disabled[k] = s.taskDisabled(k)
+	}
+	s.taskMu.Unlock()
 	var slots []slot
-	if !s.cfg.CheckinDisabled {
+	if !disabled[taskCheckin] {
 		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
 	}
-	if !s.cfg.TraeCheckDisabled {
+	if !disabled[taskTraeCheck] {
 		slots = append(slots, slot{nextFire(now, s.cfg.TraeCheckHours), taskTraeCheck})
 	}
-	if !s.cfg.TravelDisabled {
+	if !disabled[taskTravel] {
 		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
 	}
-	if !s.cfg.ActivityDisabled {
+	if !disabled[taskActivity] {
 		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
 	}
-	if !s.cfg.KeepaliveDisabled {
+	if !disabled[taskKeepalive] {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
 	}
-	if !s.cfg.SchoolDisabled {
+	if !disabled[taskSchool] {
 		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
 	}
-	if !s.cfg.CatDisabled {
+	if !disabled[taskCat] {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
-	if !s.cfg.GrowthDisabled {
+	if !disabled[taskGrowth] {
 		slots = append(slots, slot{nextFire(now, s.cfg.GrowthHours), taskGrowth})
 	}
-	if !s.cfg.BalanceDisabled {
+	if !disabled[taskBalance] {
 		slots = append(slots, slot{nextFire(now, s.cfg.BalanceHours), taskBalance})
 	}
 	var earliest time.Time
@@ -322,15 +414,26 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 全部任务都禁用：不空转，只等退出信号。
-			<-ctx.Done()
-			return
+			// 全部任务都禁用：不空转，只等退出信号或开关变更信号。
+			// 必须也听 s.wake：面板把某个任务重新启用后，这里要能醒过来重算时点，
+			// 否则进程会一直睡到退出——「启用」点了等于没点。
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+				continue
+			}
 		}
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-s.wake:
+			// 开关被改过（SetTaskEnabled）：丢掉旧时点，立刻按新值重算。
+			// 不重算的话「刚启用的任务」要等旧 timer 到点才跑——用户会以为没生效。
+			timer.Stop()
+			continue
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报

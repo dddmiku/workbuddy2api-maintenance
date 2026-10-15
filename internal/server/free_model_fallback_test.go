@@ -1,17 +1,26 @@
 // ═══ 更新日志 ═══
 // 2026-10-13：新增。锁住「免费模型不得被回落成付费的同名模型」——回落只按可用性决定，
 // 而同名模型两域倍率可以不同，静默改道会产生调用方没有要求的真实扣费。
+//
+// 2026-10-15 改判据：从「拒绝回落」改为「回落但账本记实际服务的域」。
+//
+//	旧口径拦得太死，让整个模型在 global 全冷却时彻底不可用——用户实测：
+//	「所有 global 4.1 冷却了，却无法回落到 cn 4.1」。账本归错名是**记账问题**，
+//	不该拿「拒绝服务」来治。见 handler.go 的同名回落注释。
 package server
 
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/usage"
 )
 
 // paidModelPool 造一个 global 全限流、CN 可用的池，并把付费表注入成
@@ -37,16 +46,18 @@ func paidModelPool(t *testing.T, cnPaid, globalPaid bool) (*pool.Pool, apikeys.I
 	return p, apikeys.Info{ID: "key_test", Name: "fallback", GlobalFallbackToCN: &value}
 }
 
-// TestGlobalFallbackRefusesFreeToPaidSubstitution 免费模型不得被回落成付费的同名模型。
+// TestGlobalFallbackSubstitutesFreeToPaid 免费模型在 global 全冷却时**照常**回落到
+// 付费的同名 CN 模型——调用方开了回落开关，要的就是「这个模型还能用」。
 //
-// 线上实测（2026-10-13）：密钥开了 global_fallback_to_cn，请求点名
-// global:deepseek-v4.1-flash（目录倍率 x0.00，免费），global 域限流后被静默回落到
-// cn:deepseek-v4.1-flash（x0.11，付费），单次真实扣费最高 10.03，而这笔钱按
-// 「账本记调用方请求的名字」的约定记在了免费模型名下——面板上就出现「免费模型用了
-// 260.89 积分」这种自相矛盾的数字。
+// ⚠️ 2026-10-15 改语义（原 TestGlobalFallbackRefusesFreeToPaidSubstitution）。
+// 旧口径在 global 免费 / cn 付费时**拒绝回落**，理由是会产生计划外扣费、且那笔钱会
+// 被记到免费模型名下。但拒绝的代价是整个模型在 global 全冷却时不可用（用户实测：
+// 「所有 global 4.1 冷却了，却无法回落到 cn 4.1」）。
 //
-// 判据：global 免费 + cn 付费 → 不回落（如实报 global 无可用号，由调用方决定）。
-func TestGlobalFallbackRefusesFreeToPaidSubstitution(t *testing.T) {
+// 现在回落发生，账本改记**实际服务的域**（cn:deepseek-v4.1-flash）——那笔积分确实
+// 花在 cn 的模型上，记到免费的 global 名下才是矛盾的来源。用量归属由 handler 的
+// fallbackModel 负责（见同名回落分支）。
+func TestGlobalFallbackSubstitutesFreeToPaid(t *testing.T) {
 	p, info := paidModelPool(t, true, false)
 	var used []string
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -58,10 +69,78 @@ func TestGlobalFallbackRefusesFreeToPaidSubstitution(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, fallbackRequest(info))
 
-	for _, authz := range used {
-		if authz == "Bearer at-c1" {
-			t.Fatalf("免费模型被回落到付费的 CN 同名模型，产生计划外扣费；used=%v", used)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body)
+	}
+	if len(used) == 0 || used[0] != "Bearer at-c1" {
+		t.Fatalf("global 无可用号时免费模型应回落 CN：used=%v", used)
+	}
+}
+
+// newUsageLedger 开一本临时账本，返回 Store 与「已记账的模型名」读取器。
+func newUsageLedger(t *testing.T) (*usage.Store, func() []string) {
+	t.Helper()
+	ledger, err := usage.Open(filepath.Join(t.TempDir(), "usage.json"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ledger.Close() })
+	models := func() []string {
+		var out []string
+		for _, key := range ledger.Snapshot().Keys {
+			for _, m := range key.Models {
+				out = append(out, m.Model)
+			}
 		}
+		sort.Strings(out)
+		return out
+	}
+	return ledger, models
+}
+
+// TestFallbackUsageAttributedToServedRealm 回落产生的用量必须记在**实际服务的域**名下。
+//
+// 这是替代旧「拒绝回落」判据的那道闸门：面板上不能再出现「免费模型用了 N 积分」
+// 这种自相矛盾的数字——那笔钱要记到 cn 的名下。
+func TestFallbackUsageAttributedToServedRealm(t *testing.T) {
+	p, info := paidModelPool(t, true, false)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	ledger, recordedModels := newUsageLedger(t)
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: ledger})
+
+	h.ServeHTTP(httptest.NewRecorder(), fallbackRequest(info))
+
+	models := recordedModels()
+	if len(models) != 1 {
+		t.Fatalf("应记录一次用量，实际 %v", models)
+	}
+	if models[0] != "cn:deepseek-v4.1-flash" {
+		t.Fatalf("回落后的用量应记在实际服务的域名下，实际 %q（免费→付费回落若记 global 会造出免费模型花了积分的假账）", models[0])
+	}
+}
+
+// TestFallbackUsageKeepsRequestedModelWhenPriceEqual 同价回落不改写账本模型名。
+//
+// 只在「真的换了域且两域价不同」时改写：老部署里两域同价的模型占绝大多数，
+// 无条件改写会让它们的账本口径凭空漂移。
+func TestFallbackUsageKeepsRequestedModelWhenPriceEqual(t *testing.T) {
+	p, info := paidModelPool(t, false, false)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	ledger, recordedModels := newUsageLedger(t)
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: ledger})
+
+	h.ServeHTTP(httptest.NewRecorder(), fallbackRequest(info))
+
+	models := recordedModels()
+	if len(models) != 1 {
+		t.Fatalf("应记录一次用量，实际 %v", models)
+	}
+	if models[0] != "global:deepseek-v4.1-flash" {
+		t.Fatalf("同价回落的账本应保持调用方请求的名字，实际 %q", models[0])
 	}
 }
 
