@@ -81,11 +81,28 @@ var chunkSeq uint64
 //
 // 回落必须发生在**客户端收到任何内容之前**——已交付内容再换端点会让用户看到
 // 重复/断裂的输出。Remote 建会话失败即满足（一个字节都还没发）。
+// ChatStream 是 Trae 域的入口：优先 Remote 两步协议，失败回落 llm_utils_chat。
+//
+// ═══ 带图请求直接走 llm_utils_chat（2026-10-16 实测）═══
+//
+// Remote 端点**读不到内联图片**：把媒体块放进 query 的 JSON 数组、放进
+// initial_message.content（参考 build_web_content 的原形）、或两者都放，上游一律
+// 回「没有收到图片」——连目录里标了 multimodal:true 的 kimi-k2.6 / Doubao-Seed-2.1-Pro
+// 也一样（三组对照实验，图片用 384×384 有结构的 PNG）。
+//
+// 同一个二进制、同一张图，llm_utils_chat 路径答得完全正确：
+//
+//	Doubao-Seed-2.1-Pro → "有圆形和长方形，背景是蓝色。"
+//	kimi-k2.6           → "圆形、长方形；蓝色背景。"
+//
+// 所以带图请求**必须**走 legacy——那里 messages 是原生块数组，图片原样透传上游。
+// 判据用「请求体里有没有图片块」，不是模型名：客户端可能给文本模型发图，让上游
+// 按自己的口径拒绝比网关猜一个替代模型更诚实。
 func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if RemoteEnabled() {
+	if RemoteEnabled() && !requestHasImages(prepared) {
 		if stream, err := ChatStreamRemote(ctx, a, prepared, clientIP); err == nil {
 			return stream, http.StatusOK, nil, nil
 		} else {
@@ -93,6 +110,41 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		}
 	}
 	return chatStreamLegacy(ctx, a, prepared, clientIP)
+}
+
+// requestHasImages 报告出站请求体里是否带图片块。
+//
+// 解析失败按「有图片」处理（走 legacy）：宁可少用 Remote 的能力，也不能把用户的
+// 图片静默丢掉——丢图的回答看起来像模型没看图，用户无从察觉。
+func requestHasImages(prepared []byte) bool {
+	if len(prepared) == 0 {
+		return false
+	}
+	var src map[string]any
+	if err := json.Unmarshal(prepared, &src); err != nil {
+		return true
+	}
+	messages, _ := src["messages"].([]any)
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range content {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if rendererMediaBlock(block) != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // chatStreamLegacy 是旧的 llm_utils_chat 出站路径（现为 Remote 的回落）。
@@ -137,7 +189,7 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, resp.StatusCode, raw, nil
 	}
-	stream := TranslateStream(resp.Body, modelFromPrepared(prepared))
+	stream := TranslateStreamWithTools(resp.Body, modelFromPrepared(prepared), preparedTools(prepared))
 	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
@@ -380,11 +432,12 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 的 heartbeat 会被转译器吞成 keepalive 注释，届时已无法区分「排队中」与
 	// 「模型活动」（对齐参考 stream_events 的 first-event 判定）。
 	return &remoteStreamCloser{
-		ReadCloser: TranslateStream(
+		ReadCloser: TranslateStreamWithTools(
 			translateRemoteEvents(
 				newRemoteFirstEventReader(events),
 				modelFromPrepared(prepared)),
-			modelFromPrepared(prepared)),
+			modelFromPrepared(prepared),
+			preparedTools(prepared)),
 		auth:    a,
 		session: session,
 	}, nil
@@ -535,6 +588,34 @@ func TranslateStream(upstream io.ReadCloser, model string) io.ReadCloser {
 	return newTranslateReader(upstream, newTranslator(model))
 }
 
+// TranslateStreamWithTools 与 TranslateStream 相同，但声明了调用方提供的工具名。
+//
+// 为什么需要：Remote 端点不透传 tools 结构，客户端工具只能以 opencode_tool_call
+// 文本块表达（prompt.go）。转译层要把这些块解析成 tool_calls，就必须知道**哪些
+// 工具名是合法的**——模型偶尔会臆造工具名，交付给客户端会让整轮失败
+// （Anthropic 侧拒绝一个未声明的工具调用）。非空列表 = 白名单。
+func TranslateStreamWithTools(upstream io.ReadCloser, model string, tools []any) io.ReadCloser {
+	tr := newTranslator(model)
+	if names := declaredToolNames(tools); len(names) > 0 {
+		tr.allowedTools = names
+	}
+	return newTranslateReader(upstream, tr)
+}
+
+// declaredToolNames 收集声明过的工具名（小写，供白名单比对）。
+func declaredToolNames(tools []any) map[string]bool {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := map[string]bool{}
+	for _, def := range normalizeToolDefinitions(tools) {
+		if name, _ := def["name"].(string); strings.TrimSpace(name) != "" {
+			names[strings.ToLower(strings.TrimSpace(name))] = true
+		}
+	}
+	return names
+}
+
 // chatTransport 是 SSE 专用 Transport：首字节有超时、流中空闲交给上游事件心跳，
 // 不设总时长（长回答不能因为整体耗时被砍断）。
 //
@@ -557,6 +638,22 @@ func chatTransport() http.RoundTripper {
 func newRequestID() string {
 	n := atomic.AddUint64(&chunkSeq, 1)
 	return fmt.Sprintf("trae-%d-%d", time.Now().UnixNano(), n)
+}
+
+// preparedTools 取出站请求体里声明的工具（供文本协议白名单比对）。
+//
+// 解析失败一律返回 nil（= 不设白名单，全部放行）：白名单是「防臆造」的加固，
+// 不该因为一次解析失败就把合法调用也拦掉。
+func preparedTools(prepared []byte) []any {
+	if len(prepared) == 0 {
+		return nil
+	}
+	var src map[string]any
+	if err := json.Unmarshal(prepared, &src); err != nil {
+		return nil
+	}
+	tools, _ := src["tools"].([]any)
+	return tools
 }
 
 // withModel 把出站请求体的 model 字段换成解析后的 config_name。
@@ -833,6 +930,33 @@ func (t *toolAccumulator) absorb(items []any) []map[string]any {
 	return deltas
 }
 
+// absorbTextCalls 把文本协议解析出的调用转成 OpenAI 工具帧。
+//
+// 与 absorb 分开：absorb 处理上游原生的 tool_calls 片段（首片带 id/name、后续只带
+// 参数增量），文本协议解析出的调用则是**一次性完整**的，直接按顺序发完整帧即可
+// （客户端按 index 累积，一次发完与分片发完等价）。
+func (t *toolAccumulator) absorbTextCalls(calls []textToolCall) []map[string]any {
+	var deltas []map[string]any
+	for _, call := range calls {
+		index := len(t.order)
+		state := &toolCallState{id: call.ID, typ: "function", name: call.Name}
+		state.arguments.WriteString(call.Arguments)
+		state.seenArgs = true
+		t.calls[index] = state
+		t.order = append(t.order, index)
+		deltas = append(deltas, map[string]any{
+			"index": index,
+			"id":    call.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	return deltas
+}
+
 // ── 转译器 ────────────────────────────────────────────────────────────────
 
 type translator struct {
@@ -847,18 +971,116 @@ type translator struct {
 	sawTerminal  bool
 	started      bool
 	contentCount int
-	// thinkingOpen 记录是否已经输出过 think 开头，用于把 reasoning 包成 think 块。
-	thinkingOpen bool
-	thinkingDone bool
+
+	// ── 思考的下发时机（2026-10-16 修「思考被切成很多段」）──────────────────
+	//
+	// 上游 Remote agent 的一轮回答里会连续发多个 plan_item，**每个都同时带
+	// thought 快照与正文快照**。旧实现每收到一个就「先发 reasoning、再发
+	// content」，于是下游看到 R,C,R,C,R,C… 交替；Anthropic 侧每遇一次
+	// thinking→text→thinking 都要新开一个 content block，Claude Code 便把它
+	// 渲染成十几个「Thought for 1s」碎片，中间夹着几个字的正文。
+	//
+	// 现在改成：正文首次出现之前到达的思考先累积，等正文要发时**一次性**发出
+	// （一个 thinking block）；正文开始后到达的思考进 lateReasoning，收尾时
+	// 合并成第二个 block 发出（不丢内容，但不再与正文交替）。
+	reasoningFlushed bool
+	lateReasoning    *textAccumulator
+	// reasoningPending/latePending 累积「已从累加器取出但尚未交付」的思考增量。
+	// 不能等到 flush 时才调 finalize：add 已经把增量消费掉了。
+	reasoningPending strings.Builder
+	latePending      strings.Builder
+	// pendingText 攒住「已取出但只有空白」的正文增量，等非空白内容出现时一起发
+	// （理由见 handleEvent 里正文分支的注释）。
+	pendingText strings.Builder
+
+	// textToolSeen 文本协议工具调用的签名集合（跨事件去重，同一调用只交付一次）。
+	textToolSeen map[string]bool
+	// allowedTools 调用方声明的工具名（小写）。非空时只交付声明过的调用——
+	// 模型臆造的工具名交付给客户端会让整轮失败（见 absorbTextToolCalls）。
+	allowedTools map[string]bool
+	// droppedTools 被过滤掉的未声明调用数（收尾时记一行日志，不静默丢弃）。
+	droppedTools int
 }
 
 func newTranslator(model string) *translator {
 	return &translator{
-		model:     model,
-		id:        "chatcmpl-trae-" + newRequestID(),
-		text:      &textAccumulator{},
-		reasoning: &textAccumulator{},
-		tools:     newToolAccumulator(),
+		model:         model,
+		id:            "chatcmpl-trae-" + newRequestID(),
+		text:          &textAccumulator{},
+		reasoning:     &textAccumulator{},
+		lateReasoning: &textAccumulator{},
+		tools:         newToolAccumulator(),
+	}
+}
+
+// absorbReasoning 吸收一段思考（累积快照或增量，由累加器合并）。
+//
+// 增量由累加器的 add 返回（它同时推进去重状态），这里累积到待发缓冲里，
+// 等 flush 时一次性交付——不能等到 flush 再调 finalize，那时 add 已经消费过
+// 增量、finalize 只会返回空串（2026-10-16 实测踩到）。
+func (t *translator) absorbReasoning(chunk string) {
+	if chunk == "" {
+		return
+	}
+	if t.contentCount > 0 {
+		// 正文已经开始：这一段的思考改走尾部通道，避免与正文交替成块。
+		t.latePending.WriteString(t.lateReasoning.add(chunk))
+		return
+	}
+	t.reasoningPending.WriteString(t.reasoning.add(chunk))
+}
+
+// flushReasoning 把正文之前累积的思考一次性发出（只发一次）。
+func (t *translator) flushReasoning(out *bytes.Buffer) {
+	if t.reasoningFlushed {
+		return
+	}
+	t.reasoningFlushed = true
+	// finalize 放行尾部被压住的不完整标记（如恰好停在 "<tool_c" 上）。
+	t.reasoningPending.WriteString(t.reasoning.finalize())
+	if text := t.reasoningPending.String(); text != "" {
+		t.start(out)
+		t.emit(out, map[string]any{"reasoning_content": text}, nil)
+	}
+}
+
+// flushLateReasoning 收尾时发出「正文开始后」到达的思考（合并成一个 block）。
+func (t *translator) flushLateReasoning(out *bytes.Buffer) {
+	t.latePending.WriteString(t.lateReasoning.finalize())
+	if text := t.latePending.String(); text != "" {
+		t.start(out)
+		t.emit(out, map[string]any{"reasoning_content": text}, nil)
+	}
+}
+
+// absorbTextToolCalls 从累积原文与思考里抽取文本协议的工具调用并交付。
+//
+// 必须在「累积原文」上扫描而不是每次的增量：块会跨事件分片，任何单片里都看不到
+// 闭合标签。签名去重保证同一调用只交付一次。详见 tooltext.go 文件头。
+func (t *translator) absorbTextToolCalls(out *bytes.Buffer) {
+	if t.textToolSeen == nil {
+		t.textToolSeen = map[string]bool{}
+	}
+	var found []textToolCall
+	found = append(found, extractTextToolCalls(t.text.raw, t.textToolSeen)...)
+	found = append(found, extractTextToolCalls(t.reasoning.raw, t.textToolSeen)...)
+	found = append(found, extractTextToolCalls(t.lateReasoning.raw, t.textToolSeen)...)
+	if len(found) == 0 {
+		return
+	}
+	// 过滤模型臆造的工具名：未声明的调用交付给客户端会整轮失败（Anthropic 侧
+	// 会以「上游要求调用一个不存在的工具」拒绝整条消息）。
+	kept := found[:0]
+	for _, call := range found {
+		if len(t.allowedTools) > 0 && !t.allowedTools[strings.ToLower(call.Name)] {
+			t.droppedTools++
+			continue
+		}
+		kept = append(kept, call)
+	}
+	for _, delta := range t.tools.absorbTextCalls(kept) {
+		t.start(out)
+		t.emit(out, map[string]any{"tool_calls": []any{delta}}, nil)
 	}
 }
 
@@ -954,21 +1176,31 @@ func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (b
 	rawResponse, _ := obj["response"].(string)
 	embeddedReasoning, visibleResponse := splitEmbeddedReasoning(rawResponse)
 
-	// reasoning 先发：客户端要能区分"思考"与"回答"。
+	// 思考先累积（不与正文交替——见 translator.reasoningFlushed 注释）。
 	for _, chunk := range []string{reasoning, embeddedReasoning} {
-		if chunk == "" {
-			continue
-		}
-		if addition := t.reasoning.add(chunk); addition != "" {
-			t.start(out)
-			t.emit(out, map[string]any{"reasoning_content": addition}, nil)
-		}
+		t.absorbReasoning(chunk)
 	}
 	if addition := t.text.add(visibleResponse); addition != "" {
-		t.start(out)
-		t.contentCount++
-		t.emit(out, map[string]any{"content": addition}, nil)
+		// 正文要发了：先把之前累积的思考一次性放出去，再开正文块。
+		//
+		// 但**纯空白**的正文增量不算「正文开始」：实测上游每个 plan_item 的
+		// content 字段常常只有一个换行，于是思考分片之间夹着 C("\n")，Anthropic
+		// 侧就反复 thinking→text→thinking 开关块，Claude Code 渲染成十几个
+		// 「Thought for 1s」（用户报障的形态：每段思考都被切成独立条目）。
+		// 空白先攒着，等真出现非空白内容时连同它一起发——这样连续思考就落在
+		// 同一个 thinking 块里。
+		t.pendingText.WriteString(addition)
+		if strings.TrimSpace(t.pendingText.String()) != "" {
+			t.flushReasoning(out)
+			t.start(out)
+			t.contentCount++
+			t.emit(out, map[string]any{"content": t.pendingText.String()}, nil)
+			t.pendingText.Reset()
+		}
 	}
+	// 文本协议的工具调用：模型把 opencode_tool_call 写在正文或思考里，
+	// 这里抽取成标准 tool_calls 帧（旧版只 strip 不抽取，调用凭空消失）。
+	t.absorbTextToolCalls(out)
 	if calls, ok := obj["tool_calls"].([]any); ok && len(calls) > 0 {
 		for _, delta := range t.tools.absorb(calls) {
 			t.start(out)
@@ -992,13 +1224,24 @@ func (t *translator) finish(out *bytes.Buffer) error {
 	}
 	// 尾部增量（可能含最后一段正文或 reasoning）。
 	if addition := t.text.finalize(); addition != "" {
+		t.pendingText.WriteString(addition)
+	}
+	if t.pendingText.Len() > 0 {
+		t.flushReasoning(out)
 		t.start(out)
 		t.contentCount++
-		t.emit(out, map[string]any{"content": addition}, nil)
+		t.emit(out, map[string]any{"content": t.pendingText.String()}, nil)
+		t.pendingText.Reset()
 	}
-	if addition := t.reasoning.finalize(); addition != "" {
-		t.start(out)
-		t.emit(out, map[string]any{"reasoning_content": addition}, nil)
+	// 正文开始后到达的思考（以及与正文同时收尾的那批）：合并成尾部一个块。
+	t.flushLateReasoning(out)
+	// 全文已到齐，做最后一次抽取：分片恰好停在收尾处时前面的扫描看不到闭合标签。
+	t.absorbTextToolCalls(out)
+	// 正文之前完全没发过思考（例如纯工具轮次的思考只在 reasoning.raw 里）：
+	// 补一次，保证思考不丢。
+	t.flushReasoning(out)
+	if t.droppedTools > 0 {
+		log.Printf("WARN: [trae] 丢弃 %d 个未声明工具的文本调用（模型臆造的工具名）", t.droppedTools)
 	}
 	if t.contentCount == 0 && !t.tools.hasCalls() {
 		t.start(out)

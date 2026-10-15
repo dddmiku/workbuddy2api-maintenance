@@ -38,7 +38,56 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
-## v3.8.0 — 2026-10-16
+## v3.8.1 — 2026-10-16
+
+Trae 域三处实测缺陷修复：思考在 Claude Code 里被切成碎片、图片被静默丢弃、
+文本协议的工具调用被删除却不交付。
+
+### 思考不再与正文交替成块（碎片化）
+
+用户报障：Claude Code 里一个回答被渲染成十几个「Thought for 1s」，中间夹着
+几个字的正文。根因是上游 Remote agent 一轮里连发多个 `plan_item`，**每个都同时带
+thought 快照与正文快照**（正文常常只有一个换行），旧实现逐个「先发 reasoning、
+再发 content」，下游看到 R,C,R,C… 交替；Anthropic 侧每遇一次 thinking→text→thinking
+都要新开一个 content block，客户端就把它渲染成独立条目。
+
+改为：正文之前到达的思考累积到「正文要发」时**一次性**发出（一个 thinking 块）；
+正文开始后到达的思考进尾部通道，收尾时合并成第二个块。纯空白正文增量不再触发
+「正文开始」——那正是碎片化的直接推手。
+
+实测（glm-5.3，带工具两轮）：思考段数从十几个降到 1–2 段，正文与思考内容零丢失。
+
+### 带图请求改走 llm_utils_chat
+
+`glm-5.3` 读不了图是**两个独立原因叠加**，此前只看到第一个：
+
+1. `messageText` 把图片压成 `[image omitted]` 文本——模型看到的是「这里本来有张图」；
+2. Remote 端点**根本读不到内联图片**：媒体块放 query 的 JSON 数组、放
+   `initial_message.content`（参考 `build_web_content` 原形）、或两者都放，上游一律回
+   「没有收到图片」——连目录里标了 `multimodal:true` 的 `kimi-k2.6` /
+   `Doubao-Seed-2.1-Pro` 也一样（384×384 有结构 PNG，三组对照）。
+
+同一个二进制、同一张图，`llm_utils_chat` 路径答得完全正确
+（`Doubao-Seed-2.1-Pro` → 「有圆形和长方形，背景为蓝色」）。因此 `ChatStream` 现在
+**带图请求直接走 legacy**（判据是请求体里有没有图片块，不是模型名）；Remote 的
+媒体构造（query 部件 + content 数组）保留完整，供非图片请求与后续上游支持时使用。
+
+注意：`glm-5.3` 在 Trae 自己的模型目录里就是 `multimodal:false`——它读不了图是
+上游限制，换 `kimi-k2.6` / `Doubao-Seed-2.1-Pro` 即可。
+
+### 文本协议的工具调用被交付（此前被删除）
+
+Remote 不透传 tools 结构，客户端工具只能以 `opencode_tool_call` 文本块表达
+（prompt.go 注入）。旧实现**只 strip 不抽取**：`visibleText()` 把块从正文里删掉，
+却没有任何地方把它解析成调用。后果是模型发出的工具请求凭空消失——实测
+`tool_choice=required` 时客户端收到 `finish_reason=stop`、零 `tool_calls`、
+正文是占位文案 `(trae upstream returned an empty response)`，整条工具链路等于断了。
+
+新增 `tooltext.go`：从**累积原文**（块会跨事件分片，单片里看不到闭合标签）与
+思考里抽取调用，签名去重保证同一调用只交付一次；未声明的工具名（模型臆造）过滤
+并记日志。实测 3/3 轮交付 `tool_calls=[Read]`。
+
+
 
 Trae 域重写为 Remote 会话端点主路径（对齐 Trae2api-cn 的 UPSTREAM_MODE=remote），
 llm_utils_chat 降为回落；长工具会话、1M max 档与客户端工具协议全部换轨。

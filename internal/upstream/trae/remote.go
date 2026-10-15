@@ -253,7 +253,16 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 	if dropped > 0 {
 		remoteTrimLog(dropped)
 	}
-	query := flattenQuery(bounded)
+	// content 是会话体的**结构化半边**，query 是扁平化文本半边（两者内容重叠，
+	// 上游各取所需）。形态对齐参考 build_web_content：文本部件
+	// {"type":"text","data":{"content":...}}，图片部件是渲染器媒体块原形
+	// {"type":"image_url","value":{"mimeType","data"}}，按消息顺序交替排列。
+	//
+	// 2026-10-16 实测：只把图片塞进 query（或只放图片不放文本）模型都读不到图。
+	content := buildRemoteContent(bounded)
+	// query 文本半边去掉图片块：媒体已由 content 携带，文本里再留 "[image omitted]"
+	// 会让模型以为图丢了（参考 _without_native_images 同一口径）。
+	query := flattenQuery(stripImageParts(bounded))
 
 	agentType := remoteAgentTypeFor(model, withTools)
 	// auto / work 是路由 id；具名模型走 manual。
@@ -267,7 +276,7 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 
 	msg := remoteInitialMessage{
 		ChatSessionID: "",
-		Content:       []any{},
+		Content:       content,
 		Query:         query,
 		ModelName:     modelName,
 		AgentType:     agentType,

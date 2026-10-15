@@ -112,6 +112,317 @@ func flattenQueryChars(messages []map[string]any) int {
 	return len(strings.Join(flattenedParts(messages), "\n\n"))
 }
 
+// ── 图片：Remote 的 query 也能承载 renderer media 块 ──────────────────────
+//
+// 移植自参考实现 images.query_parts / flatten_query_parts。
+//
+// 为什么不能只靠 messageText 的占位符：旧版把图片压成 "[image omitted]" 文本，
+// 模型收到的是「这里本来有张图」这句话——它**看不到图**，于是 glm-5.3 明明支持
+// 读图却答不出图里有什么（2026-10-16 用户实测报障）。
+//
+// Remote 的 query 是 JSON 数组，文本部件是 {"type":"text","data":{"content":...}}；
+// 图片部件是渲染器媒体形状 {"type":"image_url","data":{"mimeType","data"}}——
+// 上游 agent 认这个形状（与原生通道同一套 payload）。图片跟在文本之后，
+// 另附一条短占位文本，让非多模态读者也知道「这里附了图」。
+//
+// 注意：图片**不计入** query 裁剪的字符预算（对齐参考 _bounded_remote_query ——
+// 它也只按 flatten_query 的纯文本长度裁剪）。base64 体积大，计入会让长历史被
+// 误裁；上游对 query 的上限约束针对的是文本历史部分。
+
+// rendererMediaBlock 把一个图片部件转成渲染器媒体块（返回 nil 表示不是图片）。
+func rendererMediaBlock(block map[string]any) map[string]any {
+	kind, _ := block["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "image":
+		// Anthropic 形态：{"type":"image","source":{"type":"base64","media_type","data"}}
+		source, _ := block["source"].(map[string]any)
+		if source == nil {
+			return nil
+		}
+		switch strings.ToLower(strings.TrimSpace(stringFieldOf(source, "type"))) {
+		case "base64":
+			data := compactBase64(stringFieldOf(source, "data"))
+			if data == "" {
+				return nil
+			}
+			return mediaBlock(data, firstNonEmpty(stringFieldOf(source, "media_type"), defaultImageMIME))
+		case "url":
+			url := stringFieldOf(source, "url")
+			if url == "" {
+				return nil
+			}
+			return mediaBlock(url, "url")
+		}
+		return nil
+	case "image_url", "input_image":
+		// OpenAI 形态：{"type":"image_url","image_url":{"url":"data:..."}}
+		url := imageURLOf(block)
+		if url == "" {
+			return nil
+		}
+		if strings.HasPrefix(url, "data:") {
+			mime, data := splitDataURL(url)
+			if data == "" {
+				return nil
+			}
+			return mediaBlock(data, firstNonEmpty(mime, defaultImageMIME))
+		}
+		// 远程 URL 网关不代下：原样转发仍好过静默丢图（对齐参考）。
+		return mediaBlock(url, "url")
+	}
+	return nil
+}
+
+const defaultImageMIME = "image/png"
+
+// mediaBlock 构造渲染器媒体块。
+func mediaBlock(data, mime string) map[string]any {
+	return map[string]any{
+		"type":  "image_url",
+		"value": map[string]any{"mimeType": mime, "data": data},
+	}
+}
+
+// imageURLOf 从 OpenAI 图片部件取 URL（三种拼写）。
+func imageURLOf(block map[string]any) string {
+	if image, ok := block["image_url"].(map[string]any); ok {
+		if url, _ := image["url"].(string); url != "" {
+			return url
+		}
+	}
+	if image, ok := block["image_url"].(string); ok && image != "" {
+		return image
+	}
+	for _, key := range []string{"url", "image", "image_url"} {
+		if url, ok := block[key].(string); ok && url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
+// splitDataURL 拆 data URL 成 (mime, base64)。
+func splitDataURL(url string) (string, string) {
+	trimmed := strings.TrimSpace(url)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return "", ""
+	}
+	rest := trimmed[len("data:"):]
+	semicolon := strings.Index(rest, ";")
+	if semicolon < 0 {
+		return "", ""
+	}
+	mime := rest[:semicolon]
+	after := rest[semicolon+1:]
+	if !strings.HasPrefix(after, "base64,") {
+		return "", ""
+	}
+	return mime, compactBase64(after[len("base64,"):])
+}
+
+// compactBase64 去掉 base64 里的空白（换行的 data URL 很常见）。
+func compactBase64(value string) string {
+	if !strings.ContainsAny(value, " \t\r\n") {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	for _, r := range value {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+		default:
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+// stringFieldOf 取 map 里的字符串字段。
+func stringFieldOf(obj map[string]any, key string) string {
+	value, _ := obj[key].(string)
+	return value
+}
+
+// firstNonEmpty 返回第一个非空串。
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// queryMediaParts 收集消息里所有图片，转成 query 的媒体部件 + 占位文本。
+func queryMediaParts(messages []map[string]any) []any {
+	var parts []any
+	for _, m := range messages {
+		content, ok := m["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range content {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			media := rendererMediaBlock(block)
+			if media == nil {
+				continue
+			}
+			value, _ := media["value"].(map[string]any)
+			parts = append(parts, map[string]any{
+				"type": "image_url",
+				"data": map[string]any{
+					"mimeType": firstNonEmpty(stringFieldOf(value, "mimeType"), defaultImageMIME),
+					"data":     stringFieldOf(value, "data"),
+				},
+			})
+			parts = append(parts, map[string]any{
+				"type": "text",
+				"data": map[string]any{"content": describeMedia(value)},
+			})
+		}
+	}
+	return parts
+}
+
+// buildRemoteContent 组装 Remote 会话体的 content 数组（结构化半边）。
+//
+// 形态对齐参考 build_web_content：**文本与图片都放这里**，按消息顺序交替排列。
+//   - 文本部件 {"type":"text","data":{"content":...}}
+//   - 图片部件 {"type":"image_url","value":{"mimeType","data"}}（渲染器媒体原形）
+//
+// 2026-10-16 实测：只把图片放进 query（或只放图片、不放文本）上游都读不到图——
+// 模型回「没有收到图片」，连目录标了 multimodal:true 的 kimi-k2.6 也一样。
+// 参考实现的两个会话创建函数（create_web_session / create_session）都把 content
+// 填成完整结构化历史，本函数对齐这个口径。
+func buildRemoteContent(messages []map[string]any) []any {
+	items := []any{}
+	for _, m := range messages {
+		content, ok := m["content"].([]any)
+		if !ok {
+			// 字符串 content：整条当文本部件。
+			if text, ok := m["content"].(string); ok && text != "" {
+				items = append(items, map[string]any{
+					"type": "text",
+					"data": map[string]any{"content": text},
+				})
+			}
+			continue
+		}
+		for _, raw := range content {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				if text, ok := raw.(string); ok && text != "" {
+					items = append(items, map[string]any{
+						"type": "text",
+						"data": map[string]any{"content": text},
+					})
+				}
+				continue
+			}
+			if renderer := rendererMediaBlock(block); renderer != nil {
+				items = append(items, renderer)
+				continue
+			}
+			if text := contentBlockText(block); text != "" {
+				items = append(items, map[string]any{
+					"type": "text",
+					"data": map[string]any{"content": text},
+				})
+			}
+		}
+	}
+	return items
+}
+
+// describeMedia 生成图片的短标签（不泄露 base64 内容）。
+func describeMedia(value map[string]any) string {
+	mime := firstNonEmpty(stringFieldOf(value, "mimeType"), defaultImageMIME)
+	data := stringFieldOf(value, "data")
+	if mime == "url" || strings.HasPrefix(data, "http") {
+		if len(data) > 120 {
+			data = data[:120]
+		}
+		return "[image: " + data + "]"
+	}
+	if size := base64DecodedLen(data); size > 0 {
+		return fmt.Sprintf("[image: %s, %d bytes]", mime, size)
+	}
+	return "[image: " + mime + "]"
+}
+
+// base64DecodedLen 估算 base64 串解码后的字节数（不实际解码）。
+func base64DecodedLen(data string) int {
+	if data == "" {
+		return 0
+	}
+	padding := 0
+	if strings.HasSuffix(data, "==") {
+		padding = 2
+	} else if strings.HasSuffix(data, "=") {
+		padding = 1
+	}
+	return len(data)/4*3 - padding
+}
+
+// flattenQueryWithImages 扁平化 query，并在文本之后附上图片媒体部件。
+//
+// 无图片时与 flattenQuery 完全等价（不改变既有行为）。
+//
+// 有图片时文本半边**去掉图片占位符**（对齐参考 raw_client 的 _without_native_images）：
+// 媒体部件已经把图带给模型了，文本里再留一句 "[image omitted]" 只会让它以为图丢了。
+func flattenQueryWithImages(messages []map[string]any) string {
+	media := queryMediaParts(messages)
+	if len(media) == 0 {
+		return flattenQuery(messages)
+	}
+	var textParts []any
+	if json.Unmarshal([]byte(flattenQuery(stripImageParts(messages))), &textParts) != nil {
+		textParts = nil
+	}
+	// 文本历史在前（模型先读对话），图片按调用方附加顺序在后。
+	combined := append(textParts, media...)
+	encoded, err := json.Marshal(combined)
+	if err != nil {
+		return flattenQuery(messages)
+	}
+	return string(encoded)
+}
+
+// stripImageParts 返回去掉图片块的消息副本（文本半边的扁平化用）。
+//
+// 只动 content 数组里的图片块，其它字段与块原样保留。
+func stripImageParts(messages []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, m := range messages {
+		content, ok := m["content"].([]any)
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		kept := make([]any, 0, len(content))
+		for _, raw := range content {
+			if block, ok := raw.(map[string]any); ok && rendererMediaBlock(block) != nil {
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		if len(kept) == len(content) {
+			out = append(out, m)
+			continue
+		}
+		copied := make(map[string]any, len(m))
+		for key, value := range m {
+			copied[key] = value
+		}
+		copied["content"] = kept
+		out = append(out, copied)
+	}
+	return out
+}
+
 // flattenedParts 只取文本段（与 flattenQuery 同逻辑，省掉 JSON 编码）。
 func flattenedParts(messages []map[string]any) []string {
 	var parts []string
