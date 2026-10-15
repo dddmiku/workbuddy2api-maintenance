@@ -148,3 +148,24 @@ func modelFromSource(src map[string]any) string {
 	model, _ := src["model"].(string)
 	return model
 }
+
+// staticModelKnown 报告一个模型名是否被静态别名表认识（键或值任一命中）。
+//
+// Remote 的 custom_model 绑定在目录不可用时按这张表判断「是否已知模型」：
+// 已知 → 构造一个最小 custom_model（上游按 name/config_name 匹配）；
+// 未知 → 不带 custom_model，让上游走 auto 路由而不是硬绑一个不存在的名字。
+func staticModelKnown(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	if _, ok := modelAliases[strings.ToLower(trimmed)]; ok {
+		return true
+	}
+	for _, value := range modelAliases {
+		if strings.EqualFold(value, trimmed) {
+			return true
+		}
+	}
+	return false
+}

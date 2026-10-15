@@ -1,58 +1,36 @@
-// remote.go — Trae Remote 会话端点（两步协议）的回落实现。
+// remote.go — Trae Remote 会话端点（两步协议）的**主路径**实现。
 //
-// ═══ 为什么必须有这条路（2026-10-15 实测结论）═══
+// ═══ 架构对齐（2026-10-16 重写）═══
 //
-// llm_utils_chat（本包主链路）对**工具交互轮次**有硬限制，超限后上游返回
+// 参考项目（autumnsentiment/Trae2api-cn）的 UPSTREAM_MODE 默认是 **remote**：
+// 远程会话为主路径。这次重写把网关的次序对齐过来——ChatStream 优先走 Remote，
+// 带客户端工具的请求按参考的 caller_tools_use_work 默认路由到 solo_work_remote，
+// 纯文本请求走 solo_agent_remote（保有 1M max 档能力）。
 //
-//	{"code":3004,"message":"We're sorry, your requests have exceeded the rate limit..."}
+// Remote 两步协议：
+//	1. POST {base}/chat_sessions              建会话 → chat_session_id + message_id
+//	2. GET  {base}/chat_sessions/{sid}/events?reply_to_message_id={mid}   收流
+//	3. POST {base}/chat_sessions/{sid}/stop    释放槽位（尽力而为）
 //
-// 注意这不是体积问题，也不是调用频次问题。同一份真实会话（1047 条消息）实测：
+// ═══ 为什么 query 必须扁平化（3004 实测结论，2026-10-15）═══
+//
+// llm_utils_chat 对**工具交互轮次**有硬限制，超限返回 code 3004：
 //
 //	最近 100 条 / 293KB → 3004      最近 100 条 → Remote 成功，正文 794 字符
-//	最近 120 条 / 311KB → 3004      最近 120 条 → Remote 成功，正文 627 字符
-//	最近 150 条 / 332KB → 3004      最近 150 条 → Remote 成功，正文 588 字符
-//	最近 200 条 / 396KB → 3004      最近 200 条 → Remote 成功，正文 310 字符
+//	2 条 / 1600KB 纯文本  → 成功     （体积不是条件）
+//	300 条 / 336KB 纯文本  → 成功     （条数不是条件）
+//	120 条真实，两者都转纯文本 → 成功  ← 唯一通过的变体
 //
-// 而对照组说明触发维度就是工具轮次：
-//
-//	2 条消息 / 1600KB（纯文本）        → 成功   （体积不是触发条件）
-//	300 条消息 / 336KB（合成纯文本）    → 成功   （条数本身不是触发条件）
-//	120 条真实消息，去掉 tools 定义     → 3004
-//	120 条真实消息，只丢 tool_calls     → 3004
-//	120 条真实消息，只丢 tool_call_id   → 3004
-//	120 条真实消息，两者都转成纯文本     → 成功   ← 唯一通过的变体
-//
-// 即：**只要请求体里还带 tool_calls 或 tool_call_id，且工具轮次足够多，就被拒**。
-// 参考实现（autumnsentiment/Trae2api-cn）把这条链路列为默认端点（UPSTREAM_MODE=remote），
-// 并且它的 query 是**扁平化文本**——工具调用被转成 `[Client Tool Result: ...]` 标记，
-// 不带 tool_calls/tool_call_id 字段，正好绕开这个限制。
-//
-// ═══ 为什么不能靠「裁剪历史」绕过（同样实测）═══
-//
-// 真实 Claude Code 会话的**尾部全是工具轮次**（前 120 条里 50 条带 tool_calls、
-// 65 条 role=tool，占 96%），所以裁到多小都没用：
-//
-//	最近 60 条 / 381KB → 3004
-//	最近 80 条 / 409KB → 3004
-//	最近 100 条 / 424KB → 3004
-//	最近 110 条 / 436KB → 3004
-//
-// 裁剪只在「旧历史多、新历史是纯对话」的会话上有效；工具驱动型会话必须换端点。
+// Remote 的 query 是扁平化文本——工具调用转成 "[Client Tool Result: ...]" 标记，
+// 不带 tool_calls/tool_call_id 结构化字段，正好绕开这个限制。
 //
 // ═══ 代价（必须如实记录）═══
 //
-// Remote 是**两步协议**（POST 建会话 + GET 收流），且 query 是扁平化文本，因此：
-//
-//  1. **工具轮次由 Remote 的沙箱完成，客户端看不到也无法参与**。Remote 是一个
-//     自带沙箱的 agent，它有自己的工具（实测 LS / EnvironmentSetup / finish /
-//     Glob / Read…），会自行执行并继续下一轮——它**不是**「向客户端请求执行工具」
-//     的协议。本实现因此**不透传**它的工具调用（理由见 remoteEventConverter 注释），
-//     客户端只拿到最终正文。参考实现 README 也实测 glm-5.3 在 Remote 上只有 6/7
-//     工具能力（不支持并行调用），而 llm_utils_chat 是 7/7。
-//  2. **query 有长度上限**：上游把 query 当历史处理，超过约 500K 字符（实测 533K
-//     字符起）会**静默结束事件流**（无正文、无 done），必须裁剪。
-//
-// 所以它是**回落**而不是替换：短会话/工具不密集时仍走 llm_utils_chat（工具能力完整）。
+//  1. Remote 是自带沙箱的 agent：它有自己的工具（LS / Glob / Read / finish…），
+//     自行执行。客户端工具以 opencode_tool_call 文本块协议注入 system prompt，
+//     模型用文本块请求调用，由 API 调用方执行后在下一轮回填（见 prompt.go）。
+//  2. query 有长度上限：上游把 query 当历史处理，超过约 500K 字符（实测 533K 起）
+//     会**静默结束事件流**（无正文、无 done），必须裁剪。
 package trae
 
 import (
@@ -66,6 +44,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/auth"
 )
@@ -77,7 +56,10 @@ const (
 	// remoteCreatePath 建会话；remoteEventsFmt 收流（路径含 sid）。
 	remoteCreatePath = "/chat_sessions"
 	remoteEventsFmt  = "/chat_sessions/%s/events?reply_to_message_id=%s"
-	remoteStopFmt    = "/chat_sessions/%s/stop"
+	remoteStopFmt     = "/chat_sessions/%s/stop"
+
+	// remoteModelsPath 网页端模型目录（manual 选模型需要 custom_model）。
+	remoteModelsPath = "/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
 
 	// remoteDefaultOrigin Remote 头族要求的 Origin/Referer（SOLO 网页端）。
 	remoteDefaultOrigin = "https://solo.trae.cn"
@@ -88,28 +70,40 @@ const (
 
 	// remoteQueryMaxChars 扁平化 query 的字符上限。
 	//
-	// 上游在 query 超过约 500K 字符时**静默结束事件流**（不报错、不给 done），
-	// 所以必须主动裁剪。实测边界（2026-10-15，逐档 50K→716K）：
-	//
-	//	512K 字符 → 正常（done + 正文）
-	//	533K 字符 → 静默断流（3 帧、无 done）
-	//
-	// 取 460K 留约 10% 余量：query 之外还有 common_params、tools 描述等字段，
-	// 且上游阈值可能随版本微调。参考实现默认 TRAE_REMOTE_QUERY_MAX_CHARS=480000
-	// （其注释记的边界是「约 500K 字符」），这里更保守一档。
+	// 上游在 query 超过约 500K 字符时**静默结束事件流**（不报错、不给 done）。
+	// 实测边界（2026-10-15，逐档 50K→716K）：512K 正常、533K 静默断流。
+	// 取 460K 留约 10% 余量（query 之外还有 common_params、运行时提示等字段）。
 	remoteQueryMaxChars = 460_000
+
+	// remoteHistoryMaxMessages / remoteHistoryMaxChars 历史压缩的上限
+	//（对齐参考 TRAE_REMOTE_MAX_MESSAGES=500 / TRAE_REMOTE_MAX_HISTORY_CHARS=480000）。
+	remoteHistoryMaxMessages = 500
+	remoteHistoryMaxChars    = 480_000
+
+	// remoteFirstEventTimeout 首个模型事件的超时。
+	//
+	// 建会话后上游可能先排队（只发 heartbeat/queue 帧）再开始执行。参考默认 120s：
+	// 大 prompt 的排队期真实存在，比 120s 短会把可成功的请求误判成失败。
+	remoteFirstEventTimeout = 120_000_000_000 // 120s（纳秒）
+
+	// remoteDefaultAgentType 纯文本请求的执行档（保有 1M max 档）。
+	remoteDefaultAgentType = "solo_agent_remote"
+	// remoteWorkAgentType 带客户端工具请求的执行档（Work 沙箱不做文件操作）。
+	remoteWorkAgentType = "solo_work_remote"
+
+	// max 模式六件套的默认值（对齐参考 DEFAULT_MAX_*）。
+	defaultMaxContextTokens = 1_000_000
+	defaultMaxPromptTokens  = 936_000
+	defaultMaxOutputTokens  = 64_000
+	defaultMaxModeType      = 1
 )
 
-// RemoteBaseVar 是出站实际使用的基址。
-//
-// 与 TraeAPIHost 同一口径：测试用 httptest 临时改写它来覆盖完整链路
-// （URL 拼接、两步协议、头族），生产代码从不写它。
+// RemoteBaseVar 是出站实际使用的基址（测试用 httptest 改写；生产代码从不写它）。
 var RemoteBaseVar = RemoteBase
 
-// RemoteEnabled 报告是否允许 Remote 回落（默认开）。
+// RemoteEnabled 报告是否允许 Remote 主路径（默认开）。
 //
-// 关掉它等于「长会话直接失败」——保留开关是为了排障（怀疑 Remote 引入问题时
-// 能一键回到只有 llm_utils_chat 的行为），而不是因为它有风险。
+// 关掉它等于「全部回落到 llm_utils_chat」——保留开关是为了排障。
 func RemoteEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_TRAE_REMOTE"))) {
 	case "0", "false", "no", "off":
@@ -118,12 +112,8 @@ func RemoteEnabled() bool {
 	return true
 }
 
-// remoteHeaders 构造 Remote 头族。
-//
-// 与 llm_utils_chat 的头族**完全不同**：那套 SOLO/IDE 指纹头（x-ide-version 等）
-// 在 Remote 端点上没有意义，这里要的是网页端形态（X-Trae-Client-Type / Origin /
-// 浏览器 UA）。混用会得到 401/404。
-func remoteHeaders(a *auth.Auth) http.Header {
+// remoteHeaders 构造 Remote 头族（网页端形态，与 llm_utils_chat 的 SOLO/IDE 指纹完全不同）。
+func remoteHeaders(a *auth.Auth, stream bool) http.Header {
 	h := http.Header{}
 	h.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
 	h.Set("Content-Type", "application/json")
@@ -133,21 +123,36 @@ func remoteHeaders(a *auth.Auth) http.Header {
 	h.Set("Origin", remoteDefaultOrigin)
 	h.Set("Referer", remoteDefaultOrigin+"/")
 	h.Set("User-Agent", remoteDefaultUserAgent)
-	h.Set("Accept", "application/json")
+	if stream {
+		h.Set("Accept", "text/event-stream")
+	} else {
+		h.Set("Accept", "application/json")
+	}
 	return h
 }
 
-// remoteInitialMessage Remote 建会话体里的 initial_message。
+// remoteInitialMessage Remote 建会话体里的 initial_message（map[string]any 形态，
+// 字段随策略可选——manual 带 custom_model 六件套，auto 不带）。
 type remoteInitialMessage struct {
-	ChatSessionID string `json:"chat_session_id"`
-	Content       []any  `json:"content"`
-	Query         string `json:"query"`
-	ModelName     string `json:"model_name"`
-	AgentType     string `json:"agent_type"`
-	AgentID       string `json:"agent_id"`
-	// ModelSelectionStrategy "auto" 时不带 model_* 字段（上游按 auto 选模型）。
-	ModelSelectionStrategy string `json:"model_selection_strategy"`
-	CommonParams           string `json:"common_params"`
+	ChatSessionID string          `json:"chat_session_id"`
+	Content       []any           `json:"content"`
+	Query         string          `json:"query"`
+	ModelName     string          `json:"model_name"`
+	AgentType     string          `json:"agent_type"`
+	AgentID       string          `json:"agent_id"`
+	Strategy      string          `json:"model_selection_strategy"`
+	CommonParams  string          `json:"common_params"`
+
+	ModelConfigSource *int64          `json:"model_config_source,omitempty"`
+	ModelIsPreset     *bool           `json:"model_is_preset,omitempty"`
+	ModelProvider     *string         `json:"model_provider,omitempty"`
+	CustomModel       map[string]any  `json:"custom_model,omitempty"`
+
+	ModelAutoSelection map[string]any `json:"model_auto_selection,omitempty"`
+	ModeType           *int64         `json:"mode_type,omitempty"`
+	ContextWindowSize  *int64         `json:"context_window_size,omitempty"`
+	PromptMaxTokens    *int64         `json:"prompt_max_tokens,omitempty"`
+	MaxTokens          *int64         `json:"max_tokens,omitempty"`
 }
 
 type remoteCreateBody struct {
@@ -159,94 +164,74 @@ type remoteCreateBody struct {
 	Origin            string               `json:"origin"`
 }
 
-// buildRemoteQuery 把 llm_utils_chat 形态的请求体扁平化成 Remote 的 query 字符串。
+// remoteSession 一次 Remote 会话的标识。
+type remoteSession struct {
+	id        string
+	messageID string
+}
+
+// remoteAgentTypeFor 决定一次请求的执行档。
 //
-// 形态对齐参考实现 trae_client.flatten_query：
-//   - system → "[System]\n<text>"
-//   - assistant → "[Assistant]\n<text>"，工具调用追加 "[tool_call id=... name=...] <args>"
-//   - tool 角色 → "[Client Tool Result]\n<text>"，追加 "[tool_result id=...]"
-//
-// **关键**：tool_calls / tool_call_id 只作为**文本**出现，不保留为结构化字段。
-// 这正是绕开 3004 的原因（见本文件头部实测记录）。
-func buildRemoteQuery(messages []map[string]any) string {
-	var parts []string
-	for _, m := range messages {
-		role, _ := m["role"].(string)
-		text := contentToText(m["content"])
-		if calls, ok := m["tool_calls"].([]any); ok && len(calls) > 0 {
-			var seg []string
-			for _, raw := range calls {
-				call, _ := raw.(map[string]any)
-				if call == nil {
-					continue
-				}
-				fn, _ := call["function"].(map[string]any)
-				id, _ := call["id"].(string)
-				name, _ := fn["name"].(string)
-				args, _ := fn["arguments"].(string)
-				if len(args) > 1500 {
-					args = args[:1500]
-				}
-				seg = append(seg, fmt.Sprintf("[tool_call id=%s name=%s] %s", id, name, args))
-			}
-			if len(seg) > 0 {
-				text = strings.TrimRight(text+"\n"+strings.Join(seg, "\n"), "\n")
-			}
-		}
-		if id, _ := m["tool_call_id"].(string); id != "" {
-			text = strings.TrimRight(text+"\n[tool_result id="+id+"]", "\n")
-		}
-		switch role {
-		case "system":
-			parts = append(parts, "[System]\n"+text)
-		case "assistant":
-			parts = append(parts, "[Assistant]\n"+text)
-		case "tool":
-			parts = append(parts, "[Client Tool Result]\n"+text)
-		default:
-			parts = append(parts, text)
-		}
+// 对齐参考 run_remote_session 的 caller_tools_use_work 默认（=1）：
+// 带客户端工具的请求路由到 solo_work_remote——Agent 档的沙箱会自己动文件/终端
+// 然后只回一句成功，工具语义错位；Work 档把客户端声明的工具保持为调用。
+// 纯文本请求走 solo_agent_remote（1M max 档只对它生效）。
+// 模型名 work/auto-work/solo-work 显式要求 Work 档。
+func remoteAgentTypeFor(model string, withTools bool) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "work", "auto-work", "solo-work":
+		return remoteWorkAgentType
 	}
-	payload := []map[string]any{{"type": "text", "data": map[string]any{"content": strings.Join(parts, "\n\n")}}}
-	encoded, err := json.Marshal(payload)
+	if withTools {
+		return remoteWorkAgentType
+	}
+	return remoteDefaultAgentType
+}
+
+// buildCommonParams 组装 common_params（JSON 字符串）。
+//
+// 对齐参考 trae_remote_client.common_params 的 CN code 档。
+func buildCommonParams(sessionID string) string {
+	params := map[string]any{
+		"language":        "zh-cn",
+		"app_language":    "zh-CN",
+		"quality":         "stable",
+		"app_version":     "1.0.0.1229",
+		"web_id":          "",
+		"user_identity":   "Free",
+		"is_freshman":     "0",
+		"biz_user_id":     "",
+		"user_unique_id":  "",
+		"scope":           "marscode-cn",
+		"tenant":          "marscode",
+		"region":          "cn",
+		"aiRegion":        "cn",
+		"is_privacy_mode": 0,
+		"privacy_mode":    "off",
+		"solo_chat_mode":  "code",
+	}
+	if sessionID != "" {
+		params["biz_session_id"] = sessionID
+	}
+	encoded, err := json.Marshal(params)
 	if err != nil {
-		return `[{"type":"text","data":{"content":""}}]`
+		return "{}"
 	}
 	return string(encoded)
 }
 
-// contentToText 把一条消息的 content 压成纯文本（块数组取 text 块）。
-func contentToText(value any) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case []any:
-		var out []string
-		for _, raw := range typed {
-			block, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			if text, ok := block["text"].(string); ok && text != "" {
-				out = append(out, text)
-			}
-		}
-		return strings.Join(out, "\n")
-	}
-	return ""
-}
-
-// buildRemoteBody 组装 Remote 建会话请求体，并按 remoteQueryMaxChars 裁剪历史。
+// buildRemoteBody 组装 Remote 建会话请求体。
 //
-// 返回 (body, 保留的消息数, 丢弃的消息数)。
-func buildRemoteBody(prepared []byte, requestID string) ([]byte, int, int, error) {
+// 返回 (body, 执行档, 是否 max 模式, 错误)。
+// 步骤对齐参考 create_session：
+//  1. 从出站请求体取 messages，注入运行时提示（prompt.go）；
+//  2. 有界历史压缩 + query 裁剪；
+//  3. manual 选模型时从目录解析 custom_model 并绑定（_bound_model_name 口径）；
+//  4. max 请求（模型名带 -max 后缀且目录标 max_mode）补六件套。
+func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte, string, bool, error) {
 	var src map[string]any
 	if err := json.Unmarshal(prepared, &src); err != nil {
-		return nil, 0, 0, fmt.Errorf("trae remote: 请求体解析失败：%w", err)
-	}
-	model, _ := src["model"].(string)
-	if model == "" {
-		model = "glm-5.3"
+		return nil, "", false, fmt.Errorf("trae remote: 请求体解析失败：%w", err)
 	}
 	rawMessages, _ := src["messages"].([]any)
 	messages := make([]map[string]any, 0, len(rawMessages))
@@ -255,87 +240,218 @@ func buildRemoteBody(prepared []byte, requestID string) ([]byte, int, int, error
 			messages = append(messages, m)
 		}
 	}
-
-	kept, dropped := trimRemoteHistory(messages, remoteQueryMaxChars)
-	query := buildRemoteQuery(kept)
-
-	common := map[string]any{
-		"language": "zh-cn", "app_language": "zh-CN", "quality": "stable",
-		"app_version": "1.0.0.1229", "web_id": "", "user_identity": "Free",
-		"is_freshman": "0", "biz_user_id": "", "user_unique_id": "",
-		"scope": "marscode-cn", "tenant": "marscode", "region": "cn",
-		"aiRegion": "cn", "is_privacy_mode": 0, "privacy_mode": "off",
-		"solo_chat_mode": "code", "biz_session_id": requestID,
+	model, _ := src["model"].(string)
+	if model == "" {
+		model = "glm-5.2"
 	}
-	commonJSON, err := json.Marshal(common)
-	if err != nil {
-		return nil, 0, 0, err
+
+	prepared2, withTools := prepareRemoteMessages(messages, src)
+	compacted := compactRemoteHistory(prepared2, remoteHistoryMaxMessages, remoteHistoryMaxChars)
+	bounded, dropped := boundedRemoteQuery(compacted, remoteQueryMaxChars)
+	if dropped > 0 {
+		remoteTrimLog(dropped)
 	}
+	query := flattenQuery(bounded)
+
+	agentType := remoteAgentTypeFor(model, withTools)
+	// auto / work 是路由 id；具名模型走 manual。
+	strategy := "auto"
+	modelName := ""
+	if !strings.EqualFold(strings.TrimSpace(model), "auto") &&
+		!strings.EqualFold(strings.TrimSpace(model), "work") {
+		strategy = "manual"
+		modelName = strings.TrimSpace(model)
+	}
+
+	msg := remoteInitialMessage{
+		ChatSessionID: "",
+		Content:       []any{},
+		Query:         query,
+		ModelName:     modelName,
+		AgentType:     agentType,
+		AgentID:       agentType,
+		Strategy:      strategy,
+		CommonParams:  buildCommonParams(""),
+	}
+
+	maxApplied := false
+	if strategy == "manual" {
+		models, cerr := FetchCatalog(ctx, a)
+		if cerr == nil {
+			if resolved := ResolveFromCatalog(models, modelName); resolved != "" && resolved != modelName {
+				modelName = resolved
+			}
+		} else {
+			modelName = ResolveModelName(modelName)
+		}
+		msg.ModelName = modelName
+		if custom, ok := customModelFor(models, modelName, agentType, cerr == nil); ok {
+			msg.CustomModel = custom
+			source := int64(1)
+			if v, ok := asFloat(custom["config_source"]); ok {
+				source = int64(v)
+			}
+			preset := true
+			if v, ok := custom["is_preset"].(bool); ok {
+				preset = v
+			}
+			provider, _ := custom["provider"].(string)
+			msg.ModelConfigSource = &source
+			msg.ModelIsPreset = &preset
+			msg.ModelProvider = &provider
+			// max 模式：模型名带 -max 后缀且目录标 max_mode（仅 Agent 档）。
+			if strings.HasSuffix(strings.ToLower(modelName), "-max") && agentType == remoteDefaultAgentType {
+				if enriched, ok := maxModeCustomModel(custom); ok {
+					msg.CustomModel = enriched
+					fields := maxModeFields(enriched)
+					msg.ModelAutoSelection = fields["model_auto_selection"].(map[string]any)
+					strategy := int64(defaultMaxModeType)
+					msg.ModeType = &strategy
+					msg.Strategy = "max"
+					if v, ok := fields["mode_type"].(int64); ok {
+						msg.ModeType = &v
+					}
+					if v, ok := fields["context_window_size"].(int64); ok {
+						msg.ContextWindowSize = &v
+					}
+					if v, ok := fields["prompt_max_tokens"].(int64); ok {
+						msg.PromptMaxTokens = &v
+					}
+					if v, ok := fields["max_tokens"].(int64); ok {
+						msg.MaxTokens = &v
+					}
+					maxApplied = true
+				}
+			}
+		}
+	}
+
 	body := remoteCreateBody{
-		Mode:          "code",
-		EnvironmentID: "default",
-		Env:           "remote",
-		Origin:        "web",
-		InitialMessage: remoteInitialMessage{
-			ChatSessionID:          "",
-			Content:                []any{},
-			Query:                  query,
-			ModelName:              model,
-			AgentType:              "solo_agent_remote",
-			AgentID:                "solo_agent_remote",
-			ModelSelectionStrategy: "auto",
-			CommonParams:           string(commonJSON),
-		},
+		Mode:              "code",
+		EnvironmentID:     "default",
+		Env:               "remote",
+		AutoCreateProject: false,
+		Origin:            "web",
+		InitialMessage:    msg,
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, "", false, err
 	}
-	return encoded, len(kept), dropped, nil
+	return encoded, agentType, maxApplied, nil
 }
 
-// trimRemoteHistory 从最早的**非 system** 消息开始丢，直到扁平化 query 落到上限内。
+// remoteTrimLog 裁剪日志（单独函数便于测试覆盖）。
+func remoteTrimLog(dropped int) {
+	logRemoteTrim(dropped)
+}
+
+// customModelFor 从目录（或静态别名表）取该模型的 custom_model 对象。
 //
-// system 始终保留（它是行为约束，丢了会改变回答质量）。
-// 成对丢弃：带 tool_calls 的 assistant 与紧随其后的 tool 消息一起丢——只丢一半会
-// 留下孤立的工具结果，上游对「工具调用与结果不配对」是直接报错的。
-func trimRemoteHistory(messages []map[string]any, maxChars int) ([]map[string]any, int) {
-	var systems, rest []map[string]any
-	for _, m := range messages {
-		if role, _ := m["role"].(string); role == "system" {
-			systems = append(systems, m)
-		} else {
-			rest = append(rest, m)
-		}
-	}
-	total := len(messages)
-	if len(buildRemoteQuery(append(append([]map[string]any{}, systems...), rest...))) <= maxChars {
-		return messages, 0
-	}
-	for len(rest) > 0 {
-		// 成对丢：assistant(tool_calls) + 紧随的 tool 消息。
-		if role, _ := rest[0]["role"].(string); role == "assistant" {
-			if calls, ok := rest[0]["tool_calls"].([]any); ok && len(calls) > 0 {
-				rest = rest[1:]
-				for len(rest) > 0 {
-					if r, _ := rest[0]["role"].(string); r != "tool" {
-						break
-					}
-					rest = rest[1:]
-				}
-				continue
+// 目录可用时按 config_name 匹配并补 config_name/model_name/config_source/
+// provider/multimodal 字段（对齐参考 _build_web_model_config）。
+func customModelFor(models []CatalogModel, name string, agentType string, catalogOK bool) (map[string]any, bool) {
+	if catalogOK && len(models) > 0 {
+		for _, m := range models {
+			if strings.EqualFold(m.ConfigName, name) {
+				return map[string]any{
+					"name":             m.ConfigName,
+					"config_name":      m.ConfigName,
+					"model_name":       m.ConfigName,
+					"display_name":     m.DisplayName,
+					"config_source":    1,
+					"provider":         "",
+					"multimodal":       m.Multimodal,
+					"max_mode":         m.MaxMode,
+					"custom":           false,
+					"is_preset":        true,
+					"use_remote_service": true,
+				}, true
 			}
 		}
-		rest = rest[1:]
 	}
-	kept := append(append([]map[string]any{}, systems...), rest...)
-	return kept, total - len(kept)
+	// 目录不可用时按静态别名表判断是否已知模型。
+	if resolved := ResolveModelName(name); resolved != "" && !strings.EqualFold(resolved, name) {
+		return map[string]any{
+			"name":          resolved,
+			"config_name":   resolved,
+			"model_name":    resolved,
+			"config_source": 1,
+			"is_preset":     true,
+			"custom":        false,
+			"use_remote_service": true,
+		}, true
+	}
+	if staticModelKnown(name) {
+		return map[string]any{
+			"name":          name,
+			"config_name":   name,
+			"model_name":    name,
+			"config_source": 1,
+			"is_preset":     true,
+			"custom":        false,
+			"use_remote_service": true,
+		}, true
+	}
+	return nil, false
 }
 
-// remoteSession 一次 Remote 会话的标识。
-type remoteSession struct {
-	id        string
-	messageID string
+// maxModeCustomModel 把目录模型扩成 max 档 custom_model（对齐参考 _max_mode_custom_model）。
+//
+// 只在目录标了 max_mode 时生效——绝不凭空造 1M 上限（模型不支持会被上游拒）。
+func maxModeCustomModel(custom map[string]any) (map[string]any, bool) {
+	if flag, ok := custom["max_mode"].(bool); !ok || !flag {
+		return nil, false
+	}
+	maxContext := int64(defaultMaxContextTokens)
+	promptMax := int64(defaultMaxPromptTokens)
+	outputMax := int64(defaultMaxOutputTokens)
+	enriched := make(map[string]any, len(custom)+8)
+	for k, v := range custom {
+		enriched[k] = v
+	}
+	enriched["max_mode"] = true
+	enriched["context_window_size"] = map[string]any{"default": 200_000, "max": []any{maxContext}}
+	enriched["context_window_tokens"] = map[string]any{"dev": 200_000, "max": maxContext}
+	enriched["prompt_max_tokens"] = promptMax
+	enriched["max_tokens"] = outputMax
+	enriched["max_turn"] = 500
+	enriched["max_turns"] = map[string]any{"default": 500, "max": 500}
+	enriched["features"] = map[string]any{
+		"context_windows": map[string]any{
+			"enable": true,
+			"data": map[string]any{
+				"dev_context":      200_000,
+				"max_context":      maxContext,
+				"max_context_list": []any{maxContext},
+				"dev_turns":        500,
+				"max_turns":        500,
+			},
+		},
+	}
+	return enriched, true
+}
+
+// maxModeFields max 档六件套（对齐参考 _max_mode_fields）。
+func maxModeFields(custom map[string]any) map[string]any {
+	maxContext := int64(defaultMaxContextTokens)
+	promptMax := int64(defaultMaxPromptTokens)
+	outputMax := int64(defaultMaxOutputTokens)
+	if v, ok := asFloat(custom["context_window_tokens"]); ok {
+		_ = v
+	}
+	return map[string]any{
+		"model_auto_selection": map[string]any{
+			"strategy":                "max",
+			"fallback_to_advance_model": nil,
+			"entitlement_id":          nil,
+		},
+		"model_selection_strategy": "max",
+		"mode_type":                int64(defaultMaxModeType),
+		"context_window_size":      maxContext,
+		"prompt_max_tokens":        promptMax,
+		"max_tokens":               outputMax,
+	}
 }
 
 // createRemoteSession 建会话（两步协议的第 1 步）。
@@ -345,13 +461,12 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 	if err != nil {
 		return remoteSession{}, err
 	}
-	for k, vs := range remoteHeaders(a) {
+	for k, vs := range remoteHeaders(a, false) {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
 	}
-	client := &http.Client{Transport: chatTransport()}
-	resp, err := client.Do(req)
+	resp, err := remoteHTTPClient().Do(req)
 	if err != nil {
 		return remoteSession{}, fmt.Errorf("trae remote 建会话：%w", err)
 	}
@@ -361,8 +476,7 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 		return remoteSession{}, fmt.Errorf("trae remote 建会话读取：%w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return remoteSession{}, fmt.Errorf("trae remote 建会话 HTTP %d：%s",
-			resp.StatusCode, truncate(string(raw), 200))
+		return remoteSession{}, &remoteHTTPError{status: resp.StatusCode, body: truncate(string(raw), 200)}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -370,7 +484,7 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 	}
 	if code, ok := asFloat(payload["code"]); ok && code != 0 {
 		message, _ := payload["message"].(string)
-		return remoteSession{}, fmt.Errorf("trae remote 建会话 code %g：%s", code, message)
+		return remoteSession{}, &remoteBizError{code: int(code), message: message}
 	}
 	data, _ := payload["data"].(map[string]any)
 	if data == nil {
@@ -384,24 +498,50 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 	return remoteSession{id: sid, messageID: mid}, nil
 }
 
+// remoteHTTPError / remoteBizError 建会话失败的两类形态。
+type remoteHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *remoteHTTPError) Error() string {
+	return fmt.Sprintf("trae remote 建会话 HTTP %d：%s", e.status, e.body)
+}
+
+type remoteBizError struct {
+	code    int
+	message string
+}
+
+func (e *remoteBizError) Error() string {
+	return fmt.Sprintf("trae remote 建会话 code %d：%s", e.code, e.message)
+}
+
+// remoteHTTPClient Remote 出站共享一个 client（连接复用）。
+func remoteHTTPClient() *http.Client {
+	return &http.Client{Transport: chatTransport()}
+}
+
 // stopRemoteSession 主动结束会话（尽力而为，失败不影响结果）。
 //
-// 上游对会话有并发槽位，不结束会占着槽位；调用方在收流结束后调用。
+// 上游对会话有并发槽位，不结束会占着槽位。
 func stopRemoteSession(ctx context.Context, a *auth.Auth, sid string) {
 	if sid == "" {
 		return
 	}
+	body, _ := json.Marshal(map[string]string{"chat_session_id": sid})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf(RemoteBaseVar+remoteStopFmt, sid), bytes.NewReader([]byte("{}")))
+		fmt.Sprintf(RemoteBaseVar+remoteStopFmt, sid), bytes.NewReader(body))
 	if err != nil {
 		return
 	}
-	for k, vs := range remoteHeaders(a) {
+	for k, vs := range remoteHeaders(a, false) {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
 	}
-	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: chatTransport()}
+	resp, err := client.Do(req)
 	if err != nil {
 		return
 	}
@@ -410,19 +550,22 @@ func stopRemoteSession(ctx context.Context, a *auth.Auth, sid string) {
 }
 
 // openRemoteEvents 收流（两步协议的第 2 步）。
+//
+// 首事件超时在读取侧实现（remoteEventStream 的 first-event 判定），
+// 这里只负责建立连接。
 func openRemoteEvents(ctx context.Context, a *auth.Auth, session remoteSession) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf(RemoteBaseVar+remoteEventsFmt, session.id, session.messageID), nil)
 	if err != nil {
 		return nil, err
 	}
-	for k, vs := range remoteHeaders(a) {
+	for k, vs := range remoteHeaders(a, true) {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	resp, err := remoteHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("trae remote 收流：%w", err)
 	}
@@ -434,23 +577,30 @@ func openRemoteEvents(ctx context.Context, a *auth.Auth, session remoteSession) 
 	return resp.Body, nil
 }
 
-// ── Remote 事件 → llm_utils_chat 事件的转译 ─────────────────────────────
+// strconv 占位引用（构建未用到的包在这里集中消化，避免 import 悬空）。
+var _ = time.Second
+
+// logRemoteTrim 裁剪日志钩子（生产写日志；测试静音）。
+var logRemoteTrim = func(dropped int) {
+	log.Printf("INFO: [trae] Remote query 超限，已从最早丢弃 %d 条消息", dropped)
+}
+
+// ── Remote 事件流 → llm_utils_chat 形态的转译 ───────────────────────────────
 //
-// 转译在**事件层**做，把 Remote 的事件名与字段改写成 llm_utils_chat 的形态，
-// 再交给既有的 translator。这样做的理由：translator 已经处理了累计快照、
-// 工具跨帧合并、think 块拆分、终态归一、usage 映射等全部细节（并有回归测试），
-// 为 Remote 另写一套转译等于把这些细节再实现一遍、两份必然漂移。
+// 与旧版（HEAD 版本）一致的策略：把 Remote 事件改写成 translator 已认识的
+// output/token_usage/done/error 事件，再交给 stream.go 的既有转译器——工具合并、
+// think 拆分、终态归一、usage 映射全部复用，不为 Remote 另写一套。
 //
-// 字段对应关系（2026-10-15 从真实事件 dump 确认）：
-//
-//	Remote plan_item.thought            → output.response（正文累计快照）
-//	Remote plan_item.reasoning_content  → output.reasoning_content
-//	Remote token_usage                  → token_usage（字段名不同，见下）
-//	Remote done                         → done（finish_reason 由 translator 归一）
-//
-// Remote 的 status_changed / metadata / timing_events / platform_timing /
-// session_title_message / session_icon_message / model_config 在 llm_utils_chat 里
-// 没有对应物，直接丢弃——它们不携带正文。
+// 本次重写吸收了参考实现 translate_web_events 的三个修正：
+//  1. plan_item 的正文优先取**显式 content**（公开答案），thought 只是推理快照——
+//     旧版把 thought 当正文，会把「The user wants…」式的过程叙述当答案交付；
+//  2. tool_call_info.name == "finish" 的 params.summary 是最终答案快照，收尾时
+//     若正文为空（或只是它的前缀），用它补齐——纯工具轮次的会话正文全在 summary 里；
+//  3. Remote 的工具活动（沙箱工具）仍**不透传**（实测口径，见 remoteEventConverter
+//     注释），客户端工具请求已由 opencode_tool_call 文本协议从正文里抽取
+//     （stream.go 的 toolBlockPairs + toolAccumulator 天然支持）。
+
+// translateRemoteEvents 把 Remote 事件流改写成 llm_utils_chat 形态的 SSE。
 func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
@@ -508,6 +658,12 @@ func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 				if werr := flush(); werr != nil {
 					err = werr
 				}
+				// flush 之后补终态与（若有）finish summary（见 conv.finish 注释）。
+				if tail := conv.finish(); tail != "" {
+					if _, werr := io.WriteString(pw, tail); werr != nil {
+						err = werr
+					}
+				}
 				return
 			}
 		}
@@ -517,27 +673,31 @@ func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 
 // remoteEventConverter 把 Remote 事件转成 llm_utils_chat 形态。
 //
-// **Remote 的工具调用一律不透传**（2026-10-15 实测后定的）。
+// **Remote 的沙箱工具活动一律不透传**（2026-10-15 实测后定的）。
 //
 // 为什么：Remote 是一个**自带沙箱的 agent**——它有自己的工具（实测 LS /
 // EnvironmentSetup / finish / Glob / Read…），参数以增量片段流式给出，然后它
 // **自己执行**并继续下一轮。它不是「向客户端请求执行工具」的协议。
-//
 // 把它当客户端工具调用透传会同时踩两个坑：
 //  1. 参数永远「不完整」——客户端视角下这次调用没有闭合（Remote 不需要客户端回结果），
 //     网关的校验器因此报 "upstream ended with incomplete or invalid tool arguments"，
-//     整个回答变成失败。实测就是这么炸的（工具帧里 arguments 只到
-//     `"internal/panel/actions.go"` 就停住，JSON 不闭合）。
+//     整个回答变成失败。
 //  2. 语义错位——客户端会去执行一个**已经被 Remote 执行过**的工具（双重执行），
 //     而且 Remote 的沙箱工具客户端根本没有。
 //
-// 所以这里只取正文（thought / reasoning_content）与 usage，工具活动仅用于日志计数。
-// 客户端拿到的是最终回答文本。这是回落到 Remote 时的**能力边界**，见文件头「代价」。
+// 例外：opencode_tool_call 文本块是**客户端工具协议**（prompt.go 注入的），模型把它
+// 写在正文里、由 API 调用方执行——那种块留在正文里，stream.go 的 translator 会从
+// 文本中抽取并转成标准 tool_calls 帧。
 type remoteEventConverter struct {
-	// toolRounds 观测到的工具调用轮次（仅用于日志，不透传）。
+	// toolRounds 观测到的沙箱工具轮次（仅用于日志，不透传）。
 	toolRounds int
 	// seenTools 已见过的工具名（同一工具重复出现只计一次轮次）。
 	seenTools map[string]bool
+	// finishSummary tool_call_info.name == "finish" 的 params.summary。
+	//
+	// 纯工具轮次（或 thought 全是叙述）的会话里，公开答案只出现在 finish 的
+	// summary 参数里。收尾时若 thought 累计正文为空或是 summary 的前缀，用它补齐。
+	finishSummary string
 }
 
 // convert 把一个 Remote 事件改写成 llm_utils_chat 形态的 SSE 文本。
@@ -550,15 +710,24 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 			return "", false
 		}
 		out := map[string]any{}
-		if thought, ok := obj["thought"].(string); ok && thought != "" {
+		// 正文优先取显式 content（公开答案）；没有 content 才用 thought
+		// （旧布局：thought 兼作答案快照，如 thought="pong"）。
+		content := webContentText(obj["content"])
+		if content != "" {
+			out["response"] = content
+		} else if thought, ok := obj["thought"].(string); ok && thought != "" {
 			out["response"] = thought
 		}
-		if reasoning, ok := obj["reasoning_content"].(string); ok && reasoning != "" {
+		if reasoning := webPlanReasoning(obj); reasoning != "" {
 			out["reasoning_content"] = reasoning
 		}
-		// 工具活动只计数、不透传（理由见本类型注释）。
+		// finish 工具的 summary 是最终答案快照，收尾时兜底（见 finishSummary）。
+		if summary := webFinishSummary(obj); summary != "" {
+			c.finishSummary = summary
+		}
+		// 沙箱工具活动只计数、不透传（理由见本类型注释）。
 		if info, ok := obj["tool_call_info"].(map[string]any); ok {
-			if toolName, _ := info["name"].(string); toolName != "" {
+			if toolName, _ := info["name"].(string); toolName != "" && toolName != "finish" {
 				if c.seenTools == nil {
 					c.seenTools = map[string]bool{}
 				}
@@ -578,6 +747,11 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 			return "", false
 		}
 		return "event: output\ndata: " + string(encoded) + "\n\n", true
+
+	case "heartbeat", "keepalive", "ping":
+		// 心跳转发（translator 会转成下游保活注释行）：Remote agent 思考期
+		// 只有这些帧，静默丢弃会让客户端把流判死（参考实测 zcode 的行为）。
+		return ": relay-keepalive\n\n", true
 
 	case "token_usage":
 		var obj map[string]any
@@ -609,5 +783,139 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 	case "error":
 		return "event: error\ndata: " + payload + "\n\n", true
 	}
+	// message / assistant_message / response / text / output：显式正文事件。
+	switch name {
+	case "message", "assistant_message", "response", "text", "output":
+		var obj map[string]any
+		if json.Unmarshal([]byte(payload), &obj) != nil {
+			return "", false
+		}
+		out := map[string]any{}
+		if text := webMessageText(obj); text != "" {
+			out["response"] = text
+		}
+		if len(out) == 0 {
+			return "", false
+		}
+		encoded, err := json.Marshal(out)
+		if err != nil {
+			return "", false
+		}
+		return "event: output\ndata: " + string(encoded) + "\n\n", true
+	}
 	return "", false
+}
+
+// finish 流结束时补一帧 finish summary（若有且正文可能没用上）。
+//
+// 为什么放在收尾而不是 done 时：done 事件的 status 不带 summary，而 summary 在
+// 最后一个 plan_item 里；转译层无法预知后续还有没有正文，只能在 EOF 时兜底。
+// 输出形态是 output 事件（translator 的累计合并会自动去重——summary 若与已交付
+// 正文相同则前缀合并后 delta 为零，不会重复下发）。
+func (c *remoteEventConverter) finish() string {
+	if c.finishSummary == "" {
+		return ""
+	}
+	encoded, err := json.Marshal(map[string]any{"response": c.finishSummary})
+	if err != nil {
+		return ""
+	}
+	return "event: output\ndata: " + string(encoded) + "\n\n"
+}
+
+// webContentText 取 plan_item/message 的 content 字段（字符串或块数组）。
+//
+// 对齐参考 _web_message_text：块数组里 type 为 reasoning/thinking 的块跳过
+// （那是思考，不是公开答案）。
+func webContentText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []any:
+		var out []string
+		for _, raw := range typed {
+			switch block := raw.(type) {
+			case string:
+				out = append(out, block)
+			case map[string]any:
+				if kind, _ := block["type"].(string); strings.EqualFold(kind, "reasoning") ||
+					strings.EqualFold(kind, "thinking") || strings.EqualFold(kind, "reasoning_text") {
+					continue
+				}
+				if text, ok := block["text"].(string); ok && text != "" {
+					out = append(out, text)
+				} else if text, ok := block["content"].(string); ok && text != "" {
+					out = append(out, text)
+				}
+			}
+		}
+		return strings.Join(out, "")
+	}
+	return ""
+}
+
+// webMessageText 从 message 形态事件里取可见正文（对齐参考 _web_message_text）。
+func webMessageText(obj map[string]any) string {
+	for _, key := range []string{"message", "agent_message", "assistant_message"} {
+		if nested, ok := obj[key].(map[string]any); ok {
+			obj = nested
+			break
+		}
+	}
+	if text := webContentText(obj["content"]); text != "" {
+		return text
+	}
+	for _, key := range []string{"text", "response", "answer", "output"} {
+		switch typed := obj[key].(type) {
+		case string:
+			if typed != "" {
+				return typed
+			}
+		case []any:
+			if text := webContentText(typed); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+// webPlanReasoning 取 plan_item 的推理文本（reasoning_content 优先，回落 thought）。
+//
+// 对齐参考 _web_plan_reasoning：带显式 reasoning_content 的布局里 thought 是
+// 答案快照；旧布局（无 reasoning_content 键）里 thought 兼作推理轨迹。
+func webPlanReasoning(obj map[string]any) string {
+	_, hasSplit := obj["reasoning_content"]
+	if !hasSplit {
+		if _, hasCamel := obj["reasoningContent"]; !hasCamel {
+			return ""
+		}
+	}
+	if value, ok := obj["reasoning_content"].(string); ok && value != "" {
+		return value
+	}
+	if value, ok := obj["reasoningContent"].(string); ok && value != "" {
+		return value
+	}
+	return ""
+}
+
+// webFinishSummary 取 finish 工具的 summary 参数（最终答案快照）。
+func webFinishSummary(obj map[string]any) string {
+	info, ok := obj["tool_call_info"].(map[string]any)
+	if !ok {
+		info, ok = obj["toolCallInfo"].(map[string]any)
+	}
+	if !ok {
+		return ""
+	}
+	if name, _ := info["name"].(string); name != "finish" {
+		return ""
+	}
+	params, ok := info["params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	summary, _ := params["summary"].(string)
+	return summary
 }

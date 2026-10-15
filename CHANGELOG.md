@@ -38,7 +38,60 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
-## v3.7.0 — 2026-10-15
+## v3.8.0 — 2026-10-16
+
+Trae 域重写为 Remote 会话端点主路径（对齐 Trae2api-cn 的 UPSTREAM_MODE=remote），
+llm_utils_chat 降为回落；长工具会话、1M max 档与客户端工具协议全部换轨。
+
+### 路径反转：Remote 主路径，llm_utils_chat 回落
+
+v3.6.0 的方向是「llm_utils_chat 优先，3004 时回落 Remote」。本次对齐参考项目
+（autumnsentiment/Trae2api-cn）的默认形态——**Remote 就是主路径**：
+
+- Remote 的 query 是扁平化文本（工具调用转 `[Client Tool Result: …]` 文本标记），
+  天然绕开 llm_utils_chat 的 3004 工具轮次硬限制，长工具会话不再依赖「先失败
+  一次再回落」；
+- 纯文本请求走 `solo_agent_remote`，保有 1M max 档（max 六件套在该端点真实生效）；
+- Remote 失败（建会话/收流）时回落 llm_utils_chat——两个端点故障域不同
+  （网页端会话服务 vs IDE 通道），互为冗余；
+- `WB2API_TRAE_REMOTE=0` 可整体关掉 Remote（排障开关，直接走 llm_utils_chat，
+  保留其 3004 → Remote 的旧回落）。
+
+### Remote 主路径的完整移植
+
+- **请求构造**（`remote.go` + `prompt.go`，对齐参考 `trae_remote_client.py`）：
+  query 扁平化（system→`[System]`、assistant 带工具历史、tool→结果标记，
+  兼容 `toolCallId` 拼写）、历史压缩（保 system 去重 + 最近 500 条 + 480K 字符 +
+  孤儿工具结果配对）、query 上限 460K（实测 533K 起静默断流）。
+- **模型路由**：带客户端工具的请求默认路由 `solo_work_remote`（参考
+  caller_tools_use_work=1，Agent 档沙箱自执行），纯文本走 `solo_agent_remote`；
+  `work`/`auto-work`/`solo-work` 显式要求 Work 档。manual 选模型绑定 custom_model
+  （目录按 config_name 匹配；目录不可用回落静态别名表，完全未知不硬绑）。
+- **max 六件套**：目录标 `max_mode` 且模型名带 `-max` 后缀时，custom_model 补
+  `context_window_size{default:200K,max:[1M]}` + 顶层
+  `model_auto_selection.strategy="max"` / `context_window_size=1M` /
+  `prompt_max_tokens=936K` / `max_tokens=64K` / `mode_type=1`——绝不凭空造
+  1M 上限（模型不支持会被上游拒）。
+- **客户端工具协议**（`prompt.go`，对齐参考 opencode_tool_call 文本块）：
+  客户端工具定义以 system prompt 注入 `<opencode_tool_call>` 文本协议，模型用
+  文本块请求调用，调用方执行后下一轮回填；无工具时注入 responseStyleInstruction
+  （防推理轨迹当答案）。**Remote 沙箱工具不透传**（实测口径：只计数日志，
+  finish 不计轮）。
+- **事件转译**（`remote.go` 转译器，对齐参考 `sse.py`）：plan_item 显式
+  **content 优先**（thought 是推理快照，旧布局无 content 才回落）；finish 工具的
+  `params.summary` 收尾兜底（纯工具轮次的正文全在 summary 里）；heartbeat 转发为
+  `: relay-keepalive` 注释行；token_usage 平铺包成 `{usage:…}` 嵌套；done 只有
+  status 时造 `finish_reason:"stop"`。
+- **首事件超时 120s**：建会话后上游先排队（只发 heartbeat）再执行，超时即判失败
+  回落——判定放在**原始事件层**（转译前），排队心跳不会误判为模型活动。
+
+### 账号与签到不动
+
+账号存储格式、域标识（`trae`）、ExchangeToken 刷新链路、签到状态机
+（claim 幂等 / 9074 换代重试 / 退避墙钟）全部保持原样——已有账号无需重新登录，
+签到与积分行为零变化。
+
+
 
 Trae 域声明 1M 上下文窗口，客户端不再按 200K 自我截断。
 

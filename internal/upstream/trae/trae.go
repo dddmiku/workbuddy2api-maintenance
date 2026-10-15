@@ -60,6 +60,10 @@ const (
 	soloLSCBDAID           = "787976"
 )
 
+// GatewayBaseVar 是 llm_utils_chat / 目录端点出站实际使用的基址（测试用
+// httptest 改写；生产代码从不写它）。Remote 端点有独立的 RemoteBaseVar。
+var GatewayBaseVar = GatewayBase
+
 // chatBody llm_utils_chat 的原生请求体（TraeWork 的 solo_work_lite 形态）。
 type chatBody struct {
 	Messages          []map[string]any `json:"messages"`

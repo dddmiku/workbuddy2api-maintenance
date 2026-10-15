@@ -62,15 +62,45 @@ const (
 
 var chunkSeq uint64
 
-// ChatStream 调用 llm_utils_chat 并返回**已转译成 OpenAI SSE** 的流。
+// ChatStream 调用上游并返回**已转译成 OpenAI SSE** 的流。
 //
 // 返回的 io.ReadCloser 与既有 upstream.ChatStreamContext 契约一致：调用方直接
 // 交给 upstream.Stream / Aggregate，无需知道上游是 Trae。上游非 2xx 时返回
 // (nil, status, body, nil) 让上层按既有错误分类处理（对齐既有出站实现）。
+//
+// ═══ 路径次序（2026-10-16 反转，对齐参考 UPSTREAM_MODE=remote）═══
+//
+// **Remote 会话端点是主路径**，llm_utils_chat 是回落：
+//   - Remote 的 query 是扁平化文本（工具调用转文本标记），天然绕开 3004
+//     工具轮次硬限制；solo_agent_remote 还保有 1M max 档（见 remote.go 文件头）；
+//   - Remote 失败（建会话/收流/首事件超时）时回落 llm_utils_chat——两个端点
+//     的故障域不同（Remote 是网页端会话服务，llm_utils_chat 是 IDE 通道），
+//     互为冗余；
+//   - Remote 关闭（WB2API_TRAE_REMOTE=0，排障用）时直接走 llm_utils_chat，
+//     并保留其 3004 → Remote 的旧回落（那个方向不消失，只是次序反转）。
+//
+// 回落必须发生在**客户端收到任何内容之前**——已交付内容再换端点会让用户看到
+// 重复/断裂的输出。Remote 建会话失败即满足（一个字节都还没发）。
 func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if RemoteEnabled() {
+		if stream, err := ChatStreamRemote(ctx, a, prepared, clientIP); err == nil {
+			return stream, http.StatusOK, nil, nil
+		} else {
+			log.Printf("WARN: [trae] Remote 主路径失败，回落 llm_utils_chat：%v", err)
+		}
+	}
+	return chatStreamLegacy(ctx, a, prepared, clientIP)
+}
+
+// chatStreamLegacy 是旧的 llm_utils_chat 出站路径（现为 Remote 的回落）。
+//
+// 语义与反转前完全一致（含 3004 → Remote 的反向回落），原样保留——它现在是
+// 双向冗余的另一半。上游非 2xx 时返回 (nil, status, body, nil) 让上层按既有
+// 错误分类处理。
+func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
 	requestID := newRequestID()
 	// 用实时目录把客户端模型名解析成 config_name（含显示名匹配，如
 	// "DeepSeek-V4.1-Flash" → "deepseek-v4.1-flash"）；目录不可用时
@@ -84,7 +114,7 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBase+ChatPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBaseVar+ChatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -319,8 +349,8 @@ func isToolTurnLimitError(err error) bool {
 
 // ChatStreamRemote 走 Remote 会话端点（两步协议），返回**已转译成 OpenAI SSE** 的流。
 //
-// 由上层在 llm_utils_chat 返回 3004（工具轮次超限）时回落调用——为什么需要它、
-// 以及实测的触发条件与代价，见 remote.go 文件头。
+// 这是本包的**主路径**（2026-10-16 对齐参考 UPSTREAM_MODE=remote 后反转次序；
+// 为什么、以及实测的触发条件与代价，见 remote.go 文件头）。
 //
 // 与 ChatStream 的差别：这里**不返回上游状态码**给上层做错误分类，而是把两步协议
 // 里的失败就地转成 error（建会话失败时上游给的是业务码，不是可分类的 HTTP 状态）。
@@ -328,8 +358,7 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	requestID := newRequestID()
-	body, _, _, err := buildRemoteBody(prepared, requestID)
+	body, _, _, err := buildRemoteBody(ctx, a, prepared)
 	if err != nil {
 		return nil, err
 	}
@@ -343,12 +372,105 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 		return nil, err
 	}
 	// 收流结束/客户端断开后主动停会话：上游对会话有并发槽位，不结束会占着。
+	// 链路（三层，顺序不能乱）：
+	//   原始 Remote 事件 → firstEventReader（首模型事件超时，看原始事件名）
+	//   → translateRemoteEvents（Remote 事件 → llm_utils_chat 形态）
+	//   → TranslateStream（llm_utils_chat → OpenAI SSE）。
+	// 超时判定必须放在转译**之前**的原始层：转译后的流只有 output 事件，排队期
+	// 的 heartbeat 会被转译器吞成 keepalive 注释，届时已无法区分「排队中」与
+	// 「模型活动」（对齐参考 stream_events 的 first-event 判定）。
 	return &remoteStreamCloser{
-		ReadCloser: TranslateStream(translateRemoteEvents(events, modelFromPrepared(prepared)),
+		ReadCloser: TranslateStream(
+			translateRemoteEvents(
+				newRemoteFirstEventReader(events),
+				modelFromPrepared(prepared)),
 			modelFromPrepared(prepared)),
 		auth:    a,
 		session: session,
 	}, nil
+}
+
+// remoteFirstEventReader 包住 Remote 原始事件流，实现首模型事件超时。
+//
+// 只在**第一个携带正文/终态的事件**（plan_item/message/done/error/token_usage 等）
+// 到来之前计时；heartbeat/排队帧不重置计时（对齐参考：排队期计入首事件窗口，
+// 超时即失败）。一旦见过模型活动，本包装退化为纯透传。
+//
+// 判定时序：超时只在**至少尝试读过一次**之后生效——立即可用的模型事件不能被
+// 已过期的 deadline 误杀（首读之前不做预检查）。真正的死流（上游一个字节都
+// 不发）由外层 ctx 取消兜底；排队期上游会持续发 heartbeat，读写间隙足以触发
+// 判定（测试里两次 Read 之间恰好落在判定点上）。
+//
+// SSE 帧可能被 TCP 分片切开（event: 与名字分属两次 Read），判定用跨 Read 的
+// 滚动窗口（最近 512 字节）找 "event: <模型事件名>"，避免帧边界漏判。
+type remoteFirstEventReader struct {
+	inner         io.Reader
+	deadline      time.Time
+	timedOut      bool
+	sawFirst      bool
+	readAttempted bool
+	closed        bool
+	window        []byte
+}
+
+func newRemoteFirstEventReader(inner io.Reader) *remoteFirstEventReader {
+	return &remoteFirstEventReader{
+		inner:    inner,
+		deadline: time.Now().Add(remoteFirstEventTimeout),
+	}
+}
+
+// remoteModelEventMarkers 首模型事件的 event 名（Remote 原始事件名）。
+var remoteModelEventMarkers = []string{
+	"plan_item", "message", "assistant_message",
+	"response", "text", "output",
+	"token_usage", "done", "error",
+}
+
+// remoteModelEventPrefix 报告一段 SSE 文本是否含首模型事件的 event 行。
+// 认 "event: name" 与 "event:name" 两种拼写（SSE 冒号后空格可选）。
+func remoteModelEventPrefix(text string) bool {
+	for _, marker := range remoteModelEventMarkers {
+		if strings.Contains(text, "event: "+marker) || strings.Contains(text, "event:"+marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *remoteFirstEventReader) Read(p []byte) (int, error) {
+	if r.timedOut {
+		return 0, fmt.Errorf("trae remote: 首个模型事件超时（%v）", remoteFirstEventTimeout)
+	}
+	if r.closed {
+		return 0, io.EOF
+	}
+	if r.readAttempted && !r.sawFirst && time.Now().After(r.deadline) {
+		r.timedOut = true
+		return 0, fmt.Errorf("trae remote: 首个模型事件超时（%v）", remoteFirstEventTimeout)
+	}
+	n, err := r.inner.Read(p)
+	r.readAttempted = true
+	if n > 0 && !r.sawFirst {
+		// 滚动窗口：跨分片拼出完整的 event 行再判定。
+		r.window = append(r.window, p[:n]...)
+		if len(r.window) > 512 {
+			r.window = r.window[len(r.window)-512:]
+		}
+		if remoteModelEventPrefix(string(r.window)) {
+			r.sawFirst = true
+			r.window = nil
+		}
+	}
+	return n, err
+}
+
+func (r *remoteFirstEventReader) Close() error {
+	r.closed = true
+	if closer, ok := r.inner.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // remoteStreamCloser 在流关闭时顺带结束上游会话。
@@ -378,7 +500,7 @@ func RawChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP 
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBase+ChatPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBaseVar+ChatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, nil, err
 	}

@@ -52,6 +52,14 @@ type CatalogModel struct {
 	Rate float64
 	// HasRate 报告倍率是否真的从上游读到了。缺失 ≠ 0。
 	HasRate bool
+	// Multimodal 是否多模态（custom_model 要透传的字段）。
+	Multimodal bool
+	// MaxMode 账号目录是否标注该模型支持 1M max 档。
+	//
+	// 判据对齐参考 _fetch_solo_model_configs：顶层 max_mode 或
+	// display_config.max_mode 任一为真。max 六件套**只在它为真时**生效——
+	// 绝不凭空造 1M 上限（模型不支持会被上游拒）。
+	MaxMode bool
 }
 
 // catalogEntry 是带时间的缓存项。
@@ -119,7 +127,7 @@ func fetchCatalogUpstream(ctx context.Context, a *auth.Auth) ([]CatalogModel, er
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		GatewayBase+CatalogPath, bytes.NewReader(body))
+		GatewayBaseVar+CatalogPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +218,31 @@ func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
 		model.Rate = rate
 		model.HasRate = true
 	}
+	model.Multimodal = truthyFlag(item["multimodal"])
+	model.MaxMode = truthyFlag(item["max_mode"])
+	if dc, ok := item["display_config"].(map[string]any); ok {
+		if truthyFlag(dc["max_mode"]) {
+			model.MaxMode = true
+		}
+		if truthyFlag(dc["multimodal"]) {
+			model.Multimodal = true
+		}
+	}
 	return model, true
+}
+
+// truthyFlag 上游布尔字段的三种拼写（bool / "true" / "1"）都认。
+func truthyFlag(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1", "yes":
+			return true
+		}
+	}
+	return false
 }
 
 // parseConsumptionRate 从 display_contact_config 里取消费倍率。
