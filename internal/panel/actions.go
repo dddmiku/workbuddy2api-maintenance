@@ -345,3 +345,39 @@ func uidPrefix(uid string) string {
 	}
 	return uid
 }
+
+// lanToggle 开/关局域网访问（写 config.json 的 listen 与 admin_allow_cidrs）。
+//
+// 与 taskToggle 的差别在生效路径：任务开关经 restartContainer——容器形态是
+// docker restart（真的重启），**native 形态（桌面/安卓/裸机 systemd）却是
+// POST /runtime/reload（进程内重载，只重读账号，不会重绑监听套接字）**。
+// 所以 native 下不调 restartContainer（它返回的「配置与账号已重新加载」对
+// listen 是假的），如实提示手动重启。
+func (s *Server) lanToggle(ctx context.Context, body map[string]any) map[string]any {
+	enabled := jsonBool(body["enabled"], false)
+	allowCIDRs := strings.TrimSpace(jsonString(body["allow_cidrs"]))
+	s.lock.Lock()
+	ok, message := SetLANAccess(s.opts.ConfigPath, enabled, allowCIDRs)
+	s.lock.Unlock()
+	if !ok {
+		return map[string]any{"ok": false, "message": message}
+	}
+	if message == "状态未变化" {
+		return map[string]any{"ok": true, "message": message}
+	}
+	// native 形态无法经面板真正重启（reload 不重绑监听），只能提示手动重启。
+	// 容器形态走 docker restart，真实生效。
+	if s.opts.Runtime == "native" {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s局域网访问；监听地址在重启服务后生效（桌面版关闭窗口重开 / 安卓重启 App / 服务器 systemctl restart）", enabledLabel(enabled))}
+	}
+	restartOK, restartMessage, seconds := s.restartContainer(ctx)
+	out := map[string]any{"ok": restartOK, "restart": nil, "message": restartMessage}
+	if restartOK {
+		out["restart"] = seconds
+		out["message"] = formatMessage("已%s局域网访问，%s", enabledLabel(enabled), restartMessage)
+	} else {
+		out["message"] = formatMessage("已%s局域网访问的设置，但%s", enabledLabel(enabled), restartMessage)
+	}
+	return out
+}

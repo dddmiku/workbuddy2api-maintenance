@@ -366,3 +366,37 @@ func orQuestion(value string) string {
 	}
 	return value
 }
+
+// NetworksAllow 纯函数形态的网段白名单判定（面板 AdminClientAllowed 与网关 API 侧
+// 中间件共用，保证两处口径一致——各写一份 CIDR 解析迟早分叉）。
+//
+// rawCIDRs 空 = 不限制（全部放行）；回环始终放行（就绪探针与本地排障）。
+// rawCIDRs 非空但全部非法时 parseNetworks 返回空表——本函数视同「不限制」，
+// 与 AdminClientAllowed 的空表分支一致：宁可放开也不把运维锁在门外
+// （配置写错导致面板彻底不可达比暴露面问题更难恢复）。
+func NetworksAllow(rawCIDRs, clientIP string) bool {
+	networks := parseNetworks(rawCIDRs, "忽略无法解析的管理白名单网段: %q")
+	if len(networks) == 0 {
+		return true
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(clientIP))
+	if err != nil {
+		return false
+	}
+	if addr.IsLoopback() {
+		return true
+	}
+	for _, prefix := range networks {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientIPOf 提取请求的对端 IP（透传 Throttle 的可信代理口径，供 API 侧共用）。
+func ClientIPOf(r *http.Request, trustedProxies string) string {
+	t := &Throttle{now: time.Now}
+	t.trustedProxies = parseNetworks(trustedProxies, "忽略无法解析的可信代理网段: %q")
+	return t.ClientIP(r)
+}

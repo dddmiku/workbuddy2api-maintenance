@@ -395,6 +395,26 @@
             </section>
             <section class="panel" style="margin-top:14px">
               <div class="ph">
+                <h2>局域网访问</h2>
+                <span class="sp"></span>
+                <span class="sub" id="lanState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="lanRows"></div>
+                <div class="cred-form" style="margin-top:10px">
+                  <label class="fld">
+                    <span class="k">允许来源网段</span>
+                    <input id="lanCIDRs" spellcheck="false" placeholder="192.168.5.0/24（留空 = 不限网段）">
+                  </label>
+                </div>
+                <div class="frow" style="margin-top:10px">
+                  <button class="btn pri sm" id="btnLanApply">保存</button>
+                  <span class="sub" id="lanHint" style="line-height:1.6">开启后同网络的人都能访问面板登录页与 API；调用密钥是唯一门槛，请先在「密钥」页创建一把。</span>
+                </div>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
                 <h2>重复推理保护</h2>
                 <span class="sp"></span>
                 <span class="sub" id="rlState">—</span>

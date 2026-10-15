@@ -104,6 +104,17 @@ type StatePayload struct {
 	// 回显等于把它发给任何能打开面板的人）。保留字段是为了前端不必改结构。
 	APIKey         string `json:"apiKey"`
 	APIKeysManaged bool   `json:"apiKeysManaged"`
+	// LAN 局域网访问状态（2026-10-15）：enabled/listen/allow_cidrs/has_key，
+	// 系统页「局域网访问」卡渲染用。has_key 只说「有没有」，不回传密钥本身。
+	LAN LANState `json:"lan"`
+}
+
+// LANState 是局域网访问开关的当前状态。
+type LANState struct {
+	Enabled    bool   `json:"enabled"`
+	Listen     string `json:"listen"`
+	AllowCIDRs string `json:"allow_cidrs"`
+	HasKey     bool   `json:"has_key"`
 }
 
 // PanelVersion 是面板自身的版本号。报给前端的 version 字段用**网关**版本
@@ -119,6 +130,9 @@ type StateBuilder struct {
 	Credits   *CreditCache
 	Runner    Runner
 	Container string
+	// ConfigPath 是网关 config.json 路径：局域网访问状态（listen/admin_allow_cidrs/
+	// api_key 存在性）从它读，见 lanStateOf。
+	ConfigPath string
 }
 
 // Build 生成首屏状态。forceCredit=true 时等待一次新积分查询。
@@ -177,7 +191,25 @@ func (b *StateBuilder) Build(ctx context.Context, forceCredit bool) StatePayload
 		PendingRestart: len(changed) > 0,
 		APIKey:         "",
 		APIKeysManaged: b.Gateway.Management != nil && b.Gateway.Management.ManagementEnabled(),
+		LAN:            lanStateOf(b.Gateway, b.ConfigPath),
 	}
+}
+
+// lanStateOf 组装局域网访问状态。has_key 判定与 SetLANAccess 的闸门口径一致：
+// api_key 非空，或密钥库文件存在（面板密钥页建的第一把密钥就落它）。
+func lanStateOf(gateway *GatewayClient, configPath string) LANState {
+	enabled, cidrs := LANAccessState(configPath)
+	listen := configString(configPath, "listen")
+	if listen == "" {
+		listen = "127.0.0.1:7863"
+	}
+	hasKey := configString(configPath, "api_key") != ""
+	if !hasKey {
+		if keysFile := configString(configPath, "api_keys_file"); keysFile != "" {
+			hasKey = fileExists(keysFile)
+		}
+	}
+	return LANState{Enabled: enabled, Listen: listen, AllowCIDRs: cidrs, HasKey: hasKey}
 }
 
 // containerRunning 判断网关是否在跑。

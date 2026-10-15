@@ -533,7 +533,7 @@ func main() {
 			if panelErr != nil {
 				log.Printf("ERROR: Go 版面板启动失败 (%v)；网关 API 继续服务", panelErr)
 			} else {
-				publicHandler = withPanel(h, goPanel)
+				publicHandler = withPanel(h, goPanel, lanAllowCIDRs())
 			}
 		} else {
 			// 面板启动失败（凭据文件损坏、目录不可写、Python 启动过慢等）不再拖垂整个网关：
@@ -546,7 +546,7 @@ func main() {
 				}
 				log.Printf("ERROR: 内嵌面板启动失败（%v）；API 继续服务，面板会在后台重试", err)
 			}
-			publicHandler = withPanel(h, panel)
+			publicHandler = withPanel(h, panel, lanAllowCIDRs())
 		}
 	}
 	srv := &http.Server{

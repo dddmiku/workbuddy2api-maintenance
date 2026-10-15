@@ -1447,7 +1447,41 @@ function renderSystem(){
     mrow('异常账号', String(bad), bad ? 'e' : 'ok') +
     mrow('账号总数', String(accounts.length)) +
     mrow('定时任务', taskList().length ? String(taskList().length) : '—');
+  renderLan();
 }
+
+/* ── 局域网访问（2026-10-15）────────────────────────────
+   开关 + 可选来源网段白名单；写 config.json 的 listen / admin_allow_cidrs。
+   面板与 API 在同一个监听上，开启即一起暴露——这是安全敏感操作：
+   后端拒绝在无调用密钥时开启（SetLANAccess 闸门）。 */
+function renderLan(){
+  var el = document.getElementById('lanRows'); if (!el) return;
+  var d = S.data && S.data.lan || {};
+  $('#lanState').textContent = d.enabled ? '已开启' : '已关闭';
+  el.innerHTML =
+    mrow('当前监听', d.listen || '—') +
+    mrow('来源白名单', d.allow_cidrs ? d.allow_cidrs : '不限（仅回环与局域网可达）') +
+    mrow('调用密钥', d.has_key ? '已配置' : '未配置（开启前需先创建）', d.has_key ? 'ok' : 'e');
+  if (document.activeElement !== $('#lanCIDRs')) $('#lanCIDRs').value = d.allow_cidrs || '';
+  var b = $('#btnLanApply');
+  b.setAttribute('data-enable', d.enabled ? 'off' : 'on');
+  b.textContent = d.enabled ? '关闭局域网访问' : '开启局域网访问';
+}
+async function actLanApply(cidrs){
+  var d = S.data && S.data.lan || {};
+  var enable = d.enabled ? false : true;   // 按当前状态取反
+  busy(true);
+  try{
+    var r = await api('api/lan', { enabled: enable, allow_cidrs: cidrs || '' });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) setTimeout(function(){ loadAll(); }, 1200);
+  }catch(err){ toast('保存失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+document.addEventListener('click', function(e){
+  var b = e.target.closest('#btnLanApply');
+  if (b){ actLanApply($('#lanCIDRs').value); return; }
+});
 
 /* ── 交互委托 ─────────────────────────────────────── */
 document.addEventListener('click', function(e){

@@ -17,6 +17,8 @@ import (
 	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/panelruntime"
 	"workbuddy2api/internal/runlog"
+
+	panelpkg "workbuddy2api/internal/panel"
 )
 
 // executableName 按平台给辅助程序名补后缀。
@@ -198,7 +200,14 @@ func prepareUnified(cfg *Config, configPath string) (unifiedLayout, error) {
 // panel 是 http.Handler 而不是 *panelruntime.Runtime：Go 引擎直接是 handler，
 // Python 引擎的 Runtime 也实现了 ServeHTTP（它反代到子进程）。两种引擎在挂载点上
 // 无差别，切换引擎不需要改路由。
-func withPanel(gateway http.Handler, panel http.Handler) http.Handler {
+//
+// allowCIDRs 非空时整套服务（面板 + API）外面再包一层来源网段闸门：不在白名单
+// 且非回环的来源直接 403。面板侧入口有同一份判定（panel.Server 的
+// AdminClientAllowed），这里补的是 **API 侧**——此前 /v1/* 不经过面板闸门，
+// 配了 admin_allow_cidrs 也只护住面板，API 仍然全可达。放组装层（而不是
+// internal/server）是因为闸门口径与面板共享（panel.NetworksAllow），
+// internal/server 不该依赖面板包。
+func withPanel(gateway http.Handler, panel http.Handler, allowCIDRs string) http.Handler {
 	mux := http.NewServeMux()
 	prefix := adminPrefix()
 	mux.Handle(prefix+"/", panel)
@@ -206,7 +215,29 @@ func withPanel(gateway http.Handler, panel http.Handler) http.Handler {
 		http.Redirect(w, r, prefix+"/", http.StatusTemporaryRedirect)
 	})
 	mux.Handle("/", gateway)
-	return mux
+	if strings.TrimSpace(allowCIDRs) == "" {
+		return mux
+	}
+	proxies := os.Getenv("WB2API_TRUSTED_PROXIES")
+	if proxies == "" {
+		proxies = "127.0.0.1/32,::1/128"
+	}
+	// panelServer 是 *panel.Server（Go 引擎）或 *panelruntime.Runtime（Python 引擎）
+	// 的 http.Handler；这里只需要它的处理能力，闸门口径走 panel 包的纯函数。
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !panelpkg.NetworksAllow(allowCIDRs, panelpkg.ClientIPOf(r, proxies)) {
+			writeForbiddenOrigin(w)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// writeForbiddenOrigin 是来源闸门的拒绝响应。
+func writeForbiddenOrigin(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"error":{"message":"source network not allowed by admin_allow_cidrs","type":"forbidden"}}`))
 }
 
 // reloadHandler 处理 /runtime/reload：让网关重新加载配置与账号。
@@ -247,4 +278,27 @@ func reloadHandler(reload func(context.Context) error, manager *hotupdate.Manage
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	}
+}
+
+// lanAllowCIDRs 返回当前生效的来源网段白名单（读 config.json 的 admin_allow_cidrs）。
+//
+// 空串 = 不启用闸门。注意**不按 listen 是否回环过滤**：运维在只绑回环的部署里
+// 手写了 admin_allow_cidrs 也照常生效（闸门挡的是来源不是监听面，两层独立）；
+// 面板的局域网开关（SetLANAccess）只在开启时写这个键，但手写配置同样受尊重。
+func lanAllowCIDRs() string {
+	configPath := strings.TrimSpace(os.Getenv("WB2API_CONFIG_PATH"))
+	if configPath == "" {
+		configPath = "config.json"
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		AdminAllowCIDRs string `json:"admin_allow_cidrs"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.AdminAllowCIDRs)
 }

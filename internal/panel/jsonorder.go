@@ -44,6 +44,20 @@ func (o *orderedObject) Get(key string) (any, bool) {
 	return value, ok
 }
 
+// Delete 移除一个键；不存在时是 no-op。保持其余键的顺序不变。
+func (o *orderedObject) Delete(key string) {
+	if _, exists := o.vals[key]; !exists {
+		return
+	}
+	delete(o.vals, key)
+	for i, k := range o.keys {
+		if k == key {
+			o.keys = append(o.keys[:i], o.keys[i+1:]...)
+			break
+		}
+	}
+}
+
 // Len 返回键数量。
 func (o *orderedObject) Len() int { return len(o.keys) }
 

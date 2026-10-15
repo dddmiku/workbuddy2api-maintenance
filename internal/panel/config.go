@@ -16,6 +16,7 @@ package panel
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,3 +195,125 @@ func configNestedString(path, section, key string) string {
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
 }
+
+// ═══ 局域网访问（2026-10-15）════════════════════════════════════════════════
+
+// lanListenHost 局域网开启时的监听主机（全部网卡）。
+const lanListenHost = "0.0.0.0"
+
+// loopbackListenHost 默认（关闭局域网）时的监听主机——与安卓/桌面默认配置同源
+// （internal/android/layout.go 的 DefaultConfig 也写 127.0.0.1:7863）。
+const loopbackListenHost = "127.0.0.1"
+
+// listenPortOf 从 listen 值解析端口；解析不到回落 7863。
+//
+// 接受 "7863"、":7863"、"127.0.0.1:7863"、"0.0.0.0:7864" 四种形态。
+func listenPortOf(listen string) string {
+	listen = strings.TrimSpace(listen)
+	if listen == "" {
+		return "7863"
+	}
+	if i := strings.LastIndex(listen, ":"); i >= 0 && i < len(listen)-1 {
+		if port := listen[i+1:]; strings.Trim(port, "0123456789") == "" {
+			return port
+		}
+		return "7863"
+	}
+	if strings.Trim(listen, "0123456789") == "" {
+		return listen
+	}
+	return "7863"
+}
+
+// LANAccessState 读当前局域网访问状态：enabled = listen 绑的不是回环；
+// allowCIDRs = admin_allow_cidrs 的原始值（空 = 未配置）。
+//
+// 判定口径「非回环即开启」而不是「等于 0.0.0.0」：运维手写的 listen 可能是
+// 具体网卡 IP（如 192.168.5.65:7863），那同样是局域网可达，开关应如实显示开。
+func LANAccessState(configPath string) (enabled bool, allowCIDRs string) {
+	object, err := readConfigObject(configPath)
+	if err != nil {
+		return false, ""
+	}
+	listen, _ := jsonStringOf(object, "listen")
+	host, _, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil || strings.TrimSpace(listen) == "" {
+		host = ""
+	}
+	enabled = host != "" && host != loopbackListenHost && host != "localhost" &&
+		host != "::1" && !strings.EqualFold(host, "[::1]")
+	cidrs, _ := jsonStringOf(object, "admin_allow_cidrs")
+	return enabled, cidrs
+}
+
+// jsonStringOf 从保序对象读顶层字符串键。
+func jsonStringOf(object *orderedObject, key string) (string, bool) {
+	if object == nil {
+		return "", false
+	}
+	value, ok := object.Get(key)
+	if !ok {
+		return "", false
+	}
+	text, isString := value.(string)
+	if !isString {
+		return "", false
+	}
+	return strings.TrimSpace(text), true
+}
+
+// SetLANAccess 开/关局域网访问（写 config.json，重启后生效）。
+//
+// 开启的前提是 api_key 非空或已配置密钥库（api_keys_file 指向的文件存在）：
+// listen 放开后面板与 API 一起暴露到局域网，而空 api_key = 任何同网段的人都能
+// 直接调用账号池。密钥库形态下按文件存在判定（面板密钥页建的第一把密钥就落它），
+// 不再读内容——内容校验是网关启动时的事。
+//
+// admin_allow_cidrs：非空时写入（API 与面板两侧都会按它 403 白名单外的来源）；
+// 空串时删除该键（不限网段）。非法 CIDR 不在这里报错——解析侧（panel/throttle.go
+// 的 parseNetworks）对非法项跳过并打日志，网关仍能启动；真要拦也是配置校验的事。
+//
+// 返回 (ok, message)。已是目标状态返回「状态未变化」（调用方据此跳过重启）。
+func SetLANAccess(configPath string, enabled bool, allowCIDRs string) (bool, string) {
+	object, err := readConfigObject(configPath)
+	if err != nil {
+		return false, fmt.Sprintf("读取 config.json 失败：%s", err)
+	}
+	listen, _ := jsonStringOf(object, "listen")
+	port := listenPortOf(listen)
+
+	if enabled {
+		// 安全闸门：没有可用鉴权就拒绝放开监听——不写文件、不重启。
+		apiKey, _ := jsonStringOf(object, "api_key")
+		keysFile, _ := jsonStringOf(object, "api_keys_file")
+		keysExist := keysFile != "" && fileExists(keysFile)
+		if apiKey == "" && !keysExist {
+			return false, "请先在「密钥」页创建一把调用密钥，再开启局域网访问：放开监听后面板与 API 一起暴露到局域网，空密钥等于任何同网段的人都能直接调用账号池"
+		}
+	}
+
+	// 关闭时忽略传入的 CIDR、直接清空白名单：关闭的语义是「回到只本机」，
+	// 白名单只在开启时有意义；留着旧值会在下次开启时意外复用。
+	want := loopbackListenHost + ":" + port
+	wantCIDRs := ""
+	if enabled {
+		want = lanListenHost + ":" + port
+		wantCIDRs = strings.TrimSpace(allowCIDRs)
+	}
+	current, _ := jsonStringOf(object, "listen")
+	currentCIDRs, _ := jsonStringOf(object, "admin_allow_cidrs")
+	if strings.TrimSpace(current) == want && currentCIDRs == wantCIDRs {
+		return true, "状态未变化"
+	}
+	object.Set("listen", want)
+	if wantCIDRs == "" {
+		object.Delete("admin_allow_cidrs")
+	} else {
+		object.Set("admin_allow_cidrs", wantCIDRs)
+	}
+	if err := writeConfigObject(configPath, object); err != nil {
+		return false, fmt.Sprintf("写入 config.json 失败：%s", err)
+	}
+	return true, "已保存（重启后生效）"
+}
+

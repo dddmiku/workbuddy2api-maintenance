@@ -1304,6 +1304,26 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
             </section>
             <section class="panel" style="margin-top:14px">
               <div class="ph">
+                <h2>局域网访问</h2>
+                <span class="sp"></span>
+                <span class="sub" id="lanState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="lanRows"></div>
+                <div class="cred-form" style="margin-top:10px">
+                  <label class="fld">
+                    <span class="k">允许来源网段</span>
+                    <input id="lanCIDRs" spellcheck="false" placeholder="192.168.5.0/24（留空 = 不限网段）">
+                  </label>
+                </div>
+                <div class="frow" style="margin-top:10px">
+                  <button class="btn pri sm" id="btnLanApply">保存</button>
+                  <span class="sub" id="lanHint" style="line-height:1.6">开启后同网络的人都能访问面板登录页与 API；调用密钥是唯一门槛，请先在「密钥」页创建一把。</span>
+                </div>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
                 <h2>重复推理保护</h2>
                 <span class="sp"></span>
                 <span class="sub" id="rlState">—</span>
@@ -2926,7 +2946,41 @@ function renderSystem(){
     mrow('异常账号', String(bad), bad ? 'e' : 'ok') +
     mrow('账号总数', String(accounts.length)) +
     mrow('定时任务', taskList().length ? String(taskList().length) : '—');
+  renderLan();
 }
+
+/* ── 局域网访问（2026-10-15）────────────────────────────
+   开关 + 可选来源网段白名单；写 config.json 的 listen / admin_allow_cidrs。
+   面板与 API 在同一个监听上，开启即一起暴露——这是安全敏感操作：
+   后端拒绝在无调用密钥时开启（SetLANAccess 闸门）。 */
+function renderLan(){
+  var el = document.getElementById('lanRows'); if (!el) return;
+  var d = S.data && S.data.lan || {};
+  $('#lanState').textContent = d.enabled ? '已开启' : '已关闭';
+  el.innerHTML =
+    mrow('当前监听', d.listen || '—') +
+    mrow('来源白名单', d.allow_cidrs ? d.allow_cidrs : '不限（仅回环与局域网可达）') +
+    mrow('调用密钥', d.has_key ? '已配置' : '未配置（开启前需先创建）', d.has_key ? 'ok' : 'e');
+  if (document.activeElement !== $('#lanCIDRs')) $('#lanCIDRs').value = d.allow_cidrs || '';
+  var b = $('#btnLanApply');
+  b.setAttribute('data-enable', d.enabled ? 'off' : 'on');
+  b.textContent = d.enabled ? '关闭局域网访问' : '开启局域网访问';
+}
+async function actLanApply(cidrs){
+  var d = S.data && S.data.lan || {};
+  var enable = d.enabled ? false : true;   // 按当前状态取反
+  busy(true);
+  try{
+    var r = await api('api/lan', { enabled: enable, allow_cidrs: cidrs || '' });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) setTimeout(function(){ loadAll(); }, 1200);
+  }catch(err){ toast('保存失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+document.addEventListener('click', function(e){
+  var b = e.target.closest('#btnLanApply');
+  if (b){ actLanApply($('#lanCIDRs').value); return; }
+});
 
 /* ── 交互委托 ─────────────────────────────────────── */
 document.addEventListener('click', function(e){

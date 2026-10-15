@@ -174,7 +174,7 @@ func New(opts Options) (*Server, error) {
 	}
 	server.credits = NewCreditCache(runner, opts.ConfigPath, 0, 0)
 	server.credits.now = opts.Now
-	server.state = &StateBuilder{Store: server.store, Gateway: server.gateway, Credits: server.credits,
+	server.state = &StateBuilder{Store: server.store, Gateway: server.gateway, Credits: server.credits, ConfigPath: opts.ConfigPath,
 		Runner: runner, Container: opts.Container}
 
 	// 启动时就把凭证准备好（Python 版的 main() 也这么做）。
@@ -458,6 +458,8 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, http.StatusOK, s.taskToggle(r.Context(), body))
 	case "/api/service/restart":
 		writeJSON(w, http.StatusOK, s.serviceRestart(r.Context()))
+	case "/api/lan":
+		writeJSON(w, http.StatusOK, s.lanToggle(r.Context(), body))
 	case "/api/features/reasoning-loop":
 		writeJSON(w, http.StatusOK, s.reasoningLoopToggle(r.Context(), body))
 	case "/api/update/check", "/api/update/apply":
@@ -640,6 +642,7 @@ func validateActionBody(path string, body map[string]any) string {
 	}
 	for _, route := range []struct{ path, field string }{
 		{"/api/account/toggle", "disabled"}, {"/api/task/toggle", "enabled"},
+		{"/api/lan", "enabled"},
 	} {
 		if path == route.path {
 			if _, ok := body[route.field].(bool); !ok {
