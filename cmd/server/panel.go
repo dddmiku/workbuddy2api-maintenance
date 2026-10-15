@@ -280,14 +280,18 @@ func reloadHandler(reload func(context.Context) error, manager *hotupdate.Manage
 	}
 }
 
-// lanAllowCIDRs 返回当前生效的来源网段白名单（读 config.json 的 admin_allow_cidrs）。
+// lanAllowCIDRs 返回当前生效的来源网段白名单（读网关实际加载的那份 config.json）。
+//
+// configPath 来自 -config flag（网关真实加载的路径），**不是** WB2API_CONFIG_PATH
+// 环境变量——那个变量 native 形态下经常没设（板子 systemd unit 只设 GATEWAY_DIR
+// 一族），回落到相对路径 config.json 会读错文件，闸门形同虚设（2026-10-15 板子
+// 实测：白名单写了 10.99/16，本机 192.168.5.x 仍 200——就是读错了配置路径）。
 //
 // 空串 = 不启用闸门。注意**不按 listen 是否回环过滤**：运维在只绑回环的部署里
 // 手写了 admin_allow_cidrs 也照常生效（闸门挡的是来源不是监听面，两层独立）；
 // 面板的局域网开关（SetLANAccess）只在开启时写这个键，但手写配置同样受尊重。
-func lanAllowCIDRs() string {
-	configPath := strings.TrimSpace(os.Getenv("WB2API_CONFIG_PATH"))
-	if configPath == "" {
+func lanAllowCIDRs(configPath string) string {
+	if strings.TrimSpace(configPath) == "" {
 		configPath = "config.json"
 	}
 	raw, err := os.ReadFile(configPath)
