@@ -1572,7 +1572,15 @@ async function actTaskRun(key){
   try{
     var r = await api('api/task/run', { key:key });
     toast(r.message, r.ok ? 'ok' : 'err');
-    if (r.ok) setTimeout(function(){ loadAll(); }, 1200);
+    if (r.ok){
+      // 触发成功就直接打开这个任务的日志窗口：用户点「跑一次」要看的正是
+      // 「现在跑成什么样」，让他再去找小眼睛按钮是多余一跳（2026-10-15 用户
+      // 反馈「手动执行的任务看不到实时日志」——日志机制本身是好的，缺的就是
+      // 这一步引导）。弹窗自带 2s 轮询，任务结束后回落到 5s。
+      var t = taskList().filter(function(x){ return x.key === key; })[0] || {};
+      openTaskLog(key, t.name || key);
+      setTimeout(function(){ loadAll(); }, 1200);
+    }
   }catch(err){ toast('触发失败：' + (err && err.message || err), 'err'); }
   finally{ busy(false); }
 }

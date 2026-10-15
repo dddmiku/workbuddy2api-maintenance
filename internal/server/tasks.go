@@ -93,6 +93,8 @@ func (h *Handler) taskRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok": true, "key": key, "message": "已触发，结果见容器日志",
+		// 前端收到 ok 后会直接打开该任务的日志窗口（2026-10-15 起），文案不再把
+		// 用户引去翻容器日志——日志弹窗就是为看「正在跑什么」准备的。
+		"ok": true, "key": key, "message": "已触发",
 	})
 }

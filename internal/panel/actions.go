@@ -265,7 +265,9 @@ func (s *Server) taskRun(ctx context.Context, body map[string]any) map[string]an
 	if !ok {
 		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "触发失败")}
 	}
-	return map[string]any{"ok": true, "message": "已触发，结果可在下方日志里看到"}
+	// 前端收到 ok 会直接打开该任务的日志窗口（2026-10-15 起），不再指引
+	// 「下方日志」——任务页没有内嵌日志区，那句话让人找不到入口。
+	return map[string]any{"ok": true, "message": "已触发"}
 }
 
 // taskToggle 改任务开关（写 config.json，必须重启才生效）。
