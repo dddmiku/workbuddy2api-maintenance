@@ -84,7 +84,9 @@ const (
 	//
 	// 建会话后上游可能先排队（只发 heartbeat/queue 帧）再开始执行。参考默认 120s：
 	// 大 prompt 的排队期真实存在，比 120s 短会把可成功的请求误判成失败。
-	remoteFirstEventTimeout = 120_000_000_000 // 120s（纳秒）
+	// 显式 time.Duration 类型：120e9 纳秒超出 32 位平台的 int 范围（armv7），
+	// 无类型常量在 32 位下会被推断成 int32 而编译失败。
+	remoteFirstEventTimeout = 120 * time.Second
 
 	// remoteDefaultAgentType 纯文本请求的执行档（保有 1M max 档）。
 	remoteDefaultAgentType = "solo_agent_remote"
