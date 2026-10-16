@@ -103,25 +103,20 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// ═══ 已移除「带图 + 非多模态模型 → 出站前拦下」（2026-10-16 二次修正）═══
+	// ═══ 带图请求改走 Remote（2026-10-16 二次修正）═══
 	//
-	// v3.8.4 加过一段拦截：读目录的 multimodal 标记，为 false 且本轮带图就在出站前
-	// 拒绝，理由是「glm-5.3 没有视觉能力，上游只会回一句无关的英文提示」。
+	// 此前带图请求强制走 legacy（llm_utils_chat），依据是「Remote 端点读不到内联图片」
+	// 的实测结论。但那条结论是用**当时构造的形态**得出的，而 Trae 客户端本身用
+	// Remote 端点（solo_agent_remote）读图完全正常——用户实测：同一账号、同一个
+	// GLM-5.3 Max，客户端贴图能逐项认出「三角洲行动」「S1B+ 段位」。
 	//
-	// 用户随后用 **Trae 客户端**（同一账号、同一个 GLM-5.3 Max）贴图提问，
-	// 得到的是逐项准确的图片描述——「三角洲行动」「S1B+ 段位」「企鹅图案徽章」
-	// 全认出来了。这直接推翻「该模型没有视觉能力」这个结论。
+	// 而 legacy 路径带图**必然失败**（实测：glm-5.3 带图 → 上游回一句
+	// 「exceeded the rate limit」；deepseek-v4.1-flash 带图能成功，说明不是图片本身
+	// 的问题，是这条路径对 glm 系模型的图片处理有差异）。
 	//
-	// 复核拦截依据时还发现它本身不可靠：判据来自目录接口的 multimodal 字段，
-	// 而实测该接口对这几个 trae 账号返回的是**空列表**（
-	// `{"allow_tenant_user_add_model":true,"config_info_list":[],"metadata":{}}`），
-	// 也就是说那个 false 要么来自过期缓存、要么来自解析错误，不是上游当下的口径。
-	//
-	// 所以这里回到最朴素的策略：**不替上游判断模型能力**。带图请求照常发出去，
-	// 上游认就给答案、不认就回它自己的错误——那比我用一个可疑的标记提前拒绝更诚实，
-	// 也不会把本来能读图的组合拦掉。真正需要防的只是「回落丢图」，那条闸门仍在
-	// （见 chatStreamLegacy 的 freshInputHasImages）。
-	if RemoteEnabled() && !requestHasImages(prepared) {
+	// 所以把带图也交给 Remote：它才是上游当前主推、且被客户端验证过能读图的路径。
+	// 若 Remote 建会话失败，仍回落到 legacy（保留原有的兜底）。
+	if RemoteEnabled() {
 		if stream, err := ChatStreamRemote(ctx, a, prepared, clientIP); err == nil {
 			return stream, http.StatusOK, nil, nil
 		} else {
