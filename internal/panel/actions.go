@@ -195,6 +195,26 @@ func (s *Server) accountRevive(ctx context.Context, body map[string]any) map[str
 	return map[string]any{"ok": true, "message": formatMessage("已复活 %s", uidPrefix(uid))}
 }
 
+// accountReviveAll 一键复活全部被停用账号（面板「全部复活」按钮）。
+//
+// 与 accountRevive 同一条管理通道，只是不带 uid——网关侧遍历池里 disabled 的号。
+// 返回处理数量，便于面板直接展示结果。
+func (s *Server) accountReviveAll(ctx context.Context, body map[string]any) map[string]any {
+	ok, payload := s.gateway.PostJSON(ctx, "/accounts/revive-all", map[string]any{})
+	if !ok {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(payload)}
+	}
+	if !jsonBool(payload["ok"], false) {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "复活失败")}
+	}
+	revived := int(jsonInt64(payload["revived"]))
+	total := int(jsonInt64(payload["total"]))
+	if revived == 0 {
+		return map[string]any{"ok": true, "message": formatMessage("没有需要复活的账号（共 %d 个账号全部正常）", total)}
+	}
+	return map[string]any{"ok": true, "message": formatMessage("已复活 %d 个账号（共 %d 个）", revived, total)}
+}
+
 // accountFission 补发 Trae 邀请奖励（面板「补发邀请奖励」按钮）。
 //
 // 背景：面板上的邀请记录停在「邀请中」，不是服务端没发，而是**发奖动作在 TRAE 桌面端

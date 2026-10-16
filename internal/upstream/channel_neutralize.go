@@ -82,8 +82,14 @@ func NeutralizeChannelTrigger(body []byte) ([]byte, bool) {
 	return NeutralizeChannelTriggerAt(body, channelLevelFingerprint)
 }
 
-// NeutralizeChannelTriggerAt 按档位断词：0 只处理已实测指纹，1 追加通用归属句，
-// 2 在消息正文里全量断词。档位越高越不依赖「猜中原文」，代价是正文多出零宽字符。
+// NeutralizeChannelTriggerAt 按档位断词：0 只处理已实测指纹（含 system 首行），
+// 1 追加通用归属句，2 在消息正文里全量断词。档位越高越不依赖「猜中原文」，
+// 代价是正文多出零宽字符。
+//
+// 2026-10-17 新增 system 首行档：实测确认上游的渠道校验**只看 system 消息的第一行**——
+// 同一句 "You are Claude Code, ..." 放在首行必被拒，加 20 字节前缀或挪到第二行即通过；
+// 计费头 "x-anthropic-billing-header" 同理。首行断词是最小代价的解法（只动一行，
+// 句子其余部分与后文完全不动）。
 func NeutralizeChannelTriggerAt(body []byte, level int) ([]byte, bool) {
 	if len(body) == 0 {
 		return body, false
@@ -94,6 +100,8 @@ func NeutralizeChannelTriggerAt(body []byte, level int) ([]byte, bool) {
 	}
 	changed := false
 	obj = neutralizeChannelJSONValue(obj, &changed)
+	// 第 0 档即处理 system 首行：这是实测的确定性触发点，代价最小（只断一行）。
+	changed = neutralizeSystemFirstLine(obj, &changed) || changed
 	switch {
 	case level >= channelLevelAll:
 		changed = neutralizeMessageText(obj, channelTextModeAll) || changed
@@ -114,6 +122,119 @@ const (
 	channelTextModeAttribution = iota
 	channelTextModeAll
 )
+
+// channelFirstLineTriggerTokens 只出现在 system 首行就必被 11128 拒的 token。
+//
+// 2026-10-17 实测（docs/channel-verification.md 的矩阵）：
+//   - 把该 token 所在整句放在 system 首行 → 两个 realm 都返回
+//     11128 "Illegal API invocation from an unapproved channel"；
+//   - 同句前面加 20 字节中性前缀、或挪到第二行 → 通过；
+//   - 首行内每个单词首字母后插零宽空格 → 通过（本函数采用的做法）。
+//
+// 为什么单列成表而不复用 channelTriggerSentences：这两个 token 的判定与
+// 「整句归属声明」无关（"x-anthropic-billing-header" 单独一行也照样被拒），
+// 触发条件是「在首行」而非「句子内容像归属声明」，误判边界不同。
+var channelFirstLineTriggerTokens = []string{
+	// Claude Code 计费归属头（2.1.283+ 系统提示首行）。单独出现即触发。
+	"x-anthropic-billing-header",
+	// Claude Code 系统提示首句的产品归属声明。
+	"You are Claude Code, Anthropic's official CLI for Claude",
+	"Codex CLI is an open source project led by OpenAI",
+}
+
+// neutralizeSystemFirstLine 断开 system 消息**首行**里的渠道触发 token。
+//
+// 上游的渠道校验窗口实测限定在 system 的第一行（详见函数调用点注释与
+// docs/channel-verification.md）：同句出现在第二行或加前缀即通过。
+// 只处理首行 = 最小改动面：句子其余部分与后面全部正文原样不动。
+//
+// system 可能是字符串，也可能是 part 数组（官方客户端两种都用），逐个分支处理。
+// 返回值报告是否发生改动。
+func neutralizeSystemFirstLine(obj any, changed *bool) bool {
+	root, ok := obj.(map[string]any)
+	if !ok {
+		return false
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return false
+	}
+	touched := false
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "system") {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			head, rest := splitFirstLine(content)
+			if broken := breakFirstLineTokens(head, changed); broken != head {
+				message["content"] = broken + rest
+				touched = true
+			}
+		case []any:
+			// part 数组：每一块都是一次「首行」机会——上游对块内首行同样校验。
+			for _, rawPart := range content {
+				part, ok := rawPart.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, ok := part["text"].(string)
+				if !ok {
+					continue
+				}
+				head, rest := splitFirstLine(text)
+				if broken := breakFirstLineTokens(head, changed); broken != head {
+					part["text"] = broken + rest
+					touched = true
+				}
+			}
+		}
+	}
+	return touched
+}
+
+// splitFirstLine 把文本切成首行与其余部分（rest 保留换行符本身）。
+// 无换行符时整条文本就是首行（head=全量、rest 为空）——单行 system 的首行即其全部，
+// 上游照样检查它，因此必须处理（2026-10-17：早前一版把这种形态跳过，导致
+// 「单行 system 含触发串」漏检）。
+func splitFirstLine(text string) (head, rest string) {
+	if index := strings.IndexByte(text, '\n'); index >= 0 {
+		return text[:index], text[index:]
+	}
+	return text, ""
+}
+
+// breakFirstLineTokens 对首行内命中的 token 逐词断字。
+func breakFirstLineTokens(head string, changed *bool) string {
+	insertAt := map[int]struct{}{}
+	for _, token := range channelFirstLineTriggerTokens {
+		start := 0
+		for {
+			index := indexFrom(head, token, start)
+			if index < 0 {
+				break
+			}
+			for _, pos := range wordBreakPoints(head, index, index+len(token)) {
+				insertAt[pos] = struct{}{}
+			}
+			start = index + len(token)
+		}
+	}
+	if len(insertAt) == 0 {
+		return head
+	}
+	points := make([]int, 0, len(insertAt))
+	for pos := range insertAt {
+		points = append(points, pos)
+	}
+	*changed = true
+	return insertBreaks(head, points)
+}
 
 // neutralizeMessageText 只对消息正文断词：content（字符串或 part 数组的 text/thinking）、
 // reasoning_content 与顶层 system。工具名、调用编号、工具参数、枚举值等结构性字符串不动，
@@ -377,9 +498,15 @@ var preNeutralizeTriggers = []string{
 	"You are Claude Code, Anthropic's official CLI for Claude",
 }
 
-// NeutralizeBillingHeaders 提前断开已知的渠道触发串；没有命中时原样返回 false。
+// NeutralizeBillingHeaders 发送前断开 system 首行的已知渠道触发串；没命中时原样返回 false。
 // 与 NeutralizeChannelTriggerAt 的分工：这里是「已知必被拒、且无信息价值」的提前处理，
 // 那边是「被拒之后的逐档补救」。
+//
+// 2026-10-17 收窄作用域：此前对 body 全文递归断词（neutralizePreemptValue），
+// 而实测确认上游只看 system 的**第一行**（同句加到第二行或加 20 字节前缀即通过）。
+// 全文断词会在整篇历史消息里插入大量零宽字符（每条历史 system/user 正文都中），
+// 既无必要也增加上游侧解析不确定性；改为只处理 system 首行后，
+// 未命中首行的请求 body 一个字节都不变。
 func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 	if len(body) == 0 {
 		return body, false
@@ -389,8 +516,7 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	changed := false
-	obj = neutralizePreemptValue(obj, &changed)
-	if !changed {
+	if !neutralizeSystemFirstLine(obj, &changed) {
 		return body, false
 	}
 	out, err := json.Marshal(obj)
@@ -401,6 +527,9 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 }
 
 // neutralizePreemptValue 递归遍历解码后的 JSON，断开计费头触发串。
+//
+// DeptestOnly：保留给跨包回归测试（锁定历史的全文断词语义）。
+// 生产路径改用 neutralizeSystemFirstLine（见 NeutralizeBillingHeaders 注释）。
 func neutralizePreemptValue(value any, changed *bool) any {
 	switch node := value.(type) {
 	case string:

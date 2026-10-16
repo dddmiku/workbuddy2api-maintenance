@@ -448,6 +448,8 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, http.StatusOK, s.accountToggle(r.Context(), body))
 	case "/api/account/revive":
 		writeJSON(w, http.StatusOK, s.accountRevive(r.Context(), body))
+	case "/api/account/revive-all":
+		writeJSON(w, http.StatusOK, s.accountReviveAll(r.Context(), body))
 	case "/api/account/fission":
 		writeJSON(w, http.StatusOK, s.accountFission(r.Context(), body))
 	case "/api/account/delete":
@@ -595,6 +597,7 @@ var actionShapes = map[string][]string{
 	"/api/account/toggle":          {"uid", "disabled"},
 	"/api/account/delete":          {"uid"},
 	"/api/account/revive":          {"uid"},
+	"/api/account/revive-all":      {},
 	"/api/account/fission":         {"uid"},
 	"/api/task/run":                {"key"},
 	"/api/task/stop":               {"key"},

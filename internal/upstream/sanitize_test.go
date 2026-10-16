@@ -171,14 +171,22 @@ func TestChatStreamWireBodyPreservesBusinessContent(t *testing.T) {
 			messages[1].(map[string]any)["role"] = "system"
 			// 计费头会在发送前断词（2026-09-28）：它没有语义价值却被上游当渠道特征拒掉。
 			// 期望值按同一规则断词，其余内容必须逐字节一致。
-			for _, raw := range messages {
-				m, _ := raw.(map[string]any)
-				if text, ok := m["content"].(string); ok {
-					if broken, changed := NeutralizeBillingHeaders([]byte(`{"c":` + mustJSON(text) + `}`)); changed {
-						var wrap map[string]any
-						_ = json.Unmarshal(broken, &wrap)
-						m["content"] = wrap["c"]
+			//
+			// 2026-10-17：断词范围收窄到**整条 body 的 system 首行**（实测上游只看
+			// system 第一行；见 NeutralizeBillingHeaders 注释）。因此期望值不能再逐条
+			// 消息独立调用断词器——那样会把「每条消息各自的首行」都断掉，与生产不符。
+			// 这里把整套 messages 包成 body 调一次，与出站路径完全同构。
+			{
+				probe, err := json.Marshal(map[string]any{"model": "deepseek-v4.1-flash", "messages": messages})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if broken, changed := NeutralizeBillingHeaders(probe); changed {
+					var wrap map[string]any
+					if err := json.Unmarshal(broken, &wrap); err != nil {
+						t.Fatal(err)
 					}
+					messages = wrap["messages"].([]any)
 				}
 			}
 			if !reflect.DeepEqual(got["messages"], messages) {

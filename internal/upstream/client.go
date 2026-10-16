@@ -583,6 +583,19 @@ func ParseRateReset(body string) (time.Time, bool) {
 
 // isUnapprovedChannel 只依据主错误文案识别已观测的渠道拒绝。
 // code=11128、泛化 displayMsg 或回显请求中的同名文本均不能单独证明拒绝原因。
+//
+// 2026-10-17 新增第三形态：上游对同一拦截会在主 msg 里写泛化的 "request illegal"，
+// 把真正原因放在 displayTips 里（实测原文）：
+//
+//	{"code":11128,"msg":"request illegal",
+//	 "displayMsg":{"zh":"请求被拦截，请重新发送"},
+//	 "displayTips":{"en":"This call failed channel verification, possibly because it was
+//	                 not sent from an official client. Please resend from the official client.",
+//	                "zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+//
+// 这种形态此前归 ErrClient → 不触发断词重试 → 用户看到的是「请求被拦截」终态。
+// displayTips 里上游自己点名了 channel verification / 渠道校验，是比 msg 更权威的
+// 证据；仍要求 code 为 11128（11140 的同 msg 是账号级封禁，绝不可混入）。
 func isUnapprovedChannel(body string) bool {
 	message := body
 	var envelope map[string]json.RawMessage
@@ -597,10 +610,59 @@ func isUnapprovedChannel(body string) bool {
 				message = upstreamError.Message
 			}
 		}
+		// displayTips 自证渠道校验：仅在 code==11128 时采信（见函数注释）。
+		if code, ok := decodeUpstreamCode(envelope["code"]); ok && code == 11128 {
+			if mentionsChannelVerification(envelope["displayTips"]) {
+				return true
+			}
+		}
 	}
 	message = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(message), "."))
 	return strings.EqualFold(message, "Illegal API invocation from an unapproved channel") ||
 		strings.EqualFold(message, "unapproved channel")
+}
+
+// decodeUpstreamCode 解出信封里的 code（数字或字符串两种形态）。
+func decodeUpstreamCode(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var asInt int
+	if json.Unmarshal(raw, &asInt) == nil {
+		return asInt, true
+	}
+	var asStr string
+	if json.Unmarshal(raw, &asStr) == nil {
+		var parsed int
+		if _, err := fmt.Sscanf(strings.TrimSpace(asStr), "%d", &parsed); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// mentionsChannelVerification 判断 displayTips（对象或字符串）里是否自证渠道校验。
+// 上游两个语言的原文同时收录：英文 "channel verification"，中文「渠道校验」。
+func mentionsChannelVerification(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		// 对象形态：把全部取值拼起来一并匹配（en/zh/zh-hant 三份文案同义）。
+		var fields map[string]string
+		if json.Unmarshal(raw, &fields) != nil {
+			return false
+		}
+		parts := make([]string, 0, len(fields))
+		for _, v := range fields {
+			parts = append(parts, v)
+		}
+		text = strings.Join(parts, "\n")
+	}
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "channel verification") ||
+		strings.Contains(text, "渠道校验")
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -1226,6 +1288,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		return true
 	}
 
+	// 首条 system 兜底：只对 global 域生效（2026-10-17 实测）。
+	//
+	// 上游对 chat 端点的「首条必须是 system」校验**只在 global 域强制**：
+	// AI 域缺 system 首条 → 11128 "first message is not system prompt"（稳定复现）；
+	// CN 域同形态 → 通过（实测 4/4，见 docs/channel-verification.md 矩阵）。
+	// 故保持 CN 零回归，只在 global 域补这条兜底。
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}

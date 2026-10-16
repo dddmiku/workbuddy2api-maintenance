@@ -358,7 +358,7 @@ var busyDepth = 0;
 function busy(on){
   busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
   var b = busyDepth > 0;
-  ['#btnRefresh','#btnRestart','#btnAdd','#btnTaskReload','#btnLogs'].forEach(function(s){
+  ['#btnRefresh','#btnRestart','#btnAdd','#btnTaskReload','#btnLogs','#btnReviveAll'].forEach(function(s){
     var el = $(s); if (el) el.disabled = b;
   });
 }
@@ -1876,6 +1876,28 @@ function closeDrawer(){
 $('#drClose').addEventListener('click', closeDrawer);
 $('#scrimD').addEventListener('click', closeDrawer);
 $('#btnAdd').addEventListener('click', openDrawer);
+
+// 一键复活全部被停用账号。
+// 使用场景：上游误判是**系统性**的——一次风控窗口会把同一批号连续判错
+// （2026-10-16/17 实测 9 个健康号因 11128 被误标 11140 停用）。逐个点太慢，这里批量处理。
+$('#btnReviveAll').addEventListener('click', function(){
+  var a = (S.data && S.data.accounts) || [];
+  var n = a.filter(function(x){ return x.disabled; }).length;
+  if (!n){ toast('没有被停用的账号', 'ok'); return; }
+  ask('全部复活',
+    '将清除 ' + n + ' 个被停用账号的停用标记，让它们重新参与调度。\n\n' +
+    '注意：如果某个号是真的被上游封禁，复活后第一次请求会被再次拒绝并重新停用——' +
+    '这类号需要先用官方客户端重新登录一次。',
+    '全部复活', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/revive-all', {});
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+});
 
 function renderPick(){
   DT.url = '';

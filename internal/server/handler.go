@@ -297,6 +297,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /update/check", h.requireInternal(h.updateCheck))
 	h.mux.HandleFunc("POST /update/apply", h.requireInternal(h.updateApply))
 	h.mux.HandleFunc("POST /accounts/revive", h.requireInternal(h.reviveAccount))
+	// 一键复活全部被停用账号（面板「全部复活」按钮）。与单号复位同族、同鉴权边界。
+	h.mux.HandleFunc("POST /accounts/revive-all", h.requireInternal(h.reviveAllAccounts))
 	// 重复推理保护的「命中后怎么办」热切换，同样只走本机管理通道：它改变的是所有
 	// 调用方看到的行为，不能让任一调用密钥自己改。
 	h.mux.HandleFunc("GET /features/reasoning-loop", h.requireInternal(h.reasoningLoopFeature))
@@ -545,6 +547,46 @@ func (h *Handler) reviveAccount(w http.ResponseWriter, r *http.Request) {
 	log.Printf("INFO: [服务] 账号已复活 uid=%s（原停用=%v，原因=%q）",
 		logfmt.UID8(uid), before.Disabled, before.DisabledReason)
 	_ = writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "disabled": after.Disabled, "was_disabled": before.Disabled})
+}
+
+// reviveAllAccounts 一键复活**全部**被停用的账号（仅管理通道）。
+//
+// 需要它的原因：上游的误判是**系统性**的——一次风控窗口会把同一批账号连续判错
+// （2026-10-16/17 实测：9 个健康号因 11128 被误标 11140 停用；修好分类后旧记录仍在）。
+// 逐个点复活在账号多时不可用，运维需要一个批量入口。
+//
+// 语义：只处理 disabled=true 的号；已健康的号不动（幂等）。返回处理明细便于核对。
+func (h *Handler) reviveAllAccounts(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Pool == nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "账号池不可用"})
+		return
+	}
+	type entry struct {
+		UID    string `json:"uid"`
+		Reason string `json:"reason"`
+	}
+	// 从池快照里筛出被停用的号（不改动池，只读）。
+	var targets []entry
+	for _, item := range h.cfg.Pool.List() {
+		if !item.Disabled {
+			continue
+		}
+		targets = append(targets, entry{UID: item.UID, Reason: item.DisabledReason})
+	}
+	revived := make([]entry, 0, len(targets))
+	for _, t := range targets {
+		h.cfg.Pool.ReviveDisabled(t.UID)
+		revived = append(revived, t)
+	}
+	if len(revived) > 0 {
+		log.Printf("INFO: [服务] 一键复活完成：%d 个账号已恢复（总账号 %d）", len(revived), len(h.cfg.Pool.List()))
+	}
+	_ = writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"revived": len(revived),
+		"total":   len(h.cfg.Pool.List()),
+		"items":   revived,
+	})
 }
 
 // updateCheck 查询远端最新版本（只读，不改动任何东西）。

@@ -69,6 +69,57 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
 
 `accountFaultRule` 的 `"request illegal"` 只作为第 3 条的回退保留。
 
+## v3.10.0 — 2026-10-17
+
+新增「一键复活全部账号」，并按最新版官方客户端的实测请求形态修正 global 域的渠道校验。
+
+### 新能力：一键复活全部被停用账号
+
+上游的误判是**系统性**的——一次风控窗口会把同一批号连续判错（v3.9.4 记录的 9 个健康号
+被误标 11140 停用即是此例）。逐个点复活在账号多时不可用：
+
+| 层 | 新增 |
+|---|---|
+| 网关 | `POST /accounts/revive-all`（管理通道，遍历池内 `disabled` 号，幂等） |
+| 面板 | `POST /api/account/revive-all` + 账号页「全部复活」按钮（带二次确认与数量提示） |
+
+无被停用账号时返回「没有需要复活的账号」，不会误报成功。
+
+### 修复：global 域首条消息必须是 system
+
+上游对 chat 端点校验「`messages[0].role == system`」，**只在 global 域强制**：
+AI 域缺 system 首条稳定复现 `11128 first message is not system prompt`，
+CN 域同形态通过（实测矩阵见下方）。此前 `ensureConsoleSystem` 已存在且仅对
+global 调用——本次复核确认该范围正确，并补齐了注释依据；CN 域**不动**，零回归。
+
+### 修复：渠道触发串只检查 system 首行
+
+实测确认上游的渠道校验窗口**限定在 system 消息的第一行**，且同时适用于两个 realm：
+
+| 位置 | 结果 |
+|---|---|
+| system 首行含触发串 | ❌ `11128 Illegal API invocation from an unapproved channel` |
+| system 第二行 / 前面加 20 字节前缀 | ✅ 通过 |
+| user 消息（任意位置） | ✅ 通过 |
+| 首行内逐词插入零宽空格 | ✅ 通过 |
+
+触发串（system 首行）：
+`x-anthropic-billing-header`、`You are Claude Code, Anthropic's official CLI for Claude`、
+`Codex CLI is an open source project led by OpenAI`。
+
+据此把预中和（`NeutralizeBillingHeaders`）与第 0 档断词的作用域**收窄到 system 首行**：
+- 修好此前「全文递归断词」对整篇历史消息的过度改写（未命中首行的请求一个字节都不变）；
+- 单行 system 也视为「首行」处理（早前一版跳过该形态导致漏检）；
+- 首行断词在三个触发串上均实测有效（生产账号 3/3 复现：脏首行拒绝、断词后通过）。
+
+### 修复：`request illegal` 形态的渠道拒绝也能被识别
+
+上游对同一拦截会在主 msg 里写泛化的 `request illegal`，把真正原因放进 `displayTips`
+（原文：「这次调用没通过渠道校验，可能不是官方客户端发出的」）。此前该形态归
+`ErrClient` → 不触发断词重试 → 用户看到终态错误。现在 `isUnapprovedChannel` 在
+**code==11128 且 displayTips 自证渠道校验**时也判为渠道拒绝（11140 的同 msg 是账号级
+封禁，按 code 严格区分，绝不混入）。
+
 ## v3.9.3 — 2026-10-16
 
 修 v3.9.2 引入/遗漏的三处：退回目标写成了自己、`-max` 是真实模型名时被误剥、

@@ -250,6 +250,10 @@ func normalizeRoles(obj map[string]any) {
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11128）：
 // 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
 // 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+//
+// 2026-10-17 复测复核：上游「首条必须是 system」的校验**只在 global 域强制**。
+// AI 域缺 system 首条稳定复现 11128 "first message is not system prompt"；
+// 同形态打 CN 域通过（实测矩阵见 docs/channel-verification.md）。故调用点维持仅 global。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {
