@@ -38,6 +38,37 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.9.4 — 2026-10-17
+
+修复「健康账号被误停」：`code 11128` 被当成账号级封禁，连续 2 次即停号。
+
+### 根因
+
+上游两类响应的**主 msg 逐字相同**，只有 code 与 displayMsg 不同：
+
+| code | msg | displayMsg | 真实语义 |
+|---|---|---|---|
+| 11140 | `request illegal` | 账号异常…重新登录 | 账号级封禁，需重登 |
+| **11128** | `request illegal` | **请求被拦截，请重新发送** | **请求级拦截，换一条就能过** |
+
+`accountFaultRule` 只按关键词 `"request illegal"` 匹配，于是 11128 也落进
+`ErrAccountFault` → 连续 2 次触发 `NoteAccountFault` → 健康号被停。
+
+生产实测（面板报障，2026-10-16）：9 个账号被标成
+`account banned by upstream (11140 request illegal), re-login required`，
+而 72 小时日志里**一次 11140 都没有**，26 次全是 11128——上游自己写着「请重新发送」。
+
+### 修复
+
+新增 `upstreamErrorCode`（读顶层 `code` / `error.code` / `error.data.code` 三种拼写）
+与 `isAccountFault`，判定顺序改为：
+
+1. 命中限流文案 → 不是账号故障（code 11140 也承载模型级限流，必须保持 soft_rate）；
+2. **有 code 时一律按 code 判**：只有 11140 / 14017 是账号级，11128 不是；
+3. 读不到 code（上游回纯文本）→ 退回关键词，保持既有行为。
+
+`accountFaultRule` 的 `"request illegal"` 只作为第 3 条的回退保留。
+
 ## v3.9.3 — 2026-10-16
 
 修 v3.9.2 引入/遗漏的三处：退回目标写成了自己、`-max` 是真实模型名时被误剥、

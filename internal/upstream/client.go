@@ -350,6 +350,51 @@ var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already"}}
 
+// upstreamErrorCode 从错误信封里取业务 code（无 code 时返回 0）。
+//
+// 支持三种已知拼写：顶层 `code`、`error.data.code`（WorkBuddy 国际版）、
+// `error.code`。取不到就返回 0——调用方必须把「没读到 code」与「code=0」同等对待，
+// 不能因为读不到就当作某个默认码。
+func upstreamErrorCode(body string) int {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal([]byte(body), &envelope) != nil || envelope == nil {
+		return 0
+	}
+	read := func(raw json.RawMessage) (int, bool) {
+		var n int
+		if json.Unmarshal(raw, &n) == nil {
+			return n, true
+		}
+		return 0, false
+	}
+	if raw, ok := envelope["code"]; ok {
+		if n, ok := read(raw); ok {
+			return n
+		}
+	}
+	if raw, ok := envelope["error"]; ok {
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(raw, &nested) == nil && nested != nil {
+			if c, ok := nested["code"]; ok {
+				if n, ok := read(c); ok {
+					return n
+				}
+			}
+			if data, ok := nested["data"]; ok {
+				var inner map[string]json.RawMessage
+				if json.Unmarshal(data, &inner) == nil && inner != nil {
+					if c, ok := inner["code"]; ok {
+						if n, ok := read(c); ok {
+							return n
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // accountFaultRule 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
@@ -360,15 +405,47 @@ var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签�
 //   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateRule
-// 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
-// 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
+// ⚠ "request illegal" 这个关键词**不是账号级的充分条件**（2026-10-16 修）：
+// 上游 `code 11128` 的主 msg 逐字也是 "request illegal"，但它的 displayMsg 是
+// 「请求被拦截，请重新发送」——那是**请求级**拦截（换一条请求就能过），
+// 账号本身没有故障。生产实测 72 小时里 26 次全是 11128、零次 11140，
+// 却按本规则停掉了 9 个健康号。因此判定必须**看 code**：见 accountFaultCode。
 var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
+	// 只在**读不到 code** 时才会用到（见 isAccountFault 的第 4 条）。
+	// 有 code 的响应一律按 code 判——11128 与 11140 的主 msg 逐字相同，
+	// 按文案判正是 2026-10-16 停掉 9 个健康号的根因。
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
 }}
+
+// accountFaultCodes 是全部账号级故障码。
+var accountFaultCodes = map[int]bool{
+	11140: true, // 账号级授权封禁（auth_forbidden）
+	14017: true, // trial not activated
+}
+
+// isAccountFault 报告该响应是否为**账号级**故障（决定是否计进停号阈值）。
+//
+// 判定顺序：
+//  1. 命中限流文案 → 不是账号故障（code 11140 也承载模型级限流
+//     "The model provider is rate-limiting requests."，那种必须保持 soft_rate，
+//     否则会把限流误升成停号）；
+//  2. code 明确是 11140 → 账号级；
+//  3. code 明确是别的（如 11128）→ **不是**，即使 msg 写着 "request illegal"；
+//  4. 没有可解析的 code（上游回了纯文本）→ 退回关键词，保持既有行为。
+//
+// 第 4 条保留是有意的：老版本实测过 `403 + 裸文本 "request illegal"`（见
+// client_test.go 的用例），那种响应没有 code 可看，只能按文案判。
+func isAccountFault(body, lower string) bool {
+	if softRateRule.hit(body, lower) {
+		return false
+	}
+	if code := upstreamErrorCode(body); code != 0 {
+		return accountFaultCodes[code]
+	}
+	return accountFaultRule.hit(body, lower)
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -595,7 +672,7 @@ func Classify(status int, body string) ErrKind {
 	if sessionDeadRule.hit(body, lower) || matchSessionDeadCode(body) {
 		return ErrSessionDead
 	}
-	if accountFaultRule.hit(body, lower) {
+	if isAccountFault(body, lower) {
 		return ErrAccountFault
 	}
 	// 明确的请求参数错误先于限流关键词判定：限流词表按子串匹配（含 "too many"），会把
