@@ -24,18 +24,29 @@ func modelsMain(authPath string) {
 		fail("parse auth: %v", err)
 	}
 
+	// 与生产同一形状：batch_get_detail_param + 22 个 functions + agent_type。
+	// 旧实现打的是 get_detail_param + function=solo_work_lite，那个组合对 trae
+	// 账号恒返回空列表——探针必须走生产路径，否则排障看到的是假象。
 	body, _ := json.Marshal(map[string]any{
-		"function":            "solo_work_lite",
-		"config_names":        nil,
-		"need_prompt":         false,
-		"current_config_info": nil,
-		"poly_prompt":         true,
-		"mode_type":           nil,
-		"agent_type":          nil,
+		"functions": []string{
+			"ui_builder_v2", "solo_coder", "chat_v3", "solo_builder", "builder_v3", "builder",
+			"chat", "inline_chat", "git_ai", "custom_agent_generation", "utils", "code_reviewer",
+			"code_review_summary", "solo_agent", "solo_agent_remote", "solo_work_remote",
+			"solo_agent_lite", "solo_work_lite", "solo_design_lite", "solo_design_remote",
+			"multimodal", "system_diagnosis",
+		},
+		"agent_type":                "solo_agent",
+		"current_config_info":       map[string]any{"config_name": "", "is_custom_model": false},
+		"mode_type":                 0,
+		"access_type":               0,
+		"ab_force_vids":             "",
+		"ab_autotest_advanced_mode": 0,
+		"show_custom_model":         true,
+		"biz_context":               map[string]any{"window_type": "Agent"},
 	})
 
 	req, err := http.NewRequest(http.MethodPost,
-		trae.GatewayBase+"/api/ide/v1/get_detail_param", bytes.NewReader(body))
+		trae.GatewayBase+trae.BatchCatalogPath, bytes.NewReader(body))
 	if err != nil {
 		fail("build request: %v", err)
 	}
@@ -52,7 +63,8 @@ func modelsMain(authPath string) {
 		fail("request: %v", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 目录响应实测 2.17 MB（373 条模型条目），1 MiB 会把它截断成非法 JSON。
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	fmt.Printf("HTTP %d, %d bytes\n", resp.StatusCode, len(data))
 	if resp.StatusCode != 200 {
 		fmt.Println(truncate(string(data), 800))
@@ -69,6 +81,8 @@ func modelsMain(authPath string) {
 		if m.HasRate {
 			rate = fmt.Sprintf("x%.2f", m.Rate)
 		}
-		fmt.Printf("  %-28s rate=%-7s display=%s\n", m.ConfigName, rate, m.DisplayName)
+		// 能力与档位真名是这次修复的核心，探针必须一并打印，否则排障看不到。
+		fmt.Printf("  %-28s rate=%-7s mm=%-5v max=%-5v dev=%-24s maxname=%-24s\n",
+			m.ConfigName, rate, m.Multimodal, m.MaxMode, m.DevModelName, m.MaxModelName)
 	}
 }
