@@ -135,6 +135,14 @@ func InvalidateCatalog(uid string) {
 	delete(catalogCache, uid)
 }
 
+// catalogFunctionAll 是「模型最全」的那个 function。
+//
+// 实测（2026-10-16）：同一账号下 solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
+// 只在 solo_agent 里的模型（qwen3.8-flash / kimi-k2.8-preview / Doubao-Seed-Evolving-auto
+// 等）按其它 function 发出去会拿到 `config item is empty for config opt`，
+// 因此它是 out-of-catalog 模型的退回目标。
+const catalogFunctionAll = "solo_agent"
+
 // catalogFunctions 是 batch_get_detail_param 要问的 function 列表。
 //
 // 必须一次问全：上游按 function 逐个返回 config_info_list，只问一个（旧实现问
@@ -593,6 +601,11 @@ func LookupCatalogModel(models []CatalogModel, name string) (CatalogModel, bool)
 //
 // 网关对外公布的档位写法是 `<model>-max`（trae:glm-5.3-max），与上游的
 // `__max` 是两套写法：前者是**客户端意图**，后者是**出站真名**。这里只做前者。
+//
+// ⚠ 不能无条件剥：`qwen3.8-max` 是**真实模型名**（目录里它的档位真名是
+// `qwen3.8-max__dev` / `qwen3.8-max__max`），剥掉就成了不存在的 `qwen3.8`——
+// 上游回 `config item is empty for config opt`（2026-10-16 实测）。
+// 所以调用方必须**先查目录**：名字原样命中目录就不拆，未命中才当作档位后缀拆。
 func SplitMaxSuffix(name string) (base string, wantMax bool) {
 	trimmed := strings.TrimSpace(name)
 	lower := strings.ToLower(trimmed)
@@ -602,4 +615,23 @@ func SplitMaxSuffix(name string) (base string, wantMax bool) {
 		}
 	}
 	return trimmed, false
+}
+
+// ResolveRequestedModel 把请求名解析成 (目录里的 config_name, 是否 max 档)。
+//
+// 顺序很重要：
+//  1. 名字原样命中目录 → 它就是模型名，不带档位意图（`qwen3.8-max` 走这条）；
+//  2. 未命中 → 试剥 `-max` 后缀，剥后的名字命中目录则认作「要 max 档」；
+//  3. 都没命中 → 原样返回（让上游自己报错，比网关猜一个替代名更诚实）。
+func ResolveRequestedModel(models []CatalogModel, name string) (string, bool) {
+	if _, ok := LookupCatalogModel(models, name); ok {
+		return name, false
+	}
+	base, wantMax := SplitMaxSuffix(name)
+	if wantMax {
+		if _, ok := LookupCatalogModel(models, base); ok {
+			return base, true
+		}
+	}
+	return strings.TrimSpace(name), false
 }

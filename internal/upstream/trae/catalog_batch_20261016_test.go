@@ -165,3 +165,41 @@ func TestCatalogTracksFunctionMembership(t *testing.T) {
 		t.Errorf("未知模型不应被拦下")
 	}
 }
+
+// TestResolveRequestedModelKeepsRealMaxNames `-max` 是真实模型名的一部分时不得剥掉。
+//
+// 实测（2026-10-16）：`qwen3.8-max` 是真实模型（目录里档位真名
+// `qwen3.8-max__dev` / `qwen3.8-max__max`）。旧实现无条件剥 `-max`，于是发出
+// `qwen3.8` 这个名字，上游回 `config item is empty for config opt`。
+func TestResolveRequestedModelKeepsRealMaxNames(t *testing.T) {
+	models := []CatalogModel{
+		{ConfigName: "qwen3.8-max", MaxMode: true,
+			DevModelName: "qwen3.8-max__dev", MaxModelName: "qwen3.8-max__max"},
+		{ConfigName: "glm-5.3", MaxMode: true,
+			DevModelName: "glm-5.3__dev", MaxModelName: "glm-5.3__max"},
+	}
+
+	// 原样命中目录 → 不拆，且不是 max 档意图。
+	name, wantMax := ResolveRequestedModel(models, "qwen3.8-max")
+	if name != "qwen3.8-max" || wantMax {
+		t.Errorf("qwen3.8-max 应原样保留且非 max 档意图，实际 name=%q wantMax=%v", name, wantMax)
+	}
+	if got := models[0].OutboundModelName(false); got != "qwen3.8-max__dev" {
+		t.Errorf("qwen3.8-max 普通档出站名应为 qwen3.8-max__dev，实际 %q", got)
+	}
+
+	// 未命中目录 + `-max` 后缀 → 认作档位意图。
+	name, wantMax = ResolveRequestedModel(models, "glm-5.3-max")
+	if name != "glm-5.3" || !wantMax {
+		t.Errorf("glm-5.3-max 应解析为 glm-5.3 + max 档，实际 name=%q wantMax=%v", name, wantMax)
+	}
+	if got := models[1].OutboundModelName(true); got != "glm-5.3__max" {
+		t.Errorf("glm-5.3 max 档出站名应为 glm-5.3__max，实际 %q", got)
+	}
+
+	// 未命中且无后缀 → 原样返回，让上游报错。
+	name, wantMax = ResolveRequestedModel(models, "nonexistent")
+	if name != "nonexistent" || wantMax {
+		t.Errorf("未知模型应原样返回，实际 name=%q wantMax=%v", name, wantMax)
+	}
+}

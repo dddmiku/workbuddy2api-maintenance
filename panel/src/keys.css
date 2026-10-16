@@ -69,6 +69,11 @@
 .key-model-tags{display:flex;flex-wrap:wrap;gap:5px;max-width:240px}
 .key-model-tag{font:11.5px/1.7 var(--mono);padding:1px 8px;border-radius:999px;color:var(--ink-2);
   background:var(--sunken);overflow-wrap:anywhere}
+/* 模型绑定折叠（2026-10-16）：绑定几十个模型时全部平铺会把行高撑到上千像素。
+   默认隐藏超出的标签，点「还有 N 个」原地展开。 */
+.key-model-more{display:none;flex-wrap:wrap;gap:5px}
+.key-model-more.on{display:contents}
+.key-model-toggle{margin-top:6px}
 
 /* ── 绑定模型：自绘选择器 ────────────────────────────────────────────────
  * 2026-10-08：替换原来的原生 <select>。原生控件无法显示倍率、也跟不上面板的

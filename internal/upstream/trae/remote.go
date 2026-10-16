@@ -308,27 +308,35 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 	maxApplied := false
 	if strategy == "manual" {
 		// 请求名里的 `-max` 后缀是**客户端意图**，上游真名是 `__max`（见
-		// CatalogModel.OutboundModelName）。先拆出意图，再按目录解析真名。
-		base, wantMax := SplitMaxSuffix(modelName)
+		// CatalogModel.OutboundModelName）。但 `qwen3.8-max` 这种名字里带 -max 的
+		// 真实模型不能被剥，所以交给 ResolveRequestedModel 先查目录再决定。
 		models, cerr := FetchCatalog(ctx, a)
+		var wantMax bool
+		var base string
 		if cerr == nil {
+			base, wantMax = ResolveRequestedModel(models, modelName)
 			if resolved := ResolveFromCatalog(models, base); resolved != "" && resolved != base {
 				base = resolved
 			}
-			// 目标 function 的表里没有这个模型时退回 solo_agent——那里一定有它。
+			// 目标 function 的表里没有这个模型时退回 **solo_agent**——那里一定有它。
 			//
 			// 实测（2026-10-16）：solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
 			// qwen3.8-flash / kimi-k2.8-preview 这类只在 solo_agent 里，按默认的
 			// 「带工具 → solo_work_remote」发出去会拿到
 			// `config item is empty for config opt`。退回 solo_agent 后正常。
+			//
+			// 注意退回目标是 **solo_agent**（catalogFunctionAll），不是
+			// remoteDefaultAgentType（那正是 solo_agent_remote，退等于没退）。
 			if !agentTypeSupportsModel(models, base, agentType) {
 				log.Printf("INFO: [trae] 模型 %s 不在 %s 的目录里，退回 %s",
-					base, agentType, remoteDefaultAgentType)
-				agentType = remoteDefaultAgentType
+					base, agentType, catalogFunctionAll)
+				agentType = catalogFunctionAll
 				msg.AgentType = agentType
 				msg.AgentID = agentType
 			}
 		} else {
+			// 目录不可用：退回静态别名表，并按纯后缀拆档位意图。
+			base, wantMax = SplitMaxSuffix(modelName)
 			base = ResolveModelName(base)
 		}
 		modelName = base

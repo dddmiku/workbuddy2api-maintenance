@@ -597,6 +597,11 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 .key-model-tags{display:flex;flex-wrap:wrap;gap:5px;max-width:240px}
 .key-model-tag{font:11.5px/1.7 var(--mono);padding:1px 8px;border-radius:999px;color:var(--ink-2);
   background:var(--sunken);overflow-wrap:anywhere}
+/* 模型绑定折叠（2026-10-16）：绑定几十个模型时全部平铺会把行高撑到上千像素。
+   默认隐藏超出的标签，点「还有 N 个」原地展开。 */
+.key-model-more{display:none;flex-wrap:wrap;gap:5px}
+.key-model-more.on{display:contents}
+.key-model-toggle{margin-top:6px}
 
 /* ── 绑定模型：自绘选择器 ────────────────────────────────────────────────
  * 2026-10-08：替换原来的原生 <select>。原生控件无法显示倍率、也跟不上面板的
@@ -3718,6 +3723,10 @@ if (document.readyState === 'loading'){
 
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-10-16：模型绑定列折叠显示。绑定几十个模型时，原先把每个模型渲染成一枚标签
+//             全部平铺，行高被撑到上千像素、整张表没法看（用户实测反馈）。
+//             现在只显示前 N 个 + 「还有 N 个」按钮，点开展开全部；绑定少于一屏
+//             时不出现按钮，与原来完全一致。
 // 2026-09-25：逐密钥编辑请求频率、并发与排队，显示实时快照和请求明细入口；未知消费不补零。
 // 2026-09-23：密钥新增「global 全部限流时回落同名 CN 模型」开关：表单、列表与提交
 //             三处同步，未设置按关闭处理（既有密钥零回归）。
@@ -4030,6 +4039,35 @@ function keyCreditCell(key){
   return '<span class="sub" title="' + esc(why) + '">—</span>';
 }
 
+// keyModelsCell 渲染「模型绑定」单元格。
+//
+// 折叠的必要性（2026-10-16 用户实测）：Trae 域接入动态目录后，一个密钥可能绑定
+// 几十个模型（内置模型 + 各自的 max 档）。原先把每个模型平铺成一枚标签，
+// 39 个标签把这一行撑到上千像素高，整张表只剩一行可见、其余全被挤走。
+//
+// 现在默认只显示前 KEY_MODELS_COLLAPSED 个，其余折叠成「还有 N 个」按钮；
+// 点按钮原地展开/收起。绑定数不超过上限时**不出现按钮**，渲染结果与旧版逐字相同
+// （既有前端测试按旧 DOM 断言，这条保证它们不受影响）。
+var KEY_MODELS_COLLAPSED = 6;
+
+function keyModelsCell(key, models){
+  if (!models.length) return '<span class="sub">不限制</span>';
+  var shown = models.slice(0, KEY_MODELS_COLLAPSED);
+  var rest = models.length - shown.length;
+  var tags = function(list){
+    return list.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('');
+  };
+  if (rest <= 0){
+    return '<div class="key-model-tags">' + tags(shown) + '</div>';
+  }
+  // 全部标签都渲染进 DOM，靠 class 控制可见性——展开/收起纯 CSS，不用重渲染整表。
+  return '<div class="key-model-tags">' + tags(shown) +
+    '<span class="key-model-more" data-key-more="' + esc(key.id) + '">' + tags(models.slice(KEY_MODELS_COLLAPSED)) + '</span>' +
+    '</div>' +
+    '<button type="button" class="btn sm key-model-toggle" data-key-action="models" data-id="' + esc(key.id) +
+    '" aria-expanded="false">还有 ' + rest + ' 个</button>';
+}
+
 function renderKeys(){
   var keys = KS.keys || [];
   $('#keyError').textContent = KS.error;
@@ -4055,9 +4093,7 @@ function renderKeys(){
       '<td data-l="密钥"><div class="key-value"><code class="key-mask">' + esc(key.masked_key) + '</code>' +
       '<button type="button" class="btn sm" data-key-action="copy" data-id="' + esc(key.id) + '" title="' +
       (key.copy_available ? '复制完整密钥' : '旧密钥正常使用后可再次复制') + '">复制</button></div></td>' +
-      '<td data-l="模型绑定">' + (models.length
-        ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
-        : '<span class="sub">不限制</span>') + '</td>' +
+      '<td data-l="模型绑定">' + keyModelsCell(key, models) + '</td>' +
       // token 与积分合成一列：积分是本列的自然补充（「用了多少、扣了多少」），
       // 单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
       // 「有效期」与「创建时间」合成了一列，这里沿用同一取舍。
@@ -4330,6 +4366,18 @@ $('#keyRows').addEventListener('click', function(event){
   var button = event.target.closest('button[data-key-action]'); if (!button) return;
   var key = (KS.keys || []).find(function(k){return k.id === button.getAttribute('data-id');}); if (!key) return;
   var action = button.getAttribute('data-key-action');
+  // 模型绑定列的展开/收起：纯前端 DOM 切换，不打接口、不重渲染整表。
+  // 全部标签本来就在 DOM 里（见 keyModelsCell），这里只切 class 与按钮文案。
+  if (action === 'models'){
+    var cell = button.closest('td');
+    var more = cell ? cell.querySelector('.key-model-more') : null;
+    if (!more) return;
+    var expanded = more.classList.toggle('on');
+    button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    var hidden = more.querySelectorAll('.key-model-tag').length;
+    button.textContent = expanded ? '收起' : ('还有 ' + hidden + ' 个');
+    return;
+  }
   if (action === 'edit'){openKeyEditor(key);return;}
   if (action === 'limits'){openKeyEditor(key);$('#keyRPM').focus();return;}
   if (action === 'requests'){if (typeof openRequestsForKey === 'function') openRequestsForKey(key.id,key.name);return;}

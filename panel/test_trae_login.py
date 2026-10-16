@@ -437,8 +437,10 @@ class PanelTaskWhitelistTest(unittest.TestCase):
             go = fh.read()
         want = set(re.findall(r'TaskKey\w+\s+TaskKey\s*=\s*"([a-z_]+)"', go))
         self.assertTrue(want, "未能从 tasks.go 解析出任务清单")
-        have = set(re.findall(r'^\s{4}"([a-z_]+)":\s*"([a-z_]+)_enabled",', panel, re.M))
-        have = {k for k, _ in have}
+        # 值允许是空串：**一次性任务**（如 compensation）没有排程开关，
+        # config 里也没有 schedule.<key>_enabled 字段，面板据此渲染成「一次性」pill。
+        # 白名单仍必须登记它，否则「跑一次」照样报任务标识不正确。
+        have = set(re.findall(r'^\s{4}"([a-z_]+)":\s*"[a-z_]*",', panel, re.M))
         missing = sorted(want - have)
         self.assertEqual(missing, [],
                          "面板白名单缺少这些任务（会导致「跑一次」报任务标识不正确）：%s" % missing)
