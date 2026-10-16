@@ -1,0 +1,77 @@
+{
+ "function_configs": [
+  {
+   "function": "solo_agent",
+   "config_info_list": [
+    {
+     "config_name": "glm-5.3-flash",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "GLM-5.3-Flash",
+      "multimodal": true,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "glm-5.3-flash__dev",
+       "prompt_max_tokens": 168000
+      },
+      {
+       "model_name": "glm-5.3-flash__max",
+       "prompt_max_tokens": 936000
+      }
+     ]
+    },
+    {
+     "config_name": "qwen3.8-flash",
+     "usage": "chat_completion",
+     "is_invisible_to_user": null,
+     "display_config": {
+      "display_name": "Qwen3.8-Flash",
+      "multimodal": true,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "qwen3.8-flash__dev",
+       "prompt_max_tokens": 168000
+      },
+      {
+       "model_name": "qwen3.8-flash__max",
+       "prompt_max_tokens": 936000
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "function": "solo_agent_remote",
+   "config_info_list": [
+    {
+     "config_name": "glm-5.3-flash",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "GLM-5.3-Flash",
+      "multimodal": false,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "glm-5.3-flash__dev",
+       "prompt_max_tokens": 168000
+      },
+      {
+       "model_name": "glm-5.3-flash__max",
+       "prompt_max_tokens": 936000
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

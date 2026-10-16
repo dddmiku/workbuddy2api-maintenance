@@ -113,3 +113,55 @@ func TestParseCatalogSkipsNonChatModels(t *testing.T) {
 		t.Fatalf("只应保留 glm-5.3，实际 %+v", models)
 	}
 }
+
+// TestCatalogTracksFunctionMembership 目录要记住模型属于哪些 function。
+//
+// 夹具是 2026-10-16 真实响应裁剪版：glm-5.3-flash 在两张表里都有，
+// qwen3.8-flash 只在 solo_agent 里（实测 solo_agent 67 个 vs solo_agent_remote 45 个）。
+//
+// 为什么必须记：网关按请求是否带工具在 solo_agent_remote / solo_work_remote 之间路由。
+// 若目标 function 的表里没有这个模型，上游回 `config item is empty for config opt`
+// （ConfigName 用了干净名，因为那张表没给 model_detail_list，取不到 __dev 真名）。
+func TestCatalogTracksFunctionMembership(t *testing.T) {
+	data, err := os.ReadFile("testdata/catalog_functions_20261016.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	models, err := parseCatalog(data)
+	if err != nil {
+		t.Fatalf("parseCatalog: %v", err)
+	}
+	byName := map[string]CatalogModel{}
+	for _, m := range models {
+		byName[m.ConfigName] = m
+	}
+
+	// glm-5.3-flash 两张表都有。
+	flash := byName["glm-5.3-flash"]
+	if !flash.Functions["solo_agent"] || !flash.Functions["solo_agent_remote"] {
+		t.Errorf("glm-5.3-flash 应同时属于 solo_agent 与 solo_agent_remote，实际 %v", flash.Functions)
+	}
+	// qwen3.8-flash 只在 solo_agent。
+	qwen := byName["qwen3.8-flash"]
+	if !qwen.Functions["solo_agent"] {
+		t.Errorf("qwen3.8-flash 应属于 solo_agent，实际 %v", qwen.Functions)
+	}
+	if qwen.Functions["solo_agent_remote"] {
+		t.Errorf("qwen3.8-flash 不该属于 solo_agent_remote（真实目录里没有它），实际 %v", qwen.Functions)
+	}
+
+	// 路由判据：不在目标 function 里就该退回 solo_agent。
+	if agentTypeSupportsModel(models, "qwen3.8-flash", "solo_agent_remote") {
+		t.Errorf("qwen3.8-flash 不在 solo_agent_remote，agentTypeSupportsModel 应返回 false")
+	}
+	if !agentTypeSupportsModel(models, "qwen3.8-flash", "solo_agent") {
+		t.Errorf("qwen3.8-flash 在 solo_agent，agentTypeSupportsModel 应返回 true")
+	}
+	if !agentTypeSupportsModel(models, "glm-5.3-flash", "solo_agent_remote") {
+		t.Errorf("glm-5.3-flash 在 solo_agent_remote，应返回 true")
+	}
+	// 目录里没有的模型不拦（宁可按原路由试，让上游报错）。
+	if !agentTypeSupportsModel(models, "unknown-model", "solo_agent_remote") {
+		t.Errorf("未知模型不应被拦下")
+	}
+}

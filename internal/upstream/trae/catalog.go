@@ -74,6 +74,16 @@ type CatalogModel struct {
 	// DevPromptMax / MaxPromptMax 是两档各自的上下文上限（来自 model_detail_list）。
 	DevPromptMax int64
 	MaxPromptMax int64
+	// Functions 记录该模型出现在哪些 function 的目录里。
+	//
+	// 必须记：不同 function 的模型集**不一样**（实测 solo_agent 有 67 个，
+	// solo_agent_remote 只有 45 个；qwen3.8-flash / kimi-k2.8-preview 只在
+	// solo_agent 里）。网关按请求是否带工具在 solo_agent_remote 与
+	// solo_work_remote 之间路由，若目标 function 的表里没有这个模型，上游会回
+	// `config item is empty for config opt`（ConfigName 用了干净名，因为那张表
+	// 没给 model_detail_list，取不到 __dev 真名）。出站前用 Functions 校验，
+	// 不在就退回 solo_agent——那里一定有它。
+	Functions map[string]bool
 }
 
 // catalogEntry 是带时间的缓存项。
@@ -220,18 +230,23 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return nil, fmt.Errorf("trae catalog parse: %w", err)
 	}
-	// 收集所有 function 下的条目（扁平形状就是单张表）。
-	var entries []map[string]any
+	// 收集所有 function 下的条目（扁平形状就是单张表，function 名记空）。
+	type catalogEntry struct {
+		function string
+		item     map[string]any
+	}
+	var entries []catalogEntry
 	if groups, ok := parsed["function_configs"].([]any); ok {
 		for _, g := range groups {
 			group, ok := g.(map[string]any)
 			if !ok {
 				continue
 			}
+			fn, _ := group["function"].(string)
 			list, _ := group["config_info_list"].([]any)
 			for _, raw := range list {
 				if item, ok := raw.(map[string]any); ok {
-					entries = append(entries, item)
+					entries = append(entries, catalogEntry{function: fn, item: item})
 				}
 			}
 		}
@@ -245,7 +260,7 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 		}
 		for _, raw := range list {
 			if item, ok := raw.(map[string]any); ok {
-				entries = append(entries, item)
+				entries = append(entries, catalogEntry{item: item})
 			}
 		}
 	}
@@ -253,10 +268,16 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 		return nil, fmt.Errorf("trae catalog: no config_info_list in response")
 	}
 	merged := make(map[string]CatalogModel, len(entries))
-	for _, item := range entries {
-		model, ok := catalogModelFrom(item)
+	for _, entry := range entries {
+		model, ok := catalogModelFrom(entry.item)
 		if !ok {
 			continue
+		}
+		if entry.function != "" {
+			if model.Functions == nil {
+				model.Functions = map[string]bool{}
+			}
+			model.Functions[entry.function] = true
 		}
 		if previous, seen := merged[model.ConfigName]; seen {
 			merged[model.ConfigName] = mergeCatalogModel(previous, model)
@@ -284,6 +305,15 @@ func mergeCatalogModel(a, b CatalogModel) CatalogModel {
 	}
 	out.Multimodal = a.Multimodal || b.Multimodal
 	out.MaxMode = a.MaxMode || b.MaxMode
+	// Functions 取并集：模型在任一 function 的表里出现过就算可用。
+	if len(b.Functions) > 0 {
+		if out.Functions == nil {
+			out.Functions = map[string]bool{}
+		}
+		for fn := range b.Functions {
+			out.Functions[fn] = true
+		}
+	}
 	if out.DevModelName == "" {
 		out.DevModelName = b.DevModelName
 	}

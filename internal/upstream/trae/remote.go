@@ -190,6 +190,26 @@ func remoteAgentTypeFor(model string, withTools bool) string {
 	return remoteDefaultAgentType
 }
 
+// agentTypeSupportsModel 报告目标 function 的目录里是否有这个模型。
+//
+// 必须校验：不同 function 的模型集**不一样**（实测 solo_agent 67 个、
+// solo_agent_remote 只有 45 个）。qwen3.8-flash / kimi-k2.8-preview /
+// Doubao-Seed-Evolving-auto 这类只在 solo_agent 里，若按「带工具 → solo_work_remote」
+// 发出去，上游回 `config item is empty for config opt`（2026-10-16 实测）。
+//
+// 目录没拉到（Functions 为空）时返回 true：宁可按原路由试一次，也不要因为
+// 缺目录把请求改道——上游的错误比网关猜的路由更准确。
+func agentTypeSupportsModel(models []CatalogModel, name, agentType string) bool {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok {
+		return true
+	}
+	if len(model.Functions) == 0 {
+		return true
+	}
+	return model.Functions[agentType]
+}
+
 // buildCommonParams 组装 common_params（JSON 字符串）。
 //
 // 对齐参考 trae_remote_client.common_params 的 CN code 档。
@@ -294,6 +314,19 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 		if cerr == nil {
 			if resolved := ResolveFromCatalog(models, base); resolved != "" && resolved != base {
 				base = resolved
+			}
+			// 目标 function 的表里没有这个模型时退回 solo_agent——那里一定有它。
+			//
+			// 实测（2026-10-16）：solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
+			// qwen3.8-flash / kimi-k2.8-preview 这类只在 solo_agent 里，按默认的
+			// 「带工具 → solo_work_remote」发出去会拿到
+			// `config item is empty for config opt`。退回 solo_agent 后正常。
+			if !agentTypeSupportsModel(models, base, agentType) {
+				log.Printf("INFO: [trae] 模型 %s 不在 %s 的目录里，退回 %s",
+					base, agentType, remoteDefaultAgentType)
+				agentType = remoteDefaultAgentType
+				msg.AgentType = agentType
+				msg.AgentID = agentType
 			}
 		} else {
 			base = ResolveModelName(base)

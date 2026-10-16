@@ -38,6 +38,34 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.9.2 — 2026-10-16
+
+修复「部分 Trae 模型必然 502」：目录没记住模型属于哪个 function，按默认路由发出去
+上游回 `config item is empty for config opt`。
+
+### 根因
+
+网关按请求是否带客户端工具在 `solo_agent_remote`（纯文本）与 `solo_work_remote`
+（带工具）之间路由，但**不同 function 的模型集不一样**——实测同一账号下
+`solo_agent` 有 67 个模型，`solo_agent_remote` 只有 45 个：
+
+| 模型 | solo_agent | solo_agent_remote |
+|---|---|---|
+| `glm-5.3-flash` | ✅ | ✅ |
+| `qwen3.8-flash` | ✅ | ❌ |
+| `kimi-k2.8-preview` | ✅ | ❌ |
+| `Doubao-Seed-Evolving-auto` | ✅ | ❌ |
+
+这些模型只在 `solo_agent` 里，按默认路由发到 `solo_agent_remote` 后上游回
+`config item is empty for config opt`（2026-10-16 实测 `qwen3.8-flash`）。
+
+### 修复
+
+`CatalogModel` 新增 `Functions`（模型出现在哪些 function 的目录里，跨 function 取并集）。
+出站前用 `agentTypeSupportsModel` 校验目标 function 是否收录该模型，不在就退回
+`solo_agent` 并记一行 INFO 日志。目录没拉到时不拦（按原路由试，上游的错误比网关
+猜的路由更准确）。
+
 ## v3.9.1 — 2026-10-16
 
 修复三处：模型目录接口用错导致 max 档从未生效、只有思考的回合被误报「空响应」、
