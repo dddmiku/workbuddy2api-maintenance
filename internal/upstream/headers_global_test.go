@@ -8,11 +8,16 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// globalUAString global realm 默认出站 UA：两 realm 同形
-// `WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`。2026-10-07 对国际版客户端 5.7.6 重新抓包
-// （GUI 形态实发 /v1/chat/completions）得到 `WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0`，
-// 国际版不存在 `WorkBuddy AI` 平台段；版本段沿用本仓库 clientVersion/cliVersion。
-const globalUAString = "WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0"
+// globalUAString global realm 默认出站 UA。
+//
+// 2026-10-17 双端抓包实测（5.8.4）：
+//
+//	global → `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
+//	CN     → `WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0`
+//
+// 第二段按 realm 分流：国际版用**全小写连字符** `workbuddy-ai`，国内版沿用
+// `WorkBuddy`。此前两 realm 同形（2026-09-17 对 5.5.2 抓包的结论）已被实测推翻。
+const globalUAString = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
 
 // TestChatHeadersGlobalRealm global 账号的 chat 请求头对齐 intl 三件套：
 //  1. UA 用官方国际版实测形态 `WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`；
@@ -127,8 +132,8 @@ func TestChatHeadersCNNoEnterpriseZeroRegression(t *testing.T) {
 	}
 }
 
-// TestDefaultWorkBuddyUAForGlobal UA 单元级断言：两 realm 同形（第二段均为
-// `WorkBuddy`，与官方国际版客户端抓包一致），版本覆盖仍生效。
+// TestDefaultWorkBuddyUAForGlobal UA 单元级断言：第二段按 realm 分流
+// （global → `workbuddy-ai`，cn → `WorkBuddy`），版本覆盖仍生效。
 func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	c := &Client{}
 	if got := c.defaultWorkBuddyUAFor(&auth.Auth{}); got != defaultUAString {
@@ -139,7 +144,7 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	}
 	// version 覆盖仍生效：平台段跟随 clientVersion。
 	c2 := &Client{ClientVersion: "6.0.0"}
-	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.156.0" {
+	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 workbuddy-ai/6.0.0 CLI/2.161.0" {
 		t.Errorf("defaultWorkBuddyUAFor(global, v6) = %q", got)
 	}
 }

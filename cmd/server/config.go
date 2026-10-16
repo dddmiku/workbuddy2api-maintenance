@@ -128,6 +128,16 @@ type Config struct {
 		// 2.156.0）；显式配置则随配置走。
 		CliVersion string `json:"cli_version"`
 
+		// ChannelDumpDir 渠道拒绝（11128）时的**完整出站报文**落盘目录。
+		//
+		// 为什么需要：11128 的判定依据不在任何单一字段里——2026-10-17 排障时用逐项
+		// 排除法（头/字段/体积/图片/工具/账号/压缩）几十组实验都无法复现生产的拒绝，
+		// 差异只能在整个报文里。开这个开关后，每次渠道拒绝都写一份完整 JSON
+		// （出站请求头 + 完整请求体 + 完整上游响应），供事后逐字节对照。
+		//
+		// 空 = 关闭（默认）。排查期设成 /app/data/channel-dumps 即可。
+		ChannelDumpDir string `json:"channel_dump_dir"`
+
 		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底。
 		// 容器内无桌面端 Turing SDK，这是把外部生成的 token 注入的入口；空 = 不注入。
 		// 每号覆盖优先级：auths 文件 device_token > 本全局值 > DeviceTokenFile（文件兜底）。

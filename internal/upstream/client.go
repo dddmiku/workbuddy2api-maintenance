@@ -1346,6 +1346,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				kind := Classify(resp.StatusCode, string(raw))
 				log.Printf("WARN: [上游] 流式对话 uid=%s 上游返回 %d %s body=%s",
 					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+				// 渠道拒绝：落盘**完整出站报文**（请求头 + 请求体 + 上游响应），供事后精确定位。
+				//
+				// 为什么必须落盘：2026-10-17 排查中，用「逐项排除法」（头 / body 字段 / 体积 /
+				// 图片 / 工具定义 / 账号 / gzip）反复对照直打与网关出站，几十组实验全部无法复现
+				// 生产的 11128——差异只能在整个报文的某个未被枚举的角落。日志此前按 200 字节
+				// 截断上游响应，等于把唯一的证据源也切掉了。这里把三样东西完整留下。
+				if kind == ErrChannelRejected {
+					c.dumpChannelRejection(ctx, a, prepared, resp.Request, resp.StatusCode, raw)
+				}
 				// 上下文超限：上游计的是「输入 + max_tokens」。预算由网关自选时，按上游报告的
 				// 精确计数收缩到刚好放得下再同号重发一次；客户端显式预算、计数缺失或剩余空间
 				// 不足下限时，保留全部历史和原始错误作为终态，让客户端压缩后再请求。

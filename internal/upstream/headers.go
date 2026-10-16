@@ -23,14 +23,22 @@ const (
 	// 桌面端 last-launch.json 的 version、install-manifest.json 的 appVersion、
 	// 以及 GUI 形态出站 UA 的 `WorkBuddy/<ver>` 段三者一致为 5.7.6
 	// （CLIENT_INFO_PLATFORM_VERSION / CLIENT_INFO_PRODUCT_VERSION 注入）。
-	defaultClientVersion = "5.7.6"
+	//
+	// 2026-10-17 双端再次抓包，官方已升级：
+	//   国内 WorkBuddy  5.8.3 → UA `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`
+	//   国际 WorkBuddyAI 5.8.4 → UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
+	// 注意国际版第二段是**小写连字符** `workbuddy-ai`（与首段 `WorkBuddy` 不同大小写），
+	// 见 defaultWorkBuddyUAFor。
+	defaultClientVersion = "5.8.4"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
 	// （cli/package.json publishConfig.customPackage.version）。
 	//
 	// 2026-10-07 双端重新抓包：5.7.6 分发包内置 CLI 已升到 2.156.0
 	// （CLIENT_INFO_USER_AGENT_EXTENSION = CLI/2.156.0，双端一致）。
 	// 该值同时是 X-IDE-Version 之外唯一随包升级而变动的版本段。
-	defaultCliVersion = "2.156.0"
+	//
+	// 2026-10-17 再次抓包：随 5.8.x 升级到 2.161.0（双端一致）。
+	defaultCliVersion = "2.161.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -63,22 +71,27 @@ func (c *Client) cliVersion() string {
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`
-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
+// `WorkBuddy/<clientVersion> <platformSegment> CLI/<cliVersion>`。
 //
-// 平台段（第二段）两 realm 同值 `WorkBuddy`。早前按逆向文档把 global 段写成
-// `WorkBuddy AI`，2026-09-17 对国际版客户端 5.5.2 抓包（本机 CLI host 实发
-// /v2/chat/completions）得到的原文是 `WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1`，
-// 即国际版分发包同样用 `WorkBuddy`，不存在 `WorkBuddy AI` 平台段。官方无任何 UA
-// 随机化（step1 §4），故默认确定性。realm 判定委托 auth.Realm()（含全局开关逃生门）。
+// platformSegment（第二段）按 realm 分：
+//   - CN        → `WorkBuddy/<ver>`（大小写与首段相同）
+//   - global     → `workbuddy-ai/<ver>`（**全小写连字符**）
 //
-// 2026-10-07 双端（5.7.6）重新抓包复核：GUI 形态实发
-// `WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0`，形状不变、两 realm 仍同值，
-// 仅版本段随包升级（CLIENT_INFO_PLATFORM/PRODUCT_VERSION=5.7.6 +
-// CLIENT_INFO_USER_AGENT_EXTENSION=CLI/2.156.0）。
+// 2026-10-17 双端抓包实测：
+//
+//	CN   5.8.3：`WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`
+//	global 5.8.4：`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
+//
+// 此前实现让两 realm 同用 `WorkBuddy` 段（2026-09-17 对 5.5.2 抓包时的结论），
+// 但本次实测确认国际版已改为小写连字符形态——这是「完整伪装」里唯一与 realm
+// 相关的形状差异。UA 不参与渠道校验（实测 4 组全过），但对齐官方形态无害。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
-	_ = a
-	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	platform := "WorkBuddy"
+	if a != nil && a.IsGlobal() {
+		platform = "workbuddy-ai"
+	}
+	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() +
+		" CLI/" + c.cliVersion()
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。

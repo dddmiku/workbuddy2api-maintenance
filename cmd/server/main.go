@@ -209,6 +209,11 @@ func main() {
 	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
 	up.ClientVersion = cfg.Upstream.ClientVersion
 	up.CliVersion = cfg.Upstream.CliVersion
+	// 渠道拒绝样本落盘（排查用；空 = 关闭，零开销）。
+	upstream.SetChannelDumpDir(cfg.Upstream.ChannelDumpDir)
+	if cfg.Upstream.ChannelDumpDir != "" {
+		log.Printf("[上游] 渠道拒绝样本落盘已启用：%s", cfg.Upstream.ChannelDumpDir)
+	}
 	// 设备风控头（X-Device-Token）全局兜底 + 文件读取路径；空 = 不注入。
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile

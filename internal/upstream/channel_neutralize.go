@@ -210,17 +210,51 @@ func splitFirstLine(text string) (head, rest string) {
 }
 
 // breakFirstLineTokens 对首行内命中的 token 逐词断字。
+//
+// 零宽容（2026-10-17 实测修正）：匹配前先把**零宽字符剥掉**再比。
+//
+// 为什么必须这样：Claude Code 的系统提示首行**自带零宽空格**——Anthropic 自己
+// 在每个单词首字母后插了 U+200B（防字符串级检测），实际发来的字节是
+//   "x​-a​nthropic-b​illing-h​eader: ..."
+// 而表里存的是纯 ASCII "x-anthropic-billing-header"。逐字节 Contains 永不命中，
+// 中和因此**从未生效**——这正是「客户端伪装不到位」在网关侧的具体形态。
+//
+// 实现：把首行过滤成「纯可见字节 + 原字节偏移」的平行数组，在过滤后的串上定位
+// token，再把命中的区间换算回原串偏移去插零宽字符。这样命中判断与插入位置都对。
 func breakFirstLineTokens(head string, changed *bool) string {
+	// 构造过滤后的串（丢弃零宽类字符），并记录每个过滤后位置的原始字节偏移。
+	visible := make([]byte, 0, len(head))
+	origin := make([]int, 0, len(head)) // origin[i] = visible[i] 在 head 里的起始字节偏移
+	for i := 0; i < len(head); {
+		size, isZW := zeroWidthAt(head, i)
+		if isZW {
+			i += size
+			continue
+		}
+		visible = append(visible, head[i])
+		origin = append(origin, i)
+		i++
+	}
+	if len(visible) == 0 {
+		return head
+	}
+	haystack := string(visible)
+
 	insertAt := map[int]struct{}{}
 	for _, token := range channelFirstLineTriggerTokens {
 		start := 0
 		for {
-			index := indexFrom(head, token, start)
+			index := indexFrom(haystack, token, start)
 			if index < 0 {
 				break
 			}
-			for _, pos := range wordBreakPoints(head, index, index+len(token)) {
-				insertAt[pos] = struct{}{}
+			// 过滤后区间 [index, index+len(token)) → 原串偏移换算后交给 wordBreakPoints
+			for _, pos := range wordBreakPoints(haystack, index, index+len(token)) {
+				// wordBreakPoints 的偏移是过滤后的位置，换算回原串
+				if pos >= len(origin) {
+					continue
+				}
+				insertAt[origin[pos]] = struct{}{}
 			}
 			start = index + len(token)
 		}
@@ -234,6 +268,31 @@ func breakFirstLineTokens(head string, changed *bool) string {
 	}
 	*changed = true
 	return insertBreaks(head, points)
+}
+
+// zeroWidthAt 报告 head[i] 处是否是一个零宽/格式类字符，并返回其字节长度。
+// 覆盖 Claude Code 实际使用的 U+200B，以及同类常见形态（U+200C/200D/2060/FEFF）
+// ——它们在「两个字母之间插入」这件事上对匹配的影响完全相同。
+func zeroWidthAt(s string, i int) (int, bool) {
+	if i >= len(s) {
+		return 0, false
+	}
+	switch {
+	case s[i] == 0xE2: // U+2000–U+206F 区（含 200B/200C/200D/2060）
+		if i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0x8B || s[i+2] == 0x8C || s[i+2] == 0x8D) {
+			return 3, true
+		}
+		if i+2 < len(s) && s[i+1] == 0x81 && s[i+2] == 0xA0 { // U+2060 word joiner
+			return 3, true
+		}
+		return 1, false
+	case s[i] == 0xEF: // U+FEFF BOM / zero width no-break space
+		if i+2 < len(s) && s[i+1] == 0xBB && s[i+2] == 0xBF {
+			return 3, true
+		}
+		return 1, false
+	}
+	return 1, false
 }
 
 // neutralizeMessageText 只对消息正文断词：content（字符串或 part 数组的 text/thinking）、
