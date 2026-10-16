@@ -194,6 +194,22 @@ type StreamOptions struct {
 	OnHold func()
 }
 
+// reasoningLoopModels 是启用重复短行保护的白名单。
+//
+// 为什么是白名单而不是「所有模型」：判定用的是启发式（短行重复覆盖率），
+// 合法输出里也可能出现重复短行（表格、状态行）。白名单保证只有**已观测到**
+// 该形态退化的模型才承担误截风险。
+//
+// 2026-10-16 扩充：加入 glm-5.3。此前只有 deepseek-v4.1-flash，于是 trae 域
+// （用户主力是 trae:glm-5.3）**完全没有循环保护**——实测模型在 Remote 沙箱里
+// 陷入「文件在客户端还是服务端」的自我纠结，连续推理 15 万字符不收敛，客户端
+// 只能一直等，既不报错也不出答案。glm-5.3 的退化形态与 deepseek 同形
+// （十来句口头禅轮换的叙述循环），因此沿用同一套判据。
+var reasoningLoopModels = map[string]bool{
+	"deepseek-v4.1-flash": true,
+	"glm-5.3":             true,
+}
+
 func reasoningLoopModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if realm, bare, found := strings.Cut(model, ":"); found {
@@ -211,7 +227,17 @@ func reasoningLoopModel(model string) bool {
 			return false
 		}
 	}
-	return model == "deepseek-v4.1-flash"
+	// 上下文标记后缀（[1M]）在 handler 里已剥离，这里只需处理 Trae 的 max 档
+	// 命名（glm-5.3-max，见 remote.go 的 max 模式）。
+	//
+	// 只认这一个后缀，不做通配前缀匹配：既有契约测试锁定
+	// `deepseek-v4.1-flash-other` 这类未知名**不得**被纳入保护，宽匹配会把它
+	// 误判成已知模型的档位变体。
+	if reasoningLoopModels[model] {
+		return true
+	}
+	return strings.HasSuffix(model, "-max") &&
+		reasoningLoopModels[strings.TrimSuffix(model, "-max")]
 }
 
 func IsReasoningLoopError(err error) bool {

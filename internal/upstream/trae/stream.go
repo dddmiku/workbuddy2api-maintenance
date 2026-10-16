@@ -268,17 +268,263 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
 	//
-	// 带**当前轮图片**的请求不回落：Remote 端点读不到内联图片（见 ChatStream 注释
-	// 的实测），回落等于把图悄悄丢掉，用户会拿到一个「没看图」的回答而无从察觉。
-	// 宁可如实把 3004 报给客户端（它可以选择压缩历史后重试）。
+	// 带**当前轮图片**的请求不能回落 Remote：Remote 端点读不到内联图片（见
+	// ChatStream 注释的实测），回落等于把图悄悄丢掉，用户会拿到一个「没看图」的
+	// 回答而无从察觉。
+	//
+	// 但**也不能就此把 400 直接甩给用户**（v3.8.3 的行为，实测代价很大）：
+	// Claude Code 的常态是「工具密集历史 + 本轮贴图」，这类请求必然撞 3004，
+	// 于是带图提问在长会话里**必然失败**。3004 的触发维度是**结构化工具字段**
+	// （tool_calls/tool_call_id），不是体积——所以这里给带图请求一条真正的出路：
+	// 把工具轮次扁平化成文本标记后**重发同一个端点**，图片原样保留（见
+	// flattenToolTurnsForLegacy）。两条路径的取舍是「留图但丢结构化工具字段」
+	// 对「丢图但留结构化工具字段」，前者对「用户想看这张图」的意图更贴合。
 	//
 	// 判据是 freshInputHasImages（只看本轮新输入），不是 requestHasImages：
 	// 用后者会让「历史里贴过一张图」永久禁用该会话的回落，正常提问直接吃 400
 	// ——这正是 v3.8.2 引入、v3.8.3 修掉的回归。
-	if RemoteEnabled() && !freshInputHasImages(prepared) {
-		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
+	if RemoteEnabled() {
+		if !freshInputHasImages(prepared) {
+			stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
+		} else {
+			stream = newImageFallbackReader(ctx, a, prepared, clientIP, stream)
+		}
 	}
 	return stream, resp.StatusCode, nil, nil
+}
+
+// imageFallbackReader 在**带当前轮图片**的请求被 3004 拒绝时，把工具轮次扁平化成
+// 文本标记后重发同一个端点。
+//
+// 与 remoteFallbackReader 的差别：
+//   - 它换端点（Remote），代价是丢图；
+//   - 本读取器换**请求形态**（扁平化），代价是丢结构化工具字段。
+//
+// 共同点：都只在「客户端还没收到任何实质内容」时切换，都在切换后不再回头。
+type imageFallbackReader struct {
+	ctx      context.Context
+	auth     *auth.Auth
+	prepared []byte
+	clientIP string
+	primary  io.ReadCloser
+
+	secondary io.ReadCloser
+	sawContent bool
+	buffered   []byte
+	released   bool
+	done       bool
+}
+
+func newImageFallbackReader(ctx context.Context, a *auth.Auth, prepared []byte,
+	clientIP string, primary io.ReadCloser) *imageFallbackReader {
+	return &imageFallbackReader{ctx: ctx, auth: a, prepared: prepared,
+		clientIP: clientIP, primary: primary}
+}
+
+// Read 的判定逻辑与 remoteFallbackReader 同形（先扣住非实质字节，直到确认要么
+// 有内容要么可切换），只在切换动作上不同。
+func (r *imageFallbackReader) Read(p []byte) (int, error) {
+	for {
+		if r.secondary != nil {
+			n, err := r.secondary.Read(p)
+			if n > 0 {
+				r.sawContent = true
+			}
+			return n, err
+		}
+		if r.released {
+			if len(r.buffered) > 0 {
+				n := copy(p, r.buffered)
+				r.buffered = r.buffered[n:]
+				return n, nil
+			}
+			if r.done {
+				return 0, io.EOF
+			}
+			n, err := r.primary.Read(p)
+			if n > 0 {
+				r.sawContent = true
+			}
+			if err != nil {
+				r.done = true
+			}
+			return n, err
+		}
+		if r.done {
+			return 0, io.EOF
+		}
+		n, err := r.primary.Read(p)
+		if n > 0 {
+			if containsSubstantiveDelta(p[:n]) {
+				r.sawContent = true
+				r.released = true
+				r.buffered = append(r.buffered, p[:n]...)
+				n = copy(p, r.buffered)
+				r.buffered = r.buffered[n:]
+				return n, nil
+			}
+			r.buffered = append(r.buffered, p[:n]...)
+			continue
+		}
+		if err == nil {
+			continue
+		}
+		if !r.sawContent && isToolTurnLimitError(err) {
+			flattened, ok := flattenToolTurnsForLegacy(r.prepared)
+			if ok {
+				if secondary, ferr := resendLegacyFlat(r.ctx, r.auth, flattened, r.clientIP); ferr == nil {
+					log.Printf("INFO: [trae] 带图请求因工具轮次超限被拒（3004），已扁平化工具轮次后重发（图片保留）")
+					_ = r.primary.Close()
+					r.secondary = secondary
+					r.buffered = nil
+					continue
+				} else {
+					log.Printf("WARN: [trae] 扁平化重发失败：%v（原始错误：%v）", ferr, err)
+				}
+			}
+		}
+		r.done = true
+		if len(r.buffered) > 0 {
+			n := copy(p, r.buffered)
+			r.buffered = r.buffered[n:]
+			if n > 0 {
+				return n, nil
+			}
+		}
+		return 0, err
+	}
+}
+
+func (r *imageFallbackReader) Close() error {
+	err := r.primary.Close()
+	if r.secondary != nil {
+		if serr := r.secondary.Close(); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	return err
+}
+
+// flattenToolTurnsForLegacy 把消息里的**结构化工具字段**降级成文本标记，保留图片块。
+//
+// 为什么这样能绕开 3004：实测触发条件是「请求体里带 tool_calls / tool_call_id
+// 结构化字段」——2 条消息/1600KB 纯文本成功，而 120 条工具密集消息/311KB 被拒；
+// 只丢 tool_calls 或只丢 tool_call_id 仍被拒，**两者都转成纯文本才通过**。
+// 本函数正是做这件事，且**不动图片块**（图片走 legacy 的原生 content 数组）。
+//
+// 返回 ok=false 表示没有可降级的工具字段（重发无意义，别白花一次请求）。
+func flattenToolTurnsForLegacy(prepared []byte) ([]byte, bool) {
+	var src map[string]any
+	if json.Unmarshal(prepared, &src) != nil || src == nil {
+		return nil, false
+	}
+	rawMessages, _ := src["messages"].([]any)
+	if len(rawMessages) == 0 {
+		return nil, false
+	}
+	changed := false
+	out := make([]any, 0, len(rawMessages))
+	for _, raw := range rawMessages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		role, _ := message["role"].(string)
+		role = strings.ToLower(strings.TrimSpace(role))
+		switch role {
+		case "assistant":
+			calls, _ := message["tool_calls"].([]any)
+			if len(calls) == 0 {
+				out = append(out, raw)
+				continue
+			}
+			// 调用记录转成正文文本；结构化字段整个删掉。
+			text := messageText(message["content"])
+			if history := serializeToolCalls(calls); history != "" {
+				if text != "" {
+					text += "\n\n"
+				}
+				text += history
+			}
+			copied := cloneMessage(message)
+			delete(copied, "tool_calls")
+			delete(copied, "function_call")
+			copied["content"] = text
+			out = append(out, copied)
+			changed = true
+		case "tool", "function":
+			// 工具结果转成 user 消息（保留图片块，若有）。
+			text := messageText(message["content"])
+			name, _ := message["name"].(string)
+			if name == "" {
+				name = "tool"
+			}
+			copied := cloneMessage(message)
+			delete(copied, "tool_call_id")
+			delete(copied, "name")
+			copied["role"] = "user"
+			copied["content"] = "[Client Tool Result: " + name + "]\n" + text
+			out = append(out, copied)
+			changed = true
+		default:
+			out = append(out, raw)
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	src["messages"] = out
+	// tools 定义本身不触发 3004（实测纯文本 + tools 可通过），但既然已经降级成
+	// 文本协议，就把结构化 tools 去掉，避免上游按原生工具路径再走一遍限制。
+	delete(src, "tools")
+	delete(src, "tool_choice")
+	delete(src, "parallel_tool_calls")
+	encoded, err := json.Marshal(src)
+	if err != nil {
+		return nil, false
+	}
+	return encoded, true
+}
+
+// resendLegacyFlat 用扁平化后的请求体重发 llm_utils_chat（图片原样保留）。
+func resendLegacyFlat(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, error) {
+	requestID := newRequestID()
+	body, err := BuildChatBody(prepared, requestID)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBaseVar+ChatPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range buildHeaders(a) {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("trae 扁平化重发 HTTP %d：%s", resp.StatusCode, truncate(string(raw), 200))
+	}
+	return TranslateStreamWithTools(resp.Body, modelFromPrepared(prepared), preparedTools(prepared)), nil
+}
+
+// cloneMessage 浅拷贝一条消息（改字段时不污染原请求体）。
+func cloneMessage(message map[string]any) map[string]any {
+	copied := make(map[string]any, len(message)+1)
+	for key, value := range message {
+		copied[key] = value
+	}
+	return copied
 }
 
 // remoteFallbackReader 在 llm_utils_chat 因工具轮次超限被拒时，透明切到 Remote 端点。
@@ -1124,6 +1370,15 @@ func (t *translator) flushReasoning(out *bytes.Buffer) {
 		t.start(out)
 		t.emit(out, map[string]any{"reasoning_content": text}, nil)
 	}
+	// 尾部通道**继承**正文前的去重状态。
+	//
+	// 上游发的是**累计快照**：正文之后到达的 thought 通常是「正文前那段 + 新增」
+	// 的完整前缀扩展。若尾部通道从空状态起步，那段前缀会被当成全新文本整段再交付
+	// 一次——生产实测的表现就是 thinking 首尾相接重复两遍（同一段话出现两次）。
+	// 继承 raw/visible 后，add() 的前缀匹配会正确算出「只交付新增部分」。
+	// 新思考（与前面无关）走 default 分支拼接，不受影响。
+	t.lateReasoning.raw = t.reasoning.raw
+	t.lateReasoning.visible = t.reasoning.visible
 }
 
 // flushLateReasoning 收尾时发出「正文开始后」到达的思考（合并成一个 block）。

@@ -130,6 +130,148 @@ func countRuns(items []string, kind string) int {
 	return runs
 }
 
+// TestLateReasoningDoesNotRepeatPreContentThought 尾部思考通道不得重发正文前的思考。
+//
+// 这是「思考被完整重复两遍」的直接判据（2026-10-16 生产实测：一个简单请求返回的
+// thinking 是同一段话首尾相接的两份）。
+//
+// 根因：正文开始后到达的思考改走 lateReasoning 尾部通道，而它是**全新的**累加器
+// （raw 为空）。上游每个 plan_item 都带**累计快照**，于是「正文前那段思考」会作为
+// 新快照的前缀被整段再交付一次——首尾相接的重复。
+func TestLateReasoningDoesNotRepeatPreContentThought(t *testing.T) {
+	upstream := strings.Join([]string{
+		"event: output\ndata: {\"reasoning_content\":\"先想第一步。\"}\n\n",
+		"event: output\ndata: {\"reasoning_content\":\"先想第一步。再想第二步。\"}\n\n",
+		"event: output\ndata: {\"reasoning_content\":\"先想第一步。再想第二步。\",\"response\":\"答案。\"}\n\n",
+		// 正文之后上游又发一遍累计快照（实测形态）：只有新增部分该交付。
+		"event: output\ndata: {\"reasoning_content\":\"先想第一步。再想第二步。收尾检查。\",\"response\":\"答案。\"}\n\n",
+		"event: done\ndata: {}\n\n",
+	}, "")
+	sse, err := collect(t, upstream)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	joined := strings.Join(reasoningFrames(t, sse), "")
+	if count := strings.Count(joined, "先想第一步。"); count != 1 {
+		t.Fatalf("正文前的思考被交付 %d 次（应为 1 次）：%q", count, joined)
+	}
+	if count := strings.Count(joined, "再想第二步。"); count != 1 {
+		t.Fatalf("思考被重复交付：%q", joined)
+	}
+	// 正文之后真正新增的思考不能丢。
+	if !strings.Contains(joined, "收尾检查") {
+		t.Errorf("正文后新增的思考丢失：%q", joined)
+	}
+	// 正文不受影响。
+	if content := contentOf(t, sse); !strings.Contains(content, "答案") {
+		t.Errorf("正文丢失：%q", content)
+	}
+}
+
+// TestLateReasoningFreshThoughtKept 尾部通道里的**新**思考要原样保留（不被去重误伤）。
+func TestLateReasoningFreshThoughtKept(t *testing.T) {
+	upstream := strings.Join([]string{
+		"event: output\ndata: {\"reasoning_content\":\"开头想法。\",\"response\":\"正文一\"}\n\n",
+		// 与前面完全无关的新思考（不是累计快照）：必须交付。
+		"event: output\ndata: {\"reasoning_content\":\"另一段独立想法。\",\"response\":\"正文二\"}\n\n",
+		"event: done\ndata: {}\n\n",
+	}, "")
+	sse, err := collect(t, upstream)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	joined := strings.Join(reasoningFrames(t, sse), "")
+	for _, want := range []string{"开头想法", "另一段独立想法"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("思考丢失 %q：%q", want, joined)
+		}
+	}
+}
+
+// TestFlattenToolTurnsKeepsImages 扁平化工具轮次时不得动图片块。
+//
+// 这是「带图 + 工具密集」场景的出路：Claude Code 的常态就是工具密集历史 + 本轮
+// 贴图，这类请求必然撞 3004（触发维度是结构化工具字段，与体积无关）。回落 Remote
+// 会丢图，所以改成**扁平化工具轮次后重发同一端点**——图片必须原样保留，否则这条
+// 出路等于换一种方式丢图。
+func TestFlattenToolTurnsKeepsImages(t *testing.T) {
+	prepared, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "开始"},
+			map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
+				map[string]any{"id": "c1", "type": "function",
+					"function": map[string]any{"name": "Read", "arguments": `{"file_path":"/a"}`}}}},
+			map[string]any{"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "这张图呢"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64,QUJD"}}}},
+		},
+		"tools": []any{map[string]any{"type": "function",
+			"function": map[string]any{"name": "Read", "parameters": map[string]any{"type": "object"}}}},
+	})
+	flat, ok := flattenToolTurnsForLegacy(prepared)
+	if !ok {
+		t.Fatal("有结构化工具字段时应能扁平化")
+	}
+	text := string(flat)
+	// 结构化字段必须消失（这才是绕开 3004 的关键）。
+	if strings.Contains(text, `"tool_calls"`) {
+		t.Errorf("tool_calls 未清除，3004 仍会触发：%s", text)
+	}
+	if strings.Contains(text, `"tool_call_id"`) {
+		t.Errorf("tool_call_id 未清除，3004 仍会触发：%s", text)
+	}
+	// 图片必须还在。
+	if !strings.Contains(text, "QUJD") {
+		t.Fatalf("图片被扁平化丢掉了：%s", text)
+	}
+	if !strings.Contains(text, `"image_url"`) {
+		t.Errorf("图片块类型丢失：%s", text)
+	}
+	// 工具语义要保留成文本（模型仍需知道工具轮次发生过）。
+	if !strings.Contains(text, "Client Tool Result") && !strings.Contains(text, "Client tool history") {
+		t.Errorf("工具轮次语义丢失：%s", text)
+	}
+}
+
+// TestFlattenToolTurnsNoToolsUnchanged 没有工具字段时不做无谓重发。
+func TestFlattenToolTurnsNoToolsUnchanged(t *testing.T) {
+	prepared, _ := json.Marshal(map[string]any{
+		"model":    "glm-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": "纯文本"}},
+	})
+	if _, ok := flattenToolTurnsForLegacy(prepared); ok {
+		t.Error("无工具字段时不该报告可扁平化（会白花一次请求）")
+	}
+}
+
+// TestImageRequestGetsFallbackPath 带图请求必须挂上扁平化回落读取器。
+//
+// v3.8.3 的行为是「带图就不回落」——于是带图提问在长会话里必然吃 400。
+// 现在改为：带图 → 扁平化回落；不带图 → Remote 回落。两条路都不再是死路。
+func TestImageRequestGetsFallbackPath(t *testing.T) {
+	// 这条规则由 chatStreamLegacy 的分支保证；这里断言判据本身的取值，
+	// 因为两处必须一致（否则会退化成「挂着读取器却不触发」或反之）。
+	withImage, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{
+				"url": "data:image/png;base64,QUJD"}}}}},
+	})
+	if !freshInputHasImages(withImage) {
+		t.Fatal("本轮带图应判为真（走扁平化回落）")
+	}
+	textOnly, _ := json.Marshal(map[string]any{
+		"model":    "glm-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if freshInputHasImages(textOnly) {
+		t.Error("纯文本应判为假（走 Remote 回落）")
+	}
+}
+
 // TestTextToolCallExtractedFromContent 正文里的 opencode_tool_call 必须转成 tool_calls。
 //
 // 这是「工具调用凭空消失」的直接判据。旧实现只在 visibleText 里 strip 掉块，

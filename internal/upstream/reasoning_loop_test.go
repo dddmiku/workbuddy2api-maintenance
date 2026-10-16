@@ -144,6 +144,18 @@ func TestReasoningLoopGuardModelScopeAndDisabledCompatibility(t *testing.T) {
 			}
 		})
 	}
+	// 2026-10-16 扩充：trae:glm-5.3 必须受保护。此前白名单只认 deepseek-v4.1-flash，
+	// 于是用户主力模型 trae:glm-5.3 **完全没有循环保护**——实测模型在 Remote 沙箱里
+	// 陷入「文件在客户端还是服务端」的自我纠结，连续推理 15 万字符不收敛，客户端
+	// 既不报错也拿不到答案。
+	for _, model := range []string{"glm-5.3", "trae:glm-5.3", "cn:glm-5.3", "glm-5.3-max"} {
+		t.Run("guarded/"+model, func(t *testing.T) {
+			result, err := Aggregate(strings.NewReader(raw), StreamOptions{Model: model, ReasoningLoopGuard: true})
+			if result != nil || !IsReasoningLoopError(err) {
+				t.Fatalf("glm-5.3 未被循环保护覆盖（trae 域会静默失去保护）：%v", err)
+			}
+		})
+	}
 	for _, options := range []StreamOptions{
 		{Model: "deepseek-v4.1-flash", ReasoningLoopGuard: false},
 		{Model: "deepseek-v3", ReasoningLoopGuard: true},

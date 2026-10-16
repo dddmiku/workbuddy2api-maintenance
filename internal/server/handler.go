@@ -2120,6 +2120,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
+			//
+			// 必须落日志：此前这里只写响应不记日志，于是生产出现 502 时日志里
+			// **一行都没有**（实测 2026-10-16 10:47 两次 502 完全静默），排障只能
+			// 靠猜。错误码与原文一起记，与流式路径的口径一致。
+			log.Printf("WARN: [服务] 非流式上游失败 uid=%s 模型=%s code=upstream_parse 原文=%s",
+				logfmt.UID8(acct.UID), bareModel, logfmt.Truncate(err.Error(), 200))
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
@@ -2127,6 +2133,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if checker, ok := w.(interface{ ValidateCompletion(map[string]any) error }); ok {
 			if err := checker.ValidateCompletion(resp); err != nil {
 				st.trace.markLastFailure("response_contract_violation", false)
+				log.Printf("WARN: [服务] 非流式响应契约违规 uid=%s 模型=%s 原文=%s",
+					logfmt.UID8(acct.UID), bareModel, logfmt.Truncate(err.Error(), 200))
 				writeOpenAIError(w, http.StatusBadGateway, "response_contract_violation", err.Error())
 				st.status = http.StatusBadGateway
 				return
