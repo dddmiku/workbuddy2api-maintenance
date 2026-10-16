@@ -112,7 +112,73 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	return chatStreamLegacy(ctx, a, prepared, clientIP)
 }
 
-// requestHasImages 报告出站请求体里是否带图片块。
+// freshInputHasImages 报告「本轮新输入」里是否带图片。
+//
+// 轮次边界是**上一条不含工具调用的 assistant 消息**——那才是上一轮的回答；
+// 带 tool_calls 的 assistant 消息属于**本轮的中间步骤**，不是边界。
+//
+// 为什么边界要这样定（两个都踩过的坑）：
+//  1. 不能取「最后一条消息」：Claude Code 的工具轮形态是
+//     [… 用户贴图, assistant(tool_calls), tool(结果)]，最后一条是 tool_result
+//     （role=user 但无图），只看最后一条会把用户刚贴的图误判成「无图」；
+//  2. 不能把带 tool_calls 的 assistant 当边界：那会让图片落在边界之前，
+//     同样误判成「无图」。
+//
+// 与 requestHasImages 的分工（2026-10-16 回归修复）：
+//   - requestHasImages（扫全部消息）用于**路由**：历史里有图也该走 legacy，
+//     因为它把 messages 原样透传，图片不会丢；
+//   - 本函数用于**回落闸门**：只有本轮新输入带图才值得挡住回落。
+//
+// 为什么必须区分（v3.8.2 的教训）：回落闸门最初也用 requestHasImages，结果
+// 「会话历史里曾经贴过一张截图」就永久禁用了该会话的 3004 回落——用户正常提问
+// 直接吃 400，比丢一张旧图严重得多。实测事故：Claude Code 会话里带过截图后，
+// trae:glm-5.3 连续三次 400，日志里没有任何回落记录。
+func freshInputHasImages(prepared []byte) bool {
+	if len(prepared) == 0 {
+		return false
+	}
+	var src map[string]any
+	if err := json.Unmarshal(prepared, &src); err != nil {
+		return true
+	}
+	messages, _ := src["messages"].([]any)
+	// 从末尾往前扫，遇到「不含工具调用的 assistant 消息」即停——它之后的就是本轮。
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, ok := messages[index].(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if strings.EqualFold(strings.TrimSpace(role), "assistant") && !hasToolCalls(message) {
+			break
+		}
+		if messageHasImageBlock(message) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasToolCalls 报告 assistant 消息是否携带工具调用（决定它是不是轮次边界）。
+func hasToolCalls(message map[string]any) bool {
+	for _, key := range []string{"tool_calls", "function_call"} {
+		if value, present := message[key]; present && value != nil {
+			switch typed := value.(type) {
+			case []any:
+				if len(typed) > 0 {
+					return true
+				}
+			case map[string]any:
+				if len(typed) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// requestHasImages 报告出站请求体里是否带图片块（扫全部消息，含历史）。
 //
 // 解析失败按「有图片」处理（走 legacy）：宁可少用 Remote 的能力，也不能把用户的
 // 图片静默丢掉——丢图的回答看起来像模型没看图，用户无从察觉。
@@ -130,18 +196,26 @@ func requestHasImages(prepared []byte) bool {
 		if !ok {
 			continue
 		}
-		content, ok := message["content"].([]any)
+		if messageHasImageBlock(message) {
+			return true
+		}
+	}
+	return false
+}
+
+// messageHasImageBlock 报告一条消息的 content 里是否含图片块。
+func messageHasImageBlock(message map[string]any) bool {
+	content, ok := message["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range content {
+		block, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		for _, item := range content {
-			block, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if rendererMediaBlock(block) != nil {
-				return true
-			}
+		if rendererMediaBlock(block) != nil {
+			return true
 		}
 	}
 	return false
@@ -194,10 +268,14 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
 	//
-	// 带图请求**不回落**：Remote 端点读不到内联图片（见 ChatStream 注释的实测），
-	// 回落等于把图悄悄丢掉，用户会拿到一个「没看图」的回答而无从察觉。宁可如实
-	// 把 3004 报给客户端（它可以选择压缩历史后重试），也不交付一个缺图的结果。
-	if RemoteEnabled() && !requestHasImages(prepared) {
+	// 带**当前轮图片**的请求不回落：Remote 端点读不到内联图片（见 ChatStream 注释
+	// 的实测），回落等于把图悄悄丢掉，用户会拿到一个「没看图」的回答而无从察觉。
+	// 宁可如实把 3004 报给客户端（它可以选择压缩历史后重试）。
+	//
+	// 判据是 freshInputHasImages（只看本轮新输入），不是 requestHasImages：
+	// 用后者会让「历史里贴过一张图」永久禁用该会话的回落，正常提问直接吃 400
+	// ——这正是 v3.8.2 引入、v3.8.3 修掉的回归。
+	if RemoteEnabled() && !freshInputHasImages(prepared) {
 		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
 	}
 	return stream, resp.StatusCode, nil, nil

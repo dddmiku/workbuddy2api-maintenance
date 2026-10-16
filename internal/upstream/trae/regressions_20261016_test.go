@@ -235,6 +235,76 @@ func TestDeclaredToolCallAllowed(t *testing.T) {
 	}
 }
 
+// TestHistoricalImageDoesNotBlockFallback 历史里有图不得禁用回落（v3.8.2 回归）。
+//
+// 事故：回落闸门最初用 requestHasImages（扫全部消息），于是「会话里贴过一张截图」
+// 就永久禁用该会话的 3004 回落——用户正常提问直接吃 400。实测：Claude Code 会话
+// 带过截图后，trae:glm-5.3 连续三次 400，日志里没有任何回落记录。
+//
+// 正确语义：路由看全部消息（历史有图也走 legacy，图片不会丢）；回落闸门只看本轮
+// 新输入（历史旧图丢了不影响当前提问）。
+func TestHistoricalImageDoesNotBlockFallback(t *testing.T) {
+	// 历史里有图，本轮是纯文本 → 不该挡回落。
+	historical, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "看这张图"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64,QUJD"}}}},
+			map[string]any{"role": "assistant", "content": "我看到一张图。"},
+			map[string]any{"role": "user", "content": "继续刚才的话题"},
+		},
+	})
+	if !requestHasImages(historical) {
+		t.Error("路由判据应认出历史里有图（走 legacy，图片不会丢）")
+	}
+	if freshInputHasImages(historical) {
+		t.Error("本轮是纯文本，回落闸门不该被历史图片挡住——那正是 v3.8.2 的回归")
+	}
+
+	// 本轮带图 → 该挡回落。
+	fresh, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "先前的纯文本"},
+			map[string]any{"role": "assistant", "content": "好的。"},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "这张图呢"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64,QUJD"}}}},
+		},
+	})
+	if !freshInputHasImages(fresh) {
+		t.Error("本轮带图，回落闸门应生效（否则会丢当前轮的图）")
+	}
+}
+
+// TestFreshInputImageAfterToolResult 工具轮里用户贴的图不能被漏判。
+//
+// Claude Code 的工具轮形态是 [... 用户贴图, tool_result, ...]，最后一条是
+// tool_result（role=user 但无图）。只看最后一条会误判成「无图」，于是刚贴的图
+// 被回落丢掉。判据必须是「上一条 assistant 之后的所有消息」。
+func TestFreshInputImageAfterToolResult(t *testing.T) {
+	withToolResult, _ := json.Marshal(map[string]any{
+		"model": "glm-5.3",
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": "上一轮回答"},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "看看这张图"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64,QUJD"}}}},
+			map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
+				map[string]any{"id": "c1", "type": "function",
+					"function": map[string]any{"name": "Read", "arguments": "{}"}}}},
+			map[string]any{"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+		},
+	})
+	if !freshInputHasImages(withToolResult) {
+		t.Fatal("工具轮里用户贴的图被漏判——只看最后一条会踩这个坑")
+	}
+}
+
 // TestImageRequestDoesNotFallBackToRemote 带图请求在 3004 时也不回落 Remote。
 //
 // 回落会把图片悄悄丢掉（Remote 读不到内联图），用户拿到「没看图」的回答却无从
