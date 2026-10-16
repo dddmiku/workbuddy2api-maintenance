@@ -951,60 +951,67 @@ func commonPrefixLen(left, right string) int {
 	return index
 }
 
-// toolBlockPairs 是正文里可能出现的序列化工具块（上游把工具调用写进文本的形态）。
-var toolBlockPairs = [][2]string{
-	{"<opencode_tool_call>", "</opencode_tool_call>"},
-	{"<tool_use>", "</tool_use>"},
-	{"<tool_call", "</tool_call>"},
-	{"<tool_cell", "</tool_cell>"},
-	{"<invoke", "</invoke>"},
-	{"<bash>", "</bash>"},
-	{"<read>", "</read>"},
-	{"<write>", "</write>"},
-	{"<edit>", "</edit>"},
-	{"<glob>", "</glob>"},
-	{"<grep>", "</grep>"},
-	{"<task>", "</task>"},
+// toolBlockOpeners 是可能出现在正文里的工具块开标签（未闭合检测用）。
+//
+// 由 tooltext.go 的 textToolTags 派生，**不再单独维护**：此前这里是独立的一份
+// toolBlockPairs，与抽取用的 textToolTags 各写一份，实测已经漂移
+// （`toolcall` 只抽取不剥离、`bash/read/…` 只剥离不抽取）。单一来源从结构上
+// 消灭这类不一致。
+func toolBlockOpeners() []string {
+	openers := make([]string, 0, len(textToolTags))
+	for _, tag := range textToolTags {
+		openers = append(openers, "<"+tag)
+	}
+	return openers
 }
 
 // stripToolCallBlocks 移除成对的工具块；未闭合的块由 holdIncompleteToolBlock 压住。
+//
+// **识别到就剥离，不论能否解析成调用**（保持既有契约，见
+// TestVisibleTextHoldsIncompleteToolBlock）。另一种做法是「读不出的块原样保留」
+// （magpie 的选择），但那会把原始协议标签漏给用户，而它自己的 #2414 记录过那条路
+// 的代价（agent 把原始标签当答案收下、调用彻底丢失）。两条路都有代价：
+//   本实现：不泄漏协议标记，代价是读不出的块内容会消失；
+//   magpie：内容不丢，代价是原始标签进正文。
+// 这里选前者，但**把「内容消失」从静默变成可观测**：translator 统计读不出的块数，
+// 收尾时记一行 WARN（见 translator.unparsedBlocks），排障时能看到发生过几次。
 func stripToolCallBlocks(text string) string {
-	out := text
-	for _, pair := range toolBlockPairs {
-		for {
-			start := strings.Index(out, pair[0])
-			if start < 0 {
-				break
-			}
-			end := strings.Index(out[start+len(pair[0]):], pair[1])
-			if end < 0 {
-				break
-			}
-			out = out[:start] + out[start+len(pair[0])+end+len(pair[1]):]
-		}
+	blocks := scanToolBlocks(text)
+	if len(blocks) == 0 {
+		return text
 	}
-	return out
+	var out strings.Builder
+	cursor := 0
+	for _, block := range blocks {
+		out.WriteString(text[cursor:block.start])
+		cursor = block.end
+	}
+	out.WriteString(text[cursor:])
+	return out.String()
 }
 
 // holdIncompleteToolBlock 截断到第一个「已开始但还没闭合」的工具块之前，
 // 避免把半截工具标记当正文发给客户端。
 func holdIncompleteToolBlock(text string) string {
+	if text == "" {
+		return text
+	}
 	lowered := strings.ToLower(text)
 	earliest := len(text)
-	for _, pair := range toolBlockPairs {
-		start := strings.Index(lowered, pair[0])
+	for _, opener := range toolBlockOpeners() {
+		start := strings.Index(lowered, opener)
 		if start < 0 {
 			continue
 		}
-		if strings.Index(lowered[start+len(pair[0]):], pair[1]) < 0 {
+		if strings.Index(lowered[start+len(opener):], "</"+strings.TrimPrefix(opener, "<")+">") < 0 {
 			earliest = min(earliest, start)
 		}
 	}
 	// 可能正好停在 "<tool_c" 这种前缀上：压住最后一个 '<' 起的尾巴。
 	if last := strings.LastIndex(lowered, "<"); last >= 0 {
 		suffix := lowered[last:]
-		for _, pair := range toolBlockPairs {
-			if strings.HasPrefix(pair[0], suffix) {
+		for _, opener := range toolBlockOpeners() {
+			if strings.HasPrefix(opener, suffix) {
 				earliest = min(earliest, last)
 				break
 			}
@@ -1190,6 +1197,14 @@ type translator struct {
 	allowedTools map[string]bool
 	// droppedTools 被过滤掉的未声明调用数（收尾时记一行日志，不静默丢弃）。
 	droppedTools int
+	// unparsedBlocks 扫到但**读不出调用形态**的工具块数。
+	//
+	// 这些块会被 stripToolCallBlocks 从正文里删掉：用户看不到内容、也拿不到调用。
+	// 计数 + 一份样本在收尾时记日志，让这种「内容消失」可观测——持续非零说明模型
+	// 写出的形态超出解析器覆盖（magpie 的 #823 就是这么发现还缺两套格式的）。
+	unparsedBlocks int
+	unparsedSeen   map[string]bool
+	unparsedSample string
 }
 
 func newTranslator(model string) *translator {
@@ -1261,9 +1276,31 @@ func (t *translator) absorbTextToolCalls(out *bytes.Buffer) {
 		t.textToolSeen = map[string]bool{}
 	}
 	var found []textToolCall
-	found = append(found, extractTextToolCalls(t.text.raw, t.textToolSeen)...)
-	found = append(found, extractTextToolCalls(t.reasoning.raw, t.textToolSeen)...)
-	found = append(found, extractTextToolCalls(t.lateReasoning.raw, t.textToolSeen)...)
+	for _, raw := range []string{t.text.raw, t.reasoning.raw, t.lateReasoning.raw} {
+		found = append(found, extractTextToolCalls(raw, t.textToolSeen)...)
+		// 观测：扫到但读不出调用形态的块。这些块会被 stripToolCallBlocks 从正文里
+		// 删掉，用户看不到内容、也拿不到调用——如果数量持续不为零，说明模型写出的
+		// 形态超出解析器覆盖范围（magpie 的 #823 就是这么长出两套额外格式的）。
+		// 用 seen 集合去重，避免每个分片重复计数同一块。
+		if t.unparsedSeen == nil {
+			t.unparsedSeen = map[string]bool{}
+		}
+		for _, block := range scanToolBlocks(raw) {
+			if _, ok := parseTextToolCall(block.attrs, block.body); ok {
+				continue
+			}
+			key := block.tag + "\x00" + block.body
+			if t.unparsedSeen[key] {
+				continue
+			}
+			t.unparsedSeen[key] = true
+			t.unparsedBlocks++
+			// 只留开头一段样本，够识别形态即可（正文可能很长）。
+			if t.unparsedSample == "" {
+				t.unparsedSample = "<" + block.tag + ">" + truncate(strings.TrimSpace(block.body), 160)
+			}
+		}
+	}
 	if len(found) == 0 {
 		return
 	}
@@ -1441,6 +1478,12 @@ func (t *translator) finish(out *bytes.Buffer) error {
 	t.flushReasoning(out)
 	if t.droppedTools > 0 {
 		log.Printf("WARN: [trae] 丢弃 %d 个未声明工具的文本调用（模型臆造的工具名）", t.droppedTools)
+	}
+	// 读不出的块：内容会被剥离掉，所以必须留痕，否则「模型发了工具块但什么都没发生」
+	// 只能靠猜。样本用于识别模型实际写出的形态。
+	if t.unparsedBlocks > 0 {
+		log.Printf("WARN: [trae] %d 个工具块无法解析成调用，已从正文剥离（内容丢失）；样本=%s",
+			t.unparsedBlocks, t.unparsedSample)
 	}
 	if t.contentCount == 0 && !t.tools.hasCalls() {
 		t.start(out)

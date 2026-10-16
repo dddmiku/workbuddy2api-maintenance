@@ -268,6 +268,86 @@ func TestImageRejectMessageHasNoRateLimitWording(t *testing.T) {
 	}
 }
 
+// TestToolTagListIsSingleSource 剥离与抽取必须共用同一份标签表。
+//
+// 2026-10-16 重构前的实测漂移：剥离用 stream.go 的 toolBlockPairs、抽取用
+// tooltext.go 的 textToolTags，两处各写一份且已经不一致——
+//   `toolcall` 只抽取不剥离（块被抽成调用，但正文里还留着原始标签）
+//   `bash/read/write/edit/glob/grep/task` 只剥离不抽取（内容被删掉，也没变调用）
+// 注释里写着「两处必须同步增删」，靠自觉维持不住。现在两处都走 scanToolBlocks，
+// 本测试把「不再有第二份表」钉死。
+func TestToolTagListIsSingleSource(t *testing.T) {
+	// 每个已知标签都必须能被扫描器认出来（闭合块）。
+	for _, tag := range textToolTags {
+		text := "前<" + tag + ` name="Read">x</` + tag + ">后"
+		blocks := scanToolBlocks(text)
+		if len(blocks) != 1 {
+			t.Errorf("标签 %s 未被扫描器识别（blocks=%d）", tag, len(blocks))
+			continue
+		}
+		if blocks[0].tag != tag {
+			t.Errorf("标签 %s 识别成了 %s", tag, blocks[0].tag)
+		}
+	}
+	// 抽取与剥离对同一个块必须给出一致判断：能被抽成调用的，必然被剥离。
+	callable := `前<opencode_tool_call>{"name":"Read","input":{}}</opencode_tool_call>后`
+	if len(extractTextToolCalls(callable, map[string]bool{})) != 1 {
+		t.Fatal("可解析的块应被抽成调用")
+	}
+	if got := stripToolCallBlocks(callable); got != "前后" {
+		t.Errorf("可解析的块应被剥离：%q", got)
+	}
+	// 反向：`toolcall` 这个标签过去「只抽取不剥离」，现在两侧必须一致。
+	toolcall := `前<toolcall>{"name":"Read","input":{}}</toolcall>后`
+	if len(extractTextToolCalls(toolcall, map[string]bool{})) != 1 {
+		t.Error("toolcall 标签应被抽成调用")
+	}
+	if got := stripToolCallBlocks(toolcall); got != "前后" {
+		t.Errorf("toolcall 标签应被剥离（此前只抽取不剥离）：%q", got)
+	}
+}
+
+// TestUnparsedToolBlockIsCounted 读不出的块要被计数（内容会丢，不能静默）。
+//
+// 语义决策（2026-10-16）：识别到就剥离，不论能否解析——保持既有契约
+// （不把协议标签漏给用户），代价是读不出的块内容消失。所以必须可观测。
+func TestUnparsedToolBlockIsCounted(t *testing.T) {
+	upstream := "event: output\ndata: {\"response\":\"前<opencode_tool_call>{这不是合法 JSON}</opencode_tool_call>后\"}\n\n" +
+		"event: done\ndata: {}\n\n"
+	tr := newTranslator("glm-5.3")
+	r := newTranslateReader(io.NopCloser(strings.NewReader(upstream)), tr)
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if tr.unparsedBlocks != 1 {
+		t.Errorf("读不出的块应被计数，实际 %d", tr.unparsedBlocks)
+	}
+	if tr.unparsedSample == "" {
+		t.Error("应保留一份样本供识别形态")
+	}
+	// 协议标签不得漏给用户（这是选择「剥离」而非「原样保留」的理由）。
+	if sse := string(data); strings.Contains(contentOf(t, sse), "opencode_tool_call") {
+		t.Errorf("协议标签漏进正文：%q", contentOf(t, sse))
+	}
+}
+
+// TestValidToolBlockNotCountedAsUnparsed 能解析的块不该被计入 unparsed。
+func TestValidToolBlockNotCountedAsUnparsed(t *testing.T) {
+	upstream := "event: output\ndata: {\"response\":\"<opencode_tool_call>{\\\"name\\\":\\\"Read\\\",\\\"input\\\":{\\\"file_path\\\":\\\"/a\\\"}}</opencode_tool_call>\"}\n\n" +
+		"event: done\ndata: {}\n\n"
+	tr := newTranslator("glm-5.3")
+	r := newTranslateReader(io.NopCloser(strings.NewReader(upstream)), tr)
+	defer r.Close()
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if tr.unparsedBlocks != 0 {
+		t.Errorf("能解析的块不该计入 unparsed，实际 %d", tr.unparsedBlocks)
+	}
+}
+
 // TestTextToolCallExtractedFromContent 正文里的 opencode_tool_call 必须转成 tool_calls。
 //
 // 这是「工具调用凭空消失」的直接判据。旧实现只在 visibleText 里 strip 掉块，

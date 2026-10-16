@@ -49,11 +49,17 @@ type textToolCall struct {
 	signature string
 }
 
-// textToolTags 认的文本协议标签，按「越具体越先」排列。
+// textToolTags 是文本协议的工具块标签——**唯一来源**，剥离与抽取共用。
 //
-// opencode_tool_call 是本网关注入的协议；其余是上游/其它客户端历史里出现过的
-// 序列化形态（与 stream.go 的 toolBlockPairs 同一族，两处必须同步增删——否则会
-// 出现「strip 掉了但没抽取」或「抽取了但正文里还留着」的半吊子状态）。
+// 2026-10-16 重构：此前剥离用 stream.go 的 toolBlockPairs、抽取用本表，两处各写一份
+// 且**已经漂移**（探针实测：`toolcall` 只抽取不剥离、`bash/read/write/edit/glob/grep/task`
+// 只剥离不抽取）。注释里那句「两处必须同步增删」靠自觉维持不住，所以改成单一来源 +
+// 单一扫描器（scanToolBlocks）：任何一处增删标签，两侧行为自动一致。
+//
+// 前六个是**客户端工具协议**的序列化形态（opencode_tool_call 是本网关注入的）；
+// 后七个是上游沙箱工具或其它客户端历史里出现过的形态——它们**不作为客户端调用交付**
+// （客户端没声明这些工具名，交付未声明调用会让整轮失败），但必须参与扫描，
+// 否则半截标记会漏进正文。
 var textToolTags = []string{
 	"opencode_tool_call",
 	"tool_use",
@@ -61,61 +67,144 @@ var textToolTags = []string{
 	"toolcall",
 	"tool_cell",
 	"invoke",
+	"bash",
+	"read",
+	"write",
+	"edit",
+	"glob",
+	"grep",
+	"task",
+}
+
+// toolBlock 文本里一个**已闭合**的工具块（含位置，供剥离与抽取共用）。
+type toolBlock struct {
+	// tag 标签名（小写，不含尖括号）。
+	tag string
+	// attrs 开标签里除标签名外的属性串（`<tool_call name="Read">` 的 ` name="Read"`）。
+	attrs string
+	// body 开闭标签之间的内容。
+	body string
+	// start 开标签 '<' 的下标。
+	start int
+	// end 闭标签 '>' 之后的下标。
+	end int
+}
+
+// scanToolBlocks 扫出文本里所有已闭合的工具块，按出现顺序返回。
+//
+// **未闭合的块不返回**：分片还没到齐，由 holdIncompleteToolBlock 负责压住
+// （压住 ≠ 删除，等后续分片到齐后再判定）。
+//
+// 这是本包**唯一**的文本工具块扫描器：剥离（visibleText）与抽取
+// （extractTextToolCalls）都走它，因此两者的标签集合与边界判定不可能不一致。
+func scanToolBlocks(text string) []toolBlock {
+	if text == "" {
+		return nil
+	}
+	lowered := strings.ToLower(text)
+	var blocks []toolBlock
+	from := 0
+	for from < len(text) {
+		tag, at := nextToolTag(lowered, from)
+		if at < 0 {
+			break
+		}
+		after := at + 1 + len(tag)
+		// 标签名必须在此处结束，否则 `<tool_call` 会命中 `<tool_calls>`。
+		if after < len(text) && !isTagBoundary(text[after]) {
+			from = after
+			continue
+		}
+		gt := strings.IndexByte(text[at:], '>')
+		if gt < 0 {
+			break // 开标签本身还没读完
+		}
+		gt += at
+		if gt > 0 && text[gt-1] == '/' {
+			from = gt + 1 // 自闭合空标签，不携带调用
+			continue
+		}
+		closeTag := "</" + tag + ">"
+		end := strings.Index(lowered[gt+1:], closeTag)
+		if end < 0 {
+			// 未闭合：等后续分片。同一标签的后续块更不可能闭合，直接换下一个标签
+			// （不 break 整个循环——别的标签的块可能已经闭合了）。
+			from = gt + 1
+			continue
+		}
+		end += gt + 1
+		blocks = append(blocks, toolBlock{
+			tag:   tag,
+			attrs: text[at+1+len(tag) : gt],
+			body:  text[gt+1 : end],
+			start: at,
+			end:   end + len(closeTag),
+		})
+		from = end + len(closeTag)
+	}
+	return blocks
+}
+
+// nextToolTag 返回 from 之后**最早出现**的工具标签名与其 '<' 的下标（-1 表示没有）。
+func nextToolTag(lowered string, from int) (string, int) {
+	best, bestAt := "", -1
+	for _, tag := range textToolTags {
+		at := strings.Index(lowered[from:], "<"+tag)
+		if at < 0 {
+			continue
+		}
+		at += from
+		if bestAt < 0 || at < bestAt {
+			best, bestAt = tag, at
+		}
+	}
+	return best, bestAt
+}
+
+// parseToolBlocks 扫出所有已闭合的块，返回**成功解析成调用**的那些（含位置）。
+//
+// 「成功解析」的判据与交付完全一致（同一个 parseTextToolCall），所以调用方可以
+// 放心用它的结果决定「哪些块该从正文里剥掉」：**只有变成调用的块才剥**。
+//
+// 为什么这条约束重要（2026-10-16 探针实测）：旧实现按标签无条件删除块，
+// 于是「模型写了个读不出来的块」时，那段内容**既没变成调用、也没给用户看**——
+// 凭空消失。magpie 的 #2414 记录过同一类问题（它选择把读不出的块当文本发出去），
+// 两边结论一致：**宁可让用户看到原始块，也不能静默删除**。
+func parseToolBlocks(text string) []toolBlock {
+	blocks := scanToolBlocks(text)
+	if len(blocks) == 0 {
+		return nil
+	}
+	kept := blocks[:0]
+	for _, block := range blocks {
+		if _, ok := parseTextToolCall(block.attrs, block.body); ok {
+			kept = append(kept, block)
+		}
+	}
+	return kept
 }
 
 // extractTextToolCalls 从累积原文里抽取尚未见过的工具调用。
 //
 // seen 是跨事件持久的签名集合，调用方负责传入同一个 map（同一调用只交付一次）。
-// 只处理**已闭合**的块：未闭合说明分片还没到齐，留待下一次扫描。
 func extractTextToolCalls(text string, seen map[string]bool) []textToolCall {
 	if text == "" || seen == nil {
 		return nil
 	}
-	lowered := strings.ToLower(text)
 	var calls []textToolCall
-	for _, tag := range textToolTags {
-		open := "<" + tag
-		closeTag := "</" + tag + ">"
-		from := 0
-		for {
-			start := strings.Index(lowered[from:], open)
-			if start < 0 {
-				break
-			}
-			start += from
-			after := start + len(open)
-			// 标签名必须在此处结束，否则 <tool_call 会命中 <tool_calls>。
-			if after < len(text) && !isTagBoundary(text[after]) {
-				from = after
-				continue
-			}
-			gt := strings.IndexByte(text[start:], '>')
-			if gt < 0 {
-				break // 标签本身还没读完
-			}
-			gt += start
-			if gt > 0 && text[gt-1] == '/' {
-				from = gt + 1 // 自闭合空标签，不携带调用
-				continue
-			}
-			end := strings.Index(lowered[gt+1:], closeTag)
-			if end < 0 {
-				break // 未闭合：等后续分片，但同标签的后续块也不必找了
-			}
-			end += gt + 1
-			attrs := text[start+len(open) : gt]
-			body := text[gt+1 : end]
-			if call, ok := parseTextToolCall(attrs, body); ok {
-				signature := textToolSignature(call)
-				if !seen[signature] {
-					seen[signature] = true
-					call.signature = signature
-					call.ID = "call_" + signature
-					calls = append(calls, call)
-				}
-			}
-			from = end + len(closeTag)
+	for _, block := range scanToolBlocks(text) {
+		call, ok := parseTextToolCall(block.attrs, block.body)
+		if !ok {
+			continue
 		}
+		signature := textToolSignature(call)
+		if seen[signature] {
+			continue
+		}
+		seen[signature] = true
+		call.signature = signature
+		call.ID = "call_" + signature
+		calls = append(calls, call)
 	}
 	return calls
 }
