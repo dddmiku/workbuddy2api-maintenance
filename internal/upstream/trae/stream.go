@@ -27,7 +27,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -61,12 +60,6 @@ const (
 	thinkClose = "\n response\n\n"
 )
 
-// badParamsCode 是上游「请求体本身有问题」的业务码。
-//
-// 网关自己产生的请求级拒绝复用它，好让 upstream.Classify 的 badParamsRule
-// （精确匹配 `"code":11101`）把这次拒绝归成 ErrBadParams——请求终态、不轮转账号。
-// 语义也贴合：带图发给没有视觉能力的模型，确实是「这个请求本身不该发」。
-const badParamsCode = 11101
 
 var chunkSeq uint64
 
@@ -110,44 +103,24 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// 带图 + 非多模态模型：**在出站之前**拒绝，别把请求发给上游白等一轮。
+	// ═══ 已移除「带图 + 非多模态模型 → 出站前拦下」（2026-10-16 二次修正）═══
 	//
-	// 2026-10-16 实测（3/3 交替 A/B，纯文本全成功、带图全 502）：`trae:glm-5.3`
-	// 带图**必然失败**，而上游只回一句「exceeded the rate limit」（3004 形态），
-	// 完全看不出真正原因是「这个模型没有视觉能力」——连网关自己的日志都只能记
-	// 一条 upstream_parse。同一张图、同一时刻，`trae:deepseek-v4.1-flash` 与
-	// `trae:glm-5.3-flash` 都答得完全正确（「蓝色背景、红色圆形、绿色矩形」）。
+	// v3.8.4 加过一段拦截：读目录的 multimodal 标记，为 false 且本轮带图就在出站前
+	// 拒绝，理由是「glm-5.3 没有视觉能力，上游只会回一句无关的英文提示」。
 	//
-	// 判据用**目录的 multimodal 标记**（Trae 自己的口径：glm-5.3 是 false），
-	// 而不是网关猜一个模型名清单——目录是上游发布的，会随版本变。
-	// 目录取不到时**放行**（宁可让上游按自己的口径拒绝，也不能因为目录抖动
-	// 把能读图的模型误拦）。
+	// 用户随后用 **Trae 客户端**（同一账号、同一个 GLM-5.3 Max）贴图提问，
+	// 得到的是逐项准确的图片描述——「三角洲行动」「S1B+ 段位」「企鹅图案徽章」
+	// 全认出来了。这直接推翻「该模型没有视觉能力」这个结论。
 	//
-	// 返回形态必须是 **(nil, status, body, nil)** 而不是 error：handler 把非 nil 的
-	// err 一律当成「传输层抖动」→ 换号重试（`if terr != nil { … st.status = 503;
-	// fail(acct.UID); continue }`），于是这个「与账号无关」的确定性拒绝会被当成
-	// 号池故障，换遍所有号之后回一句 `no_healthy_account`（2026-10-16 实测：
-	// 拦截生效了，但用户看到的是 503「所有账号暂时不可用」，比原始 502 更误导）。
-	// 走 status/body 这条路，handler 才会按 body 分类成终态、直接回给客户端。
-	if requestHasImages(prepared) {
-		if reason := imageModelRejection(ctx, a, prepared); reason != "" {
-			// body 里带 `"code":11101` 是**刻意**的：upstream.Classify 的
-			// badParamsRule 精确匹配这个串，于是这次拒绝被归成 ErrBadParams——
-			// 请求终态、不轮转账号、不罚号，直接回 400 给客户端。
-			//
-			// 为什么不用别的形态：
-			//   - 返回非 nil 的 error → handler 当成传输层抖动，换号换到池空，
-			//     用户看到 503「所有账号暂时不可用」（实测踩过）；
-			//   - 用 3004 → 归成限流（429），客户端会退避重试，永远等不到成功；
-			//   - 用其它未知 400 → 归成 ErrClient，会白试几个账号才回 400。
-			payload, _ := json.Marshal(map[string]any{
-				"code":    badParamsCode,
-				"message": reason,
-			})
-			log.Printf("INFO: [trae] 带图请求被拦下（模型无视觉能力）：%s", reason)
-			return nil, http.StatusBadRequest, payload, nil
-		}
-	}
+	// 复核拦截依据时还发现它本身不可靠：判据来自目录接口的 multimodal 字段，
+	// 而实测该接口对这几个 trae 账号返回的是**空列表**（
+	// `{"allow_tenant_user_add_model":true,"config_info_list":[],"metadata":{}}`），
+	// 也就是说那个 false 要么来自过期缓存、要么来自解析错误，不是上游当下的口径。
+	//
+	// 所以这里回到最朴素的策略：**不替上游判断模型能力**。带图请求照常发出去，
+	// 上游认就给答案、不认就回它自己的错误——那比我用一个可疑的标记提前拒绝更诚实，
+	// 也不会把本来能读图的组合拦掉。真正需要防的只是「回落丢图」，那条闸门仍在
+	// （见 chatStreamLegacy 的 freshInputHasImages）。
 	if RemoteEnabled() && !requestHasImages(prepared) {
 		if stream, err := ChatStreamRemote(ctx, a, prepared, clientIP); err == nil {
 			return stream, http.StatusOK, nil, nil
@@ -156,59 +129,6 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		}
 	}
 	return chatStreamLegacy(ctx, a, prepared, clientIP)
-}
-
-// imageModelRejection 报告「本轮带图但所用模型没有视觉能力」的说明，可放行时返回空串。
-//
-// 只在**能确定**该模型不支持图片时才拒绝：目录里有这个模型、且它的 multimodal
-// 明确为 false。任何一步不确定（目录不可用、模型不在目录里）都返回空串放行——
-// 让上游按自己的口径拒绝，比网关猜错把可用组合拦掉好。
-func imageModelRejection(ctx context.Context, a *auth.Auth, prepared []byte) string {
-	models, err := FetchCatalog(ctx, a)
-	if err != nil || len(models) == 0 {
-		return ""
-	}
-	requested := modelFromPrepared(prepared)
-	resolved := ResolveFromCatalog(models, requested)
-	if resolved == "" {
-		resolved = ResolveModelName(requested)
-	}
-	if resolved == "" {
-		return ""
-	}
-	var target *CatalogModel
-	for index := range models {
-		if strings.EqualFold(models[index].ConfigName, resolved) {
-			target = &models[index]
-			break
-		}
-	}
-	if target == nil || target.Multimodal {
-		return ""
-	}
-	// 列出目录里**确实支持图片**的模型，让调用方有可操作的下一步。
-	var alternatives []string
-	for _, model := range models {
-		if model.Multimodal {
-			alternatives = append(alternatives, model.ConfigName)
-		}
-	}
-	sort.Strings(alternatives)
-	if len(alternatives) > 6 {
-		alternatives = alternatives[:6]
-	}
-	message := "模型 " + resolved + " 不支持图片输入（上游目录标 multimodal=false），" +
-		"本轮请求带图，网关已在出站前拦下（否则上游会回一句与图片无关的英文提示，无法排障）。" +
-		"请去掉图片，或改用支持图片的模型"
-	if len(alternatives) > 0 {
-		message += "：" + strings.Join(alternatives, "、")
-	}
-	// 文案里**不得出现** explicitRateMarkers 的词（"rate limit" / "限流" 等）：
-	// upstream.Classify 的 isExplicitInvalidRequest 会先扫这些词，命中即放弃
-	// 「请求参数错误」的判定、退回限流分类（→ HTTP 429，客户端退避重试一个永远
-	// 不会成功的请求）。2026-10-16 实测踩到：原本文案写了「与图片无关的限流文案」，
-	// 于是拦截虽生效，返回的却是 429 rate_limit_exceeded。
-	return message
 }
 
 // freshInputHasImages 报告「本轮新输入」里是否带图片。
