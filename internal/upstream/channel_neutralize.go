@@ -209,22 +209,28 @@ func splitFirstLine(text string) (head, rest string) {
 	return text, ""
 }
 
-// breakFirstLineTokens 对首行内命中的 token 逐词断字。
+// breakFirstLineTokens 对首行内命中的 token 逐词断字（幂等）。
 //
-// 零宽容（2026-10-17 实测修正）：匹配前先把**零宽字符剥掉**再比。
+// 零宽容 + 幂等（2026-10-17 实测修正，两处都必需）：
 //
-// 为什么必须这样：Claude Code 的系统提示首行**自带零宽空格**——Anthropic 自己
-// 在每个单词首字母后插了 U+200B（防字符串级检测），实际发来的字节是
-//   "x​-a​nthropic-b​illing-h​eader: ..."
-// 而表里存的是纯 ASCII "x-anthropic-billing-header"。逐字节 Contains 永不命中，
-// 中和因此**从未生效**——这正是「客户端伪装不到位」在网关侧的具体形态。
+//  1. **匹配前剥掉零宽字符**：Claude Code 的系统提示首行自带零宽空格——Anthropic
+//     自己在每个单词首字母后插了 U+200B（防字符串级检测），实际发来的字节是
+//     "x​-a​nthropic-..."，而表里是纯 ASCII。逐字节 Contains 永不命中，
+//     中和从未生效。
 //
-// 实现：把首行过滤成「纯可见字节 + 原字节偏移」的平行数组，在过滤后的串上定位
-// token，再把命中的区间换算回原串偏移去插零宽字符。这样命中判断与插入位置都对。
+//  2. **输出前也剥掉零宽字符**（先归一化再断词）：多档重试会对同一 token 反复断词，
+//     零宽字符**累积**——生产落盘样本实测到 5 层嵌套：
+//     `x[5ZW]-a[5ZW]nthropic-b[5ZW]illing-h[5ZW]eader: ...`
+//     这种「被反复篡改」的形态本身就是异常特征，等于把「非官方客户端」写在脸上。
+//     归一化后每档输出形态一致（每词首一个零宽），重试不再叠加。
+//
+// 实现：先把首行归一化成「纯可见文本」，再一次性插入断词，输出即最终形态——
+// 因此同一份文本无论经过多少次中和，输出都逐字节相同。副作用是**命中时**首行里
+// 客户端的其它零宽字符会被顺带清掉；那些字符对模型无语义价值，清掉反而更接近
+// 官方客户端的正常形态。未命中时首行一个字节都不动（见下方 return）。
 func breakFirstLineTokens(head string, changed *bool) string {
-	// 构造过滤后的串（丢弃零宽类字符），并记录每个过滤后位置的原始字节偏移。
+	// 归一化：剥掉全部零宽类字符。
 	visible := make([]byte, 0, len(head))
-	origin := make([]int, 0, len(head)) // origin[i] = visible[i] 在 head 里的起始字节偏移
 	for i := 0; i < len(head); {
 		size, isZW := zeroWidthAt(head, i)
 		if isZW {
@@ -232,33 +238,32 @@ func breakFirstLineTokens(head string, changed *bool) string {
 			continue
 		}
 		visible = append(visible, head[i])
-		origin = append(origin, i)
 		i++
 	}
 	if len(visible) == 0 {
 		return head
 	}
-	haystack := string(visible)
+	plain := string(visible)
 
+	// 在归一化文本上定位 token，一次性算出断词点。
 	insertAt := map[int]struct{}{}
 	for _, token := range channelFirstLineTriggerTokens {
 		start := 0
 		for {
-			index := indexFrom(haystack, token, start)
+			index := indexFrom(plain, token, start)
 			if index < 0 {
 				break
 			}
-			// 过滤后区间 [index, index+len(token)) → 原串偏移换算后交给 wordBreakPoints
-			for _, pos := range wordBreakPoints(haystack, index, index+len(token)) {
-				// wordBreakPoints 的偏移是过滤后的位置，换算回原串
-				if pos >= len(origin) {
-					continue
-				}
-				insertAt[origin[pos]] = struct{}{}
+			for _, pos := range wordBreakPoints(plain, index, index+len(token)) {
+				insertAt[pos] = struct{}{}
 			}
 			start = index + len(token)
 		}
 	}
+	// 未命中：原样返回，**不要**把归一化结果落回去。
+	// 首行里的零宽字符可能是同一轮其它断词器（句子档 / 归属档 / 全量档）刚插入的，
+	// 在这里清掉等于把它们的成果抹平（2026-10-17 实测：会把指纹句的断词擦干净，
+	// 于是「已中和」的请求又带着连续触发串打上游）。
 	if len(insertAt) == 0 {
 		return head
 	}
@@ -266,8 +271,15 @@ func breakFirstLineTokens(head string, changed *bool) string {
 	for pos := range insertAt {
 		points = append(points, pos)
 	}
+	// 在归一化文本上算断点、插入，得到「规范形态」。再与原文逐字节比对：
+	// 相同即无需改动（幂等），也必须报 false —— 调用方用 changed 决定要不要
+	// 改写 body 重发，报错会白花一趟往返。
+	out, _ := insertBreaks(plain, points)
+	if out == head {
+		return head
+	}
 	*changed = true
-	return insertBreaks(head, points)
+	return out
 }
 
 // zeroWidthAt 报告 head[i] 处是否是一个零宽/格式类字符，并返回其字节长度。
@@ -354,8 +366,12 @@ func breakAllWords(text string, changed *bool) string {
 	if len(points) == 0 {
 		return text
 	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
 	*changed = true
-	return insertBreaks(text, points)
+	return out
 }
 
 // breakAttributionSentences 断开「自称客户端」的句子：句内出现产品名或官方归属措辞即命中。
@@ -370,8 +386,12 @@ func breakAttributionSentences(text string, changed *bool) string {
 	if len(points) == 0 {
 		return text
 	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
 	*changed = true
-	return insertBreaks(text, points)
+	return out
 }
 
 // sentenceSpans 按句末标点与换行切句，返回半开区间的字节偏移。
@@ -416,21 +436,36 @@ func isChannelAttribution(segment string) bool {
 		strings.Contains(lower, "assistant") || strings.Contains(lower, "agent")
 }
 
-// insertBreaks 按升序偏移插入零宽标记。
-func insertBreaks(text string, points []int) string {
+// insertBreaks 按升序偏移插入零宽标记，第二个返回值报告是否真的插入了标记。
+//
+// 已带标记的位置跳过（幂等）：多档重试会对同一段正文反复断词，若同一位置再插一个，
+// 零宽字符就累积成 5 层嵌套（生产落盘实测），形态本身就是「非官方客户端」的铁证。
+//
+// 返回值必须精确（2026-10-17）：调用方用 changed 决定「要不要改写 body 重发」。
+// 若全是已标记位置（无新断点），返回 false —— 否则调用方会把一份已知被拒的请求
+// 原样再发一次，白等一趟往返。
+func insertBreaks(text string, points []int) (string, bool) {
 	sortInts(points)
 	out := make([]byte, 0, len(text)+len(points)*len(wafBreakMarker))
 	prev := 0
+	inserted := false
 	for _, pos := range points {
 		if pos <= prev || pos >= len(text) {
 			continue
 		}
+		if _, isZW := zeroWidthAt(text, pos); isZW {
+			continue // 该位置已有标记
+		}
 		out = append(out, text[prev:pos]...)
 		out = append(out, wafBreakMarker...)
 		prev = pos
+		inserted = true
+	}
+	if !inserted {
+		return text, false
 	}
 	out = append(out, text[prev:]...)
-	return string(out)
+	return string(out), true
 }
 
 // neutralizeChannelJSONValue 递归遍历解码后的 JSON，对每个字符串做触发句断词。
@@ -504,8 +539,12 @@ func neutralizeChannelText(text string, changed *bool) string {
 	for pos := range insertAt {
 		points = append(points, pos)
 	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
 	*changed = true
-	return insertBreaks(text, points)
+	return out
 }
 
 // indexFrom 从 from 起查找 needle 的字节偏移（区分大小写；触发句大小写固定）。
@@ -525,14 +564,27 @@ func indexFrom(text, needle string, from int) int {
 
 // wordBreakPoints 返回片段内每个单词首字母之后的插入点（原字符串字节偏移）。
 // 单词以 ASCII 字母/数字起始，遇到空格、标点或大小写之外的分隔即结束。
+//
+// 零宽字符**整个序列**都要跳过（幂等关键，2026-10-17 修正）：
+//
+//   - 它不算分隔符——否则「a​b」被看成两个单词，再断一次就在原标记后
+//     又插一个，多档重试累积成 5 层嵌套（生产落盘实测）；
+//   - 而且必须按 zeroWidthAt 返回的长度整块跳过。此前循环是 `i++`，U+200B 的
+//     第 2、3 字节（0x80 0x8B）会被当作普通分隔符各扫一遍，于是「词首字母后」
+//     判定重新成立，又在词中插入新的断点——这正是 ​ 后紧跟新断点的来源。
 func wordBreakPoints(text string, start, end int) []int {
 	points := []int{}
 	atWordStart := true
-	for i := start; i < end; i++ {
+	for i := start; i < end; {
 		c := text[i]
+		if size, isZW := zeroWidthAt(text, i); isZW {
+			i += size // 整块跳过，零宽不改变「仍在单词内」的状态
+			continue
+		}
+		i++
 		if isASCIIAlnum(c) {
 			if atWordStart {
-				points = append(points, i+1)
+				points = append(points, i)
 				atWordStart = false
 			}
 			continue
@@ -634,6 +686,10 @@ func neutralizePreemptText(text string, changed *bool) string {
 	for pos := range insertAt {
 		points = append(points, pos)
 	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
 	*changed = true
-	return insertBreaks(text, points)
+	return out
 }
