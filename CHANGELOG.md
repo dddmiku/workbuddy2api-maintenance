@@ -38,6 +38,57 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.9.1 — 2026-10-16
+
+修复三处：模型目录接口用错导致 max 档从未生效、只有思考的回合被误报「空响应」、
+以及热更新后辅助二进制缺可执行位导致积分数据不可用。
+
+### 模型目录改走客户端真实接口（根因修复）
+
+网关一直打的是 `POST /api/ide/v1/get_detail_param`，body `{"function":"solo_work_lite"}`。
+**这个组合对 trae 账号恒返回空列表**——抓包与探针双向确认：同一账号下它返回 0 条，
+而客户端真正用的 `POST /api/ide/v1/batch_get_detail_param` 返回 2.17 MB / 373 条。
+空目录的后果是 `multimodal` 与 `max_mode` 永远取不到，网关只能退回静态别名表，
+于是**max 档从未生效**（`-max` 后缀判据从未命中）。
+
+改用客户端同款接口：`functions` 传 22 个 function、`agent_type=solo_agent`、
+`biz_context.window_type=Agent`；响应按 `function_configs[].config_info_list` 解析，
+同名模型跨 function **能力取并集**。
+
+### 出站模型名用档位真名（`__dev` / `__max`）
+
+抓包 7 次真实会话确证：上游要求 `model_name` 带**双下划线**档位后缀。
+
+| `config_name` | 普通档 | 1M 档 | prompt_max（普通/1M） |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | `__dev` | `__max` | 168000 / 936000 |
+| `glm-5.3-flash` | `__dev` | `__max` | 168000 / 936000 |
+| `glm-5.3` | `__dev` | `__max` | 168000 / 936000 |
+
+旧实现按单横线 `-max` 猜后缀，两档都没走对。现在从目录的 `model_detail_list`
+取真名与各档上限，`-max` 只作为**客户端意图**（`SplitMaxSuffix`）解析。
+`maxModeCustomModel` 也改用目录给的该模型真实上限（实测各模型不同：
+`mimo-v2.6-pro` 917504、`custom_model_*` 616000），不再一律填 936000。
+
+### 只有思考的回合不再报「空响应」
+
+`translator.finish()` 的空响应判据只看 `contentCount` 与 `tools`，没把思考算作
+已交付内容。模型只思考不写正文（实测该轮 16,291 字符思考）时，用户看到的是占位文案
+`(trae upstream returned an empty response)`，而思考其实已经交付了。
+对 Anthropic 客户端来说只带 thinking block 的回合完全合法，网关不该替它断言上游没返回。
+现在判据加上 `reasoningDelivered`，三者全空才算空响应。
+
+### 抓包记录（供后续排障）
+
+- `x-ide-token` 是上游真正的鉴权头（`Authorization: Bearer` 会 401）；
+  `Authorization: Cloud-IDE-JWT <accessToken>` 等价可用。
+- `llm_utils_chat` / `create_agent_task` 的**请求体是加密的**（base64 解出来是二进制，
+  非 gzip/zlib）——这解释了手工构造上游请求恒 4001。
+- 客户端读图的真实机制：图片上传 TOS 后以 `attachment` 本地路径 + toolcall 索引引用，
+  并由 `read_tool_image_to_text_config_name: "multimodal_image_kimi-k2.5"` **转成文字**
+  再喂主模型。所以 `multimodal:false` 的 glm-5.3 在客户端里也能答出图片内容——
+  它没有直接看图。
+
 ## v3.9.0 — 2026-10-16
 
 新增「补偿积分领取」一次性任务，并给任务面板加上「停止」按钮。

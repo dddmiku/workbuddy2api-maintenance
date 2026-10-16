@@ -8,9 +8,9 @@
 // 纯文本请求走 solo_agent_remote（保有 1M max 档能力）。
 //
 // Remote 两步协议：
-//	1. POST {base}/chat_sessions              建会话 → chat_session_id + message_id
-//	2. GET  {base}/chat_sessions/{sid}/events?reply_to_message_id={mid}   收流
-//	3. POST {base}/chat_sessions/{sid}/stop    释放槽位（尽力而为）
+//  1. POST {base}/chat_sessions              建会话 → chat_session_id + message_id
+//  2. GET  {base}/chat_sessions/{sid}/events?reply_to_message_id={mid}   收流
+//  3. POST {base}/chat_sessions/{sid}/stop    释放槽位（尽力而为）
 //
 // ═══ 为什么 query 必须扁平化（3004 实测结论，2026-10-15）═══
 //
@@ -56,7 +56,7 @@ const (
 	// remoteCreatePath 建会话；remoteEventsFmt 收流（路径含 sid）。
 	remoteCreatePath = "/chat_sessions"
 	remoteEventsFmt  = "/chat_sessions/%s/events?reply_to_message_id=%s"
-	remoteStopFmt     = "/chat_sessions/%s/stop"
+	remoteStopFmt    = "/chat_sessions/%s/stop"
 
 	// remoteModelsPath 网页端模型目录（manual 选模型需要 custom_model）。
 	remoteModelsPath = "/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
@@ -136,19 +136,19 @@ func remoteHeaders(a *auth.Auth, stream bool) http.Header {
 // remoteInitialMessage Remote 建会话体里的 initial_message（map[string]any 形态，
 // 字段随策略可选——manual 带 custom_model 六件套，auto 不带）。
 type remoteInitialMessage struct {
-	ChatSessionID string          `json:"chat_session_id"`
-	Content       []any           `json:"content"`
-	Query         string          `json:"query"`
-	ModelName     string          `json:"model_name"`
-	AgentType     string          `json:"agent_type"`
-	AgentID       string          `json:"agent_id"`
-	Strategy      string          `json:"model_selection_strategy"`
-	CommonParams  string          `json:"common_params"`
+	ChatSessionID string `json:"chat_session_id"`
+	Content       []any  `json:"content"`
+	Query         string `json:"query"`
+	ModelName     string `json:"model_name"`
+	AgentType     string `json:"agent_type"`
+	AgentID       string `json:"agent_id"`
+	Strategy      string `json:"model_selection_strategy"`
+	CommonParams  string `json:"common_params"`
 
-	ModelConfigSource *int64          `json:"model_config_source,omitempty"`
-	ModelIsPreset     *bool           `json:"model_is_preset,omitempty"`
-	ModelProvider     *string         `json:"model_provider,omitempty"`
-	CustomModel       map[string]any  `json:"custom_model,omitempty"`
+	ModelConfigSource *int64         `json:"model_config_source,omitempty"`
+	ModelIsPreset     *bool          `json:"model_is_preset,omitempty"`
+	ModelProvider     *string        `json:"model_provider,omitempty"`
+	CustomModel       map[string]any `json:"custom_model,omitempty"`
 
 	ModelAutoSelection map[string]any `json:"model_auto_selection,omitempty"`
 	ModeType           *int64         `json:"mode_type,omitempty"`
@@ -287,16 +287,26 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 
 	maxApplied := false
 	if strategy == "manual" {
+		// 请求名里的 `-max` 后缀是**客户端意图**，上游真名是 `__max`（见
+		// CatalogModel.OutboundModelName）。先拆出意图，再按目录解析真名。
+		base, wantMax := SplitMaxSuffix(modelName)
 		models, cerr := FetchCatalog(ctx, a)
 		if cerr == nil {
-			if resolved := ResolveFromCatalog(models, modelName); resolved != "" && resolved != modelName {
-				modelName = resolved
+			if resolved := ResolveFromCatalog(models, base); resolved != "" && resolved != base {
+				base = resolved
 			}
 		} else {
-			modelName = ResolveModelName(modelName)
+			base = ResolveModelName(base)
+		}
+		modelName = base
+		// 目录给出了档位真名时用它（`glm-5.3__max` / `glm-5.3__dev`）。
+		if catalogModel, ok := LookupCatalogModel(models, base); ok {
+			if real := catalogModel.OutboundModelName(wantMax); real != "" {
+				modelName = real
+			}
 		}
 		msg.ModelName = modelName
-		if custom, ok := customModelFor(models, modelName, agentType, cerr == nil); ok {
+		if custom, ok := customModelFor(models, base, agentType, cerr == nil); ok {
 			msg.CustomModel = custom
 			source := int64(1)
 			if v, ok := asFloat(custom["config_source"]); ok {
@@ -310,8 +320,10 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 			msg.ModelConfigSource = &source
 			msg.ModelIsPreset = &preset
 			msg.ModelProvider = &provider
-			// max 模式：模型名带 -max 后缀且目录标 max_mode（仅 Agent 档）。
-			if strings.HasSuffix(strings.ToLower(modelName), "-max") && agentType == remoteDefaultAgentType {
+			// max 档：请求名带 `-max` 后缀（SplitMaxSuffix 已拆出意图）且目录标
+			// max_mode（仅 Agent 档）。注意这里判的是 **wantMax**，不是模型名后缀——
+			// 上游真名此刻已是 `xxx__max`，再用 HasSuffix 判会把自己套进去。
+			if wantMax && agentType == remoteDefaultAgentType {
 				if enriched, ok := maxModeCustomModel(custom); ok {
 					msg.CustomModel = enriched
 					fields := maxModeFields(enriched)
@@ -363,44 +375,56 @@ func remoteTrimLog(dropped int) {
 // provider/multimodal 字段（对齐参考 _build_web_model_config）。
 func customModelFor(models []CatalogModel, name string, agentType string, catalogOK bool) (map[string]any, bool) {
 	if catalogOK && len(models) > 0 {
-		for _, m := range models {
-			if strings.EqualFold(m.ConfigName, name) {
-				return map[string]any{
-					"name":             m.ConfigName,
-					"config_name":      m.ConfigName,
-					"model_name":       m.ConfigName,
-					"display_name":     m.DisplayName,
-					"config_source":    1,
-					"provider":         "",
-					"multimodal":       m.Multimodal,
-					"max_mode":         m.MaxMode,
-					"custom":           false,
-					"is_preset":        true,
-					"use_remote_service": true,
-				}, true
+		if m, ok := LookupCatalogModel(models, name); ok {
+			custom := map[string]any{
+				"name":               m.ConfigName,
+				"config_name":        m.ConfigName,
+				"model_name":         m.DevModelName,
+				"display_name":       m.DisplayName,
+				"config_source":      1,
+				"provider":           "",
+				"multimodal":         m.Multimodal,
+				"max_mode":           m.MaxMode,
+				"custom":             false,
+				"is_preset":          true,
+				"use_remote_service": true,
 			}
+			// max 档的真实上限（抓包实测各模型不同），供 maxModeCustomModel 采用。
+			if m.MaxPromptMax > 0 {
+				custom["prompt_max_tokens"] = m.MaxPromptMax
+			}
+			if m.MaxModelName != "" {
+				custom["max_model_name"] = m.MaxModelName
+			}
+			if m.DevPromptMax > 0 {
+				custom["dev_prompt_max_tokens"] = m.DevPromptMax
+			}
+			if custom["model_name"] == "" {
+				custom["model_name"] = m.ConfigName
+			}
+			return custom, true
 		}
 	}
 	// 目录不可用时按静态别名表判断是否已知模型。
 	if resolved := ResolveModelName(name); resolved != "" && !strings.EqualFold(resolved, name) {
 		return map[string]any{
-			"name":          resolved,
-			"config_name":   resolved,
-			"model_name":    resolved,
-			"config_source": 1,
-			"is_preset":     true,
-			"custom":        false,
+			"name":               resolved,
+			"config_name":        resolved,
+			"model_name":         resolved,
+			"config_source":      1,
+			"is_preset":          true,
+			"custom":             false,
 			"use_remote_service": true,
 		}, true
 	}
 	if staticModelKnown(name) {
 		return map[string]any{
-			"name":          name,
-			"config_name":   name,
-			"model_name":    name,
-			"config_source": 1,
-			"is_preset":     true,
-			"custom":        false,
+			"name":               name,
+			"config_name":        name,
+			"model_name":         name,
+			"config_source":      1,
+			"is_preset":          true,
+			"custom":             false,
 			"use_remote_service": true,
 		}, true
 	}
@@ -417,6 +441,14 @@ func maxModeCustomModel(custom map[string]any) (map[string]any, bool) {
 	maxContext := int64(defaultMaxContextTokens)
 	promptMax := int64(defaultMaxPromptTokens)
 	outputMax := int64(defaultMaxOutputTokens)
+	// 目录给了该模型 max 档的真实上限就用它（抓包实测各模型不同：
+	// glm-5.3-flash 936000、mimo-v2.6-pro 917504、custom_model_* 只有 616000）。
+	if v, ok := asFloat(custom["prompt_max_tokens"]); ok && v > 0 {
+		promptMax = int64(v)
+	}
+	if v, ok := asFloat(custom["max_tokens"]); ok && v > 0 {
+		outputMax = int64(v)
+	}
 	enriched := make(map[string]any, len(custom)+8)
 	for k, v := range custom {
 		enriched[k] = v
@@ -453,9 +485,9 @@ func maxModeFields(custom map[string]any) map[string]any {
 	}
 	return map[string]any{
 		"model_auto_selection": map[string]any{
-			"strategy":                "max",
+			"strategy":                  "max",
 			"fallback_to_advance_model": nil,
-			"entitlement_id":          nil,
+			"entitlement_id":            nil,
 		},
 		"model_selection_strategy": "max",
 		"mode_type":                int64(defaultMaxModeType),

@@ -708,3 +708,27 @@ func TestNoImageKeepsPlainQuery(t *testing.T) {
 		t.Fatalf("无图时 query 应完全不变：\n got=%s\nwant=%s", got, want)
 	}
 }
+
+// TestOnlyReasoningIsNotAnEmptyResponse 只有思考、没有正文时不得报「空响应」。
+//
+// 生产事故（2026-10-16 用户截图）：Trae 里模型只输出思考（该轮 16,291 字符），
+// 正文一个字都没写就收尾，客户端看到的是占位文案
+// 「(trae upstream returned an empty response)」——而思考内容其实已经交付了。
+//
+// 根因：finish() 的空响应判据只看 contentCount 与 tools，没把 reasoning 算作
+// 已交付内容。对 Anthropic 客户端来说，只带 thinking block 的回合是完全合法的
+// （模型想完就停），网关不该替它断言「上游什么都没返回」。
+func TestOnlyReasoningIsNotAnEmptyResponse(t *testing.T) {
+	upstream := "event: output\ndata: {\"reasoning_content\":\"我在想一件很长的事情。\"}\n\n" +
+		"event: done\ndata: {}\n\n"
+	sse, err := collect(t, upstream)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if strings.Contains(contentOf(t, sse), "trae upstream returned an empty response") {
+		t.Errorf("只有思考时不应报空响应：%q", sse)
+	}
+	if !strings.Contains(sse, "我在想一件很长的事情。") {
+		t.Errorf("思考内容丢失：%q", sse)
+	}
+}

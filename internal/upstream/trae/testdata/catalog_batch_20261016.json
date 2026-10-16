@@ -1,0 +1,109 @@
+{
+ "function_configs": [
+  {
+   "function": "solo_agent",
+   "config_info_list": [
+    {
+     "config_name": "glm-5.3-flash",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "GLM-5.3-Flash",
+      "multimodal": true,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "glm-5.3-flash__dev",
+       "prompt_max_tokens": 168000,
+       "max_tokens": 32000,
+       "max_turn": 500
+      },
+      {
+       "model_name": "glm-5.3-flash__max",
+       "prompt_max_tokens": 936000,
+       "max_tokens": 64000,
+       "max_turn": 500
+      }
+     ]
+    },
+    {
+     "config_name": "glm-5.3",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "GLM-5.3",
+      "multimodal": false,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "glm-5.3__dev",
+       "prompt_max_tokens": 168000,
+       "max_tokens": 32000,
+       "max_turn": 500
+      },
+      {
+       "model_name": "glm-5.3__max",
+       "prompt_max_tokens": 936000,
+       "max_tokens": 64000,
+       "max_turn": 500
+      }
+     ]
+    },
+    {
+     "config_name": "deepseek-v4.1-flash",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "DeepSeek-V4.1-Flash",
+      "multimodal": true,
+      "max_mode": true,
+      "model_capability": "reasoning_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "deepseek-v4.1-flash__dev",
+       "prompt_max_tokens": 168000,
+       "max_tokens": 32000,
+       "max_turn": 500
+      },
+      {
+       "model_name": "deepseek-v4.1-flash__max",
+       "prompt_max_tokens": 936000,
+       "max_tokens": 64000,
+       "max_turn": 500
+      }
+     ]
+    },
+    {
+     "config_name": "kimi-k3",
+     "usage": "chat_completion",
+     "is_invisible_to_user": false,
+     "display_config": {
+      "display_name": "Kimi-K3",
+      "multimodal": true,
+      "max_mode": true,
+      "model_capability": "chat_model"
+     },
+     "model_detail_list": [
+      {
+       "model_name": "kimi-k3__dev",
+       "prompt_max_tokens": 168000,
+       "max_tokens": 32000,
+       "max_turn": 500
+      },
+      {
+       "model_name": "kimi-k3__max",
+       "prompt_max_tokens": 936000,
+       "max_tokens": 64000,
+       "max_turn": 500
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1101,7 +1101,12 @@ type translator struct {
 	// （一个 thinking block）；正文开始后到达的思考进 lateReasoning，收尾时
 	// 合并成第二个 block 发出（不丢内容，但不再与正文交替）。
 	reasoningFlushed bool
-	lateReasoning    *textAccumulator
+	// reasoningDelivered 记录「是否已向客户端交付过任何思考内容」。
+	//
+	// 供 finish() 的空响应判据使用：只思考不写正文是合法回合，不能报空响应。
+	// 三条交付路径（flushReasoning / flushLateReasoning / 直接 emit）都要置位。
+	reasoningDelivered bool
+	lateReasoning      *textAccumulator
 	// reasoningPending/latePending 累积「已从累加器取出但尚未交付」的思考增量。
 	// 不能等到 flush 时才调 finalize：add 已经把增量消费掉了。
 	reasoningPending strings.Builder
@@ -1165,6 +1170,7 @@ func (t *translator) flushReasoning(out *bytes.Buffer) {
 	t.reasoningPending.WriteString(t.reasoning.finalize())
 	if text := t.reasoningPending.String(); text != "" {
 		t.start(out)
+		t.reasoningDelivered = true
 		t.emit(out, map[string]any{"reasoning_content": text}, nil)
 	}
 	// 尾部通道**继承**正文前的去重状态。
@@ -1183,6 +1189,7 @@ func (t *translator) flushLateReasoning(out *bytes.Buffer) {
 	t.latePending.WriteString(t.lateReasoning.finalize())
 	if text := t.latePending.String(); text != "" {
 		t.start(out)
+		t.reasoningDelivered = true
 		t.emit(out, map[string]any{"reasoning_content": text}, nil)
 	}
 }
@@ -1405,7 +1412,15 @@ func (t *translator) finish(out *bytes.Buffer) error {
 		log.Printf("WARN: [trae] %d 个工具块无法解析成调用，已从正文剥离（内容丢失）；样本=%s",
 			t.unparsedBlocks, t.unparsedSample)
 	}
-	if t.contentCount == 0 && !t.tools.hasCalls() {
+	// 「上游什么都没返回」的判据必须把**思考**也算作已交付内容。
+	//
+	// 生产事故（2026-10-16 用户截图）：模型只输出思考（该轮 16,291 字符）就收尾，
+	// 正文一个字都没写，客户端看到的却是占位文案
+	// 「(trae upstream returned an empty response)」——思考明明已经交付了。
+	// 对 Anthropic 客户端来说，只带 thinking block 的回合完全合法（想完就停），
+	// 网关不该替它断言上游没返回东西。只有「正文、思考、工具调用三者全空」
+	// 才是真的空响应。
+	if t.contentCount == 0 && !t.tools.hasCalls() && !t.reasoningDelivered {
 		t.start(out)
 		t.emit(out, map[string]any{"content": "(trae upstream returned an empty response)"}, nil)
 	}
