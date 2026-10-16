@@ -61,6 +61,13 @@ const (
 	thinkClose = "\n response\n\n"
 )
 
+// badParamsCode 是上游「请求体本身有问题」的业务码。
+//
+// 网关自己产生的请求级拒绝复用它，好让 upstream.Classify 的 badParamsRule
+// （精确匹配 `"code":11101`）把这次拒绝归成 ErrBadParams——请求终态、不轮转账号。
+// 语义也贴合：带图发给没有视觉能力的模型，确实是「这个请求本身不该发」。
+const badParamsCode = 11101
+
 var chunkSeq uint64
 
 // ChatStream 调用上游并返回**已转译成 OpenAI SSE** 的流。
@@ -124,8 +131,17 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	// 走 status/body 这条路，handler 才会按 body 分类成终态、直接回给客户端。
 	if requestHasImages(prepared) {
 		if reason := imageModelRejection(ctx, a, prepared); reason != "" {
+			// body 里带 `"code":11101` 是**刻意**的：upstream.Classify 的
+			// badParamsRule 精确匹配这个串，于是这次拒绝被归成 ErrBadParams——
+			// 请求终态、不轮转账号、不罚号，直接回 400 给客户端。
+			//
+			// 为什么不用别的形态：
+			//   - 返回非 nil 的 error → handler 当成传输层抖动，换号换到池空，
+			//     用户看到 503「所有账号暂时不可用」（实测踩过）；
+			//   - 用 3004 → 归成限流（429），客户端会退避重试，永远等不到成功；
+			//   - 用其它未知 400 → 归成 ErrClient，会白试几个账号才回 400。
 			payload, _ := json.Marshal(map[string]any{
-				"code":    upstreamerr.RateLimitCode,
+				"code":    badParamsCode,
 				"message": reason,
 			})
 			log.Printf("INFO: [trae] 带图请求被拦下（模型无视觉能力）：%s", reason)
