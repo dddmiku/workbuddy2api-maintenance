@@ -1809,35 +1809,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 以下几类终态由请求本身决定、与账号无关：只释放在途名额，保留会话绑定，
 			// 下一轮仍落在同一账号，上游提示缓存不失效（换号会让整段前缀重新计费）。
 			if kind == upstream.ErrChannelRejected {
-				// 2026-10-17 实测根因：上游按 **X-Conversation-Request-ID** 记住了被拒的请求，
-				// 该 ID 之后的重发一律 400/11128（换任何账号、任何请求体都无效）。
+				// 2026-10-17 实测（36 账号 × 同一极简 body × 同一套头，两轮完全复现）：
+				// 渠道校验是**账号绑定**的，不是请求绑定，也不是请求 ID 绑定。
 				//
-				// 证据（用生产落盘的真实报文做的对照）：
-				//   同账号 + 真实头 + 真实头里那条被拒请求的 ID → 400
-				//   同账号 + 真实头 + **换一个全新 ID**        → 200
-				//   同账号 + 该 ID 后续重发                    → 200（新 ID 未被污染）
+				// 对照实验：
+				//   通过组 8 个账号：200 / 429，全部**从未**出现在渠道拒绝落盘里（0/8）
+				//   被拒组 16 个账号：11128 / 11140，13/16 有落盘记录，间隔 20s 重测恒拒
+				// 健康账号带 Claude Code 完整系统提示、带中和后的零宽形态照样 200；
+				// 被烧账号发最简「You are a helpful assistant.」照样 400。
+				// 头部（含 X-Conversation-Request-ID）、body、零宽形态、metadata /
+				// prompt_cache_key / thinking 全部排除了——那些都曾是怀疑对象。
 				//
-				// 而网关的重试**刻意复用同一个 conversationRequestID**（为后台按它聚合一次
-				// user send 内的所有尝试，见 ChatMeta 注释）——于是第一次被拒之后，所有重试
-				// 都带着同一个已被拉黑的 ID，永远 400。这解释了「面板上一直同一个号一直 400」。
+				// 即：上游已把该账号标记为「非官方客户端」，与本次请求内容无关，
+				// 换 ID / 断词 / 换号都不会让它恢复。继续重试只会：
+				//   ① 每个被烧账号每次必然再吃一个 400（白花 200–500ms 往返）；
+				//   ② 不断往落盘目录刷样本，把 8 个可用号之外的号全部拖进重试链。
 				//
-				// 最小修复：渠道拒绝时轮换会话请求 ID 再试。ID 轮换只影响后台聚合粒度
-				// （本次 user send 会记成两条），换来的是请求真的能过。
-				if softRotate < h.cfg.MaxSoftRotations {
-					softRotate++
-					freshID := session.NewMessageID()
-					chatMeta.ConversationRequestID = freshID
-					chatMeta.TraceID = freshID
-					log.Printf("INFO: [服务] 渠道拒绝 — 轮换请求 ID 并换号重试 (%d/%d) uid=%s model=%s newReqID=%s",
-						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel, freshID[:8])
-					fail(acct.UID)
-					continue
-				}
-				releaseHeld()
-				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected",
-					"upstream rejected the client channel: Illegal API invocation from an unapproved channel")
-				st.status = http.StatusBadRequest
-				return
+				// 正确处置是**隔离该账号**（24h），让选号侧直接避开它——池子因此
+				// 稳定收敛到那 8 个健康账号上，而不是每次都在 24 个号里反复撞墙。
+				h.cfg.Pool.QuarantineChannelRejected(acct.UID, bareModel,
+					"channel rejected (账号被上游标记为非官方客户端)")
+				log.Printf("WARN: [服务] 渠道拒绝 — 隔离账号 24h uid=%s model=%s（实测该标记为账号绑定，重试无效）",
+					logfmt.UID8(acct.UID), bareModel)
+				// 记下原因：若池里所有号都被隔离，循环退出时会走 lastErr 分支把
+				// 上游原文（11128 + displayTips）如实透出，而不是笼统的
+				// no_healthy_account——运维要看得出「是渠道校验，不是号池空了」。
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				fail(acct.UID)
+				continue
 			}
 			// 上游 WAF 按请求正文特征拦截（XSS/SQL 规则），返回的是 HTML 拦截页而非 JSON。
 			// 判定看正文、不看账号：同域内换任何号都会撞同一条规则，因此请求终态——
@@ -2251,6 +2250,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrChannelRejected:
+			// 池里所有候选号都被上游标记为非官方客户端（实测该标记为账号绑定、
+			// 重试无效，见 chatCompletions 的 ErrChannelRejected 分支）。给 400 +
+			// 专用 code：调用方能立刻分辨「是渠道校验」，而不是笼统的「号池空了」。
+			status = http.StatusBadRequest
+			code = "upstream_channel_rejected"
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
