@@ -1809,6 +1809,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 以下几类终态由请求本身决定、与账号无关：只释放在途名额，保留会话绑定，
 			// 下一轮仍落在同一账号，上游提示缓存不失效（换号会让整段前缀重新计费）。
 			if kind == upstream.ErrChannelRejected {
+				// 2026-10-17 修正：渠道拒绝**不是**纯请求级终态——实测证明它可以带账号维度。
+				//
+				// 依据（12 组对照 + 生产账号复现）：
+				//   · 同一份请求体，账号 A 通过、账号 B 被拒（本号直打恒 403/11140 或 400/11128）；
+				//   · 网关侧 sticky（会话粘性）命中时，3 次重试全部落在同一个被拒账号上，
+				//     前端表现为「一直请求一个号、一直 400」；
+				//   · 该分支原先把渠道拒绝当请求级终态直接 return（不解绑、不换号），
+				//     于是被标记的号在粘性会话里被无限重复选中。
+				//
+				// 因此这里改为与内容审核同构：先换号再试（解绑粘性才能真正换号），
+				// 试满 MaxSoftRotations 次才把上游原文交给调用方。
+				if softRotate < h.cfg.MaxSoftRotations {
+					softRotate++
+					log.Printf("INFO: [服务] 渠道拒绝 — trying another account (%d/%d) uid=%s model=%s",
+						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel)
+					fail(acct.UID)
+					continue
+				}
 				releaseHeld()
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected",
 					"upstream rejected the client channel: Illegal API invocation from an unapproved channel")
