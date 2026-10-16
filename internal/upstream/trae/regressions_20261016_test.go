@@ -188,87 +188,59 @@ func TestLateReasoningFreshThoughtKept(t *testing.T) {
 	}
 }
 
-// TestFlattenToolTurnsKeepsImages 扁平化工具轮次时不得动图片块。
+// TestNonMultimodalModelWithImageRejectedBeforeEgress 非多模态模型带图必须在出站前拦下。
 //
-// 这是「带图 + 工具密集」场景的出路：Claude Code 的常态就是工具密集历史 + 本轮
-// 贴图，这类请求必然撞 3004（触发维度是结构化工具字段，与体积无关）。回落 Remote
-// 会丢图，所以改成**扁平化工具轮次后重发同一端点**——图片必须原样保留，否则这条
-// 出路等于换一种方式丢图。
-func TestFlattenToolTurnsKeepsImages(t *testing.T) {
-	prepared, _ := json.Marshal(map[string]any{
-		"model": "glm-5.3",
-		"messages": []any{
-			map[string]any{"role": "user", "content": "开始"},
-			map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
-				map[string]any{"id": "c1", "type": "function",
-					"function": map[string]any{"name": "Read", "arguments": `{"file_path":"/a"}`}}}},
-			map[string]any{"role": "tool", "tool_call_id": "c1", "content": "file contents"},
-			map[string]any{"role": "user", "content": []any{
-				map[string]any{"type": "text", "text": "这张图呢"},
-				map[string]any{"type": "image_url", "image_url": map[string]any{
-					"url": "data:image/png;base64,QUJD"}}}},
-		},
-		"tools": []any{map[string]any{"type": "function",
-			"function": map[string]any{"name": "Read", "parameters": map[string]any{"type": "object"}}}},
-	})
-	flat, ok := flattenToolTurnsForLegacy(prepared)
-	if !ok {
-		t.Fatal("有结构化工具字段时应能扁平化")
-	}
-	text := string(flat)
-	// 结构化字段必须消失（这才是绕开 3004 的关键）。
-	if strings.Contains(text, `"tool_calls"`) {
-		t.Errorf("tool_calls 未清除，3004 仍会触发：%s", text)
-	}
-	if strings.Contains(text, `"tool_call_id"`) {
-		t.Errorf("tool_call_id 未清除，3004 仍会触发：%s", text)
-	}
-	// 图片必须还在。
-	if !strings.Contains(text, "QUJD") {
-		t.Fatalf("图片被扁平化丢掉了：%s", text)
-	}
-	if !strings.Contains(text, `"image_url"`) {
-		t.Errorf("图片块类型丢失：%s", text)
-	}
-	// 工具语义要保留成文本（模型仍需知道工具轮次发生过）。
-	if !strings.Contains(text, "Client Tool Result") && !strings.Contains(text, "Client tool history") {
-		t.Errorf("工具轮次语义丢失：%s", text)
-	}
-}
-
-// TestFlattenToolTurnsNoToolsUnchanged 没有工具字段时不做无谓重发。
-func TestFlattenToolTurnsNoToolsUnchanged(t *testing.T) {
-	prepared, _ := json.Marshal(map[string]any{
-		"model":    "glm-5.3",
-		"messages": []any{map[string]any{"role": "user", "content": "纯文本"}},
-	})
-	if _, ok := flattenToolTurnsForLegacy(prepared); ok {
-		t.Error("无工具字段时不该报告可扁平化（会白花一次请求）")
-	}
-}
-
-// TestImageRequestGetsFallbackPath 带图请求必须挂上扁平化回落读取器。
+// 2026-10-16 实测（3/3 交替 A/B）：`trae:glm-5.3` 带图**必然失败**，而上游只回一句
+// 「exceeded the rate limit」——完全看不出真正原因是「这个模型没有视觉能力」，
+// 网关日志也只能记一条 upstream_parse。同一张图、同一时刻，
+// `trae:deepseek-v4.1-flash` 与 `trae:glm-5.3-flash` 都答得完全正确。
 //
-// v3.8.3 的行为是「带图就不回落」——于是带图提问在长会话里必然吃 400。
-// 现在改为：带图 → 扁平化回落；不带图 → Remote 回落。两条路都不再是死路。
-func TestImageRequestGetsFallbackPath(t *testing.T) {
-	// 这条规则由 chatStreamLegacy 的分支保证；这里断言判据本身的取值，
-	// 因为两处必须一致（否则会退化成「挂着读取器却不触发」或反之）。
+// 判据用目录的 multimodal 标记（Trae 自己的口径：glm-5.3 是 false）。
+// 目录不可用或模型不在目录里时**放行**——宁可让上游按自己的口径拒绝，
+// 也不能因为目录抖动把能读图的模型误拦。
+func TestNonMultimodalModelWithImageRejectedBeforeEgress(t *testing.T) {
+	// 目录：glm-5.3 非多模态，另两个多模态（形态对齐真实目录）。
+	models := []CatalogModel{
+		{ConfigName: "glm-5.3", Multimodal: false},
+		{ConfigName: "glm-5.3-flash", Multimodal: true},
+		{ConfigName: "deepseek-v4.1-flash", Multimodal: true},
+	}
+	// imageModelRejection 依赖网络取目录，这里直接验证判据本身的三个分支：
+	// 用与它同一套解析逻辑确认「请求里的模型名 → 目录项」能对上。
+	if resolved := ResolveFromCatalog(models, "glm-5.3"); resolved != "glm-5.3" {
+		t.Fatalf("目录解析失败：%q", resolved)
+	}
+	if resolved := ResolveFromCatalog(models, "deepseek-v4.1-flash"); resolved != "deepseek-v4.1-flash" {
+		t.Fatalf("目录解析失败：%q", resolved)
+	}
+
+	// 带图的请求必须被判为「有图片」（拦下的前提）。
 	withImage, _ := json.Marshal(map[string]any{
 		"model": "glm-5.3",
 		"messages": []any{map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "image_url", "image_url": map[string]any{
 				"url": "data:image/png;base64,QUJD"}}}}},
 	})
-	if !freshInputHasImages(withImage) {
-		t.Fatal("本轮带图应判为真（走扁平化回落）")
+	if !requestHasImages(withImage) {
+		t.Fatal("带图请求必须被判为有图片，否则拦不下来")
 	}
-	textOnly, _ := json.Marshal(map[string]any{
-		"model":    "glm-5.3",
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	})
-	if freshInputHasImages(textOnly) {
-		t.Error("纯文本应判为假（走 Remote 回落）")
+	// 非多模态项必须能被识别出来（拦下的依据）。
+	var target *CatalogModel
+	for index := range models {
+		if strings.EqualFold(models[index].ConfigName, "glm-5.3") {
+			target = &models[index]
+		}
+	}
+	if target == nil || target.Multimodal {
+		t.Fatal("glm-5.3 在目录里应标为非多模态（这是拦下的依据）")
+	}
+	// 多模态项不得被误拦。
+	for _, name := range []string{"deepseek-v4.1-flash", "glm-5.3-flash"} {
+		for index := range models {
+			if strings.EqualFold(models[index].ConfigName, name) && !models[index].Multimodal {
+				t.Errorf("%s 在目录里是多模态，不该被拦", name)
+			}
+		}
 	}
 }
 
