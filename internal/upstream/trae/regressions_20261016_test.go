@@ -244,6 +244,30 @@ func TestNonMultimodalModelWithImageRejectedBeforeEgress(t *testing.T) {
 	}
 }
 
+// TestImageRejectMessageHasNoRateLimitWording 拦截文案不得含限流措辞。
+//
+// 2026-10-16 实测踩到的坑：`upstream.Classify` 的 isExplicitInvalidRequest 会先扫
+// explicitRateMarkers（"rate limit" / "限流" / "请求过于频繁" 等），命中即放弃
+// 「请求参数错误」判定、退回限流分类 → HTTP 429，客户端退避重试一个永远不会成功的
+// 请求。原本文案写了「与图片无关的限流文案」，于是拦截虽生效、状态码却是 429。
+//
+// 这条测试把「文案不得含这些词」钉死，避免以后改文案时又踩回去。
+func TestImageRejectMessageHasNoRateLimitWording(t *testing.T) {
+	markers := []string{"rate limit", "rate-limit", "too many requests",
+		"usage limit", "限流", "请求过于频繁"}
+	// 与 imageModelRejection 拼出的文案同构（含模型名与备选列表）。
+	sample := "模型 glm-5.3 不支持图片输入（上游目录标 multimodal=false），" +
+		"本轮请求带图，网关已在出站前拦下（否则上游会回一句与图片无关的英文提示，无法排障）。" +
+		"请去掉图片，或改用支持图片的模型：Doubao-Seed-2.1-Pro、deepseek-v4.1-flash"
+	lower := strings.ToLower(sample)
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			t.Errorf("拦截文案含限流措辞 %q —— 会让 Classify 归成 429（客户端会退避重试）：%s",
+				marker, sample)
+		}
+	}
+}
+
 // TestTextToolCallExtractedFromContent 正文里的 opencode_tool_call 必须转成 tool_calls。
 //
 // 这是「工具调用凭空消失」的直接判据。旧实现只在 visibleText 里 strip 掉块，

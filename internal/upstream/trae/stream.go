@@ -198,11 +198,16 @@ func imageModelRejection(ctx context.Context, a *auth.Auth, prepared []byte) str
 		alternatives = alternatives[:6]
 	}
 	message := "模型 " + resolved + " 不支持图片输入（上游目录标 multimodal=false），" +
-		"本轮请求带图，网关已在出站前拦下（否则上游会回一句与图片无关的限流文案，无法排障）。" +
+		"本轮请求带图，网关已在出站前拦下（否则上游会回一句与图片无关的英文提示，无法排障）。" +
 		"请去掉图片，或改用支持图片的模型"
 	if len(alternatives) > 0 {
 		message += "：" + strings.Join(alternatives, "、")
 	}
+	// 文案里**不得出现** explicitRateMarkers 的词（"rate limit" / "限流" 等）：
+	// upstream.Classify 的 isExplicitInvalidRequest 会先扫这些词，命中即放弃
+	// 「请求参数错误」的判定、退回限流分类（→ HTTP 429，客户端退避重试一个永远
+	// 不会成功的请求）。2026-10-16 实测踩到：原本文案写了「与图片无关的限流文案」，
+	// 于是拦截虽生效，返回的却是 429 rate_limit_exceeded。
 	return message
 }
 
