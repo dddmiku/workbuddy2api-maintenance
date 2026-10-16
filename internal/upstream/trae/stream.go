@@ -115,12 +115,21 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	// 而不是网关猜一个模型名清单——目录是上游发布的，会随版本变。
 	// 目录取不到时**放行**（宁可让上游按自己的口径拒绝，也不能因为目录抖动
 	// 把能读图的模型误拦）。
+	//
+	// 返回形态必须是 **(nil, status, body, nil)** 而不是 error：handler 把非 nil 的
+	// err 一律当成「传输层抖动」→ 换号重试（`if terr != nil { … st.status = 503;
+	// fail(acct.UID); continue }`），于是这个「与账号无关」的确定性拒绝会被当成
+	// 号池故障，换遍所有号之后回一句 `no_healthy_account`（2026-10-16 实测：
+	// 拦截生效了，但用户看到的是 503「所有账号暂时不可用」，比原始 502 更误导）。
+	// 走 status/body 这条路，handler 才会按 body 分类成终态、直接回给客户端。
 	if requestHasImages(prepared) {
 		if reason := imageModelRejection(ctx, a, prepared); reason != "" {
-			return nil, http.StatusBadRequest, nil, &upstreamerr.Error{
-				Code:    upstreamerr.RateLimitCode,
-				Message: reason,
-			}
+			payload, _ := json.Marshal(map[string]any{
+				"code":    upstreamerr.RateLimitCode,
+				"message": reason,
+			})
+			log.Printf("INFO: [trae] 带图请求被拦下（模型无视觉能力）：%s", reason)
+			return nil, http.StatusBadRequest, payload, nil
 		}
 	}
 	if RemoteEnabled() && !requestHasImages(prepared) {
