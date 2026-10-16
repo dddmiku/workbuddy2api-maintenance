@@ -258,11 +258,17 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 	// {"type":"text","data":{"content":...}}，图片部件是渲染器媒体块原形
 	// {"type":"image_url","value":{"mimeType","data"}}，按消息顺序交替排列。
 	//
-	// 2026-10-16 实测：只把图片塞进 query（或只放图片不放文本）模型都读不到图。
+	// 2026-10-16 二次修正：query **也带图片**。
+	//
+	// 此前 query 用 stripImageParts 把图片剥掉（理由：媒体已由 content 携带，
+	// 文本里再留 "[image omitted]" 会让模型以为图丢了）。但实测（Trae 客户端
+	// 能读图、我们的 Remote 路径不能）表明**图片必须出现在 query 里**：
+	// query 是 Remote agent 真正读取的输入，content 更像结构化存档。
+	//
+	// 判据：改用 flattenQueryWithImages（文本半边 + 媒体部件），它与 content
+	// 用同一套 rendererMediaBlock 形态，只是部件形状按 query 的要求放在 `data` 下。
 	content := buildRemoteContent(bounded)
-	// query 文本半边去掉图片块：媒体已由 content 携带，文本里再留 "[image omitted]"
-	// 会让模型以为图丢了（参考 _without_native_images 同一口径）。
-	query := flattenQuery(stripImageParts(bounded))
+	query := flattenQueryWithImages(bounded)
 
 	agentType := remoteAgentTypeFor(model, withTools)
 	// auto / work 是路由 id；具名模型走 manual。
