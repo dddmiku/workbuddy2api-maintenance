@@ -31,6 +31,9 @@ func (f *boundaryTasks) TaskLogDetail(string) (scheduler.TaskLogResult, error) {
 // 开关本身的效果由 scheduler 包的测试覆盖。
 func (f *boundaryTasks) SetTaskEnabled(string, bool) bool { f.calls++; return true }
 
+// StopTask 满足 TaskController（同上：只关心公开请求能不能碰到管理面）。
+func (f *boundaryTasks) StopTask(string) bool { f.calls++; return true }
+
 func TestManagedKeysCannotAccessAccountAdministration(t *testing.T) {
 	store, err := apikeys.Open(filepath.Join(t.TempDir(), "keys.json"), "fixture-legacy")
 	if err != nil {

@@ -205,6 +205,7 @@ var IC = {
   coins: '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4v9.2M9.4 10h5.2M9.4 14h5.2"/>',
   eye:   '<path d="M2.2 12S5.8 5.4 12 5.4 21.8 12 21.8 12 18.2 18.6 12 18.6 2.2 12 2.2 12Z"/><circle cx="12" cy="12" r="2.7"/>',
   play:  '<path d="M8 5.4v13.2L19 12 8 5.4Z"/>',
+  stop:  '<rect x="6.4" y="6.4" width="11.2" height="11.2" rx="1.6"/>',
   trash: '<path d="M4 7h16M9.6 7V4.8h4.8V7M6.6 7l.9 13.2h9l.9-13.2"/>',
   pulse: '<path d="M3 12h3.6l2.4-6 3.9 12 2.6-6H21"/>',
   moon:  '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
@@ -789,8 +790,11 @@ function renderCredit(){
 
 function taskState(t){
   if (!t) return { cls:'n', text:'未知' };
-  if (!t.enabled) return { cls:'n', text:'已停用' };
   if (t.running) return { cls:'a', text:'执行中' };
+  // 一次性任务（无排程小时）没有「启用/停用」的概念——它的执行由上游活动是否
+  // 过期决定。显示「已启用」会让人以为它会定时跑，所以单独给一个说法。
+  if (!(t.hours && t.hours.length)) return { cls:'n', text:'手动' };
+  if (!t.enabled) return { cls:'n', text:'已停用' };
   return { cls:'ok', text:'已启用' };
 }
 function sortTasks(list){
@@ -1425,16 +1429,27 @@ function taskTile(t){
   var st = taskState(t);
   var hours = (t.hours || []).map(function(h){
     return '<span class="hour">' + pad(h) + ':00</span>'; }).join('');
-  return '<div class="tile">' +
-    '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' +
+  // 一次性任务（无 hours）没有开关：它的执行与否由上游活动是否过期决定，
+  // 不由配置决定。面板隐藏开关（服务端也会拒绝对它的 toggle，见
+  // panel.SetTaskEnabled 的空字段保护），只留「跑一次」与「停止」。
+  var oneShot = !(t.hours && t.hours.length);
+  var toggle = oneShot ? '<span class="pill">一次性</span>' :
     '<button class="sw" role="switch" data-task="' + esc(t.key) + '" aria-checked="' +
     (t.enabled ? 'true' : 'false') + '"' + (t.running ? ' disabled' : '') +
-    ' aria-label="' + esc(t.name) + ' 开关"></button></div>' +
+    ' aria-label="' + esc(t.name) + ' 开关"></button>';
+  // 运行中时「跑一次」换成「停止」：同一个位置、同一个按钮样式，避免用户
+  // 在「已经在跑」的状态下还能再点一次触发（服务端会回 409，但那是错误提示，
+  // 不如直接把可用的动作摆出来）。
+  var action = t.running
+    ? '<button class="btn sm dgr solid" data-stop="' + esc(t.key) + '">' + svg(IC.stop, 11) + '停止</button>'
+    : '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>';
+  return '<div class="tile">' +
+    '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' + toggle + '</div>' +
     '<div><div class="tl-nm">' + esc(t.name) + '</div>' +
     '<div class="detail">' + esc(t.detail || '') + '</div></div>' +
     '<div class="hours">' + hours + '</div>' +
     '<div class="tile-f">' +
-    '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
+    action +
     '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) +
     '" title="日志">' + svg(IC.eye, 13) + '</button>' +
     '<span class="sp"></span><span class="meta">' + esc(fmtTime(t.next_run)) + '</span>' +
@@ -1493,6 +1508,10 @@ document.addEventListener('click', function(e){
 document.addEventListener('click', function(e){
   var r = e.target.closest('[data-run]');
   if (r){ actTaskRun(r.getAttribute('data-run')); return; }
+  // 停止排在 data-run 之后：两者互斥（运行中渲染 stop、空闲渲染 run），
+  // 不会同时命中，但保持「先 run 后 stop」的顺序便于阅读。
+  var p = e.target.closest('[data-stop]');
+  if (p){ actTaskStop(p.getAttribute('data-stop')); return; }
   var g = e.target.closest('[data-log]');
   if (g){ openTaskLog(g.getAttribute('data-log'), g.getAttribute('data-name')); return; }
   var s = e.target.closest('[data-task]');
@@ -1622,6 +1641,21 @@ async function actTaskRun(key){
       setTimeout(function(){ loadAll(); }, 1200);
     }
   }catch(err){ toast('触发失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+async function actTaskStop(key){
+  busy(true);
+  try{
+    var r = await api('api/task/stop', { key:key });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok){
+      // 停止是协作式的：信号发出后任务在下一个检查点退出，因此不能立刻断言
+      // 「已停止」。刷新几次让面板自己把状态翻成「空闲」——第一次 1.2s 覆盖
+      // 快速退出的任务，第二次 4s 兜住还在收尾的（脚本子进程要等它退出）。
+      setTimeout(function(){ loadAll(); }, 1200);
+      setTimeout(function(){ loadAll(); }, 4000);
+    }
+  }catch(err){ toast('停止失败：' + (err && err.message || err), 'err'); }
   finally{ busy(false); }
 }
 function actTaskToggle(key, nextEnabled){

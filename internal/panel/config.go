@@ -40,13 +40,29 @@ var taskEnableKey = map[string]string{
 	"growth": "growth_enabled",
 	// balance：余额刷新（纯读）。漏登记会让面板「跑一次/开关」报「任务标识不正确」。
 	"balance": "balance_enabled",
+	// compensation：补偿积分领取（**一次性任务**，2026-10-16）。
+	//
+	// 它没有 config.json 开关字段——空串表示「本任务不可开关，只能手动跑一次」。
+	// 登记在这里的唯一目的是让面板的 KnownTask 白名单放行它的「跑一次 / 停止」，
+	// 否则前端点按钮会吃「任务标识不正确」。
+	"compensation": "",
 }
 
 // TaskKeys 返回面板接受的任务标识（顺序固定，便于测试与日志）。
 func TaskKeys() []string {
 	// 顺序与 app.py 的 TASK_ENABLE_KEY 字面量一致；Go 的 map 无序，所以显式列出。
+	// 末尾的 compensation 是一次性任务：面板上不渲染开关，只渲染「跑一次」。
 	return []string{"checkin", "trae_check", "travel", "activity", "keepalive",
-		"school", "cat", "growth", "balance"}
+		"school", "cat", "growth", "balance", "compensation"}
+}
+
+// TaskToggleable 报告该任务是否可开关。
+//
+// 一次性任务（compensation）没有 schedule.<key>_enabled 字段：它的「是否还会执行」
+// 由上游活动是否过期决定，不由配置决定。面板据此隐藏开关，只留「跑一次」。
+func TaskToggleable(key string) bool {
+	field, ok := taskEnableKey[key]
+	return ok && field != ""
 }
 
 // KnownTask 判断任务标识是否在白名单内。
@@ -80,6 +96,15 @@ func SetTaskEnabled(configPath, key string, enabled bool) (bool, string) {
 	field, ok := taskEnableKey[key]
 	if !ok {
 		return false, fmt.Sprintf("未知任务：%s", key)
+	}
+	// 空字段 = 一次性任务，没有开关可写。
+	//
+	// 必须在这里挡住：下面 schedule.Set("", enabled) 会往 config.json 里写一个
+	// **空键名**（`"": true`），既无意义又会让配置解析出意外结构。面板的
+	// TaskToggleable 已负责不渲染开关，这里是服务端的第二道防线（面板不是唯一
+	// 调用方，管理通道也能直接打这个端点）。
+	if field == "" {
+		return false, fmt.Sprintf("「%s」是一次性任务，没有开关；请用「跑一次」触发", key)
 	}
 	object, err := readConfigObject(configPath)
 	if err != nil {

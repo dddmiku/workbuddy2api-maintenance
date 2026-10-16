@@ -29,6 +29,9 @@ type TaskController interface {
 	// 网关就生效（2026-10-15 用户反馈「任务启停都要重启，这合理吗」）。
 	// 返回 false 表示 key 未知（此时不写任何状态）。
 	SetTaskEnabled(key string, enabled bool) bool
+	// StopTask 取消正在跑的某个任务（面板「停止」按钮）。返回 false 表示该任务
+	// 当前没在运行（不是错误）。取消是协作式的：返回 true 只表示信号已发出。
+	StopTask(key string) bool
 }
 
 // tasks 返回全部排程任务的快照。
@@ -103,6 +106,31 @@ func (h *Handler) taskRun(w http.ResponseWriter, r *http.Request) {
 		// 前端收到 ok 后会直接打开该任务的日志窗口（2026-10-15 起），文案不再把
 		// 用户引去翻容器日志——日志弹窗就是为看「正在跑什么」准备的。
 		"ok": true, "key": key, "message": "已触发",
+	})
+}
+
+// taskStop 停止正在跑的某个任务（面板「停止」按钮）。
+//
+// 与 taskRun 对称，但语义不同：停止是**协作式取消**——发出取消信号后任务在下一个
+// ctx 检查点退出，因此返回 accepted 只表示"信号已发出"，不代表已停。面板应继续
+// 轮询 /tasks 的 running 字段确认（它会变成 false）。
+//
+// 任务没在跑时返回 200 + stopped=false，而不是错误：面板可能连点，或任务刚好
+// 自己结束了——那两种情况用户的意图都已满足（任务不在跑），报错只会让人困惑。
+func (h *Handler) taskStop(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Tasks == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tasks_unavailable",
+			"本进程未接入排程器，无法停止任务")
+		return
+	}
+	key := r.PathValue("key")
+	stopped := h.cfg.Tasks.StopTask(key)
+	message := "已发出停止信号，任务将在当前步骤结束后退出"
+	if !stopped {
+		message = "该任务当前没有在运行"
+	}
+	_ = writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok": true, "key": key, "stopped": stopped, "message": message,
 	})
 }
 

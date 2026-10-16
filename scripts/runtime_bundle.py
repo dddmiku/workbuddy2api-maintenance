@@ -14,7 +14,11 @@ FILES = ('wb2api', 'login', 'credit', 'signin_bin', 'trial_bin', 'activity_bin',
          'fission_bin',
          'login.sh', 'credit.sh', 'signin.sh', 'trial.sh', 'fission.sh',
          'scripts/global_region.py', 'scripts/task_common.py', 'scripts/task_runner.py',
-         'scripts/school_open_day_2026.py', 'scripts/growth_center.py')
+         'scripts/school_open_day_2026.py', 'scripts/growth_center.py',
+         # compensation_claim.py 是「补偿积分领取」一次性任务的执行体。
+         # 漏在这里的后果是**运行期才暴露**：任务在面板上可见、点「跑一次」也返回
+         # 已触发，但脚本文件不存在 → 子进程立刻失败，日志里只有一行 python 报错。
+         'scripts/compensation_claim.py')
 
 
 def package(stage, version, arch, archive=None):

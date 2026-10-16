@@ -293,6 +293,26 @@ func (s *Server) taskRun(ctx context.Context, body map[string]any) map[string]an
 	return map[string]any{"ok": true, "message": "已触发"}
 }
 
+// taskStop 停止正在跑的某个任务（面板「停止」按钮）。
+//
+// 与 taskRun 对称：转发到网关的 /tasks/{key}/stop。网关返回 stopped 字段表示
+// 是否确实发出了取消信号；任务没在跑时 stopped=false，那不是错误（面板可能连点，
+// 或任务刚好自己结束了）——对用户来说「任务不在跑」这个意图已经满足。
+func (s *Server) taskStop(ctx context.Context, body map[string]any) map[string]any {
+	key := strings.TrimSpace(jsonString(body["key"]))
+	if !KnownTask(key) {
+		return map[string]any{"ok": false, "message": formatMessage("未知任务：%s", key)}
+	}
+	ok, payload := s.gateway.Post(ctx, "/tasks/"+key+"/stop")
+	if !ok {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "停止失败")}
+	}
+	if stopped, _ := payload["stopped"].(bool); stopped {
+		return map[string]any{"ok": true, "message": "已发出停止信号，任务将在当前步骤结束后退出"}
+	}
+	return map[string]any{"ok": true, "message": "该任务当前没有在运行"}
+}
+
 // taskToggle 改任务开关（写 config.json，必须重启才生效）。
 func (s *Server) taskToggle(ctx context.Context, body map[string]any) map[string]any {
 	key := strings.TrimSpace(jsonString(body["key"]))

@@ -7,6 +7,7 @@
 package scheduler
 
 import (
+	"context"
 	"errors"
 	"log"
 	"time"
@@ -26,6 +27,9 @@ const (
 	TaskKeyCat       TaskKey = "cat"        // 夜猫子任务
 	TaskKeyGrowth    TaskKey = "growth"     // 成长中心流水线（旅行/任务奖/补登/兑换/抽奖/Buddy盲盒）
 	TaskKeyBalance   TaskKey = "balance"    // 余额刷新（纯读；快过期优先消耗的数据来源）
+	// TaskKeyCompensation 补偿积分领取（**一次性任务**，无排程小时）。
+	// 限时活动，到期即无；面板以「跑一次」提供，不进定时候选。
+	TaskKeyCompensation TaskKey = "compensation"
 )
 
 // ErrUnknownTask 未知任务 key；ErrTaskBusy 该任务当前正在执行。
@@ -77,6 +81,8 @@ func (k taskKind) key() TaskKey {
 		return TaskKeyGrowth
 	case taskBalance:
 		return TaskKeyBalance
+	case taskCompensation:
+		return TaskKeyCompensation
 	}
 	return ""
 }
@@ -102,6 +108,8 @@ func kindOf(key string) (taskKind, bool) {
 		return taskGrowth, true
 	case TaskKeyBalance:
 		return taskBalance, true
+	case TaskKeyCompensation:
+		return taskCompensation, true
 	}
 	return 0, false
 }
@@ -128,6 +136,8 @@ func describe(k TaskKey) (string, string) {
 		return "成长中心", "一轮跑完七段：领旅行礼物/派 Buddy → 任务接单与领奖 → 补登卡自动补 → 连登兑换 → 盲盒抽奖 → 能量开 Buddy 盲盒 → 能量与连签展示"
 	case TaskKeyBalance:
 		return "余额刷新", "只读查询各账号积分余额与快过期分桶，驱动「优先消耗快过期积分」选号；关掉签到也建议保留本任务"
+	case TaskKeyCompensation:
+		return "补偿积分领取", "一次性任务：领取上游发放的限时补偿积分（如模型服务异常补偿）。每个账号只能领一次，重复运行会跳过已领账号"
 	}
 	return string(k), ""
 }
@@ -154,6 +164,9 @@ func realmsOf(k TaskKey) []string {
 	case TaskKeyBalance:
 		// 纯读余额查询，cn 与 global 都跑（trae 在实现里整条跳过）。
 		return []string{"cn", "global"}
+	case TaskKeyCompensation:
+		// 补偿活动只挂在 CN 站；global/trae 打该端点会拿到 401 授权页（实测）。
+		return []string{"cn"}
 	}
 	// 其余任务只服务 CN：global 在实现里被精确排除。
 	return []string{"cn"}
@@ -192,6 +205,9 @@ func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 		return s.cfg.GrowthHours, enabled
 	case TaskKeyBalance:
 		return s.cfg.BalanceHours, enabled
+	case TaskKeyCompensation:
+		// 一次性任务：没有排程小时。返回 nil 小时 = 面板显示「手动」且无下次时点。
+		return nil, enabled
 	}
 	return nil, false
 }
@@ -207,7 +223,7 @@ func (s *Scheduler) TaskSnapshot() []TaskInfo {
 	keys := []TaskKey{
 		TaskKeyCheckin, TaskKeyTraeCheck, TaskKeyTravel, TaskKeyActivity,
 		TaskKeyKeepalive, TaskKeySchool, TaskKeyCat,
-		TaskKeyGrowth, TaskKeyBalance,
+		TaskKeyGrowth, TaskKeyBalance, TaskKeyCompensation,
 	}
 	out := make([]TaskInfo, 0, len(keys))
 	for _, key := range keys {
@@ -272,9 +288,69 @@ func (s *Scheduler) endTask(k taskKind) {
 		return
 	}
 	s.taskBusy[key] = false
+	// 取消函数用完即弃：留着会在下一轮 beginTask 覆盖前被误当成"当前这次"的。
+	// 这里**不调用**它——任务正常结束时不需要取消，调用反而会取消已经结束的 ctx。
+	delete(s.taskCancel, key)
 	s.taskLast[key] = time.Now()
 	taskSink.markEnded(key)
 	s.taskWG.Done()
+}
+
+// TaskContext 为一次任务执行建立**可单独取消**的 ctx。
+//
+// 继承 lifecycle：调度器关停时子任务照常被取消（关停语义不变）；
+// 同时把 cancel 记进 taskCancel，供 StopTask 单独取消这一个任务。
+//
+// 调用方必须已通过 beginTask 占住该 key。
+func (s *Scheduler) TaskContext(k taskKind) (context.Context, context.CancelFunc) {
+	base := s.lifecycle
+	if base == nil {
+		// 零值 Scheduler（测试直接构造 &Scheduler{} 时会出现）没有 lifecycle。
+		// 不在这里兜底会 panic 在下一行的 WithCancel(nil) 上——实测踩到：
+		// 「assignment to entry in nil map」其实是更早的 taskCancel 写入，
+		// 两个 nil 都要挡。
+		base = context.Background()
+	}
+	ctx, cancel := context.WithCancel(base)
+	key := k.key()
+	if key == "" {
+		return ctx, cancel
+	}
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	if s.taskCancel == nil {
+		s.taskCancel = make(map[TaskKey]context.CancelFunc)
+	}
+	// 上一轮的 cancel 若还在（不该发生：endTask 会清），先取消掉避免泄漏。
+	if previous, ok := s.taskCancel[key]; ok {
+		previous()
+	}
+	s.taskCancel[key] = cancel
+	return ctx, cancel
+}
+
+// StopTask 取消正在跑的某个任务，返回是否确实取消了。
+//
+// 语义是**协作式取消**：ctx 被取消后，任务里所有以它为 ctx 的 HTTP 请求会立刻中断，
+// 脚本子进程（任务脚本走 exec）也会被 kill。任务自身在下一个 ctx 检查点退出，
+// 因此返回 true 表示"取消信号已发出"，不代表任务已经停止——面板应继续轮询
+// /tasks 的 running 字段确认。
+//
+// 任务没在跑时返回 false（不是错误：面板可能连点，或任务刚好自己结束了）。
+func (s *Scheduler) StopTask(key string) bool {
+	k, ok := kindOf(key)
+	if !ok {
+		return false
+	}
+	s.taskMu.Lock()
+	cancel, running := s.taskCancel[k.key()]
+	s.taskMu.Unlock()
+	if !running || cancel == nil {
+		return false
+	}
+	log.Printf("scheduler: 收到停止请求，正在取消 %s", key)
+	cancel()
+	return true
 }
 
 // TriggerTask 手动触发单类任务。任务在后台 goroutine 里跑，调用立即返回。
@@ -299,7 +375,11 @@ func (s *Scheduler) TriggerTask(key string) error {
 			}
 		}()
 		log.Printf("scheduler: 手动触发 %s", key)
-		s.runTask(s.lifecycle, k)
+		// 用可单独取消的 ctx（而不是全局 lifecycle）：面板的「停止」按钮只该停
+		// 掉这一个任务，不该把整个排程器连同其它任务一起关掉。
+		ctx, cancel := s.TaskContext(k)
+		defer cancel()
+		s.runTask(ctx, k)
 	}()
 	return nil
 }

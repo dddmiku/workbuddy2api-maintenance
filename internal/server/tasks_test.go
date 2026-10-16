@@ -29,6 +29,9 @@ func (f fakeTasks) TaskLogDetail(key string) (scheduler.TaskLogResult, error) {
 // SetTaskEnabled 满足 TaskController；未知 key 与真实实现同口径返回 false。
 func (f fakeTasks) SetTaskEnabled(key string, enabled bool) bool { return key != "" }
 
+// StopTask 满足 TaskController；桩一律报告「取消了」。
+func (f fakeTasks) StopTask(key string) bool { return key != "" }
+
 func tasksReq(t *testing.T, h *Handler, method, path string) (int, map[string]any) {
 	t.Helper()
 	rec := httptest.NewRecorder()

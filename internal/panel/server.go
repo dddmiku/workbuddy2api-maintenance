@@ -454,6 +454,8 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, http.StatusOK, s.accountDelete(r.Context(), body))
 	case "/api/task/run":
 		writeJSON(w, http.StatusOK, s.taskRun(r.Context(), body))
+	case "/api/task/stop":
+		writeJSON(w, http.StatusOK, s.taskStop(r.Context(), body))
 	case "/api/task/toggle":
 		writeJSON(w, http.StatusOK, s.taskToggle(r.Context(), body))
 	case "/api/service/restart":
@@ -595,6 +597,7 @@ var actionShapes = map[string][]string{
 	"/api/account/revive":          {"uid"},
 	"/api/account/fission":         {"uid"},
 	"/api/task/run":                {"key"},
+	"/api/task/stop":               {"key"},
 	"/api/task/toggle":             {"key", "enabled"},
 	"/api/service/restart":         {},
 	"/api/credit":                  {},
@@ -661,7 +664,7 @@ func validateActionBody(path string, body map[string]any) string {
 			return "账号标识不正确"
 		}
 	}
-	if path == "/api/task/run" || path == "/api/task/toggle" {
+	if path == "/api/task/run" || path == "/api/task/stop" || path == "/api/task/toggle" {
 		key, _ := body["key"].(string)
 		if !KnownTask(key) {
 			return "任务标识不正确"

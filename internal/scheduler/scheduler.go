@@ -144,6 +144,18 @@ type Scheduler struct {
 	lifecycle context.Context
 	cancel    context.CancelFunc
 
+	// taskCancel 每个正在跑的任务各自的取消函数，供面板「停止」按钮单独取消**一个**
+	// 任务而不影响其它任务与调度器本身。
+	//
+	// 为什么不能复用 lifecycle（2026-10-16 实现「停止」时发现）：手动触发此前直接传
+	// s.lifecycle，而那是**调度器全局**的 ctx——取消它等于关停整个排程器，所有任务
+	// 和定时点一起停。面板要的是「停掉我正在跑的这一条」，所以每次触发建一个
+	// context.WithCancel(s.lifecycle)：继承关停语义（调度器退出时子任务照常被取消），
+	// 又能被单独取消。
+	//
+	// 与 taskBusy 同生命周期：beginTask 建、endTask 清。
+	taskCancel map[TaskKey]context.CancelFunc
+
 	// disabledOverride 是**运行期**的任务开关覆盖：TaskKey → 是否停用。
 	//
 	// 为什么需要它（2026-10-15 用户反馈「任务启停都要重启网关才行，这合理吗」）：
@@ -213,6 +225,7 @@ func New(cfg Config) *Scheduler {
 		adoptTried:       make(map[string]string),
 		taskLast:         make(map[TaskKey]time.Time),
 		taskBusy:         make(map[TaskKey]bool),
+		taskCancel:       make(map[TaskKey]context.CancelFunc),
 		disabledOverride: make(map[TaskKey]bool),
 		wake:             make(chan struct{}, 1),
 		traeDeviceGen:    make(map[string]int),
@@ -247,6 +260,11 @@ func (s *Scheduler) taskDisabled(k taskKind) bool {
 		return s.cfg.GrowthDisabled
 	case taskBalance:
 		return s.cfg.BalanceDisabled
+	case taskCompensation:
+		// 一次性任务没有开关字段：它的启停由「是否还能领」决定，不由配置决定。
+		// 返回 false（未停用）让面板能手动触发它；它不进 nextWake 候选，
+		// 所以「未停用」不会导致任何定时执行。
+		return false
 	}
 	return false
 }
@@ -338,6 +356,12 @@ const (
 	taskCat
 	taskGrowth
 	taskBalance
+	// taskCompensation 补偿积分领取（一次性任务，无排程时点）。
+	//
+	// 它没有小时配置：补偿是限时活动（实测 end_time 2026-10-22 23:59:59），
+	// 到期即无，做成定时任务只会在活动结束后每天空跑。面板上以「跑一次」提供，
+	// 不进 nextWake 的候选。
+	taskCompensation
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -547,6 +571,8 @@ func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 		s.runGrowthCenter(ctx)
 	case taskBalance:
 		s.runBalance(ctx)
+	case taskCompensation:
+		s.runCompensation(ctx)
 	}
 }
 
@@ -1162,6 +1188,28 @@ func (s *Scheduler) runBalance(ctx context.Context) {
 	if _, err := s.balanceAll(ctx); err != nil {
 		log.Printf("定时余额刷新已跳过：%v", err)
 	}
+}
+
+// runCompensation 补偿积分领取（一次性任务）。
+//
+// 走脚本（scripts/compensation_claim.py）而不是在 Go 里实现：领取逻辑要先查
+// compensation-status 再决定是否 claim，且要逐账号记录结果——与其它任务脚本
+// 同一形态，放脚本里便于单独调试与复跑。
+//
+// 脚本自带 realm 过滤（只处理 CN 账号）与幂等（claimed=true 跳过），因此
+// 重复运行是安全的，日志里会显示「已领 N」而不是报错。
+//
+// 无排程时点：本任务不进 nextWake 候选，只能由面板「跑一次」触发。
+func (s *Scheduler) runCompensation(ctx context.Context) {
+	root := repoRoot()
+	runScriptContext(ctx, "compensation", root, [][]string{
+		{pythonCmd(), "scripts/compensation_claim.py"},
+	})
+}
+
+// RunCompensationNow 供管理面板手动触发（不经排程）。
+func (s *Scheduler) RunCompensationNow() {
+	s.runCompensation(context.Background())
 }
 
 // BalanceAll 供管理面板手动触发。

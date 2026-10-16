@@ -278,6 +278,7 @@ func NewHandler(cfg Config) *Handler {
 	// 排程任务自省与手动触发（账户管理面板的「定时任务」页）。
 	h.mux.HandleFunc("GET /tasks", h.withAccountAdmin(h.tasks))
 	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAccountAdmin(h.taskRun))
+	h.mux.HandleFunc("POST /tasks/{key}/stop", h.withAccountAdmin(h.taskStop))
 	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAccountAdmin(h.taskLog))
 	// 任务开关的原地生效入口：面板改完 config.json 后调它，运行中的排程器立刻按新值
 	// 走，不必重启进程（2026-10-15）。只走本机管理通道。

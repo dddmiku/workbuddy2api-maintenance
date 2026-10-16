@@ -24,6 +24,9 @@ var runtimeFiles = map[string]os.FileMode{
 	"login.sh":    0755, "credit.sh": 0755, "signin.sh": 0755, "trial.sh": 0755, "fission.sh": 0755,
 	"scripts/global_region.py": 0644, "scripts/task_common.py": 0644, "scripts/task_runner.py": 0644,
 	"scripts/school_open_day_2026.py": 0644, "scripts/growth_center.py": 0644,
+	// 补偿积分领取（一次性任务）的执行体。必须与 scripts/runtime_bundle.py 的
+	// FILES 同步——TestRuntimeFileListsMatch 会拦住漏改的那一侧。
+	"scripts/compensation_claim.py": 0644,
 }
 
 type runtimeManifest struct {
