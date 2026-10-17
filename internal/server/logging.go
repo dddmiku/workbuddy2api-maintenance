@@ -606,9 +606,12 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 			tokpsField = "0.0"
 		}
 	}
-	ttfbMS := "-"
+	// TTFB 用秒（与 total 同口径）：25.2s 比 25180ms 直观得多，长上下文请求的
+	// 首字节经常是几十秒，毫秒值要数位数。面板 logparse 取的是 `[^|]*?`，两种
+	// 单位都能解析。
+	ttfbField := "-"
 	if ttfb > 0 {
-		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
+		ttfbField = fmt.Sprintf("%.1fs", ttfb.Seconds())
 	}
 	promptField := "-"
 	if prompt >= 0 {
@@ -648,7 +651,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		uidPrefix(uid),
 		readField,
 		preField,
-		ttfbMS,
+		ttfbField,
 		promptField,
 		cachedField,
 		cache,

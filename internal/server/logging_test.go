@@ -203,7 +203,8 @@ func TestLogChatRowFormat(t *testing.T) {
 			306401, 298112, 1234, "团队 A", "prev=305900", 180*time.Millisecond, 35*time.Millisecond)
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "read=180ms", "pre=35ms", "TTFB=412ms",
+		// TTFB 自 2026-10-18 起用秒（与 total 同口径）：25180ms 这种五位数不直观。
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "read=180ms", "pre=35ms", "TTFB=0.4s",
 		"in=306401", "hit=298112", "cache=prev=305900", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
