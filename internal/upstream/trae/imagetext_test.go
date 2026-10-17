@@ -25,7 +25,56 @@ import (
 	"workbuddy2api/internal/upstreamerr"
 )
 
-// TestExtractUpstreamTextSSE 转写响应是 SSE 时也要能取到正文。
+// TestExtractUpstreamTextTraeNative 转写请求打的是 llm_utils_chat，回的是
+// **Trae 原生事件**（event: output + response 字段），不是 OpenAI 形状。
+//
+// 2026-10-18 首版只按 OpenAI 解析，生产日志表现为「转写模型返回空正文：id:1」——
+// 响应 200 但取不到正文，整条链路静默失效。
+func TestExtractUpstreamTextTraeNative(t *testing.T) {
+	raw := `event: output
+data: {"response":"蓝色背景，"}
+
+event: output
+data: {"response":"蓝色背景，红色圆形"}
+
+event: output
+data: {"response":"蓝色背景，红色圆形，绿色矩形"}
+
+event: done
+data: {}
+`
+	got := extractUpstreamText([]byte(raw))
+	if got != "蓝色背景，红色圆形，绿色矩形" {
+		t.Errorf("累计快照应合并成最终全文，实际：%q", got)
+	}
+}
+
+// TestSnapshotAccumulator 快照与增量两种语义都要正确处理。
+func TestSnapshotAccumulator(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"纯增量", []string{"蓝", "色", "背景"}, "蓝色背景"},
+		{"纯快照", []string{"蓝", "蓝色", "蓝色背景"}, "蓝色背景"},
+		{"混合", []string{"蓝", "蓝色", "色背景"}, "蓝色背景"},
+		{"空片段", []string{"蓝", "", "色"}, "蓝色"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			acc := newSnapshotAccumulator()
+			for _, chunk := range c.chunks {
+				acc.add(chunk)
+			}
+			if got := acc.value(); got != c.want {
+				t.Errorf("期望 %q，实际 %q", c.want, got)
+			}
+		})
+	}
+}
+
+// TestExtractUpstreamTextSSE 转写响应是 OpenAI SSE 时也要能取到正文。
 func TestExtractUpstreamTextSSE(t *testing.T) {
 	raw := `event: output
 data: {"choices":[{"delta":{"content":"蓝色"}}]}

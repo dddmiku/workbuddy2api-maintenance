@@ -36,6 +36,7 @@
 package trae
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -157,7 +158,12 @@ func transcribeOneImage(ctx context.Context, a *auth.Auth, media map[string]any,
 		url = "data:" + mime + ";base64," + data
 	}
 
-	body, err := json.Marshal(map[string]any{
+	// 请求体必须经 BuildChatBodyWithCatalog 构造，不能手搓：
+	// llm_utils_chat 要求 function / config_name / model 三者同属一张目录表。
+	// 手搓的 body 没有 function，上游回
+	//   code 2001 "[LLMUtilsChat.resolveByUsage] function is empty"
+	// 且响应里没有任何正文——2026-10-18 首版就是这样，日志表现为「空正文」。
+	request := map[string]any{
 		"model": imageToTextModel,
 		"messages": []any{map[string]any{
 			"role": "user",
@@ -167,8 +173,19 @@ func transcribeOneImage(ctx context.Context, a *auth.Auth, media map[string]any,
 			},
 		}},
 		"max_tokens": 2048,
-		"stream":     false,
-	})
+	}
+	prepared, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	var catalog []CatalogModel
+	if models, cerr := FetchCatalog(ctx, a); cerr == nil && len(models) > 0 {
+		catalog = models
+		if resolved := ResolveFromCatalog(models, imageToTextModel); resolved != "" {
+			prepared = withModel(prepared, resolved)
+		}
+	}
+	body, err := BuildChatBodyWithCatalog(prepared, newRequestID(), catalog)
 	if err != nil {
 		return "", err
 	}
@@ -176,7 +193,7 @@ func transcribeOneImage(ctx context.Context, a *auth.Auth, media map[string]any,
 	reqCtx, cancel := context.WithTimeout(ctx, imageToTextTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
-		GatewayBaseVar+ChatPath, strings.NewReader(string(body)))
+		GatewayBaseVar+ChatPath, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -201,39 +218,46 @@ func transcribeOneImage(ctx context.Context, a *auth.Auth, media map[string]any,
 
 	text := extractUpstreamText(raw)
 	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("转写模型返回空正文：%s", truncate(string(raw), 200))
+		// 把原始响应的开头一并记下：正文解析不出来时，只有看到真实字节才知道
+		// 上游这次用的是什么形状（2026-10-18 首版只按 OpenAI 解析，日志里只有
+		// 「空正文：id:1」，白排查一轮）。
+		return "", fmt.Errorf("转写模型返回空正文（原始响应 %d 字节）：%s",
+			len(raw), truncate(strings.ReplaceAll(string(raw), "\n", "\\n"), 400))
 	}
 	return text, nil
 }
 
-// extractUpstreamText 从上游 SSE 或 JSON 响应里取出正文。
+// extractUpstreamText 从上游响应里取出正文。
 //
-// 转写请求用 stream=false，但上游 llm_utils_chat 实际总是回 SSE——两种形态都认。
+// ═══ 为什么不能只认 OpenAI 形状 ═══
+//
+// 转写请求打的是 llm_utils_chat——它回的是 **Trae 原生事件流**（event: output +
+// {"response": "..."}），不是 OpenAI 的 choices[].delta.content。2026-10-18 首版
+// 只按 OpenAI 解析，生产日志里表现为「转写模型返回空正文：id:1」——响应明明是
+// 200，正文却取不到，于是整条链路失效。
+//
+// 所以这里同时认两种形态：Trae 原生（response 字段，且可能是**累计快照**）与
+// OpenAI（choices[].delta/message.content，增量）。累计快照要按前缀合并，不能
+// 直接拼接——否则同一段文字会出现多遍。
 func extractUpstreamText(raw []byte) string {
 	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return ""
+	}
+	// 一次性 JSON（上游偶尔对非流式请求回整包）。
 	if strings.HasPrefix(trimmed, "{") {
-		// 一次性 JSON：优先 choices[0].message.content。
-		var one struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-		}
-		if err := json.Unmarshal(raw, &one); err == nil && len(one.Choices) > 0 {
-			if one.Choices[0].Message.Content != "" {
-				return one.Choices[0].Message.Content
+		var one map[string]any
+		if err := json.Unmarshal(raw, &one); err == nil {
+			if text := textFromTraePayload(one); text != "" {
+				return text
 			}
-			return one.Choices[0].Delta.Content
+			return textFromOpenAIPayload(one)
 		}
 		return ""
 	}
 
-	// SSE：累加所有 data 行里的正文增量。
-	var builder strings.Builder
+	// SSE：逐帧解析，Trae 原生与 OpenAI 两种都认。
+	accumulator := newSnapshotAccumulator()
 	for _, line := range strings.Split(trimmed, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data:") {
@@ -243,23 +267,100 @@ func extractUpstreamText(raw []byte) string {
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}
-		var frame struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
+		var frame map[string]any
 		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
 			continue
 		}
-		for _, choice := range frame.Choices {
-			builder.WriteString(choice.Delta.Content)
-			builder.WriteString(choice.Message.Content)
+		if text := textFromTraePayload(frame); text != "" {
+			accumulator.add(text)
+			continue
+		}
+		if text := textFromOpenAIPayload(frame); text != "" {
+			accumulator.add(text)
+		}
+	}
+	return accumulator.value()
+}
+
+// textFromTraePayload 取 Trae 原生事件里的正文（response 字段）。
+func textFromTraePayload(obj map[string]any) string {
+	if response, ok := obj["response"].(string); ok {
+		// response 可能混着思考标记，剥掉后只留正文。
+		_, visible := splitEmbeddedReasoning(response)
+		return visible
+	}
+	return ""
+}
+
+// textFromOpenAIPayload 取 OpenAI 形状里的正文（delta 或 message）。
+func textFromOpenAIPayload(obj map[string]any) string {
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return ""
+	}
+	var builder strings.Builder
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"delta", "message"} {
+			container, ok := choice[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			if content, ok := container["content"].(string); ok {
+				builder.WriteString(content)
+			}
 		}
 	}
 	return builder.String()
 }
+
+// snapshotAccumulator 按「前缀快照 or 增量」两种语义合并正文分片。
+//
+// Trae 的 output 事件有时发完整快照（response 是到目前为止的全部文本），有时只发
+// 增量——与 translator.text 的 add 同一套语义。这里用最小实现：新片段是已累积
+// 文本的前缀延长就替换，否则当作增量追加。
+type snapshotAccumulator struct {
+	text strings.Builder
+}
+
+func newSnapshotAccumulator() *snapshotAccumulator { return &snapshotAccumulator{} }
+
+func (s *snapshotAccumulator) add(chunk string) {
+	if chunk == "" {
+		return
+	}
+	current := s.text.String()
+	if current == "" {
+		s.text.WriteString(chunk)
+		return
+	}
+	if strings.HasPrefix(chunk, current) {
+		// 累计快照：整体替换。
+		s.text.Reset()
+		s.text.WriteString(chunk)
+		return
+	}
+	if strings.HasPrefix(current, chunk) {
+		// 重复片段（快照的旧前缀）：忽略。
+		return
+	}
+	// 与尾部重叠的增量：Trae 的 response 常在快照后紧跟一段与尾部重叠的文本
+	// （实测 `蓝` → `蓝色` → `色背景` 应得 `蓝色背景`，不是 `蓝色色背景`）。
+	// 从最长可能的重叠开始找，找到即拼接剩余部分。
+	limit := len(current)
+	if len(chunk) < limit {
+		limit = len(chunk)
+	}
+	for overlap := limit; overlap > 0; overlap-- {
+		if strings.HasSuffix(current, chunk[:overlap]) {
+			s.text.WriteString(chunk[overlap:])
+			return
+		}
+	}
+	s.text.WriteString(chunk)
+}
+
+func (s *snapshotAccumulator) value() string { return s.text.String() }
