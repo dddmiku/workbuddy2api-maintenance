@@ -68,8 +68,13 @@ type chatStat struct {
 	credit          float64
 	hasCred         bool
 	upstreamStarted bool
-	failed          bool
-	unreported      bool
+	// upstreamAt 出站请求真正发出的时刻。TTFB 之前的那一段（= upstreamAt-start）
+	// 是网关自己的预处理：读 body、鉴权、选号、body 改写、建连。把它单独记下来，
+	// 慢请求才能一眼分清「网关慢」还是「上游慢」——否则 TTFB 一个数把两段混在一起，
+	// 只能靠猜（2026-10-17 大上下文 TTFB 排查就走了这个弯路）。
+	upstreamAt time.Time
+	failed     bool
+	unreported bool
 
 	logged       bool
 	trace        *requestTrace
@@ -167,6 +172,11 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 func (s *chatStat) observeAttempt(event upstream.ChatAttemptEvent) {
 	if event.Stage == "start" {
 		s.upstreamStarted = true
+		// 只记**第一次**出站时刻：换号/重发时后面的 start 不覆盖它，
+		// 否则 pre= 会把前几次尝试的耗时全部吞掉，反而看不出真实成本。
+		if s.upstreamAt.IsZero() {
+			s.upstreamAt = time.Now()
+		}
 	}
 	s.trace.event(event)
 }
@@ -234,7 +244,17 @@ func (s *chatStat) done() {
 	s.cachePrev = sessionPrefixes.last(s.sessKey)
 	sessionPrefixes.record(s.sessKey, s.prompt)
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status,
-		s.prompt, s.cached, s.toks, s.keyLabel(), s.cacheField(), s.requestID)
+		s.prompt, s.cached, s.toks, s.keyLabel(), s.cacheField(), s.preDuration(), s.requestID)
+}
+
+// preDuration 返回网关自身预处理耗时（请求进入到出站请求发出）。
+// 未观测到出站时刻（同步失败、鉴权拒绝等）返回 -1，日志显示 "-"——缺失≠0，
+// 不能把「没测到」写成「网关没耗时」。
+func (s *chatStat) preDuration() time.Duration {
+	if s.upstreamAt.IsZero() {
+		return -1
+	}
+	return s.upstreamAt.Sub(s.start)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -524,7 +544,7 @@ func uidPrefix(uid string) string {
 // 三个 token 列都是「上游 usage 原值」：in= 输入、hit= 输入里命中缓存的、
 // tok= 输出（含思考 token）。负值表示上游没给 usage，显示 "-"（缺失≠0）。
 // cache= 列给出「本次该不该命中」的参照（cold / prev=N），见 chatStat.cacheField。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key, cache string, requestIDs ...string) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key, cache string, pre time.Duration, requestIDs ...string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -564,7 +584,11 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 			return -1
 		}, requestIDs[0]) + " |"
 	}
-	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | cache=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
+	preField := "-"
+	if pre >= 0 {
+		preField = fmt.Sprintf("%dms", pre.Milliseconds())
+	}
+	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | pre=%s | TTFB=%s | in=%s | hit=%s | cache=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -572,6 +596,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		status,
 		key,
 		uidPrefix(uid),
+		preField,
 		ttfbMS,
 		promptField,
 		cachedField,

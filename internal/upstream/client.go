@@ -945,11 +945,17 @@ func New() *Client {
 		// 的在途额度一起不释放（默认 max_in_flight=3，三次就把一个号占满）
 		// ——2026-10-02 第二轮体检发现。短 RPC 侧另有 120s 总超时兜底，这里补齐
 		// 聊天侧缺失的那一段。
+		//
+		// 2026-10-17 对齐参考实现（xiaofan6ya/workbuddy2api 的
+		// STREAM_CONNECT_TIMEOUT=15）：拨号 8s / TLS 8s。号池里总有连不上的号
+		// （被墙、节点故障、上游黑洞），原来的 30s+15s 意味着**每个坏号都要先
+		// 干等 30 秒**才轮到换号逻辑——用户侧看到的就是「卡住不动」。连接阶段
+		// 本来就该快速失败并轮转，把时间留给真正能出字的号。
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
+			Timeout:   8 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout: 15 * time.Second,
+		TLSHandshakeTimeout: 8 * time.Second,
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}

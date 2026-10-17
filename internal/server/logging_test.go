@@ -200,7 +200,7 @@ func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK,
-			306401, 298112, 1234, "团队 A", "prev=305900")
+			306401, 298112, 1234, "团队 A", "prev=305900", 35*time.Millisecond)
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "TTFB=412ms",
@@ -218,7 +218,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-", "-")
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-", "-", -1)
 	})
 	for _, want := range []string{"key=-", "TTFB=-", "in=-", "hit=-", "cache=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -230,8 +230,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold")
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {

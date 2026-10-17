@@ -50,13 +50,24 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 			if existing, ok := probe["prompt_cache_key"].(string); ok && existing != "" {
 				return body // 已有 key：不覆盖（保持既有语义）
 			}
+			// 键名出现但不是非空字符串（null / 空串 / 嵌套误匹配）。
+			// 复用这次已解码的 probe 继续走后面逻辑，不要再 Decode 一遍：
+			// 60 万 token 的 body 一次解码就要数毫秒，重复解码是纯浪费。
+			return injectCacheKeyInto(probe, uid, conversationID, body)
 		}
-		// 键名出现但不是非空字符串（null / 空串 / 嵌套误匹配）→ 继续走完整路径
+		// 解码失败 → 无法改写，原样返回（与完整路径的失败语义一致）。
+		return body
 	}
 	var obj map[string]any
 	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
 	}
+	return injectCacheKeyInto(obj, uid, conversationID, body)
+}
+
+// injectCacheKeyInto 在已解码的对象上执行 cache key 注入并重新编码。
+// 调用方保证 obj 非 nil；重编码失败时回落原始 body（不改写即视为未处理）。
+func injectCacheKeyInto(obj map[string]any, uid, conversationID string, body []byte) []byte {
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。
 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
 		return body
