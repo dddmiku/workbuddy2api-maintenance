@@ -322,49 +322,11 @@ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
-// QuarantineChannelRejected 把「被上游渠道校验拒绝」的账号隔离一段长时间。
-//
-// 2026-10-17 实测结论（36 账号 × 同一极简 body × 同一套头，两轮完全复现）：
-// 渠道校验是**账号绑定**的，不是请求绑定：
-//
-//	通过组 8 个账号：200/429，全部从未出现在渠道拒绝落盘里（0/8）
-//	被拒组 16 个账号：11128/11140，13/16 有落盘记录，且间隔 20s 重测仍恒拒
-//
-// 头部（含 X-Conversation-Request-ID）、请求体、零宽形态、metadata/prompt_cache_key/
-// thinking 全部排除——健康账号带 Claude Code 完整系统提示、带中和后的零宽形态照样 200，
-// 被烧账号发最简「You are a helpful assistant.」照样 400。即：上游已把这些账号标记为
-// 「非官方客户端」，与本次请求内容无关。
-//
-// 因此正确的处置是**隔离**，而不是继续换号重试：每个被烧账号的每次重试都必然再吃一个
-// 400，既白花往返，又不断在落盘里刷样本。冷却期取 24 小时——上游没有给出恢复时刻，
-// 暂按「一天后重试一次」的保守口径；恢复不了会再次被隔离，代价可控。
-//
-// kind 用 CoolSoft：这是「暂不可用」而非「余额耗尽」，不该走 CoolHard 的签到解冻路径
-// （签到不会让被烧账号复活，Cooldown 里 CoolHard 还会压过后续 CoolSoft）。
-func (p *Pool) QuarantineChannelRejected(uid, model, reason string) {
-	const quarantine = 24 * time.Hour
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return
-	}
-	now := time.Now()
-	if !e.disabled {
-		e.until = now.Add(quarantine)
-		e.coolKind = CoolSoft
-		e.reason = reason
-		p.markCoolErrorLocked(uid, e, now)
-	}
-	// 模型维度一并隔离：换模型也救不了被烧账号（校验与模型无关，实测同号换模型恒拒）。
-	if model != "" {
-		if e.modelCooldowns == nil {
-			e.modelCooldowns = map[string]modelCooldown{}
-		}
-		e.modelCooldowns[model] = modelCooldown{Until: now.Add(quarantine), Reason: reason}
-		p.markStateFieldsLocked(uid, "model_cooldowns")
-	}
-}
+// QuarantineChannelRejected 曾实现「渠道拒绝 = 账号被标记 → 隔离 24h」（2026-10-17
+// dd8dae0）。该结论已被真实客户端抓包推翻——同一批账号在官方客户端正常使用，裸探测的
+// 11128 是缺官方头部与 system 首条所致（真实 msg 为 "first message is not system prompt"，
+// 兜底文案 "request illegal" 掩盖了它）。函数已随错误结论一并删除，历史见 backup 分支
+// backup/wrong-diagnosis-20261017。
 
 // nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，

@@ -124,6 +124,14 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 			t.Errorf("%s = %q want %q (sdk fingerprint)", hdr, got, want)
 		}
 	}
+	// ACP/隐私声明头（2026-10-17 双域抓包：官方 chat 请求 100% 携带）：
+	// X-Private-Data 恒 true；acp-connection-id 零值 meta 下也要必发（32 hex）。
+	if got := h.Get("X-Private-Data"); got != "true" {
+		t.Errorf("X-Private-Data = %q want %q (official always sends)", got, "true")
+	}
+	if acp := h.Get("acp-connection-id"); len(acp) != 32 {
+		t.Errorf("acp-connection-id = %q want 32 hex (fallback)", acp)
+	}
 	// 链路族四件套：traceparent / b3 / 父跨度。
 	if tp := h.Get("traceparent"); len(tp) != 55 || tp[:3] != "00-" {
 		t.Errorf("traceparent = %q want W3C 55-char form", tp)
@@ -169,6 +177,61 @@ func TestProductWorkBuddy_WhenConfigured(t *testing.T) {
 	}
 	if got := h2.Get("X-IDE-Name"); got != "MyEditor" {
 		t.Errorf("X-IDE-Name = %q want %q", got, "MyEditor")
+	}
+}
+
+// TestACPConnectionIDPassthrough acp-connection-id 的取值链：
+// GatewayRequestID 非空时透传该值（同请求全部尝试共享一个连接 ID）；空时兜底
+// 重新生成（32 hex），但绝不发空值。
+func TestACPConnectionIDPassthrough(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{}
+
+	var captured http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Clone()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	c.ChatBaseCN = srv.URL
+	c.ChatHTTP = srv.Client()
+	c.HTTP = srv.Client()
+
+	send := func(meta ChatMeta) http.Header {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
+		if err != nil {
+			t.Fatalf("new req: %v", err)
+		}
+		c.ChatHeaders(req, a, "", meta)
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return captured
+	}
+
+	// GatewayRequestID 非空：透传原值（含横线的 UUID 形态也原样保留）。
+	h := send(ChatMeta{GatewayRequestID: "3f2b1c4d5e6f708192a3b4c5d6e7f809"})
+	if got := h.Get("acp-connection-id"); got != "3f2b1c4d5e6f708192a3b4c5d6e7f809" {
+		t.Errorf("acp-connection-id = %q want passthrough", got)
+	}
+	// X-Private-Data 与 GatewayRequestID 无关，恒为 true。
+	if got := h.Get("X-Private-Data"); got != "true" {
+		t.Errorf("X-Private-Data = %q want true", got)
+	}
+
+	// GatewayRequestID 含控制字符：sanitize 剔除后仍残留可见字符 → 用净化值
+	// （保证不发非法头值），此处为 "badvalue"。注入侧 X-Gateway-Request-ID 同样净化。
+	h2 := send(ChatMeta{GatewayRequestID: "bad\nvalue"})
+	if acp := h2.Get("acp-connection-id"); acp != "badvalue" {
+		t.Errorf("acp-connection-id = %q want %q (sanitized)", acp, "badvalue")
+	}
+	// 兜底路径：GatewayRequestID 为空 → session.NewMessageID() 的 32 hex。
+	h3 := send(ChatMeta{})
+	if acp := h3.Get("acp-connection-id"); len(acp) != 32 {
+		t.Errorf("acp-connection-id = %q want 32 hex (fallback)", acp)
 	}
 }
 

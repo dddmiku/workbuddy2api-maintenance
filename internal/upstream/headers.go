@@ -244,7 +244,7 @@ type ChatMeta struct {
 // meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	if meta.GatewayRequestID != "" {
-		req.Header.Set("X-Gateway-Request-ID", meta.GatewayRequestID)
+		req.Header.Set("X-Gateway-Request-ID", sanitizeHeaderValue(meta.GatewayRequestID))
 	}
 	a = a.Snapshot()
 	c.CommonHeaders(req, a)
@@ -288,6 +288,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 取值来自 2026-09-17 国际版客户端抓包）。补齐后网关出站头组与官方客户端同形。
 	c.injectAgentIntentHeaders(req)
 	c.injectSDKFingerprintHeaders(req)
+	// ACP/隐私声明头（X-Private-Data / acp-connection-id）：2026-10-17 双域抓包确认
+	// 官方 chat 请求 100% 携带、网关此前缺失的头。见 injectACPHeaders 注释。
+	c.injectACPHeaders(req, meta)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
 	c.injectClientIP(req, clientIP)
@@ -448,6 +451,32 @@ func (c *Client) injectAttribution(req *http.Request) {
 func (c *Client) injectAgentIntentHeaders(req *http.Request) {
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Type", "main")
+}
+
+// injectACPHeaders 注入官方客户端 chat 请求固定携带的 ACP/隐私声明头：
+//
+//	X-Private-Data: true
+//	acp-connection-id: <UUID>
+//
+// 2026-10-17 双域抓包（_wb_capture2，global 005742_0068 / CN 005747_0101）确认
+// 这两个头在两域 chat 请求里 100% 存在、且是缺了会被 11128 渠道校验拦下的头组
+// 之一（对照实验：裸头 11128 "request illegal"，补齐官方头组后同一请求返回
+// "first message is not system prompt"——校验是分层的，头组不过关根本到不了
+// body 校验）。acp-connection-id 是 ACP 协议的连接标识，官方每进程一个 UUID；
+// 网关按 gateway request 派生稳定值（同一请求的全部尝试/换号共用一个连接 ID，
+// 与官方「一次会话连接一个 ID」的语义对齐），不引入跨请求随机性。
+//
+// acp-connection-id 的取值：优先入站透传（客户端自己带 ACP 连接标识时原样转发），
+// 缺省用 X-Gateway-Request-ID（ChatHeaders 已设；每次客户端请求唯一、
+// 同请求内全部重试共享），形态为 32 hex——官方是带横线 UUID，两者同为
+// RFC 4122 形态的合法标识符（hex 无横线也是 UUID 的标准文本形式）。
+func (c *Client) injectACPHeaders(req *http.Request, meta ChatMeta) {
+	req.Header.Set("X-Private-Data", "true")
+	if conn := sanitizeHeaderValue(meta.GatewayRequestID); conn != "" {
+		req.Header.Set("acp-connection-id", conn)
+		return
+	}
+	req.Header.Set("acp-connection-id", session.NewMessageID())
 }
 
 // injectSDKFingerprintHeaders 注入官方模型请求里的 OpenAI Node SDK 输出头
