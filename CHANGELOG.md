@@ -69,6 +69,46 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
 
 `accountFaultRule` 的 `"request illegal"` 只作为第 3 条的回退保留。
 
+## v3.10.7 — 2026-10-17
+
+**修复 global 域 11128**：上游对 chat 请求做渠道校验时要求 `X-Conversation-ID`，
+官方客户端无条件发送，网关此前只在入站请求体带 `conversationId` 时才发，没有就
+不发——global 域对所有账号返回 `400 / 11128 "request illegal"`。
+
+### 根因与验证
+
+2026-10-17 生产 A/B（同账号、同 IP、同头组，只切一个变量）：
+
+| 变体 | 结果 |
+|---|---|
+| 网关现状（无 `X-Conversation-ID`） | 400 / 11128 |
+| 补 `X-Conversation-ID` | **200** |
+| 补 `Origin` / `Referer` | 400（与本问题无关） |
+| 补 `X-Machine-ID` / `X-Session-ID` | 400（与本问题无关） |
+| 换短 uid | 400 |
+
+v3.10.6 的裸探测之所以全部 200，是因为探针脚本自己带了该头，掩盖了真实差异。
+
+### 改动
+
+- `injectConversationHeaders`：空值按聚合主键派生成带横线 UUID
+  （抓包 `005646_0009` 形态 `625496a5-d61a-4cdf-897a-e51d9d5a14db`），会话级稳定；
+  聚合主键被入站污染成非 32 hex 时回落消息级 ID。该头是渠道校验必发项。
+- `ErrChannelRejected` 按账号换号，不再遇拒即终止（此前 global 只试 1–2 个号）。
+- chat 出站裁剪 `Origin` / `Referer` / `X-Machine-ID` / `X-Session-ID`（官方桌面端不发）。
+- `X-Gateway-Request-ID` 注入前 sanitize，防非法头值炸请求。
+- 新增 `WB2API_DUMP_HEADERS=1`：把 chat 出站头写日志供排障
+  （`Authorization` / `X-Device-Token` 脱敏）。
+
+### 生产验证（华为云）
+
+```
+global:glm-5.3               200  1.8s
+global:deepseek-v4.1-flash   200  1.3s
+cn:deepseek-v4.1-flash       200
+trae:glm-5.3                 200
+```
+
 ## v3.10.6 — 2026-10-17
 
 **回退错误诊断链**：v3.10.1 ~ v3.10.5 基于「裸探测脚本 11128」得出的一系列账号级归因
