@@ -38,6 +38,28 @@ func chatHeadersReq(t *testing.T, c *Client, a *auth.Auth, clientIP string) http
 	return captured
 }
 
+// looksLikeUUID 校验官方 acp-connection-id 的 8-4-4-4-12 文本形态（小写 hex）。
+// 官方抓包（005742_0068 / 005747_0101）里该头恒为这一形态。
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // TestAgentPurposeHeadersSet ClientName 配 WorkBuddy 时四头齐全跟随该值。
 func TestAgentPurposeHeadersSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
@@ -125,12 +147,16 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 		}
 	}
 	// ACP/隐私声明头（2026-10-17 双域抓包：官方 chat 请求 100% 携带）：
-	// X-Private-Data 恒 true；acp-connection-id 零值 meta 下也要必发（32 hex）。
+	// X-Private-Data 恒 true；x-codebuddy-request 恒 1；acp-connection-id 为
+	// 官方 8-4-4-4-12 UUID 形态（零值 meta 下也必须发）。
 	if got := h.Get("X-Private-Data"); got != "true" {
 		t.Errorf("X-Private-Data = %q want %q (official always sends)", got, "true")
 	}
-	if acp := h.Get("acp-connection-id"); len(acp) != 32 {
-		t.Errorf("acp-connection-id = %q want 32 hex (fallback)", acp)
+	if got := h.Get("x-codebuddy-request"); got != "1" {
+		t.Errorf("x-codebuddy-request = %q want %q (official channel marker)", got, "1")
+	}
+	if acp := h.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want UUID form (fallback)", acp)
 	}
 	// 链路族四件套：traceparent / b3 / 父跨度。
 	if tp := h.Get("traceparent"); len(tp) != 55 || tp[:3] != "00-" {
@@ -181,8 +207,10 @@ func TestProductWorkBuddy_WhenConfigured(t *testing.T) {
 }
 
 // TestACPConnectionIDPassthrough acp-connection-id 的取值链：
-// GatewayRequestID 非空时透传该值（同请求全部尝试共享一个连接 ID）；空时兜底
-// 重新生成（32 hex），但绝不发空值。
+// GatewayRequestID 非空时把它渲染成官方 UUID 形态（同请求全部尝试共享一个连接 ID）；
+// 空时兜底新生成；任何情况下都不发空值、不发无横线的 32 hex。
+//
+// 形态要求来自官方抓包（005742_0068 / 005747_0101）：该头恒为 8-4-4-4-12。
 func TestACPConnectionIDPassthrough(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{}
@@ -212,26 +240,35 @@ func TestACPConnectionIDPassthrough(t *testing.T) {
 		return captured
 	}
 
-	// GatewayRequestID 非空：透传原值（含横线的 UUID 形态也原样保留）。
+	// 32 hex 的 GatewayRequestID：渲染成同值的带横线 UUID 形态。
 	h := send(ChatMeta{GatewayRequestID: "3f2b1c4d5e6f708192a3b4c5d6e7f809"})
-	if got := h.Get("acp-connection-id"); got != "3f2b1c4d5e6f708192a3b4c5d6e7f809" {
-		t.Errorf("acp-connection-id = %q want passthrough", got)
+	if got := h.Get("acp-connection-id"); got != "3f2b1c4d-5e6f-7081-92a3-b4c5d6e7f809" {
+		t.Errorf("acp-connection-id = %q want same value in UUID form", got)
 	}
 	// X-Private-Data 与 GatewayRequestID 无关，恒为 true。
 	if got := h.Get("X-Private-Data"); got != "true" {
 		t.Errorf("X-Private-Data = %q want true", got)
 	}
-
-	// GatewayRequestID 含控制字符：sanitize 剔除后仍残留可见字符 → 用净化值
-	// （保证不发非法头值），此处为 "badvalue"。注入侧 X-Gateway-Request-ID 同样净化。
-	h2 := send(ChatMeta{GatewayRequestID: "bad\nvalue"})
-	if acp := h2.Get("acp-connection-id"); acp != "badvalue" {
-		t.Errorf("acp-connection-id = %q want %q (sanitized)", acp, "badvalue")
+	// x-codebuddy-request：官方 chat 请求固定携带的通道标记。
+	if got := h.Get("x-codebuddy-request"); got != "1" {
+		t.Errorf("x-codebuddy-request = %q want %q", got, "1")
 	}
-	// 兜底路径：GatewayRequestID 为空 → session.NewMessageID() 的 32 hex。
-	h3 := send(ChatMeta{})
-	if acp := h3.Get("acp-connection-id"); len(acp) != 32 {
-		t.Errorf("acp-connection-id = %q want 32 hex (fallback)", acp)
+
+	// 已是带横线 UUID：原样保留（入站透传场景）。
+	h2 := send(ChatMeta{GatewayRequestID: "01a145a5-ddd6-73b8-b103-f04d4cf5730e"})
+	if got := h2.Get("acp-connection-id"); got != "01a145a5-ddd6-73b8-b103-f04d4cf5730e" {
+		t.Errorf("acp-connection-id = %q want passthrough of hyphenated UUID", got)
+	}
+
+	// 非常规值：净化后形态不符 → 退回新生成的 UUID，绝不发脏值/短值。
+	h3 := send(ChatMeta{GatewayRequestID: "bad\nvalue"})
+	if acp := h3.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want generated UUID form", acp)
+	}
+	// 兜底路径：GatewayRequestID 为空 → 新生成的 UUID。
+	h4 := send(ChatMeta{})
+	if acp := h4.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want UUID form (fallback)", acp)
 	}
 }
 

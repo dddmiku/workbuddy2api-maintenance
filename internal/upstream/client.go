@@ -1319,6 +1319,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, 0, nil, err
 			}
 			c.ChatHeaders(req, a, clientIP, meta)
+			dumpOutboundHeaders(req.Header, a.UID)
 			// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 			// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 			reqCtx, cancel := context.WithCancel(ctx)

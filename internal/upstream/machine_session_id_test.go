@@ -94,18 +94,31 @@ func TestCommonHeadersEmptyUIDSkipsInjection(t *testing.T) {
 	}
 }
 
-// TestChatHeadersCarriesMachineSessionID ChatHeaders 走 CommonHeaders 之上叠加 →
-// 两头天然继承（chat/billing/refresh 全覆盖路径的回归锚点）。
+// TestChatHeadersCarriesMachineSessionID 曾断言 chat 出站带 X-Machine-ID /
+// X-Session-ID。2026-10-17 双域官方抓包（global 005742_0068 / CN 005747_0101）
+// 证明**官方 chat 请求不带这两个头**（它们只出现在 hub / 登录链路的公共头里），
+// 契约已反转为「chat 必须不带，其余接口照旧带」。见 stripBrowserHeaders。
 func TestChatHeadersCarriesMachineSessionID(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u9"}
 	req := mustRequest(t)
 	c := &Client{}
 	c.ChatHeaders(req, a, "", ChatMeta{})
 
-	if got := req.Header.Get("X-Machine-ID"); got != deriveAccountStableID("u9", "machine") {
-		t.Errorf("X-Machine-ID = %q, want deriveAccountStableID(u9, machine)", got)
+	// chat：官方 SDK 形态，不带网关自有的设备/会话派生头。
+	if got := req.Header.Get("X-Machine-ID"); got != "" {
+		t.Errorf("X-Machine-ID = %q, want empty on chat (official SDK shape)", got)
 	}
-	if got := req.Header.Get("X-Session-ID"); got != deriveAccountStableID("u9", "session") {
-		t.Errorf("X-Session-ID = %q, want deriveAccountStableID(u9, session)", got)
+	if got := req.Header.Get("X-Session-ID"); got != "" {
+		t.Errorf("X-Session-ID = %q, want empty on chat (official SDK shape)", got)
+	}
+
+	// 非 chat（业务接口）：仍按 uid 稳定派生注入。
+	req2 := mustRequest(t)
+	c.CommonHeaders(req2, a)
+	if got := req2.Header.Get("X-Machine-ID"); got != deriveAccountStableID("u9", "machine") {
+		t.Errorf("non-chat X-Machine-ID = %q, want deriveAccountStableID(u9, machine)", got)
+	}
+	if got := req2.Header.Get("X-Session-ID"); got != deriveAccountStableID("u9", "session") {
+		t.Errorf("non-chat X-Session-ID = %q, want deriveAccountStableID(u9, session)", got)
 	}
 }

@@ -9,6 +9,9 @@ import (
 
 // hex32Re / hex16Re 32 位与 16 位 hex 合法格式断言（B3 与消息级 ID 的合规性）。
 var hex32Re = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// uuidRe 官方 X-Conversation-ID 的带横线 UUID 形态（抓包 005646_0009）。
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var hex16Re = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // TestChatHeadersConversationFullMeta 全量 meta 出站头族（issue #35 后台聚合）：
@@ -60,16 +63,21 @@ func TestChatHeadersConversationFullMeta(t *testing.T) {
 	}
 }
 
-// TestChatHeadersConversationNoConvID meta.ConversationID 为空 → 不发 X-Conversation-ID
-// （透传客户端原值优先，不伪造），其余头族照常。
+// TestChatHeadersConversationNoConvID 入站没给 conversationId → 按 messageID 生成
+// 带横线 UUID 形态的 X-Conversation-ID。2026-10-17 生产实测：该头缺失时上游对所有
+// 账号返回 400/11128 "request illegal"，补回即 200，因此它是必发项而非可选透传项。
 func TestChatHeadersConversationNoConvID(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	req := mustRequest(t)
 	c := &Client{}
 	c.ChatHeaders(req, a, "", ChatMeta{ConversationRequestID: "convreq-1"})
 
-	if got := req.Header.Get("X-Conversation-ID"); got != "" {
-		t.Errorf("X-Conversation-ID = %q want empty (client didn't send one)", got)
+	got := req.Header.Get("X-Conversation-ID")
+	if !uuidRe.MatchString(got) {
+		t.Errorf("X-Conversation-ID = %q want UUID form (必发，缺失触发 11128)", got)
+	}
+	if same := req.Header.Get("X-Conversation-Message-ID"); got == same {
+		t.Errorf("X-Conversation-ID 不应等于消息级 ID（会话级与消息级语义不同）")
 	}
 	if got := req.Header.Get("X-Conversation-Request-ID"); got != "convreq-1" {
 		t.Errorf("X-Conversation-Request-ID = %q want convreq-1", got)
@@ -97,8 +105,8 @@ func TestChatHeadersConversationEmptyMeta(t *testing.T) {
 	if got := req.Header.Get("X-B3-TraceId"); got != convReqID {
 		t.Errorf("X-B3-TraceId = %q want %q", got, convReqID)
 	}
-	if got := req.Header.Get("X-Conversation-ID"); got != "" {
-		t.Errorf("X-Conversation-ID = %q want empty", got)
+	if got := req.Header.Get("X-Conversation-ID"); !uuidRe.MatchString(got) {
+		t.Errorf("X-Conversation-ID = %q want UUID form (必发)", got)
 	}
 }
 

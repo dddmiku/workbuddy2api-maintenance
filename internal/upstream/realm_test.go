@@ -76,8 +76,11 @@ func TestGlobalChatUsesV2PathAndBase(t *testing.T) {
 	if gotPath != "/v2/chat/completions" {
 		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
-	if gotOrigin != "https://www.workbuddy.ai" {
-		t.Errorf("global chat Origin=%q want https://www.workbuddy.ai", gotOrigin)
+	// 官方 chat 抓包（005742_0068）里没有 Origin/Referer：桌面端 chat 走 Node SDK
+	// 形态，浏览器语义的头只在登录/刷新链路出现。2026-10-17 生产 dump 实测网关
+	// 曾同时发 Origin+Referer 与 x-stainless-*，是矛盾指纹，已裁剪。
+	if gotOrigin != "" {
+		t.Errorf("global chat Origin=%q want empty (official SDK shape)", gotOrigin)
 	}
 	if gotModel != "gpt-5.4" {
 		t.Errorf("model=%q", gotModel)
@@ -263,9 +266,10 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`))
 		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
-			// 两个 realm 现在都走 /v2/chat/completions（官方路径），按 Origin 区分：
-			// global → https://www.workbuddy.ai，CN → https://www.codebuddy.cn。
-			if r.Header.Get("Origin") == "https://www.workbuddy.ai" {
+			// 两个 realm 现在都走 /v2/chat/completions（官方路径）。chat 已不发
+			// Origin（见 stripBrowserHeaders），改按 X-Domain 区分：
+			// global → www.workbuddy.ai，CN → 账号自带的域。
+			if r.Header.Get("X-Domain") == "www.workbuddy.ai" {
 				globalBody, _ = io.ReadAll(r.Body)
 			} else {
 				cnBody, _ = io.ReadAll(r.Body)

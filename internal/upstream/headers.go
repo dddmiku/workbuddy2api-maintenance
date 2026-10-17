@@ -180,9 +180,19 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// chat 路径在 ChatHeaders 覆盖为流式 event-stream。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	origin := originRefererFor(a)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
+	// Origin / Referer 只给非 chat 的业务接口（登录/刷新/计费/模型列表等）。
+	//
+	// 官方 chat 抓包（global 005742_0068 / CN 005747_0101）里**没有**这两个头：
+	// 桌面端发 chat 走的是 Node SDK（x-stainless-* 指纹），SDK 默认不带浏览器
+	// 语义的 Origin/Referer；而登录/刷新链路走的是网页端 XHR，才带这两个头。
+	// 2026-10-17 生产 dump 实测：网关在 chat 上同时发 Origin+Referer 且带
+	// x-stainless-*，是「SDK 客户端却自称浏览器」的矛盾组合，属可疑指纹。
+	// chat 路径由 ChatHeaders 在调用 CommonHeaders 之后删除（见 stripBrowserHeaders）。
+	if !isChatPath(req.URL.Path) {
+		origin := originRefererFor(a)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+	}
 	// User-Agent 用官方桌面端三段式（两 realm 同形，见 defaultWorkBuddyUAFor）。
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
@@ -191,10 +201,27 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
-	// injectAccountStableHeaders）。注入在 CommonHeaders 而非 ChatHeaders——hub 在
-	// 所有出站路径的公共 headers() 注入（wb_accounts.py:250-251），本网关同样全覆盖
-	// （chat 经 ChatHeaders 叠加 CommonHeaders 天然继承；billing 域另行注入）。
+	// injectAccountStableHeaders）。**官方 chat 抓包里没有这两个头**（只在 hub /
+	// 登录链路出现），chat 路径由 ChatHeaders 删除，其余接口保留。
 	c.injectAccountStableHeaders(req, a)
+}
+
+// isChatPath 判断出站路径是否为 chat/completions（各类入口前缀均覆盖）。
+func isChatPath(path string) bool {
+	return strings.HasSuffix(path, "/chat/completions")
+}
+
+// stripBrowserHeaders 从 chat 出站请求里删除官方桌面端不发的头。
+//
+// 官方 chat 请求由 @openai Node SDK 发出，形态是「SDK 客户端」：带 x-stainless-*、
+// 不带 Origin/Referer（浏览器语义）、不带网关自有派生头（X-Machine-ID /
+// X-Session-ID）。2026-10-17 生产 dump 实测网关把这两类混在一起发，正是
+// global 域持续被 11128 拒绝的可疑点之一。
+func stripBrowserHeaders(req *http.Request) {
+	req.Header.Del("Origin")
+	req.Header.Del("Referer")
+	req.Header.Del("X-Machine-ID")
+	req.Header.Del("X-Session-ID")
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -248,6 +275,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	}
 	a = a.Snapshot()
 	c.CommonHeaders(req, a)
+	// chat 路径裁剪成官方 SDK 形态（删 Origin/Referer/X-Machine-ID/X-Session-ID），
+	// 见 stripBrowserHeaders 注释。
+	stripBrowserHeaders(req)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if a.AccessToken != "" {
@@ -302,8 +332,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。**必发**——
+//     入站给了就透传，没给就按 messageID 生成带横线 UUID；官方客户端无条件发，
+//     缺失会被上游判 11128（2026-10-17 实测）。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
@@ -320,9 +351,24 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", sanitizeHeaderValue(meta.ConversationID))
+	// X-Conversation-ID 官方客户端**无条件发送**，且形态是带横线的 UUID
+	// （抓包 005646_0009：625496a5-d61a-4cdf-897a-e51d9d5a14db），与本族其余
+	// 32 hex 头不同。2026-10-17 生产实测：把它从出站请求里去掉（ConversationID 为空
+	// 时原逻辑直接跳过发送）会让上游对**所有账号**返回 400/11128 "request illegal"，
+	// 补回即 200——它是渠道校验的必发项，不是可选透传项。
+	//
+	// 空值时的取值必须**会话级稳定**（同一会话多轮同值），因此优先用聚合主键
+	// convReqID 派生 UUID；零值 meta 兜底时 convReqID 本身也是 messageID，仍自洽。
+	conversationID := sanitizeHeaderValue(meta.ConversationID)
+	if conversationID == "" {
+		if derived := uuidFormatted(convReqID); derived != "" {
+			conversationID = derived
+		} else {
+			// convReqID 被入站污染成非 32 hex（含横线/超长）：仍必须发，回落消息级。
+			conversationID = uuidFormatted(messageID)
+		}
 	}
+	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
@@ -350,6 +396,22 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-ParentSpanId", parentSpan)
 	req.Header.Set("traceparent", "00-"+b3Trace+"-"+spanID+"-01")
 	req.Header.Set("b3", b3Trace+"-"+spanID+"-1-"+parentSpan)
+}
+
+// uuidFormatted 把 32 hex 渲染成官方 X-Conversation-ID 的带横线 UUID 形态
+// （8-4-4-4-12）。入参不是 32 hex 时返回空串，由调用方决定回落。
+func uuidFormatted(raw string) string {
+	if len(raw) != 32 {
+		return ""
+	}
+	for i := 0; i < 32; i++ {
+		c := raw[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return ""
+		}
+	}
+	lower := strings.ToLower(raw)
+	return lower[0:8] + "-" + lower[8:12] + "-" + lower[12:16] + "-" + lower[16:20] + "-" + lower[20:32]
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（全新大小写均可）。
@@ -472,11 +534,44 @@ func (c *Client) injectAgentIntentHeaders(req *http.Request) {
 // RFC 4122 形态的合法标识符（hex 无横线也是 UUID 的标准文本形式）。
 func (c *Client) injectACPHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-Private-Data", "true")
+	// x-codebuddy-request: 1 —— 官方 chat 请求固定携带的 CodeBuddy 通道标记。
+	// 2026-10-17 双域抓包（global 005742_0068 / CN 005747_0101）与成功对照实验
+	// （run_full_official.py：9/13 个号 200）均携带；网关此前从未发送过。缺它时
+	// 上游对完整头组仍返回 11128 request illegal（头组不过关的兜底文案），
+	// 2026-10-17 生产实测：1e04e34d / 8c10f0f0 等健康号全部被拒。
+	req.Header.Set("x-codebuddy-request", "1")
 	if conn := sanitizeHeaderValue(meta.GatewayRequestID); conn != "" {
-		req.Header.Set("acp-connection-id", conn)
+		req.Header.Set("acp-connection-id", acpConnectionID(conn))
 		return
 	}
-	req.Header.Set("acp-connection-id", session.NewMessageID())
+	req.Header.Set("acp-connection-id", acpConnectionID(session.NewMessageID()))
+}
+
+// acpConnectionID 把 32 hex 渲染成官方 acp-connection-id 的带横线 UUID 形态。
+//
+// 官方抓包里该头恒为 8-4-4-4-12（如 01a145a5-ddd6-73b8-b103-f04d4cf5730e）。
+// 网关的 GatewayRequestID / NewMessageID 都是无横线 32 hex；直接原样发送会让
+// 头的**形态**与官方不同——头组校验若按值格式判断，无横线形态就不过关。
+// 这里按标准 UUID 文本形式重排，保持「同一请求全部尝试共享同一个连接 ID」的语义。
+func acpConnectionID(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	// 已经带横线的合法 UUID 原样保留（入站透传场景）。
+	if len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-' {
+		return value
+	}
+	hex32 := value
+	if len(hex32) != 32 {
+		// 非 32 hex（异常输入）：退回新生成的 32 hex，绝不发形态不符的值。
+		hex32 = session.NewMessageID()
+	}
+	for i := 0; i < len(hex32); i++ {
+		c := hex32[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			hex32 = strings.ToLower(session.NewMessageID())
+			break
+		}
+	}
+	return hex32[0:8] + "-" + hex32[8:12] + "-" + hex32[12:16] + "-" + hex32[16:20] + "-" + hex32[20:32]
 }
 
 // injectSDKFingerprintHeaders 注入官方模型请求里的 OpenAI Node SDK 输出头

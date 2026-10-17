@@ -1809,15 +1809,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 以下几类终态由请求本身决定、与账号无关：只释放在途名额，保留会话绑定，
 			// 下一轮仍落在同一账号，上游提示缓存不失效（换号会让整段前缀重新计费）。
 			if kind == upstream.ErrChannelRejected {
-				// 渠道拒绝的既有契约（2026-09-16 起）：上游侧 client 层已按档位中和重试
-				// （maxChannelNeutralizeLevels），handler 层只如实返回渠道拒绝原因。
-				// 2026-10-17 曾按「账号被上游标记」的实测结论改为隔离 24h——该结论已被
-				// 真实客户端抓包推翻（同一批账号官方客户端正常使用；裸探测的 11128 兜底
-				// 文案 "request illegal" 掩盖了真实原因 "first message is not system prompt"，
-				// 探测请求缺官方头部与 system 首条），已回退。伪装修复见 upstream 层。
+				// 渠道拒绝（11128 request illegal）**不是**请求级终态，而是**按账号**的：
+				// 2026-10-17 生产实测同一请求形态下 uid=61f74aa0 被判 11128，而
+				// uid=1e04e34d / 8c10f0f0 等号带同一头组能正常 200——拒绝取决于
+				// 该账号在上游的风控画像，换号就能过。
+				//
+				// 历史：2026-10-17 上半场曾按「账号被上游标记」隔离 24h（dd8dae0），
+				// 该结论被官方客户端抓包推翻（同一批号官方客户端正常使用）后回退；
+				// 回退时恢复成「请求级终态直接 return」，但那一半也是错的——它让
+				// global 只试到 1–2 个号就放弃，池里的健康号根本没被选中。
+				//
+				// 现在的口径与内容审核一致：先换号再试（softRotate 上限），试满才
+				// 把上游原文交给调用方。用 fail 而不是 releaseHeld：必须解绑会话
+				// 粘性，否则下一轮又选中同一个被拒的号，换号形同虚设。
+				if softRotate < h.cfg.MaxSoftRotations {
+					softRotate++
+					log.Printf("INFO: [服务] 渠道拒绝 — trying another account (%d/%d) uid=%s model=%s",
+						softRotate, h.cfg.MaxSoftRotations, logfmt.UID8(acct.UID), bareModel)
+					fail(acct.UID)
+					continue
+				}
+				// 换号次数已用尽：直接把上游原文连专属 code 一起返回。不用末态出口
+				// 是因为最后一个 continue 之后可能因「池子已被 tried 掏空」走
+				// acct==nil 的 break，那里的 lastErr 会被后续通用赋值覆盖。
+				log.Printf("WARN: [服务] 渠道拒绝 — 换号 %d 次后仍被拒 uid=%s model=%s；"+
+					"上游原文交给调用方",
+					softRotate, logfmt.UID8(acct.UID), bareModel)
 				releaseHeld()
-				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected",
-					"upstream rejected the client channel: Illegal API invocation from an unapproved channel")
+				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected", string(respBody))
 				st.status = http.StatusBadRequest
 				return
 			}
