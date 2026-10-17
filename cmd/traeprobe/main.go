@@ -34,6 +34,15 @@ func main() {
 		modelsMain(authPath)
 		return
 	}
+	// maxprobe：验证「默认 1M 档」在两条出站路径上真的发对了（可选真发）。
+	if model == "maxprobe" {
+		want := "glm-5.3"
+		if len(os.Args) > 3 {
+			want = os.Args[3]
+		}
+		maxprobeMain(authPath, want, hasFlag("--post"))
+		return
+	}
 	if model == "rawmodel" {
 		want := "glm-5.3"
 		if len(os.Args) > 3 {

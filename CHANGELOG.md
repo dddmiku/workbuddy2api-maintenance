@@ -38,6 +38,53 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.10.14 — 2026-10-18
+
+### 修复：所有两档模型默认走 1M（`__max`），此前恒发 200K（`__dev`）
+
+用户报「客户端声明了 1M，实际还是 200K 档」。根因在出站模型名：
+
+目录（`batch_get_detail_param`）里同一模型分两档，真名与上限都不同：
+
+| function | max_mode | 真名 | prompt_max_tokens |
+|---|---|---|---|
+| `solo_work_lite`（旧默认表） | false | `glm-5.3__dev` | 168000 |
+| `solo_agent` | **true** | `glm-5.3__dev` / `glm-5.3__max` | 168000 / **936000** |
+| `solo_work_remote` | false | `glm-5.3__dev` | 168000 |
+
+网关此前只有请求名带 `-max` 后缀才发 `__max`，默认一律 `__dev`。于是客户端看到
+1M 窗口、网关也确实能收 1M，但模型实际按 168000（≈200K）档跑——用户观察到的
+「只有 200K」正是这一档。
+
+改动：
+
+1. **默认档改 max**（`catalog.go` 新增 `ResolveRequestedTier`）。两档模型不带后缀
+   即发 `__max`；要普通档写 `<model>-dev` / `<model>_dev` / `<model>__dev`；
+   `<model>-max` 仍可显式要求。目录没标 `max_mode` 或没给 `__max` 真名的模型**不**
+   强行套档（绝不凭空造 1M）。
+2. **选表跟着档位走**（`FunctionForModelTier`）。默认表 `solo_work_lite` 只有
+   `__dev`，留在那张表里就算换成 `__max` 真名也会 `config item is empty`。
+   要 max 时必须发到**给了 `__max` 真名**的那张表（`solo_agent` 等）。
+3. **Remote 路径同步**：max 档改走 `solo_agent_remote`（只有它给了 `__max`），
+   并套 max 六件套（`context_window_size` 1M / `prompt_max_tokens` 936000）。
+   工具请求默认也这样——Agent 档工具语义的代价见 `WB2API_TRAE_MAX_TIER` 开关。
+
+### 验证（Oracle dev，真实上游）
+
+`traeprobe maxprobe glm-5.3`：
+
+```
+解析: 请求="glm-5.3" → config_name="glm-5.3" wantMax=true function="solo_agent"
+目录标记: max_mode=true dev="glm-5.3__dev" max="glm-5.3__max" devMax=100000 maxMax=936000
+llm_utils_chat 出站体: model=glm-5.3__max config_name=glm-5.3 function=solo_agent
+Remote: agent_type=solo_agent_remote maxApplied=true model_name=glm-5.3__max strategy=max
+        context_window=1e+06 prompt_max=936000
+```
+
+`--post` 真发：`llm_utils_chat HTTP 200`，事件流里
+`provider_model_name: glm-5.3` —— 上游接受 `__max` 真名（此前 `__max` 的证据只来自
+Solo 会话抓包，`llm_utils_chat` 的抓包 body 是加密的，这次补上了直接证据）。
+
 ## v3.10.13 — 2026-10-18
 
 ### 修复：`trae:glm-5.3` 带图必然 400（转写图片后重发）

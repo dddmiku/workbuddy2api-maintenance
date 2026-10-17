@@ -702,6 +702,22 @@ func (m CatalogModel) PromptMaxTokens(wantMax bool) int64 {
 	return m.DevPromptMax
 }
 
+// modelProfile 取某模型在指定 function 表里的出站参数。
+//
+// 供 Remote 路径判断「该表有没有 max 档真名」用——max 档不是每张表都有，
+// 选错表就只能拿到 `__dev` 的 168000 档（见 FunctionForModelTier）。
+func modelProfile(models []CatalogModel, name, function string) (CatalogFunctionProfile, bool) {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok {
+		return CatalogFunctionProfile{}, false
+	}
+	profile, ok := model.Profiles[function]
+	if !ok || profile.MaxModelName == "" || !model.MaxMode {
+		return CatalogFunctionProfile{}, false
+	}
+	return profile, true
+}
+
 // LookupCatalogModel 按 config_name / display_name 在目录里找模型（大小写不敏感）。
 func LookupCatalogModel(models []CatalogModel, name string) (CatalogModel, bool) {
 	want := strings.TrimSpace(name)
@@ -766,6 +782,59 @@ func ResolveRequestedModel(models []CatalogModel, name string) (string, bool) {
 	return strings.TrimSpace(name), false
 }
 
+// splitDevSuffix 拆出「显式要求普通档」的意图（`-dev` / `_dev` / `__dev`）。
+//
+// 与 SplitMaxSuffix 对称：max 现在是**默认档**，所以必须留一个退回普通档的写法，
+// 否则排障/省额度时没有口子。同样要求调用方先查目录，避免剥掉真实模型名。
+func splitDevSuffix(name string) (string, bool) {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	// 从最长后缀开始试：`glm-5.3__dev` 同时以 `_dev` 和 `__dev` 结尾，
+	// 先试 `_dev` 会剥出 `glm-5.3_`（目录里不存在），于是整条规则失效。
+	for _, suffix := range []string{"__dev", "_dev", "-dev"} {
+		if strings.HasSuffix(lower, suffix) && len(trimmed) > len(suffix) {
+			return trimmed[:len(trimmed)-len(suffix)], true
+		}
+	}
+	return trimmed, false
+}
+
+// ResolveRequestedTier 把请求名解析成 (config_name, 是否 max 档)，**max 为默认档**。
+//
+// 为什么要默认 max（2026-10-18 用户实测要求）：Trae 目录里同一模型分两档，
+// 普通档 `__dev` 的 prompt_max 是 168000（≈200K），1M 档 `__max` 是 936000：
+//
+//	solo_work_lite   glm-5.3  max_mode=false  glm-5.3__dev  168000
+//	solo_agent       glm-5.3  max_mode=true   glm-5.3__dev/glm-5.3__max  168000/936000
+//
+// 官方客户端选中「1M」时发的是 `__max`；网关此前只有请求名带 `-max` 才发
+// `__max`，于是客户端明明声明了 1M、实际永远跑 200K 档——用户报的就是这个。
+//
+// 规则：
+//  1. 名字原样命中目录且目录标了 max_mode + 给了 `__max` 真名 → max 档；
+//  2. 名字带 `-max` 后缀且剥后命中目录 → max 档（显式意图优先）；
+//  3. 名字带 `-dev` 后缀且剥后命中目录 → 普通档（显式退回）；
+//  4. 目录没标 max_mode 或没给 `__max` 真名 → 普通档（绝不凭空造 1M）。
+func ResolveRequestedTier(models []CatalogModel, name string) (string, bool) {
+	base, wantMax := ResolveRequestedModel(models, name)
+	if wantMax {
+		return base, true
+	}
+	if devBase, ok := splitDevSuffix(base); ok {
+		if _, hit := LookupCatalogModel(models, devBase); hit {
+			return devBase, false
+		}
+	}
+	model, ok := LookupCatalogModel(models, base)
+	if !ok {
+		return base, false
+	}
+	if !model.MaxMode || model.MaxModelName == "" {
+		return model.ConfigName, false
+	}
+	return model.ConfigName, true
+}
+
 // FunctionForModel 选一个**该模型确实在表里**的 function 来出站。
 //
 // 背景（2026-10-18 实测）：llm_utils_chat 的 `function` 与 `model` 必须同属
@@ -788,6 +857,21 @@ func ResolveRequestedModel(models []CatalogModel, name string) (string, bool) {
 //
 // 都不含则回 preferred（让上游如实报错，不猜）。
 func FunctionForModel(models []CatalogModel, name, preferred string) string {
+	return FunctionForModelTier(models, name, preferred, false)
+}
+
+// FunctionForModelTier 与 FunctionForModel 相同，但按**目标档位**挑表。
+//
+// 为什么档位也影响选表（2026-10-18 实测目录）：同一个模型并非每张表都有
+// `__max` 真名，而 max_mode 也按表标注：
+//
+//	solo_work_lite   glm-5.3  max_mode=false  只有 glm-5.3__dev  168000
+//	solo_agent       glm-5.3  max_mode=true   glm-5.3__dev + glm-5.3__max  936000
+//
+// 要 1M 却发到 solo_work_lite，只能拿到 `__dev` 的 168000 档——客户端声明了
+// 1M、实际永远跑 200K，正是用户报的现象。所以 wantMax 时必须优先选**该表给了
+// `__max` 真名**的 function；一张都没有时才退回普通口径（不凭空造档位）。
+func FunctionForModelTier(models []CatalogModel, name, preferred string, wantMax bool) string {
 	model, ok := LookupCatalogModel(models, name)
 	if !ok || len(model.Functions) == 0 {
 		return preferred
@@ -796,14 +880,26 @@ func FunctionForModel(models []CatalogModel, name, preferred string) string {
 		profile, ok := model.Profiles[fn]
 		return ok && strings.HasSuffix(profile.DevModelName, "__dev")
 	}
-	if preferred != "" && model.Functions[preferred] && hasDev(preferred) {
+	hasMax := func(fn string) bool {
+		profile, ok := model.Profiles[fn]
+		return ok && model.MaxMode && profile.MaxModelName != ""
+	}
+	hasTier := hasDev
+	if wantMax {
+		hasTier = hasMax
+	}
+	if preferred != "" && model.Functions[preferred] && hasTier(preferred) {
 		return preferred
 	}
-	// 优先找有 __dev 真名的表（按通用度顺序扫，结果稳定可复现）。
+	// 优先找有目标档真名的表（按通用度顺序扫，结果稳定可复现）。
 	for _, fn := range functionPreference {
-		if model.Functions[fn] && hasDev(fn) {
+		if model.Functions[fn] && hasTier(fn) {
 			return fn
 		}
+	}
+	// 目标档在这份目录里根本不存在：退回普通口径，让请求照常发出去。
+	if wantMax {
+		return FunctionForModelTier(models, name, preferred, false)
 	}
 	if preferred != "" && model.Functions[preferred] {
 		return preferred

@@ -114,6 +114,20 @@ func RemoteEnabled() bool {
 	return true
 }
 
+// maxTierPreferred 报告是否允许「要 1M 档的请求从 Work 档改道到 Agent 档」。
+//
+// 默认开：max 真名 `__max` 只出现在 Agent 表里，留在 Work 档就只能拿到
+// `__dev`（168000≈200K），客户端声明 1M 也白搭。
+// 关掉（WB2API_TRAE_MAX_TIER=0）可让工具请求回到 Work 档——排障用：
+// Agent 档自带沙箱，理论上可能自己执行工具后只回一句成功。
+func maxTierPreferred() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_TRAE_MAX_TIER"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 // remoteHeaders 构造 Remote 头族（网页端形态，与 llm_utils_chat 的 SOLO/IDE 指纹完全不同）。
 func remoteHeaders(a *auth.Auth, stream bool) http.Header {
 	h := http.Header{}
@@ -289,8 +303,14 @@ func buildCommonParams(sessionID string) string {
 //  1. 从出站请求体取 messages，注入运行时提示（prompt.go）；
 //  2. 有界历史压缩 + query 裁剪；
 //  3. manual 选模型时从目录解析 custom_model 并绑定（_bound_model_name 口径）；
-//  4. max 请求（模型名带 -max 后缀且目录标 max_mode）补六件套。
+//  4. max 请求（默认档；显式 `<model>-dev` 才退回普通档）补六件套。
 func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte, string, bool, error) {
+	return buildRemoteBodyWithCatalog(ctx, a, prepared, nil)
+}
+
+// buildRemoteBodyWithCatalog 与 buildRemoteBody 相同，但可注入目录（测试用）。
+// catalog 为 nil 时按账号拉实时目录。
+func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []byte, catalog []CatalogModel) ([]byte, string, bool, error) {
 	var src map[string]any
 	if err := json.Unmarshal(prepared, &src); err != nil {
 		return nil, "", false, fmt.Errorf("trae remote: 请求体解析失败：%w", err)
@@ -347,16 +367,45 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 
 	maxApplied := false
 	if strategy == "manual" {
-		// 请求名里的 `-max` 后缀是**客户端意图**，上游真名是 `__max`（见
-		// CatalogModel.OutboundModelName）。但 `qwen3.8-max` 这种名字里带 -max 的
-		// 真实模型不能被剥，所以交给 ResolveRequestedModel 先查目录再决定。
-		models, cerr := FetchCatalog(ctx, a)
+		// 档位默认取 max（1M）。请求名里的 `-max` 后缀是**客户端意图**，上游真名是
+		// `__max`（见 CatalogModel.OutboundModelName）；但 `qwen3.8-max` 这种名字里
+		// 带 -max 的真实模型不能被剥，所以交给 ResolveRequestedTier 先查目录再决定。
+		models := catalog
+		catalogOK := len(models) > 0
+		if !catalogOK {
+			if fetched, cerr := FetchCatalog(ctx, a); cerr == nil && len(fetched) > 0 {
+				models = fetched
+				catalogOK = true
+			}
+		}
 		var wantMax bool
 		var base string
-		if cerr == nil {
-			base, wantMax = ResolveRequestedModel(models, modelName)
-			if resolved := ResolveFromCatalog(models, base); resolved != "" && resolved != base {
-				base = resolved
+		if catalogOK {
+			// 档位默认取 max（1M）：目录里同一模型分 `__dev`（168000≈200K）与
+			// `__max`（936000）两档，官方客户端选 1M 时发 `__max`。要普通档写
+			// `<model>-dev`。先做显示名→配置名映射，再解档位。
+			base = ResolveFromCatalog(models, modelName)
+			if base == "" {
+				base = modelName
+			}
+			base, wantMax = ResolveRequestedTier(models, base)
+			// max 档只存在于 Agent 表（目录实测：solo_agent_remote 的 glm-5.3 有
+			// `__max`，solo_work_remote 只有 `__dev`）。默认要 max 的请求若被路由
+			// 到 Work 档，真名只能是 `__dev`（168000），1M 能力等于没用上。
+			// 所以 max 档优先落 solo_agent_remote；Work 档只服务「显式要普通档」的请求。
+			//
+			// 代价（必须如实记录）：Agent 档自带沙箱，可能自己执行文件/终端操作后
+			// 只回一句成功，而不发出 opencode_tool_call。若实测工具语义被破坏，
+			// 用 WB2API_TRAE_MAX_TIER=0 关掉这条改道（工具请求回 Work 档、走 `__dev`）。
+			if wantMax && agentType != remoteDefaultAgentType && maxTierPreferred() {
+				if profile, ok := modelProfile(models, base, remoteDefaultAgentType); ok &&
+					profile.MaxModelName != "" {
+					log.Printf("INFO: [trae] 模型 %s 默认 1M 档，执行档 %s → %s",
+						base, agentType, remoteDefaultAgentType)
+					agentType = remoteDefaultAgentType
+					msg.AgentType = agentType
+					msg.AgentID = agentType
+				}
 			}
 			// 目标 function 的表里没有这个模型时，在 Remote 档里换一个含它的。
 			//
@@ -396,7 +445,7 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 			}
 		}
 		msg.ModelName = modelName
-		if custom, ok := customModelFor(models, base, agentType, cerr == nil); ok {
+		if custom, ok := customModelFor(models, base, agentType, catalogOK); ok {
 			msg.CustomModel = custom
 			source := int64(1)
 			if v, ok := asFloat(custom["config_source"]); ok {
@@ -637,6 +686,11 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 		return remoteSession{}, fmt.Errorf("trae remote 建会话响应缺 id：%s", truncate(string(raw), 200))
 	}
 	return remoteSession{id: sid, messageID: mid}, nil
+}
+
+// BuildRemoteBodyForProbe 导出建会话体构造（排障探针用，生产走 ChatStreamRemote）。
+func BuildRemoteBodyForProbe(ctx context.Context, a *auth.Auth, prepared []byte, models []CatalogModel) ([]byte, string, bool, error) {
+	return buildRemoteBodyWithCatalog(ctx, a, prepared, models)
 }
 
 // remoteHTTPError / remoteBizError 建会话失败的两类形态。

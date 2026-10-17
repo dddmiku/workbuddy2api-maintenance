@@ -200,12 +200,16 @@ func BuildChatBodyWithCatalog(prepared []byte, requestID string, models []Catalo
 	// 目录可用时：按目标 function 选一张真有它的表，并用**那张表**的出站真名。
 	// 两件事必须成对做——只换 function 不换真名、或只换真名不换 function，
 	// 上游都会回 `config item is empty for config opt`。
+	//
+	// 档位默认取 max（1M）：目录里同一模型分 `__dev`（168000≈200K）与 `__max`
+	// （936000）两档，官方客户端选 1M 时发 `__max`。网关此前只有请求名带 `-max`
+	// 才发 max，导致客户端声明了 1M、实际永远跑 200K 档。要普通档写 `<model>-dev`。
 	if len(models) > 0 {
-		base, wantMax := ResolveRequestedModel(models, name)
+		base, wantMax := ResolveRequestedTier(models, name)
 		if base == "" {
 			base = name
 		}
-		function := FunctionForModel(models, base, body.Function)
+		function := FunctionForModelTier(models, base, body.Function, wantMax)
 		body.Function = function
 		body.ConfigName = base
 		if catalogModel, ok := LookupCatalogModel(models, base); ok {
