@@ -38,6 +38,82 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.10.16 — 2026-10-18
+
+### 修复：trae 请求的用量完全不落账（积分与 token 一起丢）
+
+接上一版：积分查到了、日志也打了 `扣费 1.1300`，但 `usage.json` 里那个密钥
+条目根本不存在。继续往下挖，根因在更早一层。
+
+handler 的 `recordUsage` 以 `st.upstreamStarted` 为前置条件（语义是「没打过
+上游的请求不记用量」），而这个标记**只由** `upstream.observeChatAttempt("start")`
+置位。Trae 域在 `ChatStreamContext` 里提前 return、不走 WorkBuddy 的出站循环，
+于是这一句从来没执行过——所有 trae 请求的 `upstream_started` 恒为 false，
+`recordUsage` 整段被跳过。
+
+实测证据（dev，v3.10.15）：
+
+| 观测点 | 结果 |
+|---|---|
+| 容器日志 | `INFO: [trae] Remote 扣费 1.1300（模型=GLM-5.3 …）` ← 查到了 |
+| `usage.json` 该密钥条目 | **不存在** ← 没写进去 |
+| `requests.jsonl` 该记录 | `"upstream_started": false` ← 根因 |
+
+修复：Trae 分支补发 `start` / `headers` 两个尝试事件。这同时修正了请求日志的
+`pre=` 耗时列（此前 trae 请求恒为 `-`）。
+
+验证（dev，v3.10.16）：同一请求后 `usage.json` 出现完整条目：
+
+```json
+{"name":"creditkeep","totals":{"requests":1,"prompt_tokens":20779,
+ "cached_tokens":20736,"completion_tokens":44,"total_tokens":20823,"credit":1.16},
+ "models":{"trae:glm-5.3":{...,"credit":1.16}},
+ "days":{"2026-10-18":{...,"credit":1.16}}}
+```
+
+日志里的 `WARN: 上游返回用量但无扣费` 同时消失。
+
+## v3.10.15 — 2026-10-18
+
+### 修复：积分列恒为「—」——上游不带 credit，改查商业用量接口
+
+面板「积分」列对 trae 请求恒为「—」，日志刷「上游返回用量但无扣费」。
+
+根因：`llm_utils_chat` 的 `token_usage` 事件**只有 token 数、没有 credit 字段**
+（原始事件逐字确认）：
+
+```
+event:token_usage
+data:{"prompt_tokens":17,"completion_tokens":21,"total_tokens":38,
+      "cache_read_input_tokens":0,"reasoning_tokens":17,"cluster":"normal_context"}
+```
+
+网关账本读的是 `usage.credit`，上游不给就永远记不到；成本账本
+（`NoteModelCost`）也因此从不更新，选号无法按「免费/便宜优先」排序。
+
+官方客户端另打 `POST /api/v1/commercial/get_session_usage`
+`{"session_id":"<turn id>"}` 取真实账单。实测（dev 真实上游）：
+
+```json
+{"user_usage_group_by_session":{"amount_float":0.07,"credits_float":0.07,
+ "extra_info":{"input_token":17,"output_token":84},"model_name":"GLM-5.3",
+ "use_max_mode":false,"session_id":"creditprobe-..."}}
+```
+
+两个关键事实：**turn id 就是我们发出去的 request_id**（上游 metadata 原样
+回显）；**没有结算延迟**（连续三次轮询值一致，首次即可用），所以不需要参考
+实现那套指数退避轮询。
+
+实现：
+
+1. 新增 `session_usage.go`：`FetchSessionCredit` 查扣费，5s 超时兜底；
+   缺失/非数值/HTTP 失败一律 `ok=false`（缺失≠0，绝不把查不到记成免费）。
+2. `translator` 挂流尾回调：发 usage 帧前查一次，把真实 credits 写进
+   `usage.credit`。token 数仍取事件流的值，不被覆盖。
+3. 两条路径各自传 turn id：legacy = 我们的 `request_id`，Remote = `message_id`
+   （商业接口按单轮消息记账，`chat_session_id` 是整个会话）。
+4. `use_max_mode` 一并解析并记日志——确认「默认 1M 档」是否真的按 max 计费。
+
 ## v3.10.14 — 2026-10-18
 
 ### 修复：所有两档模型默认走 1M（`__max`），此前恒发 200K（`__dev`）
