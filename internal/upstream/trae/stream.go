@@ -250,12 +250,18 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 用实时目录把客户端模型名解析成 config_name（含显示名匹配，如
 	// "DeepSeek-V4.1-Flash" → "deepseek-v4.1-flash"）；目录不可用时
 	// BuildChatBody 内部回落静态别名表。
+	//
+	// 目录同时决定**出站 function 与该 function 自己的 model_name**：只在
+	// code_reviewer / git_ai / multimodal 等专用表里的模型，发到写死的
+	// solo_work_lite 必然 `config item is empty for config opt`（2026-10-18 实测）。
+	var catalog []CatalogModel
 	if models, cerr := FetchCatalog(ctx, a); cerr == nil && len(models) > 0 {
+		catalog = models
 		if resolved := ResolveFromCatalog(models, modelFromPrepared(prepared)); resolved != "" {
 			prepared = withModel(prepared, resolved)
 		}
 	}
-	body, err := BuildChatBody(prepared, requestID)
+	body, err := BuildChatBodyWithCatalog(prepared, requestID, catalog)
 	if err != nil {
 		return nil, 0, nil, err
 	}

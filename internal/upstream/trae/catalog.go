@@ -84,6 +84,40 @@ type CatalogModel struct {
 	// 没给 model_detail_list，取不到 __dev 真名）。出站前用 Functions 校验，
 	// 不在就退回 solo_agent——那里一定有它。
 	Functions map[string]bool
+	// Hidden 报告该模型在**所有**出现的表里都被标了 is_invisible_to_user。
+	//
+	// 语义是「Trae 界面不显示」，不是「不可调用」：kimi-k2 在 chat_v3 / builder
+	// 标了 invisible，但实测 chat_v3 能正常出词。所以 Hidden 只影响对外公布
+	// （ModelIDsFromCatalog / /v1/models），不影响出站选择——用户显式点名
+	// 某个 Hidden 模型时仍应照常发出去。
+	//
+	// 注意是「全部标了」才 Hidden：只要有一张表没标（kimi-k2 的 inline_chat），
+	// 它就不是纯内部模型。
+	Hidden bool
+	// Profiles 记录**每个 function 各自**的出站真名与档位上限。
+	//
+	// 为什么不能只留一份（2026-10-18 实测）：同一 config_name 在不同 function 的
+	// 表里对应**不同的 model_name**，甚至有的表把它映射到别的模型：
+	//
+	//	code-review-judge 在 code_reviewer 表里的真名是 deepseek-V3.1__dev
+	//	Doubao-Seed-2.0-Code 在 solo_work_lite 表里的真名是 Doubao-Seed-2.1-Turbo__dev
+	//	deepseek-V3.1 只在 code_reviewer 里，kimi-k2 在 chat_v3/builder 里
+	//
+	// 合并时若只按「第一个非空」保留一份，出站到别的 function 就会把 A 表的真名
+	// 发给 B 表 → `config item is empty for config opt`。所以按 function 分别存，
+	// 出站时用**目标 function 自己那张表**的真名。
+	Profiles map[string]CatalogFunctionProfile
+}
+
+// CatalogFunctionProfile 是某模型在**一个** function 目录里的出站参数。
+type CatalogFunctionProfile struct {
+	// DevModelName 普通档出站真名（优先 `__dev` 结尾的条目；没有后缀时取该表
+	// 里第一个 model_name，例如 doubao_1_8 的 `doubao_1_8` / `kimi-k2__v2`）。
+	DevModelName string
+	// MaxModelName 1M 档出站真名（`__max` 结尾）。
+	MaxModelName string
+	DevPromptMax int64
+	MaxPromptMax int64
 }
 
 // catalogEntry 是带时间的缓存项。
@@ -135,12 +169,13 @@ func InvalidateCatalog(uid string) {
 	delete(catalogCache, uid)
 }
 
-// catalogFunctionAll 是「模型最全」的那个 function。
+// catalogFunctionAll 是 llm_utils_chat 侧「模型最全」的那个 function。
 //
 // 实测（2026-10-16）：同一账号下 solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
-// 只在 solo_agent 里的模型（qwen3.8-flash / kimi-k2.8-preview / Doubao-Seed-Evolving-auto
-// 等）按其它 function 发出去会拿到 `config item is empty for config opt`，
-// 因此它是 out-of-catalog 模型的退回目标。
+//
+// 2026-10-18 起**不再**用它当退回目标：出站 function 由 FunctionForModel 按目录
+// 逐个模型挑（专用表里的模型必须发到专用表）。它只作为 functionPreference 的
+// 一个候选保留。
 const catalogFunctionAll = "solo_agent"
 
 // catalogFunctions 是 batch_get_detail_param 要问的 function 列表。
@@ -286,6 +321,16 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 				model.Functions = map[string]bool{}
 			}
 			model.Functions[entry.function] = true
+			// 每个 function 各自记一份出站真名：同一 config_name 在不同表里可能
+			// 对应不同的 model_name（见 CatalogModel.Profiles 的实测例）。
+			model.Profiles = map[string]CatalogFunctionProfile{
+				entry.function: {
+					DevModelName: model.DevModelName,
+					MaxModelName: model.MaxModelName,
+					DevPromptMax: model.DevPromptMax,
+					MaxPromptMax: model.MaxPromptMax,
+				},
+			}
 		}
 		if previous, seen := merged[model.ConfigName]; seen {
 			merged[model.ConfigName] = mergeCatalogModel(previous, model)
@@ -313,6 +358,9 @@ func mergeCatalogModel(a, b CatalogModel) CatalogModel {
 	}
 	out.Multimodal = a.Multimodal || b.Multimodal
 	out.MaxMode = a.MaxMode || b.MaxMode
+	// Hidden 取**交集**：只要有一张表没标 invisible，这个模型就不是纯内部模型
+	// （kimi-k2 在 inline_chat 里没标）。
+	out.Hidden = a.Hidden && b.Hidden
 	// Functions 取并集：模型在任一 function 的表里出现过就算可用。
 	if len(b.Functions) > 0 {
 		if out.Functions == nil {
@@ -320,6 +368,18 @@ func mergeCatalogModel(a, b CatalogModel) CatalogModel {
 		}
 		for fn := range b.Functions {
 			out.Functions[fn] = true
+		}
+	}
+	// Profiles 按 function 合并（同 key 取先到的；不同 function 各存一份）。
+	if len(b.Profiles) > 0 {
+		if out.Profiles == nil {
+			out.Profiles = map[string]CatalogFunctionProfile{}
+		}
+		for fn, profile := range b.Profiles {
+			if _, seen := out.Profiles[fn]; seen {
+				continue
+			}
+			out.Profiles[fn] = profile
 		}
 	}
 	if out.DevModelName == "" {
@@ -348,8 +408,21 @@ func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
 		return CatalogModel{}, false
 	}
 	// 内部子代理（browser_use_subagent / explore_sub_agent_v2 等）不对外公布。
+	//
+	// ⚠ 不能整条丢掉（2026-10-18 修正）：`is_invisible_to_user` 的语义是
+	// **Trae 界面不显示**，不是「不可调用」。同一个模型常在多张表里出现，
+	// 有的表标 invisible=true、另一张表没标：
+	//
+	//	kimi-k2 在 chat_v3 / builder 里 invisible=true，在 inline_chat 里没标
+	//
+	// 按旧逻辑整条丢弃会让 chat_v3 / builder 这两张**能跑**的表从目录里消失，
+	// 只剩 inline_chat（实测 3003 model service unavailable）→ 该模型永远 502。
+	//
+	// 新逻辑：仍记进目录（否则拿不到它在这些表里的出站真名），但标 Hidden；
+	// Hidden 只影响对外公布（ModelIDsFromCatalog），不影响出站选择。
+	hidden := false
 	if invisible, ok := item["is_invisible_to_user"].(bool); ok && invisible {
-		return CatalogModel{}, false
+		hidden = true
 	}
 	name, _ := item["config_name"].(string)
 	if name == "" {
@@ -365,7 +438,7 @@ func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
 			display, _ = dc["display_name"].(string)
 		}
 	}
-	model := CatalogModel{ConfigName: name, DisplayName: strings.TrimSpace(display)}
+	model := CatalogModel{ConfigName: name, DisplayName: strings.TrimSpace(display), Hidden: hidden}
 	if rate, ok := parseConsumptionRate(item["display_contact_config"]); ok {
 		model.Rate = rate
 		model.HasRate = true
@@ -383,6 +456,12 @@ func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
 	// model_detail_list 给出该模型各档位的**出站真名**与上下文上限。
 	// 档位后缀 `__dev` / `__max` 是上游硬要求（2026-10-16 抓包），
 	// 这里把两档记下来，出站时按请求档位选用。
+	//
+	// 有的表（chat / git_ai / multimodal）的 detail 里**没有** `__dev` 后缀，
+	// 只有一个裸名（`doubao-2.0-mini` / `multimodal_image_kimi-k2.5`）或
+	// `__v2` 变体（`kimi-k2__v2`）。这类表的普通档真名就是那个裸名——不记下来
+	// 会让该 function 的 profile 空掉，出站时回落到别的表的 `__dev` 真名，
+	// 上游回 `config item is empty` 或 4023 model unknown（2026-10-18 实测）。
 	if details, ok := item["model_detail_list"].([]any); ok {
 		for _, raw := range details {
 			detail, ok := raw.(map[string]any)
@@ -402,6 +481,13 @@ func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
 					model.MaxPromptMax = promptMax
 				}
 			case strings.HasSuffix(name, "__dev"):
+				if model.DevModelName == "" {
+					model.DevModelName = name
+					model.DevPromptMax = promptMax
+				}
+			default:
+				// 裸名 / `__v2` 变体：该表的普通档真名。只取第一个——
+				// 同一张表里多个裸名时上游按第一个匹配。
 				if model.DevModelName == "" {
 					model.DevModelName = name
 					model.DevPromptMax = promptMax
@@ -509,6 +595,11 @@ func ModelIDsFromCatalog(models []CatalogModel) []string {
 		out = append(out, name)
 	}
 	for _, m := range models {
+		// Hidden 只影响公布：Trae 界面不显示的内部模型不列进 /v1/models，
+		// 但显式点名时仍能出站（见 CatalogModel.Hidden 的说明）。
+		if m.Hidden {
+			continue
+		}
 		add(m.ConfigName)
 		add(m.DisplayName)
 	}
@@ -554,6 +645,10 @@ func ResolveFromCatalog(models []CatalogModel, name string) string {
 // wantMax 为真且目录标了 max_mode 时给出 max 真名；否则给 dev 真名。
 // 目录里没有 model_detail_list（或该档缺失）时**回落成 config_name 原样**——
 // 上游对不带后缀的名字也能跑（实测 200），比凭空编一个后缀安全。
+//
+// 这是「不看 function」的旧口径，只供没有目标 function 的调用方（Remote 的
+// custom_model 绑定等）使用。出站到某个具体 function 时必须用
+// OutboundModelNameFor —— 同名模型在不同表里对应不同的 model_name。
 func (m CatalogModel) OutboundModelName(wantMax bool) string {
 	if wantMax && m.MaxMode && m.MaxModelName != "" {
 		return m.MaxModelName
@@ -562,6 +657,41 @@ func (m CatalogModel) OutboundModelName(wantMax bool) string {
 		return m.DevModelName
 	}
 	return m.ConfigName
+}
+
+// OutboundModelNameFor 返回该模型在**指定 function** 目录里的出站真名。
+//
+// 必须按 function 取（2026-10-18 实测）：同一 config_name 在不同 function 的
+// 表里对应不同的 model_name——
+//
+//	code-review-judge  在 code_reviewer 表里是 deepseek-V3.1__dev
+//	Doubao-Seed-2.0-Code 在 solo_work_lite 表里是 Doubao-Seed-2.1-Turbo__dev
+//
+// 用错表的名字，上游回 `config item is empty for config opt`。
+// function 没给 / 该 function 不在目录里时回落到全局口径（不阻断出站）。
+func (m CatalogModel) OutboundModelNameFor(function string, wantMax bool) string {
+	if profile, ok := m.Profiles[function]; ok {
+		if wantMax && m.MaxMode && profile.MaxModelName != "" {
+			return profile.MaxModelName
+		}
+		if profile.DevModelName != "" {
+			return profile.DevModelName
+		}
+	}
+	return m.OutboundModelName(wantMax)
+}
+
+// PromptMaxTokensFor 返回该模型在指定 function 目录里的档位上限。
+func (m CatalogModel) PromptMaxTokensFor(function string, wantMax bool) int64 {
+	if profile, ok := m.Profiles[function]; ok {
+		if wantMax && m.MaxMode && profile.MaxPromptMax > 0 {
+			return profile.MaxPromptMax
+		}
+		if profile.DevPromptMax > 0 {
+			return profile.DevPromptMax
+		}
+	}
+	return m.PromptMaxTokens(wantMax)
 }
 
 // PromptMaxTokens 返回该档位的上下文上限（0 表示目录没给）。
@@ -634,4 +764,67 @@ func ResolveRequestedModel(models []CatalogModel, name string) (string, bool) {
 		}
 	}
 	return strings.TrimSpace(name), false
+}
+
+// FunctionForModel 选一个**该模型确实在表里**的 function 来出站。
+//
+// 背景（2026-10-18 实测）：llm_utils_chat 的 `function` 与 `model` 必须同属
+// 一张目录表，且表里的 model_name 各不相同：
+//
+//	deepseek-V3.1 / code-review-judge → 只在 code_reviewer 表里
+//	kimi-k2                          → 只在 chat_v3 / builder / inline_chat 表里
+//	doubao-2.0-mini                  → 只在 git_ai 表里
+//	multimodal_image_kimi-k2.5       → 只在 multimodal 表里
+//
+// 网关原来把所有请求都发到写死的 solo_work_lite，这些模型必然
+// `config item is empty for config opt`。
+//
+// 选择顺序（三级，越靠前越可靠）：
+//  1. preferred 命中且**该表有 `__dev` 真名** → 直接用；
+//  2. 任何一张表有 `__dev` 真名 → 用它（`__dev` 是 llm_utils_chat 的标准形态，
+//     实测稳定可用；`glm-5v-turbo` 只在 solo_coder 有 `__dev`，chat 表里的
+//     裸名会被上游判 4023 model unknown）；
+//  3. 按 functionPreference 挑第一个含它的表（裸名 / `__v2` 表，最后手段）。
+//
+// 都不含则回 preferred（让上游如实报错，不猜）。
+func FunctionForModel(models []CatalogModel, name, preferred string) string {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok || len(model.Functions) == 0 {
+		return preferred
+	}
+	hasDev := func(fn string) bool {
+		profile, ok := model.Profiles[fn]
+		return ok && strings.HasSuffix(profile.DevModelName, "__dev")
+	}
+	if preferred != "" && model.Functions[preferred] && hasDev(preferred) {
+		return preferred
+	}
+	// 优先找有 __dev 真名的表（按通用度顺序扫，结果稳定可复现）。
+	for _, fn := range functionPreference {
+		if model.Functions[fn] && hasDev(fn) {
+			return fn
+		}
+	}
+	if preferred != "" && model.Functions[preferred] {
+		return preferred
+	}
+	for _, fn := range functionPreference {
+		if fn == preferred {
+			continue
+		}
+		if model.Functions[fn] {
+			return fn
+		}
+	}
+	return preferred
+}
+
+// functionPreference 是「模型最通用」的 function 排序。
+//
+// 只在 preferred 不含该模型时才用。顺序依据实测的通用度：solo_work_lite /
+// solo_agent 覆盖面最广，专用表（git_ai / code_reviewer / multimodal）最后。
+var functionPreference = []string{
+	"solo_work_lite", "solo_agent", "solo_agent_remote", "solo_work_remote",
+	"solo_agent_lite", "chat_v3", "builder_v3", "builder", "chat",
+	"solo_coder", "code_reviewer", "git_ai", "multimodal", "inline_chat",
 }

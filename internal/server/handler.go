@@ -997,6 +997,14 @@ func (h *Handler) modelList() []map[string]any {
 			return out
 		}
 		for _, m := range models {
+			// Hidden = 所有表都标了 is_invisible_to_user（Trae 界面不显示）。
+			// 这类是内部子代理 / 专用 judge，直接调用会 502（实测
+			// browser_use_subagent / computer_use_subagent / explore_sub_agent_v2
+			// 全是 `failed to resolve instance` / `config item is empty`）。
+			// 不列进 /v1/models，避免客户端选到必挂的名字。
+			if m.Hidden {
+				continue
+			}
 			entry := map[string]any{
 				"id":       trae.Realm + ":" + m.ConfigName,
 				"object":   "model",

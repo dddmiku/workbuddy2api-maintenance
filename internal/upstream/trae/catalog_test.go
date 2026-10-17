@@ -32,11 +32,21 @@ func TestParseCatalogFiltersAndRates(t *testing.T) {
 	for _, m := range models {
 		byName[m.ConfigName] = m
 	}
-	// 过滤：子代理（invisible）、summary（usage）、custom_model 都不该出现。
-	for _, gone := range []string{"browser_use_subagent", "summary", "custom_model_gpt-5"} {
+	// 过滤：summary（usage 不对）、custom_model 不该出现。
+	//
+	// invisible 的语义在 2026-10-18 修正过：`is_invisible_to_user` 表示 Trae
+	// 界面不显示，不是「不可调用」。kimi-k2 在 chat_v3 里标 invisible 却能正常
+	// 出词，整条丢弃会让能跑的表消失（只剩 inline_chat → 3003）。所以现在
+	// **保留**该条目并标 Hidden，只由 ModelIDsFromCatalog 决定不对外公布。
+	for _, gone := range []string{"summary", "custom_model_gpt-5"} {
 		if _, ok := byName[gone]; ok {
 			t.Errorf("%q should have been filtered out", gone)
 		}
+	}
+	if m, ok := byName["browser_use_subagent"]; !ok {
+		t.Error("browser_use_subagent 应保留在目录里（标 Hidden），整条丢弃会让它的表从目录消失")
+	} else if !m.Hidden {
+		t.Error("browser_use_subagent 应标 Hidden（界面不显示）")
 	}
 	// 用户实测发现的漏项：deepseek-v4.1-flash 必须在内。
 	if _, ok := byName["deepseek-v4.1-flash"]; !ok {

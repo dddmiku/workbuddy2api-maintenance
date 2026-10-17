@@ -157,6 +157,25 @@ func buildHeaders(a *auth.Auth) http.Header {
 // 只有 tools 声明需要转 Trae 原生（parameters 是 JSON 字符串而非对象）。
 // 上层 prepareBody 已做过 effort 降级与预算补齐，这里不再重复处理。
 func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
+	return BuildChatBodyWithCatalog(prepared, requestID, nil)
+}
+
+// BuildChatBodyWithCatalog 与 BuildChatBody 相同，但用实时目录决定出站的
+// `function` 与 `model` 真名。
+//
+// 为什么必须带目录（2026-10-18 实测）：llm_utils_chat 的 function 与 model 必须
+// 同属一张目录表，且同一 config_name 在不同表里的 model_name 不同：
+//
+//	deepseek-V3.1 / code-review-judge → 只在 code_reviewer 表（真名 deepseek-V3.1__dev）
+//	kimi-k2                          → 只在 chat_v3 / builder 表
+//	doubao-2.0-mini                  → 只在 git_ai 表
+//	multimodal_image_kimi-k2.5       → 只在 multimodal 表
+//
+// 旧实现写死 function=solo_work_lite 且发干净名，这些模型一律
+// `config item is empty for config opt`。
+//
+// models 为空（目录拉不到）时退回旧的写死行为：不因为缺目录把请求改道。
+func BuildChatBodyWithCatalog(prepared []byte, requestID string, models []CatalogModel) ([]byte, error) {
 	var src map[string]any
 	if err := jsonutil.Decode(prepared, &src); err != nil || src == nil {
 		return nil, fmt.Errorf("trae chat body parse: %w", err)
@@ -178,6 +197,25 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 	}
 	body.ConfigName = name
 	body.Model = name
+	// 目录可用时：按目标 function 选一张真有它的表，并用**那张表**的出站真名。
+	// 两件事必须成对做——只换 function 不换真名、或只换真名不换 function，
+	// 上游都会回 `config item is empty for config opt`。
+	if len(models) > 0 {
+		base, wantMax := ResolveRequestedModel(models, name)
+		if base == "" {
+			base = name
+		}
+		function := FunctionForModel(models, base, body.Function)
+		body.Function = function
+		body.ConfigName = base
+		if catalogModel, ok := LookupCatalogModel(models, base); ok {
+			if real := catalogModel.OutboundModelNameFor(function, wantMax); real != "" {
+				body.Model = real
+			}
+		} else {
+			body.Model = base
+		}
+	}
 	if msgs, ok := src["messages"].([]any); ok {
 		for _, m := range msgs {
 			if mm, ok := m.(map[string]any); ok {

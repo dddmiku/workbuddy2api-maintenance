@@ -109,8 +109,24 @@ func TestParseCatalogSkipsNonChatModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCatalog: %v", err)
 	}
-	if len(models) != 1 || models[0].ConfigName != "glm-5.3" {
-		t.Fatalf("只应保留 glm-5.3，实际 %+v", models)
+	// summary 是 usage 不对，直接丢弃；browser_use_subagent 2026-10-18 起保留
+	// 并标 Hidden（invisible 只表示界面不显示，不代表不能调用）。
+	byName := map[string]CatalogModel{}
+	for _, m := range models {
+		byName[m.ConfigName] = m
+	}
+	if _, ok := byName["summary"]; ok {
+		t.Error("summary 的 usage 不是 chat_completion，应丢弃")
+	}
+	sub, ok := byName["browser_use_subagent"]
+	if !ok {
+		t.Fatal("browser_use_subagent 应保留在目录里（标 Hidden）")
+	}
+	if !sub.Hidden {
+		t.Error("browser_use_subagent 应标 Hidden")
+	}
+	if _, ok := byName["glm-5.3"]; !ok {
+		t.Error("glm-5.3 应保留")
 	}
 }
 

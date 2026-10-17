@@ -210,6 +210,46 @@ func agentTypeSupportsModel(models []CatalogModel, name, agentType string) bool 
 	return model.Functions[agentType]
 }
 
+// remoteAgentTypes 是 Remote 建会话端点的**首选** agent_type。
+//
+// 这三个是网页端 SOLO 自己的档，优先用它们；但退回 solo_agent 也允许——
+// 2026-10-18 生产日志实测：glm-5.1 / qwen-3.5 退回 solo_agent 后 Remote
+// 建会话成功并 200（这两个模型不在任何 Remote 档的目录里）。
+//
+// 手工用不完整 body 探测 solo_agent 会拿到 500 995000，那是 body 字段缺失
+// 造成的，不能据此判定 agent_type 不合法——以生产真实链路为准。
+var remoteAgentTypes = map[string]bool{
+	"solo_agent_remote":  true,
+	"solo_work_remote":   true,
+	"solo_design_remote": true,
+}
+
+// remoteAgentTypeForModel 判断这个模型能不能走 Remote，并给出该用哪一档。
+//
+// 返回空串 = **Remote 服务不了它**，调用方应直接走 legacy（llm_utils_chat）。
+//
+// 2026-10-18 生产实测：Remote 建会话即使成功，收流时上游仍会按自己的表判
+// `Function: solo_agent` —— 对只在 code_reviewer / git_ai / multimodal / chat
+// 等**非 Remote 表**里的模型，必然回 `config item is empty for config opt`。
+// 这类模型只能由 legacy 发到它自己那张表（见 FunctionForModel）。
+//
+// 目录不可用时返回 preferred：不因缺数据改道。
+func remoteAgentTypeForModel(models []CatalogModel, name, preferred string) string {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok || len(model.Functions) == 0 {
+		return preferred
+	}
+	if remoteAgentTypes[preferred] && model.Functions[preferred] {
+		return preferred
+	}
+	for _, candidate := range []string{remoteWorkAgentType, remoteDefaultAgentType} {
+		if candidate != preferred && model.Functions[candidate] {
+			return candidate
+		}
+	}
+	return ""
+}
+
 // buildCommonParams 组装 common_params（JSON 字符串）。
 //
 // 对齐参考 trae_remote_client.common_params 的 CN code 档。
@@ -318,21 +358,29 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 			if resolved := ResolveFromCatalog(models, base); resolved != "" && resolved != base {
 				base = resolved
 			}
-			// 目标 function 的表里没有这个模型时退回 **solo_agent**——那里一定有它。
+			// 目标 function 的表里没有这个模型时，在 Remote 档里换一个含它的。
 			//
 			// 实测（2026-10-16）：solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
 			// qwen3.8-flash / kimi-k2.8-preview 这类只在 solo_agent 里，按默认的
 			// 「带工具 → solo_work_remote」发出去会拿到
-			// `config item is empty for config opt`。退回 solo_agent 后正常。
+			// `config item is empty for config opt`。换到含它的 Remote 档后正常。
 			//
-			// 注意退回目标是 **solo_agent**（catalogFunctionAll），不是
-			// remoteDefaultAgentType（那正是 solo_agent_remote，退等于没退）。
+			// 三个 Remote 档都没有它 → 放弃 Remote，让 ChatStream 回落到 legacy：
+			// 2026-10-18 实测，这类模型（deepseek-V3.1 / kimi-k2 / doubao-2.0-mini …）
+			// 在 Remote 上即使建会话成功，收流仍会按 solo_agent 表判空。
 			if !agentTypeSupportsModel(models, base, agentType) {
-				log.Printf("INFO: [trae] 模型 %s 不在 %s 的目录里，退回 %s",
-					base, agentType, catalogFunctionAll)
-				agentType = catalogFunctionAll
-				msg.AgentType = agentType
-				msg.AgentID = agentType
+				candidate := remoteAgentTypeForModel(models, base, agentType)
+				if candidate == "" {
+					return nil, "", false, fmt.Errorf(
+						"trae remote: 模型 %s 只在非 Remote 表里，改走 llm_utils_chat", base)
+				}
+				if candidate != agentType {
+					log.Printf("INFO: [trae] 模型 %s 不在 %s 的目录里，改走 %s",
+						base, agentType, candidate)
+					agentType = candidate
+					msg.AgentType = agentType
+					msg.AgentID = agentType
+				}
 			}
 		} else {
 			// 目录不可用：退回静态别名表，并按纯后缀拆档位意图。
@@ -341,8 +389,9 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 		}
 		modelName = base
 		// 目录给出了档位真名时用它（`glm-5.3__max` / `glm-5.3__dev`）。
+		// 必须按**最终 agentType** 取——同一 config_name 在不同表里真名不同。
 		if catalogModel, ok := LookupCatalogModel(models, base); ok {
-			if real := catalogModel.OutboundModelName(wantMax); real != "" {
+			if real := catalogModel.OutboundModelNameFor(agentType, wantMax); real != "" {
 				modelName = real
 			}
 		}
@@ -417,10 +466,18 @@ func remoteTrimLog(dropped int) {
 func customModelFor(models []CatalogModel, name string, agentType string, catalogOK bool) (map[string]any, bool) {
 	if catalogOK && len(models) > 0 {
 		if m, ok := LookupCatalogModel(models, name); ok {
+			// 出站真名必须按目标 function 取：同一 config_name 在不同表里对应
+			// 不同 model_name（见 CatalogModel.Profiles）。
+			devName := m.OutboundModelNameFor(agentType, false)
+			devMax := m.PromptMaxTokensFor(agentType, false)
+			maxName := m.OutboundModelNameFor(agentType, true)
+			if maxName == devName {
+				maxName = ""
+			}
 			custom := map[string]any{
 				"name":               m.ConfigName,
 				"config_name":        m.ConfigName,
-				"model_name":         m.DevModelName,
+				"model_name":         devName,
 				"display_name":       m.DisplayName,
 				"config_source":      1,
 				"provider":           "",
@@ -431,14 +488,14 @@ func customModelFor(models []CatalogModel, name string, agentType string, catalo
 				"use_remote_service": true,
 			}
 			// max 档的真实上限（抓包实测各模型不同），供 maxModeCustomModel 采用。
-			if m.MaxPromptMax > 0 {
-				custom["prompt_max_tokens"] = m.MaxPromptMax
+			if promptMax := m.PromptMaxTokensFor(agentType, true); promptMax > 0 {
+				custom["prompt_max_tokens"] = promptMax
 			}
-			if m.MaxModelName != "" {
-				custom["max_model_name"] = m.MaxModelName
+			if maxName != "" {
+				custom["max_model_name"] = maxName
 			}
-			if m.DevPromptMax > 0 {
-				custom["dev_prompt_max_tokens"] = m.DevPromptMax
+			if devMax > 0 {
+				custom["dev_prompt_max_tokens"] = devMax
 			}
 			if custom["model_name"] == "" {
 				custom["model_name"] = m.ConfigName
