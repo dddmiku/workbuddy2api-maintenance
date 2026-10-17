@@ -246,21 +246,29 @@ def deploy(env, version, expect_commit=None, allow_dirty=False):
                        .format(s=stage, r=ROOT))
         run(cli, " && ".join(install), timeout=180)
 
-        # SIGTERM 优雅停机：在途长流式请求要跑完，docker restart 只等 10s 会切断。
-        run(cli, "docker stop -t 900 %s && docker start %s" % (CONTAINER, CONTAINER),
-            timeout=1000)
+        # SIGTERM 优雅停机的等待时长按环境分档。
+        #
+        # prod 用 900s：在途长流式请求要跑完，docker restart 只等 10s 会切断用户
+        # 正在收的回复（v3.10.11 之前的教训）。
+        #
+        # dev 用 20s：dev 的唯一用途是「快速验证改动」，而 900s 意味着每次部署
+        # 只要有一条长会话在跑，容器就要挂 15 分钟——实测用户在这段时间访问会拿到
+        # Cloudflare 502（2026-10-18）。dev 上切断在途请求是可以接受的代价。
+        stop_grace = 900 if env == "prod" else 20
+        run(cli, "docker stop -t %d %s && docker start %s" % (stop_grace, CONTAINER, CONTAINER),
+            timeout=stop_grace + 120)
         started = time.time()
         healthy = ""
         while time.time() - started < 240:
-            time.sleep(5)
+            time.sleep(3)
             _rc, healthy, _ = run(cli, "curl -s -m 10 http://127.0.0.1:7863/healthz")
             if version in healthy:
                 break
         print("after: %s" % healthy.strip()[:260])
         if version not in healthy:
             raise SystemExit("健康检查未通过；回滚：printf '%s' > %s/current && "
-                             "docker stop -t 900 %s && docker start %s"
-                             % (pointer.strip(), UPDATES, CONTAINER, CONTAINER))
+                             "docker stop -t %d %s && docker start %s"
+                             % (pointer.strip(), UPDATES, stop_grace, CONTAINER, CONTAINER))
         print("OK: %s 已部署 %s 到 %s" % (version, cfg["label"], target))
     finally:
         cli.close()

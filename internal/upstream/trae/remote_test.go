@@ -391,7 +391,7 @@ func TestTranslateRemoteEventsContentOverThought(t *testing.T) {
 		"event: token_usage\ndata: {\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}\n\n",
 		"event: done\ndata: {\"status\":\"completed\"}\n\n",
 	}, "")
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}
@@ -423,7 +423,7 @@ func TestTranslateRemoteEventsContentOverThought(t *testing.T) {
 func TestTranslateRemoteEventsThoughtFallback(t *testing.T) {
 	upstream := "event: plan_item\ndata: {\"thought\":\"pong\"}\n\n" +
 		"event: done\ndata: {\"status\":\"completed\"}\n\n"
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}
@@ -441,7 +441,7 @@ func TestTranslateRemoteEventsFinishSummary(t *testing.T) {
 		"event: plan_item\ndata: {\"tool_call_info\":{\"id\":\"f1\",\"name\":\"finish\",\"params\":{\"summary\":\"已列出 3 个文件\"}}}\n\n",
 		"event: done\ndata: {\"status\":\"completed\"}\n\n",
 	}, "")
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}
@@ -456,7 +456,7 @@ func TestTranslateRemoteEventsMessageEvent(t *testing.T) {
 		"event: message\ndata: {\"content\":\"hello from message event\"}\n\n",
 		"event: done\ndata: {\"status\":\"completed\"}\n\n",
 	}, "")
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}
@@ -471,7 +471,7 @@ func TestTranslateRemoteEventsMessageEvent(t *testing.T) {
 func TestTranslateRemoteEventsUsageNesting(t *testing.T) {
 	upstream := "event: token_usage\ndata: {\"prompt_tokens\":100,\"completion_tokens\":20," +
 		"\"total_tokens\":120,\"cache_read_input_tokens\":50}\n\n"
-	out, _ := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, _ := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	var payload map[string]any
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "data: ") {
@@ -509,7 +509,7 @@ func TestRemoteToolsAreNotPassedThrough(t *testing.T) {
 		"event: plan_item\ndata: {\"thought\":\"found it\"}\n\n",
 		"event: done\ndata: {\"status\":\"completed\"}\n\n",
 	}, "")
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}
@@ -557,7 +557,7 @@ func TestTranslateRemoteEventsHeartbeat(t *testing.T) {
 		"event: plan_item\ndata: {\"content\":\"ok\"}\n\n",
 		"event: done\ndata: {\"status\":\"completed\"}\n\n",
 	}, "")
-	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3"))
+	out, err := io.ReadAll(translateRemoteEvents(io.NopCloser(strings.NewReader(upstream)), "glm-5.3", ""))
 	if err != nil {
 		t.Fatalf("转译失败：%v", err)
 	}

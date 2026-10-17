@@ -715,6 +715,11 @@ func openRemoteEvents(ctx context.Context, a *auth.Auth, session remoteSession) 
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("trae remote 收流 HTTP %d：%s", resp.StatusCode, truncate(string(raw), 200))
 	}
+	// 记录收流的 HTTP 形态：Content-Type 与是否分块，能在「立刻 EOF」时区分
+	// 「上游正常结束了一个空流」与「上游压根没建起 SSE」。
+	log.Printf("INFO: [trae] Remote 收流已建立 session=%s message=%s ct=%s te=%s",
+		session.id, session.messageID,
+		resp.Header.Get("Content-Type"), resp.Header.Get("Transfer-Encoding"))
 	return resp.Body, nil
 }
 
@@ -742,7 +747,7 @@ var logRemoteTrim = func(dropped int) {
 //     （stream.go 的 toolBlockPairs + toolAccumulator 天然支持）。
 
 // translateRemoteEvents 把 Remote 事件流改写成 llm_utils_chat 形态的 SSE。
-func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
+func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
 		var err error
@@ -754,6 +759,10 @@ func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 		conv := &remoteEventConverter{}
 		var eventName string
 		var dataBuf strings.Builder
+		// 空流诊断用：原始字节数、event 行数、已见内容的前 300 字节。
+		rawBytes := 0
+		eventCount := 0
+		var seen strings.Builder
 		flush := func() error {
 			name := strings.TrimSpace(eventName)
 			payload := strings.TrimSpace(dataBuf.String())
@@ -775,10 +784,15 @@ func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 		for {
 			line, rerr := reader.ReadString('\n')
 			if line != "" {
+				rawBytes += len(line)
+				if seen.Len() < 400 {
+					seen.WriteString(line)
+				}
 				trimmed := strings.TrimRight(line, "\r\n")
 				switch {
 				case strings.HasPrefix(trimmed, "event:"):
 					eventName = strings.TrimSpace(trimmed[len("event:"):])
+					eventCount++
 				case strings.HasPrefix(trimmed, "data:"):
 					if dataBuf.Len() > 0 {
 						dataBuf.WriteByte('\n')
@@ -804,6 +818,15 @@ func translateRemoteEvents(upstream io.ReadCloser, model string) io.ReadCloser {
 					if _, werr := io.WriteString(pw, tail); werr != nil {
 						err = werr
 					}
+				}
+				// 空流诊断：上游「建立了 SSE 但一帧不发」是 2026-10-18 实测到的新故障
+				// 形态（Remote 回落成功建会话，收流立刻 EOF，最终表现为 502）。
+				// 只有把原始字节数与事件数记下来，才能区分「真没发」与「发了但没解析」。
+				if rawBytes == 0 {
+					log.Printf("WARN: [trae] Remote 事件流为空：0 字节、0 个事件（session=%s）", sessionID)
+				} else if eventCount == 0 {
+					log.Printf("WARN: [trae] Remote 事件流有 %d 字节但 0 个 event 行（session=%s）：%s",
+						rawBytes, sessionID, truncate(seen.String(), 300))
 				}
 				return
 			}

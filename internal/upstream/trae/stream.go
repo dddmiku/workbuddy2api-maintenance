@@ -626,7 +626,7 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 		ReadCloser: TranslateStreamWithTools(
 			translateRemoteEvents(
 				newRemoteFirstEventReader(events),
-				modelFromPrepared(prepared)),
+				modelFromPrepared(prepared), session.id),
 			modelFromPrepared(prepared),
 			preparedTools(prepared)),
 		auth:    a,
@@ -1724,6 +1724,13 @@ type translateReader struct {
 	pw     *io.PipeWriter
 	closer io.Closer
 	done   chan struct{}
+	// closedByCaller 调用方主动 Close（回落切端点时关掉 primary 走这里）。
+	//
+	// 为什么需要：run 在「一帧都没收到」时会把 err 设成 no data events。回落路径
+	// 主动关闭 primary 时，这个判定会把「正常关闭」误报成上游故障，日志里出现
+	// 「Trae upstream returned no data events（已收 0 字节）」——它看起来像 Remote
+	// 失败，实际是 legacy 那条流被我们关掉了（2026-10-18 排查被这条误导过）。
+	closedByCaller atomic.Bool
 }
 
 func newTranslateReader(upstream io.ReadCloser, tr *translator) *translateReader {
@@ -1855,6 +1862,12 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 		return
 	}
 	if !sawUpstream {
+		// 调用方主动关闭（回落切端点）导致的「零帧」不是上游故障：此时 primary
+		// 的 body 被 Close，读取立即返回，看起来与「上游建立连接却不发数据」完全
+		// 一样。只有真正没被主动关闭的空流才值得报错。
+		if r.closedByCaller.Load() {
+			return
+		}
 		err = fmt.Errorf("Trae upstream returned no data events")
 		return
 	}
@@ -1874,6 +1887,7 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 func (r *translateReader) Read(p []byte) (int, error) { return r.pr.Read(p) }
 
 func (r *translateReader) Close() error {
+	r.closedByCaller.Store(true)
 	_ = r.pr.Close()
 	<-r.done
 	return nil
