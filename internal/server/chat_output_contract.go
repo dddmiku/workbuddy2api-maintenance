@@ -395,6 +395,15 @@ func (w *chatContractWriter) frame(raw []byte) {
 		raw = append(append([]byte("data: "), encoded...), '\n', '\n')
 	}
 	w.writeRaw(raw)
+	// 内容帧写出后必须立即 flush。net/http 在响应体上有一层缓冲，只有收尾、
+	// 心跳或缓冲填满才真正发到 socket：实测 71 token/16KB 的响应，网关内部
+	// 首帧在 1448ms，客户端却到 1747ms 才收到字节；更慢的流要等到 5s 心跳。
+	// 重试资格由 DeliveredContent()（正文/思考/拒答）判定，不取决于是否 flush，
+	// 所以这里只在已经交付过内容时 flush——纯角色帧仍留在缓冲里，保住
+	// 「零内容时可干净重试」的契约。
+	if w.DeliveredContent() {
+		w.Flush()
+	}
 }
 
 // keep 追加一段校验用帧；超过缓冲上限时记录错误（此时只可能是工具参数本身过大）。
