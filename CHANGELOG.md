@@ -38,6 +38,44 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.10.12 — 2026-10-18
+
+### 修复：Trae 专用表模型必然 502
+
+上游 `llm_utils_chat` 要求 `function` 与 `model` 同属一张目录表，且**同一个
+`config_name` 在不同表里对应不同的 `model_name`**：
+
+| config_name | 表 | 真名 |
+|---|---|---|
+| `code-review-judge` | code_reviewer | `deepseek-V3.1__dev` |
+| `Doubao-Seed-2.0-Code` | solo_work_lite | `Doubao-Seed-2.1-Turbo__dev` |
+| `glm-5v-turbo` | chat | 裸名 → 4023 model unknown |
+| `glm-5v-turbo` | solo_coder | `glm-5v-turbo__dev` ✅ |
+
+网关把目录按 `config_name` 合并时只保留一份出站真名，又写死
+`function=solo_work_lite`，所以只在 `code_reviewer` / `git_ai` / `multimodal` /
+`chat_v3` 里的模型一律回 `config item is empty for config opt`。
+
+改动：
+
+1. `CatalogModel.Profiles` 按 function 各存一份出站真名，
+   `OutboundModelNameFor(function, wantMax)` 按表取；
+2. `FunctionForModel` 选一张确实含该模型的表，优先有 `__dev` 真名的表；
+3. `model_detail_list` 里的裸名、`__v2` 变体也记为普通档真名
+   （`chat` / `git_ai` / `multimodal` 这几张表没有 `__dev` 后缀）；
+4. `is_invisible_to_user` 不再整条丢弃，改为标记 `Hidden` —— 语义是「Trae 界面
+   不显示」而非「不可调用」，`Hidden` 只影响 `/v1/models` 公布；
+5. Remote 侧：模型只在非 Remote 表里时直接放弃 Remote、走 legacy。
+
+实测（Oracle + 华为云，40 个公布模型逐个调用）：**39 个 200**。唯一失败的
+`doubao_1_8` 是上游自己回 `model is unknown` —— 它只存在于 `chat` 表，表里
+`doubao_1_8` 与 `doubao_1_8__v2` 两个名字上游都不认，属目录死条目。
+
+### 修复：日志 TTFB 改用秒
+
+`TTFB=25180ms` → `TTFB=25.2s`，与同行 `total=` 同口径。长上下文请求的首字节
+经常是几十秒，毫秒值要数位数。面板 `logparse` 取的是 `[^|]*?`，两种单位都能解析。
+
 ## v3.9.4 — 2026-10-17
 
 修复「健康账号被误停」：`code 11128` 被当成账号级封禁，连续 2 次即停号。
