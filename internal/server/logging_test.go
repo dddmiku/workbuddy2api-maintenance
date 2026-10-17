@@ -200,10 +200,10 @@ func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK,
-			306401, 298112, 1234, "团队 A", "prev=305900", 35*time.Millisecond)
+			306401, 298112, 1234, "团队 A", "prev=305900", 180*time.Millisecond, 35*time.Millisecond)
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "TTFB=412ms",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "read=180ms", "pre=35ms", "TTFB=412ms",
 		"in=306401", "hit=298112", "cache=prev=305900", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
@@ -215,10 +215,27 @@ func TestLogChatRowFormat(t *testing.T) {
 	}
 }
 
+// TestLogChatRowRateExcludesTTFB 锁住 2026-10-17 的口径修正：
+// 出词速度的分母必须是首个内容帧之后的生成时间，而不是含 TTFB 的总时长。
+// 反例：46s TTFB、50s total、200 tok —— 旧口径报 4.0 tok/s（实际 50.0）。
+func TestLogChatRowRateExcludesTTFB(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(46000*time.Millisecond, 50000*time.Millisecond, "m", "stream", "u", http.StatusOK,
+			1, 0, 200, "-", "cold", 300*time.Millisecond, 20*time.Millisecond)
+	})
+	if !strings.Contains(out, "50.0tok/s") {
+		t.Fatalf("rate must exclude TTFB (want 50.0tok/s):\n%s", out)
+	}
+	if strings.Contains(out, "4.0tok/s") {
+		t.Fatalf("legacy rate (tok/total) still present:\n%s", out)
+	}
+}
+
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-", "-", -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-", "-", -1, -1)
 	})
 	for _, want := range []string{"key=-", "TTFB=-", "in=-", "hit=-", "cache=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -230,8 +247,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1, -1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-", "cold", -1, -1)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {

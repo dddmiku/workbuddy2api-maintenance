@@ -19,6 +19,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,11 +69,17 @@ type chatStat struct {
 	credit          float64
 	hasCred         bool
 	upstreamStarted bool
-	// upstreamAt 出站请求真正发出的时刻。TTFB 之前的那一段（= upstreamAt-start）
-	// 是网关自己的预处理：读 body、鉴权、选号、body 改写、建连。把它单独记下来，
-	// 慢请求才能一眼分清「网关慢」还是「上游慢」——否则 TTFB 一个数把两段混在一起，
-	// 只能靠猜（2026-10-17 大上下文 TTFB 排查就走了这个弯路）。
+	// upstreamAt 出站请求真正发出的时刻。
+	//
+	// 2026-10-17：最初把 upstreamAt-start 整体当作「网关预处理」，但 start 是
+	// ServeHTTP 入口，读请求体（客户端上传）也在其中，于是几百毫秒的上传时间被
+	// 误记成网关 CPU 开销。现在拆成两段：
+	//   read= bodyReadAt-start  客户端上传 + 入口到读完 body
+	//   pre=  upstreamAt-bodyReadAt  读完 body 后的网关工作（鉴权/选号/改写/建连）
+	// Anthropic/Responses/Gemini 入口会先读原 body 再转成 chat body 调 chatCompletions，
+	// 因此原始 bodyReadAt 经 context 传下来，不能用转换后 body 的内存读取时刻冒充。
 	upstreamAt time.Time
+	bodyReadAt time.Time
 	failed     bool
 	unreported bool
 
@@ -93,6 +100,23 @@ func (s *chatStat) keyLabel() string {
 		return s.keyMask
 	}
 	return "-"
+}
+
+// requestBodyReadContextKey 携带「原始客户端请求体读完」的时刻。
+//
+// Anthropic/Responses/Gemini 入口先读原 body（含客户端上传），再转成 chat body
+// 调 chatCompletions；后者读到的只是内存里的转换结果。若不做这个传递，read= 会
+// 恒为 0、pre= 又会把上传时间算进网关——正是 2026-10-17 那次误诊的原因。
+// 沿用文件里既有的「请求级上下文快照」写法：只传时间，不传正文。
+type requestBodyReadContextKey struct{}
+
+func withRequestBodyReadAt(ctx context.Context, at time.Time) context.Context {
+	return context.WithValue(ctx, requestBodyReadContextKey{}, at)
+}
+
+func requestBodyReadAt(ctx context.Context) time.Time {
+	at, _ := ctx.Value(requestBodyReadContextKey{}).(time.Time)
+	return at
 }
 
 // sessionPrefixTracker 记录每个会话上一次请求的输入 token 数。
@@ -244,17 +268,30 @@ func (s *chatStat) done() {
 	s.cachePrev = sessionPrefixes.last(s.sessKey)
 	sessionPrefixes.record(s.sessKey, s.prompt)
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status,
-		s.prompt, s.cached, s.toks, s.keyLabel(), s.cacheField(), s.preDuration(), s.requestID)
+		s.prompt, s.cached, s.toks, s.keyLabel(), s.cacheField(), s.readDuration(), s.preDuration(), s.requestID)
 }
 
-// preDuration 返回网关自身预处理耗时（请求进入到出站请求发出）。
+// preDuration 返回「读完请求体之后」的网关耗时（bodyReadAt → 出站请求发出）。
 // 未观测到出站时刻（同步失败、鉴权拒绝等）返回 -1，日志显示 "-"——缺失≠0，
 // 不能把「没测到」写成「网关没耗时」。
 func (s *chatStat) preDuration() time.Duration {
 	if s.upstreamAt.IsZero() {
 		return -1
 	}
-	return s.upstreamAt.Sub(s.start)
+	if s.bodyReadAt.IsZero() {
+		// 兼容：bodyReadAt 未设置的路径（理论上只有测试直接构造 chatStat）。
+		return s.upstreamAt.Sub(s.start)
+	}
+	return s.upstreamAt.Sub(s.bodyReadAt)
+}
+
+// readDuration 返回入口到读完请求体的时间（客户端上传 + 入口处理）。
+// 未观测到读完时刻返回 -1（日志显示 "-"）。
+func (s *chatStat) readDuration() time.Duration {
+	if s.bodyReadAt.IsZero() {
+		return -1
+	}
+	return s.bodyReadAt.Sub(s.start)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -544,7 +581,12 @@ func uidPrefix(uid string) string {
 // 三个 token 列都是「上游 usage 原值」：in= 输入、hit= 输入里命中缓存的、
 // tok= 输出（含思考 token）。负值表示上游没给 usage，显示 "-"（缺失≠0）。
 // cache= 列给出「本次该不该命中」的参照（cold / prev=N），见 chatStat.cacheField。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key, cache string, pre time.Duration, requestIDs ...string) {
+//
+// tok/s 的口径（2026-10-17 修正）：分母是**首个内容帧之后的生成时间**
+// （total-TTFB），不是 total。旧口径把 3–46 秒的 TTFB 算进出词时间，长上下文请求
+// 会被报成 4 tok/s，而实际生成速度是 45 tok/s——用户据此判断「输出慢」是被指标误导。
+// 同步请求没有 TTFB（或 TTFB 不早于 total）时仍退回 total，避免负分母。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key, cache string, read, pre time.Duration, requestIDs ...string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -554,9 +596,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
-		if total > 0 {
+		generation := total - ttfb
+		switch {
+		case ttfb > 0 && generation > 0:
+			tokpsField = fmt.Sprintf("%.1f", float64(toks)/generation.Seconds())
+		case total > 0:
 			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
-		} else {
+		default:
 			tokpsField = "0.0"
 		}
 	}
@@ -588,7 +634,11 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 	if pre >= 0 {
 		preField = fmt.Sprintf("%dms", pre.Milliseconds())
 	}
-	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | pre=%s | TTFB=%s | in=%s | hit=%s | cache=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
+	readField := "-"
+	if read >= 0 {
+		readField = fmt.Sprintf("%dms", read.Milliseconds())
+	}
+	fmt.Fprintf(runlog.Output(os.Stdout), "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | read=%s | pre=%s | TTFB=%s | in=%s | hit=%s | cache=%s | tok=%s | %stok/s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -596,6 +646,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		status,
 		key,
 		uidPrefix(uid),
+		readField,
 		preField,
 		ttfbMS,
 		promptField,

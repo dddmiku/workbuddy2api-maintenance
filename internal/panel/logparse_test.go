@@ -26,6 +26,16 @@ func TestParseRequestLog(t *testing.T) {
 		wantOther []string
 	}{
 		{
+			name: "带 read= 与 pre= 的当前格式",
+			text: `| #018 | 22:05:12 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | read=312ms | pre=35ms | TTFB=3414ms | in=306401 | hit=298112 | cache=prev=305900 | tok=110 | 34.3tok/s | total=3.4s |`,
+			want: []RequestRow{{
+				Seq: "018", Time: "22:05:12", Model: "global:deep", Mode: "stream", Status: "200",
+				Key: "团队 A", UID: "1e04e34d", TTFB: "3414ms",
+				In: "306401", Hit: "298112", Cache: "prev=305900",
+				Tok: "110", Rate: "34.3tok/s", Total: "3.4s", RequestID: "",
+			}},
+		},
+		{
 			name: "带 pre= 的当前格式",
 			text: `| #016 | 22:05:10 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | pre=35ms | TTFB=3414ms | in=306401 | hit=298112 | cache=prev=305900 | tok=110 | 34.3tok/s | total=3.4s |`,
 			want: []RequestRow{{

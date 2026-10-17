@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"workbuddy2api/internal/jsonutil"
@@ -55,6 +56,8 @@ func (h *Handler) geminiContent(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(gw, err)
 		return
 	}
+	// 原始（含上传）body 读完时刻，交给 chatCompletions 的 read=/pre= 分段。
+	bodyReadAt := time.Now()
 	if int64(len(body)) > h.cfg.MaxBodyBytes {
 		gw.failure(413, "request_body_too_large", "request body exceeds the configured size limit")
 		return
@@ -67,7 +70,7 @@ func (h *Handler) geminiContent(w http.ResponseWriter, r *http.Request) {
 	}
 	gw.model, gw.stream = model, stream
 	gw.includeThoughts = thoughts
-	sub := r.Clone(r.Context())
+	sub := r.Clone(withRequestBodyReadAt(r.Context(), bodyReadAt))
 	sub.Body = io.NopCloser(bytes.NewReader(chat))
 	sub.ContentLength = int64(len(chat))
 	h.chatCompletions(gw, sub)

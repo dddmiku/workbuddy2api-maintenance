@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/requestlog"
@@ -41,6 +42,8 @@ func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
 			writeBodyReadError(w, err)
 			return
 		}
+		// 原始（含上传）body 读完时刻，交给 chatCompletions 的 read=/pre= 分段。
+		bodyReadAt := time.Now()
 		if int64(len(body)) > h.cfg.MaxBodyBytes {
 			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body exceeds the configured size limit")
 			return
@@ -54,7 +57,7 @@ func (h *Handler) messagesEntry(w http.ResponseWriter, r *http.Request) {
 		// 首帧 message_start 的临时 input_tokens：用与输出预算同一套估算口径，
 		// 让客户端在轮次进行中就能看到这一轮读了多少上下文（终态仍以上游实报为准）。
 		mw.promptEstimate = upstream.EstimateInputTokens(chat)
-		sub := r.Clone(r.Context())
+		sub := r.Clone(withRequestBodyReadAt(r.Context(), bodyReadAt))
 		sub.Body = io.NopCloser(bytes.NewReader(chat))
 		sub.ContentLength = int64(len(chat))
 		h.chatCompletions(w, sub)

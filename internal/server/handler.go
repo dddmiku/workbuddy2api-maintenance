@@ -1263,6 +1263,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
+	// 原始请求体读完的时刻（含客户端上传）。Anthropic/Responses/Gemini 入口会
+	// 先读原 body 再转换，调用本函数时 body 已是内存里的转换结果——那种情况用
+	// context 里传下来的原始时刻，否则 read= 恒为 0、上传时间又被并进 pre=。
+	bodyReadAt := time.Now()
+	if original := requestBodyReadAt(r.Context()); !original.IsZero() {
+		bodyReadAt = original
+	}
 	if int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
 			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
@@ -1409,6 +1416,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.bodyReadAt = bodyReadAt
 	st.requestID = requestID(r)
 	st.trace = traceFor(r)
 	if st.trace != nil {

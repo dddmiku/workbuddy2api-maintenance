@@ -28,13 +28,15 @@ import (
 //   - cache=：2026-10-10 加入，**必须**夹在 hit= 与 tok= 之间且保持可选；
 //   - pre=：2026-10-17 加入，夹在 uid= 与 TTFB= 之间，**必须**保持可选——
 //     加上它的当天就因为写成必选让整页日志解析失败（uid 组取不到 TTFB 前缀）；
+//   - read=：2026-10-17 加入，夹在 uid= 与 pre= 之间，同样必须可选；同日另有
+//     旧行只有 pre=（或两者都没有）。
 //   - rid=：请求 ID，仅部分行有。
 //
 // 各组名与 Python 版 groupdict() 的键一一对应，且与 RequestRow 的 JSON tag 同名，
 // 这样解析与序列化两处不会各自漂移。Go 的 regexp 要求组名唯一，本模式满足。
-// pre= 用非捕获组：它只影响展示排版，不进结构化输出，避免破坏「组名 == JSON tag」的自检。
+// pre=/read= 用非捕获组：它们只影响展示排版，不进结构化输出，避免破坏「组名 == JSON tag」的自检。
 var requestRowRe = regexp.MustCompile(`^\|\s*#(?P<seq>\d+)\s*\|\s*(?P<time>[^|]*?)\s*\|\s*(?P<model>[^|]*?)\s*\|\s*(?P<mode>[^|]*?)\s*\|\s*` +
-	`(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*(?:pre=[^|]*?\s*\|\s*)?TTFB=(?P<ttfb>[^|]*?)\s*\|\s*` +
+	`(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*(?:read=[^|]*?\s*\|\s*)?(?:pre=[^|]*?\s*\|\s*)?TTFB=(?P<ttfb>[^|]*?)\s*\|\s*` +
 	`(?:in=(?P<in>[^|]*?)\s*\|\s*hit=(?P<hit>[^|]*?)\s*\|\s*)?` +
 	`(?:cache=(?P<cache>[^|]*?)\s*\|\s*)?` +
 	`tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*(?:rid=(?P<request_id>[A-Za-z0-9_]+)\s*\|\s*)?$`)

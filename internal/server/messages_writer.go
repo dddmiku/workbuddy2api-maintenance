@@ -30,8 +30,14 @@ import (
 // 循环保护最多会压住 60 秒推理输出，期间客户端一个字节都收不到；先发
 // message_start + ping 让客户端的空闲计时器有东西可吃。
 //
-// 用变量而非常量：测试里缩短等待，避免每个用例多花 5 秒。
-var anthropicFirstFrameGrace = 5 * time.Second
+// 2026-10-17：5s -> 1s。首帧（真正的内容 token）在长上下文下常见 3–46 秒，
+// 5 秒宽限意味着客户端测到的首字节时间被硬性拉到 5 秒；1 秒足够躲开失败尝试
+// 的快速拒绝（实测 429/500 在 100–600ms 内返回），而 message_start/ping 不计入
+// DeliveredContent，重试资格仍保留。代价是更多请求会先开出流；若随后全部尝试
+// 失败，错误按已有的 StreamFailure 路径在流内交付。
+//
+// 用变量而非常量：测试里缩短等待，避免每个用例多花时间。
+var anthropicFirstFrameGrace = 1 * time.Second
 
 // anthropicIdlePing 静默期的 ping 间隔（Anthropic 官方流也会周期性发 ping）。
 var anthropicIdlePing = 10 * time.Second

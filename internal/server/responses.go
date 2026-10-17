@@ -1124,6 +1124,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
+	// 原始（含上传）body 读完时刻，交给 chatCompletions 的 read=/pre= 分段。
+	bodyReadAt := time.Now()
 	if int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
 			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
@@ -1143,6 +1145,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	// Extract routing identity before conversion strips client-only metadata.
 	// It stays in request context; upstream does not need client_metadata fields.
 	ctx := context.WithValue(r.Context(), routingSessionKeyContextKey{}, session.ExtractKey(body))
+	ctx = withRequestBodyReadAt(ctx, bodyReadAt)
 	sub := r.Clone(withReasoningStats(ctx, req.reasoning))
 	sub.Body = io.NopCloser(bytes.NewReader(chatBody))
 	sub.ContentLength = int64(len(chatBody))
