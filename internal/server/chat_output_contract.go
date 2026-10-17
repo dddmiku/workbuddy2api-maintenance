@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-10-17：压制期首字节宽限 85s -> 1s：心跳与 Anthropic 路径同刻发出，客户端不再等推理结束才收到首字节。
 // 2026-09-26：已开流时的失败在流内交付（StreamFailure）。
 // 2026-09-26：新增 HoldProgress：压制期发心跳。
 // 2026-09-26：结束校验只缓存工具调用等精简帧，长回答不再因整条流进 16MB 缓冲而在约 7.4 万分片处被截断。
@@ -524,23 +525,21 @@ func (w *chatContractWriter) StreamFailure(code, message string) bool {
 // HoldProgress 由 handler 在循环保护压制期调用：压制期上游的帧被压在内存里不发，
 // 这里负责让客户端与反代知道连接还活着。
 //
-// 两难与取舍（2026-10-14 实测确认）：
+// 两难与取舍（2026-10-17 修订）：
 //
-//	重发资格（StreamError.Retryable）的前提是「客户端零字节」——只有零字节，响应头
-//	才还没发出去，命中循环时才能整段丢弃、同账号静默重发，重发再失败时也才能返回
-//	干净的 400 + JSON 错误体。这两条被 TestContextLoopRetryHTTPFailurePreservesRecovery
-//	与 TestContextHTTPClassificationContract 锁定为契约，**不能**在压制一开始就写心跳。
+//	重发资格（StreamError.Retryable）由 upstream.Stream 的 released 标志判定：
+//	只要压制期还没放行，命中循环时仍可整段丢弃、同账号静默重发。但在响应头
+//	发出之前，失败还能返回干净的 400 + JSON；一旦写过字节，失败只能按 SSE 帧交付。
 //
-//	但压制期上限是 ReasoningLoopHoldBackTimeout（120 秒），而这条链路是
-//	Cloudflare(100 秒无响应即 524) → nginx(read_timeout 600s) → 网关。整个压制期
-//	零字节，会在 Cloudflare 那层被判 524，客户端拿到的就不是循环错误而是网关超时。
+//	2026-10-17 实测：deepseek 推理被压制时，客户端首字节比网关日志 TTFB 晚
+//	1.7 秒（TTFB=1032ms，客户端 2731ms），推理越长差距越大（上限 120 秒）。
+//	Anthropic 路径已在 1 秒时发 message_start + ping，Chat 路径原先要盲等 85 秒
+//	（只为躲 Cloudflare 524），客户端在这段时间里一个字节都收不到。
 //
-// 折中：压制前期保持零字节（保住重发资格与 400 JSON 契约），只有盲等逼近反代上限时
-// 才开流发心跳、把连接保下来。绝大多数循环在毫秒级就被判定（实测判定点集中在
-// 9439–76312 字符），根本走不到这条路径，契约对它们完全不变；只有真正拖到接近上限的
-// 极端形态才会放弃「干净 400」，换取「不被反代掐断」。
-//
-// 常量按最紧的一层（Cloudflare 100 秒）取值，留 15 秒余量。
+// 折中：前 chatHoldBackBlindWindow（1 秒）保持零字节，保住「快速命中循环时的干净
+// 400」；超过 1 秒就开流发心跳，让客户端拿到首字节、连接不被反代掐断。此时若再命中
+// 循环，重试仍会进行（released 仍为 false），但最终失败改为流内 error 帧——与
+// Anthropic 路径的 1 秒宽限同一取舍。
 func (w *chatContractWriter) HoldProgress() {
 	// checked 表示终态（成功收尾或错误帧 + [DONE]）已经交付，此后任何写入都会落在
 	// [DONE] 之后，客户端要么报解析错、要么丢弃。StreamFailure 与 CompletionError
@@ -549,14 +548,14 @@ func (w *chatContractWriter) HoldProgress() {
 		return
 	}
 	if !w.streaming {
-		// 零字节盲等：先记起点，未逼近反代上限时什么都不写，保住重发资格。
+		// 首字节宽限内保持零字节，保住「快速命中循环时返回干净 400」的契约。
 		if w.holdSince.IsZero() {
 			w.holdSince = time.Now()
 		}
 		if time.Since(w.holdSince) < chatHoldBackBlindWindow {
 			return
 		}
-		// 已逼近反代上限：开流发心跳。此后响应头已定，失败只能按 SSE 帧交付。
+		// 超过宽限：开流发心跳。此后响应头已定，失败只能按 SSE 帧交付。
 		w.streaming = true
 		w.writeRaw([]byte(": keepalive\n\n"))
 		w.Flush()
@@ -571,10 +570,12 @@ func (w *chatContractWriter) HoldProgress() {
 
 // chatHoldBackBlindWindow 是 chat 协议在压制期允许「零字节盲等」的时长。
 //
-// 取值依据：这条链路最紧的一层是 Cloudflare 的 100 秒无响应判 524（nginx 侧是 600s，
-// 不是瓶颈）。留 15 秒余量，让心跳在 85 秒时就发出去，确保 Cloudflare 先看到字节而不是
-// 先判超时。超过这个窗口的压制属于极端形态，此时让出「干净 400」契约换取连接不被掐断。
-const chatHoldBackBlindWindow = 85 * time.Second
+// 2026-10-17 从 85 秒降到 1 秒：85 秒只考虑了 Cloudflare 的 100 秒 524，没考虑
+// 客户端体验——deepseek 推理被压制时客户端首字节被推迟到推理结束（实测 1.7–2.7 秒，
+// 长推理可到 120 秒）。1 秒与 Anthropic 的 anthropicFirstFrameGrace 对齐：既保住
+// 快速命中循环时的干净 400，也让客户端在 1 秒内拿到首字节。1 秒仍远小于 Cloudflare
+// 的 100 秒阈值，不会引入 524 风险；1 秒后每 protocolProgressInterval 续一次心跳。
+const chatHoldBackBlindWindow = 1 * time.Second
 
 func (w *chatContractWriter) restoreToolNames(message map[string]any) bool {
 	changed := false
