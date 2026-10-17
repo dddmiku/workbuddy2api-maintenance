@@ -637,7 +637,7 @@ func TestRemoteFallbackSwitchesOn3004(t *testing.T) {
 		"model":    "glm-5.3",
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary)
+	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary, false)
 
 	// 先读一轮：应触发回落并拿到 Remote 的正文。
 	var got strings.Builder
@@ -680,7 +680,7 @@ func TestRemoteFallbackDoesNotTriggerAfterContent(t *testing.T) {
 		&upstreamerr.Error{Code: 3004, Message: "rate limit"})
 
 	prepared, _ := json.Marshal(map[string]any{"model": "glm-5.3"})
-	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary)
+	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary, false)
 
 	var got strings.Builder
 	buf := make([]byte, 4096)
@@ -712,7 +712,7 @@ func TestRemoteFallbackReportsBothFailures(t *testing.T) {
 
 	primary := newStubReadCloser("", &upstreamerr.Error{Code: 3004, Message: "rate limit"})
 	prepared, _ := json.Marshal(map[string]any{"model": "glm-5.3"})
-	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary)
+	r := newRemoteFallbackReader(context.Background(), testAuth(), prepared, "", primary, false)
 
 	var final error
 	buf := make([]byte, 4096)

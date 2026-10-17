@@ -297,19 +297,21 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// ChatStream 注释的实测），回落等于把图悄悄丢掉，用户会拿到一个「没看图」的
 	// 回答而无从察觉。
 	//
-	// 但**也不能就此把 400 直接甩给用户**（v3.8.3 的行为，实测代价很大）：
-	// Claude Code 的常态是「工具密集历史 + 本轮贴图」，这类请求必然撞 3004，
-	// 于是带图提问在长会话里**必然失败**。3004 的触发维度是**结构化工具字段**
-	// （tool_calls/tool_call_id），不是体积——所以这里给带图请求一条真正的出路：
-	// 把工具轮次扁平化成文本标记后**重发同一个端点**，图片原样保留（见
-	// flattenToolTurnsForLegacy）。两条路径的取舍是「留图但丢结构化工具字段」
-	// 对「丢图但留结构化工具字段」，前者对「用户想看这张图」的意图更贴合。
+	// 带**当前轮图片**的请求不能回落 Remote：Remote 端点读不到内联图片（见
+	// ChatStream 注释的实测），回落等于把图悄悄丢掉，用户会拿到一个「没看图」的
+	// 回答而无从察觉。
+	//
+	// 出路是「先转写再重发」（2026-10-18 实测修正）：3004 在带图请求上的真实含义
+	// 是**该模型没有视觉能力**，不是工具轮次超限。官方客户端也是这么做的——它用
+	// multimodal_image_kimi-k2.5 把图转成文字再喂主模型。网关现在把这一步搬进来：
+	// 转写图片 → 替换成文本块 → 用同一模型重发。详见 imagetext.go。
 	//
 	// 判据是 freshInputHasImages（只看本轮新输入），不是 requestHasImages：
 	// 用后者会让「历史里贴过一张图」永久禁用该会话的回落，正常提问直接吃 400
 	// ——这正是 v3.8.2 引入、v3.8.3 修掉的回归。
-	if RemoteEnabled() && !freshInputHasImages(prepared) {
-		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream)
+	if RemoteEnabled() {
+		stream = newRemoteFallbackReader(ctx, a, prepared, clientIP, stream,
+			freshInputHasImages(prepared))
 	}
 	return stream, resp.StatusCode, nil, nil
 }
@@ -340,12 +342,15 @@ type remoteFallbackReader struct {
 	released bool
 	switched bool
 	done     bool
+	// hasImages 本轮新输入是否带图。带图时 3004 走「转写后重发」而不是 Remote
+	// （Remote 读不到内联图片，回落等于静默丢图）。
+	hasImages bool
 }
 
 func newRemoteFallbackReader(ctx context.Context, a *auth.Auth, prepared []byte,
-	clientIP string, primary io.ReadCloser) *remoteFallbackReader {
+	clientIP string, primary io.ReadCloser, hasImages bool) *remoteFallbackReader {
 	return &remoteFallbackReader{ctx: ctx, auth: a, prepared: prepared,
-		clientIP: clientIP, primary: primary}
+		clientIP: clientIP, primary: primary, hasImages: hasImages}
 }
 
 // Read 的实现要点：**先攒够判定依据再下发**。
@@ -408,8 +413,35 @@ func (r *remoteFallbackReader) Read(p []byte) (int, error) {
 		if err == nil {
 			continue
 		}
-		// 尚未交付实质内容 + 上游明确因工具轮次超限拒绝 → 切 Remote 重来一次。
+		// 尚未交付实质内容 + 上游明确拒绝 → 换一条路重来一次。
+		//
+		// 两条路按「本轮是否带图」分派，因为它们解决的是**不同的拒绝**：
+		//   - 带图 → 3004 的真实含义是「该模型没有视觉能力」（实测：glm-5.3 带图
+		//     502、同模型纯文本 200）。出路是把图转写成文字后用同一模型重发，
+		//     见 imagetext.go。不能回落 Remote——那里读不到内联图片。
+		//   - 不带图 → 才是真正的工具轮次超限，回落 Remote 绕开结构化工具字段。
 		if !r.sawContent && isToolTurnLimitError(err) {
+			if r.hasImages {
+				transcribed, terr := transcribeImages(r.ctx, r.auth, r.prepared, r.clientIP)
+				if terr == nil && transcribed != nil {
+					secondary, ferr := r.resend(transcribed)
+					if ferr == nil {
+						log.Printf("INFO: [trae] 带图请求被 3004 拒绝（模型无视觉能力），已转写图片后用同一模型重发")
+						_ = r.primary.Close()
+						r.secondary = secondary
+						r.buffered = nil
+						r.switched = true
+						continue
+					}
+					log.Printf("WARN: [trae] 转写后重发失败：%v（原始错误：%v）", ferr, err)
+				} else if terr != nil {
+					log.Printf("WARN: [trae] 图片转写失败，无法绕开 3004：%v（原始错误：%v）", terr, err)
+				}
+				// 转写这条路走不通：如实报错，不再回落 Remote（会静默丢图）。
+				r.done = true
+				return 0, fmt.Errorf("trae: 该模型不支持图片，且图片转写未能完成（%v）；"+
+					"处置：改用支持图片的模型（如 glm-5.3-flash / deepseek-v4.1-flash），或本轮去掉图片", err)
+			}
 			secondary, ferr := ChatStreamRemote(r.ctx, r.auth, r.prepared, r.clientIP)
 			if ferr == nil {
 				log.Printf("INFO: [trae] llm_utils_chat 因工具轮次超限被拒（3004），已回落到 Remote 会话端点")
@@ -434,6 +466,49 @@ func (r *remoteFallbackReader) Read(p []byte) (int, error) {
 		}
 		return 0, err
 	}
+}
+
+// resend 用**改写后的请求体**重打 llm_utils_chat，返回已转译的流。
+//
+// 与 ChatStreamRemote 的分工：那个换端点，这个换请求形态、端点不变。图片转写
+// 之后请求体里已经没有图片块了，所以这里重新算一次目录解析（模型名可能因
+// 改写而变），并按新请求体重新取工具白名单。
+func (r *remoteFallbackReader) resend(prepared []byte) (io.ReadCloser, error) {
+	requestID := newRequestID()
+	var catalog []CatalogModel
+	if models, cerr := FetchCatalog(r.ctx, r.auth); cerr == nil && len(models) > 0 {
+		catalog = models
+		if resolved := ResolveFromCatalog(models, modelFromPrepared(prepared)); resolved != "" {
+			prepared = withModel(prepared, resolved)
+		}
+	}
+	body, err := BuildChatBodyWithCatalog(prepared, requestID, catalog)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(r.ctx, http.MethodPost,
+		GatewayBaseVar+ChatPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range buildHeaders(r.auth) {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if r.clientIP != "" {
+		req.Header.Set("X-Forwarded-For", r.clientIP)
+	}
+	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 300))
+	}
+	return TranslateStreamWithTools(resp.Body, modelFromPrepared(prepared), preparedTools(prepared)), nil
 }
 
 func (r *remoteFallbackReader) Close() error {
