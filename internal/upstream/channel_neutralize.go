@@ -5,6 +5,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -622,6 +623,13 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 	if len(body) == 0 {
 		return body, false
 	}
+	// 廉价前置：全部触发串都以 ASCII 形式出现在 body 里才会命中。
+	// 之前无条件做一次完整 JSON 解码 + 递归遍历 + 重编码——60 万 token 的上下文
+	// 这一趟要 7–15ms，而绝大多数请求（CN、非 Claude Code 客户端）根本不含触发串，
+	// 白做一遍。这里先做字节级 Contains（O(n) 且不分配对象图），确认可能命中才解码。
+	if !containsAnyTrigger(body) {
+		return body, false
+	}
 	var obj any
 	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body, false
@@ -635,6 +643,42 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return out, true
+}
+
+// containsAnyTrigger 报告 body 里是否**可能**含有任一触发串（字节级，区分大小写）。
+//
+// 只用于提前退出：宁可多解码一次，也不能漏判——所以对每条触发串都做一次
+// bytes.Contains。成本是 O(len(body) × 串数)，但不构造任何对象图。
+// 触发串本身是纯 ASCII 字面量（见 TestTriggerTablesHoldCleanStrings），而客户端
+// 发来的同句会在词间插零宽字符，因此这里再加一条「剥零宽后的局部匹配」太贵也不必要：
+// 只要命中就必须进完整路径，完整路径自己会做归一化。
+func containsAnyTrigger(body []byte) bool {
+	for _, sentence := range channelTriggerSentences {
+		if bytes.Contains(body, []byte(sentence)) {
+			return true
+		}
+	}
+	for _, token := range channelFirstLineTriggerTokens {
+		if bytes.Contains(body, []byte(token)) {
+			return true
+		}
+	}
+	// 组合指纹：两个片段都要出现。
+	for _, parts := range channelTriggerFingerprints {
+		all := true
+		for _, part := range parts {
+			if !bytes.Contains(body, []byte(part)) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	// 零宽形态：客户端把触发串断过词时，上面的 ASCII 匹配会落空，但归一化后仍会命中。
+	// 只检查「body 里有没有零宽字符」——有就必须进完整路径（低频，代价可接受）。
+	return bytes.Contains(body, []byte(wafBreakMarker))
 }
 
 // neutralizePreemptValue 递归遍历解码后的 JSON，断开计费头触发串。

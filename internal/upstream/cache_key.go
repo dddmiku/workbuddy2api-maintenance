@@ -12,6 +12,7 @@
 package upstream
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -39,6 +40,18 @@ import (
 func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if len(body) == 0 {
 		return body
+	}
+	// 廉价前置：客户端已带 prompt_cache_key 时无需解码（官方客户端常见）。
+	// 此前无条件解码整个 body 再判断，60 万 token 上下文光解码就要 4–8ms，
+	// 而结果往往只是原样返回。
+	if bytes.Contains(body, []byte(`"prompt_cache_key"`)) {
+		var probe map[string]any
+		if err := jsonutil.Decode(body, &probe); err == nil && probe != nil {
+			if existing, ok := probe["prompt_cache_key"].(string); ok && existing != "" {
+				return body // 已有 key：不覆盖（保持既有语义）
+			}
+		}
+		// 键名出现但不是非空字符串（null / 空串 / 嵌套误匹配）→ 继续走完整路径
 	}
 	var obj map[string]any
 	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {

@@ -11,6 +11,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"strings"
@@ -259,6 +260,12 @@ func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}
+	// 廉价前置：绝大多数客户端（含 Claude Code）首条就是 system，无需解码。
+	// 此前无条件解码整个 body——60 万 token 的上下文光这一步就要 4–8ms，
+	// 而结果往往是「首条已是 system，原样返回」，等于纯浪费。
+	if messagesStartWithSystem(body) {
+		return body
+	}
 	var obj map[string]any
 	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
@@ -279,6 +286,119 @@ func ensureConsoleSystem(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// messagesStartWithSystem 用字节扫描判断 `"messages":[` 后的第一个对象是否为
+// `{"role":"system"` 形态，全程不解码 JSON。
+//
+// 目的只是**否定**：只要不能确定首条是 system 就返回 false，交回完整解码路径处理。
+// 因此这里可以保守——只在「结构明显、字段明显」时快速返回 true，其余一律走原路。
+// 能省掉的是最常见形态（Claude Code / 官方客户端）每次请求一次全量解码。
+func messagesStartWithSystem(body []byte) bool {
+	key := []byte(`"messages"`)
+	idx := bytes.Index(body, key)
+	if idx < 0 {
+		return false
+	}
+	rest := body[idx+len(key):]
+	// 跳过空白与冒号
+	i := 0
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\n' || rest[i] == '\r') {
+		i++
+	}
+	if i >= len(rest) || rest[i] != ':' {
+		return false
+	}
+	i++
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\n' || rest[i] == '\r') {
+		i++
+	}
+	if i >= len(rest) || rest[i] != '[' {
+		return false // 不是数组（null / 缺字段）→ 交回完整路径
+	}
+	i++
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\n' || rest[i] == '\r') {
+		i++
+	}
+	if i >= len(rest) || rest[i] != '{' {
+		return false // 空数组或非对象 → 交回完整路径
+	}
+	// 定位首对象的**结束位置**（按 JSON 括号层级扫描，跳过字符串内的括号）。
+	// 不能只扫固定窗口：真实 Claude Code 请求里 content 在前、role 在后，
+	// 中间夹着几十 KB 的 system 正文，固定 512 字节窗口必然漏判。
+	end := firstObjectEnd(rest, i)
+	if end <= i {
+		return false
+	}
+	head := rest[i:end]
+
+	roleKey := bytes.Index(head, []byte(`"role"`))
+	if roleKey < 0 {
+		return false
+	}
+	after := head[roleKey+len(`"role"`):]
+	j := 0
+	for j < len(after) && (after[j] == ' ' || after[j] == '\t' || after[j] == '\n' || after[j] == '\r') {
+		j++
+	}
+	if j >= len(after) || after[j] != ':' {
+		return false
+	}
+	j++
+	for j < len(after) && (after[j] == ' ' || after[j] == '\t' || after[j] == '\n' || after[j] == '\r') {
+		j++
+	}
+	if j >= len(after) || after[j] != '"' {
+		return false
+	}
+	j++
+	const want = "system"
+	if j+len(want) > len(after) {
+		return false
+	}
+	return strings.EqualFold(string(after[j:j+len(want)]), want)
+}
+
+// firstObjectEnd 从 rest[start]（必须是 '{'）起扫描到与之配对的 '}' 之后，
+// 返回该位置（半开区间上界）。跳过字符串字面量里的括号与转义。
+// 扫描失败（不配平 / 越界）返回 start，让调用方回退到完整解码路径。
+func firstObjectEnd(rest []byte, start int) int {
+	const (
+		stObject = iota
+		stString
+	)
+	depth := 0
+	state := stObject
+	escaped := false
+	for i := start; i < len(rest); i++ {
+		c := rest[i]
+		switch state {
+		case stString:
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				state = stObject
+			}
+		default:
+			switch c {
+			case '"':
+				state = stString
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+	}
+	return start
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
