@@ -1262,7 +1262,17 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 预算/缓存键/渠道中和等改写对它没有意义（甚至会污染请求体）。转译器把 Trae
 	// 事件流归一成 OpenAI SSE，下游协议栈因此零改动复用。
 	if a.Realm() == trae.Realm {
-		return trae.ChatStream(ctx, a, body, clientIP)
+		// 必须补发尝试事件：handler 的 recordUsage 以 st.upstreamStarted 为前置条件
+		// （「没打过上游的请求不记用量」），而这个标记只由 observeChatAttempt("start")
+		// 置位。Trae 在下面提前 return、不走 WorkBuddy 的出站循环，漏掉这一句会让
+		// **所有 trae 请求的用量（token 与积分）都不落账**——面板「积分」列恒为「—」
+		// 的直接原因之一（2026-10-18 实测：请求记录里 upstream_started=false）。
+		observeChatAttempt(ctx, "start", 0)
+		rc, status, respBody, err := trae.ChatStream(ctx, a, body, clientIP)
+		if err == nil {
+			observeChatAttempt(ctx, "headers", status)
+		}
+		return rc, status, respBody, err
 	}
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
