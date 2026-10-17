@@ -288,7 +288,8 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, resp.StatusCode, raw, nil
 	}
-	stream := TranslateStreamWithTools(resp.Body, modelFromPrepared(prepared), preparedTools(prepared))
+	stream := translateStreamWithCredit(resp.Body, modelFromPrepared(prepared),
+		preparedTools(prepared), creditForStream(a, requestID))
 	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
@@ -508,7 +509,8 @@ func (r *remoteFallbackReader) resend(prepared []byte) (io.ReadCloser, error) {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 300))
 	}
-	return TranslateStreamWithTools(resp.Body, modelFromPrepared(prepared), preparedTools(prepared)), nil
+	return translateStreamWithCredit(resp.Body, modelFromPrepared(prepared),
+		preparedTools(prepared), creditForStream(r.auth, requestID)), nil
 }
 
 func (r *remoteFallbackReader) Close() error {
@@ -623,12 +625,13 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	// 的 heartbeat 会被转译器吞成 keepalive 注释，届时已无法区分「排队中」与
 	// 「模型活动」（对齐参考 stream_events 的 first-event 判定）。
 	return &remoteStreamCloser{
-		ReadCloser: TranslateStreamWithTools(
+		ReadCloser: translateStreamWithCredit(
 			translateRemoteEvents(
 				newRemoteFirstEventReader(events),
 				modelFromPrepared(prepared), session.id),
 			modelFromPrepared(prepared),
-			preparedTools(prepared)),
+			preparedTools(prepared),
+			remoteCreditSpec(a, session.messageID)),
 		auth:    a,
 		session: session,
 	}, nil
@@ -786,11 +789,38 @@ func TranslateStream(upstream io.ReadCloser, model string) io.ReadCloser {
 // 工具名是合法的**——模型偶尔会臆造工具名，交付给客户端会让整轮失败
 // （Anthropic 侧拒绝一个未声明的工具调用）。非空列表 = 白名单。
 func TranslateStreamWithTools(upstream io.ReadCloser, model string, tools []any) io.ReadCloser {
+	return translateStreamWithCredit(upstream, model, tools, nil)
+}
+
+// translateStreamWithCredit 同 TranslateStreamWithTools，但挂上流尾查扣费的回调。
+//
+// credit 为 nil 时不查询（测试、目录缺失、非 trae 路径）。回调在 usage 帧发出前
+// 执行一次，把真实 credits 写进 usage.credit——上游事件流本身不带这个字段。
+func translateStreamWithCredit(upstream io.ReadCloser, model string, tools []any, credit *creditSpec) io.ReadCloser {
 	tr := newTranslator(model)
 	if names := declaredToolNames(tools); len(names) > 0 {
 		tr.allowedTools = names
 	}
+	if credit != nil {
+		tr.withCredit(credit.scope, credit.turnID, credit.fetcher)
+	}
 	return newTranslateReader(upstream, tr)
+}
+
+// creditSpec 一次查账所需的全部信息。
+type creditSpec struct {
+	scope   string
+	turnID  string
+	fetcher creditFetcher
+}
+
+// creditForStream 组装 legacy 路径的查账规格（turn id = 我们发的 request_id）。
+func creditForStream(a *auth.Auth, requestID string) *creditSpec {
+	fetcher := creditFor(a, requestID)
+	if fetcher == nil {
+		return nil
+	}
+	return &creditSpec{scope: "llm_utils_chat", turnID: requestID, fetcher: fetcher}
 }
 
 // declaredToolNames 收集声明过的工具名（小写，供白名单比对）。
@@ -1211,6 +1241,18 @@ type translator struct {
 	unparsedBlocks int
 	unparsedSeen   map[string]bool
 	unparsedSample string
+
+	// credit 是流尾查扣费的回调（见 session_usage.go）。
+	//
+	// 为什么必须查：上游 `token_usage` 事件只有 token 数、**没有 credit 字段**，
+	// 于是账本永远拿不到扣费、面板「积分」列恒为「—」。官方客户端另打
+	// `get_session_usage` 取真实账单，这里在发 usage 帧之前补上这一步。
+	// nil = 不做查询（目录/账号缺失、测试等）。
+	credit creditFetcher
+	// creditScope 只用于日志前缀（"llm_utils_chat" / "Remote"）。
+	creditScope string
+	// creditTurnID 查账用的 turn id（legacy = 我们发的 request_id，Remote = message_id）。
+	creditTurnID string
 }
 
 func newTranslator(model string) *translator {
@@ -1222,6 +1264,33 @@ func newTranslator(model string) *translator {
 		lateReasoning: &textAccumulator{},
 		tools:         newToolAccumulator(),
 	}
+}
+
+// withCredit 挂上流尾查扣费的回调（见 session_usage.go）。
+func (t *translator) withCredit(scope, turnID string, fetcher creditFetcher) *translator {
+	t.creditScope = scope
+	t.creditTurnID = turnID
+	t.credit = fetcher
+	return t
+}
+
+// applyCredit 在 usage 帧发出前补上真实扣费。
+//
+// 上游事件流不带 credit，而账本与成本账本都靠 usage.credit 判定「本次花了多少」。
+// 查不到时**不写**该字段（缺失≠0，见 chatStatsReader.Credit 的注释）。
+func (t *translator) applyCredit() {
+	if t.credit == nil {
+		return
+	}
+	observed, ok := t.credit()
+	if !ok {
+		return
+	}
+	if t.usage == nil {
+		t.usage = map[string]any{}
+	}
+	t.usage["credit"] = observed.Credits
+	creditLog(t.creditScope, t.creditTurnID, observed)
 }
 
 // absorbReasoning 吸收一段思考（累积快照或增量，由累加器合并）。
@@ -1507,6 +1576,9 @@ func (t *translator) finish(out *bytes.Buffer) error {
 	}
 	reason := finalFinishReason(t.finishReason, t.tools.hasCalls())
 	t.emit(out, map[string]any{}, reason)
+	// 补真实扣费：上游 token_usage 事件没有 credit 字段（见 session_usage.go）。
+	// 必须在 usage 帧之前做——账本读的就是这一帧的 usage.credit。
+	t.applyCredit()
 	if t.usage != nil {
 		usageFrame := map[string]any{
 			"id":      t.id,

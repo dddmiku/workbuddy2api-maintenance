@@ -43,6 +43,24 @@ func main() {
 		maxprobeMain(authPath, want, hasFlag("--post"))
 		return
 	}
+	// rawtail：打印上游事件流尾部（token_usage / done），确认是否下发 credit。
+	if model == "rawtail" {
+		want := "glm-5.3"
+		if len(os.Args) > 3 {
+			want = os.Args[3]
+		}
+		rawtailMain(authPath, want)
+		return
+	}
+	// creditprobe：探测 get_session_usage 能否给出真实扣费。
+	if model == "creditprobe" {
+		want := "glm-5.3"
+		if len(os.Args) > 3 {
+			want = os.Args[3]
+		}
+		creditprobeMain(authPath, want)
+		return
+	}
 	if model == "rawmodel" {
 		want := "glm-5.3"
 		if len(os.Args) > 3 {
