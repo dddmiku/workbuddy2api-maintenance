@@ -18,6 +18,8 @@
 .btn.sm{height:28px;padding:0 10px;font-size:12.5px;border-radius:var(--r3)}
 .btn.ico{width:32px;padding:0}
 .btn.sm.ico{width:28px}
+/* 模型限流行内的小号「检测」按钮：与同行文字基线对齐，不撑高行距。 */
+.btn.sm.probe{height:20px;padding:0 7px;font-size:11.5px;margin-left:6px;vertical-align:baseline;line-height:1}
 .btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
 .btn.ghost:hover{background:var(--sunken);color:var(--ink)}
 .btn.dgr:hover{color:var(--err);border-color:var(--err);background:var(--err-soft)}

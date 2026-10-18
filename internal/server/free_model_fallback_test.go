@@ -33,7 +33,7 @@ func paidModelPool(t *testing.T, cnPaid, globalPaid bool) (*pool.Pool, apikeys.I
 		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-g1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "c1", Domain: "www.codebuddy.cn", AccessToken: "at-c1", ExpiresAt: 9999999999},
 	)
-	p.CooldownSoftRate("g1", time.Minute, time.Time{}, "429 rate limit")
+	p.CooldownSoftRateForModel("g1", time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
 	paid := map[string]bool{}
 	if cnPaid {
 		paid["cn\x00deepseek-v4.1-flash"] = true

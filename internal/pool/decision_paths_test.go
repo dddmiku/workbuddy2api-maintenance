@@ -85,52 +85,38 @@ func TestDecisionLRUUsesFullPreferredSetWithoutLotteryFacts(t *testing.T) {
 	}
 }
 
-func TestDecisionRecordsSeparateNormalAndFallbackFilters(t *testing.T) {
+func TestDecisionRecordsNormalExclusionReasons(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := New("")
-	for _, uid := range []string{"tried", "realm", "disabled", "hard", "soft", "breaker", "model", "busy"} {
+	for _, uid := range []string{"tried", "realm", "disabled", "hard", "limited", "breaker", "busy"} {
 		p.Add(&auth.Auth{UID: uid})
 	}
 	p.byUID["realm"].a.Domain = "www.workbuddy.ai"
 	p.byUID["tried"].disabled = true
 	p.byUID["disabled"].disabled = true
 	p.Cooldown("hard", CoolHard, time.Hour, "do-not-copy-secret-reason")
-	p.Cooldown("soft", CoolSoft, time.Hour, "do-not-copy-secret-reason")
 	p.byUID["breaker"].breakerUntil = time.Now().Add(10 * time.Minute)
-	p.CooldownSoftForModel("model", time.Hour, time.Now().Add(time.Hour), "m", "do-not-copy-model-secret")
+	p.CooldownSoftForModel("limited", time.Hour, time.Now().Add(time.Hour), "m", "do-not-copy-model-secret")
 	p.SetMaxInFlight(1)
 	if !p.Acquire("busy") {
 		t.Fatal("fixture acquisition failed")
 	}
 	defer p.Release("busy")
 	tried := map[string]bool{"tried": true}
-	// 2026-10-15 起熔断期号不参与兜底（实测：上游对熔断号挂着不回 60s）。
-	// 兜底应落在唯一的软冷却号 soft 上，且 fallback_* 计数把熔断号记为 fallback_circuit_breaker。
+
 	a, d := p.PickExcludingForRealmWithDecision(tried, "m", "cn")
-	// 熔断号 breaker 在兜底扫描里被 fallback_circuit_breaker 排除（2026-10-15 起
-	// 熔断期不参与兜底），唯一可兜底的是软冷却号 soft。
-	if a == nil || a.UID != "soft" || d.ReasonCode != "cooldown_fallback" || d.FallbackKind != "soft" ||
-		d.FallbackUntil == nil || !d.FallbackUntil.Equal(p.byUID["soft"].until) ||
-		d.StageCounts["available"] != 0 || d.StageCounts["healthy"] != 1 || d.StageCounts["fallback_eligible"] != 1 ||
-		d.ExcludedCounts["fallback_circuit_breaker"] != 1 ||
+	// 2026-10-18：账号级冷却与全冷却兜底均已删除，无可选号时如实返回 nil。
+	if a != nil || d.ReasonCode != "no_available_account" || d.AccountID != "" ||
+		// healthy=1 是 busy：它本身健康，只是在途占满没能进入候选集。
+		d.StageCounts["available"] != 0 || d.StageCounts["healthy"] != 1 ||
 		d.CostUsedForSelection || d.Weight != nil || d.WeightTotal != nil {
-		t.Fatalf("wrong cooldown fallback facts: %+v", d)
+		t.Fatalf("wrong no-account facts: %+v", d)
 	}
-	for _, key := range []string{"already_tried", "realm_mismatch", "disabled", "account_limit", "account_cooldown", "circuit_breaker", "model_cooldown", "in_flight_full"} {
+	for _, key := range []string{"already_tried", "realm_mismatch", "disabled", "account_limit", "circuit_breaker", "model_cooldown", "in_flight_full"} {
 		if d.ExcludedCounts[key] != 1 {
 			t.Fatalf("missing mutually exclusive normal exclusion %s: %+v", key, d)
 		}
-	}
-	for _, uid := range []string{"soft", "breaker"} {
-		p.CooldownSoftForModel(uid, time.Hour, time.Now().Add(time.Hour), "m", "model still unavailable")
-	}
-	a, d = p.PickExcludingForRealmWithDecision(tried, "m", "cn")
-	// soft/breaker 也进了模型冷却后：model/soft/breaker 三个都被 fallback_model_cooldown
-	// 排除（排除顺序上模型冷却先于熔断判定，breaker 计入 model_cooldown）。
-	if a != nil || d.ReasonCode != "no_available_account" || d.AccountID != "" || d.StageCounts["fallback_eligible"] != 0 ||
-		d.ExcludedCounts["fallback_model_cooldown"] != 3 || d.StageCounts["fallback_evaluated"] != 8 {
-		t.Fatalf("fallback blockers were inferred from the wrong scan: %+v", d)
 	}
 	raw, err := json.Marshal(d)
 	if err != nil || strings.Contains(string(raw), "secret") || len(d.StageCounts) > 16 || len(d.ExcludedCounts) > 20 {

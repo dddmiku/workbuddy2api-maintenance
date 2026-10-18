@@ -52,17 +52,25 @@ func TestSoftResetHonorsUpstreamWindow(t *testing.T) {
 	}
 }
 
-// TestAccountSoftResetHonorsUpstreamWindow 账号级同理：resetAt 不被 2h 封顶砍掉。
+// TestAccountSoftResetHonorsUpstreamWindow 限流只落在模型上：resetAt 不被 2h 封顶砍掉，
+// 且**不得**写账号级 until（2026-10-18 起账号级限流冷却已取消）。
 func TestAccountSoftResetHonorsUpstreamWindow(t *testing.T) {
 	p := newTestPoolForCooldown(t)
 	uid := mustAddAccount(t, p, "acc-account-window")
 
 	resetAt := time.Now().Add(9 * time.Hour)
-	p.CooldownSoftRate(uid, time.Minute, resetAt, "429 rate limit")
+	p.CooldownSoftRateForModel(uid, time.Minute, resetAt, CooldownTestModel, "429 rate limit")
 
 	e := p.byUID[uid]
-	if d := e.until.Sub(resetAt); d > time.Second || d < -time.Second {
-		t.Errorf("账号级冷却应为上游墙钟 %v，实际 %v（softRateMax=%v）", resetAt, e.until, p.softRateMaxOr())
+	mc, ok := e.modelCooldowns[CooldownTestModel]
+	if !ok {
+		t.Fatal("限流应记在该模型上")
+	}
+	if d := mc.Until.Sub(resetAt); d > time.Second || d < -time.Second {
+		t.Errorf("模型级冷却应为上游墙钟 %v，实际 %v（softRateMax=%v）", resetAt, mc.Until, p.softRateMaxOr())
+	}
+	if !e.until.IsZero() {
+		t.Errorf("限流不得写账号级 until（会摘掉整号），实际 %v", e.until)
 	}
 }
 
@@ -96,7 +104,8 @@ func TestSoftResetPastImmediate(t *testing.T) {
 	}
 }
 
-// TestNoResetTimesStillUseBackoff 没有上游时间时仍走有界退避（不受本次改动影响）。
+// TestNoResetTimesStillUseBackoff 没有上游时间时仍走有界退避——退避落在**模型**上，
+// 不写账号级 until。
 func TestNoResetTimesStillUseBackoff(t *testing.T) {
 	p := newTestPoolForCooldown(t)
 	uid := mustAddAccount(t, p, "acc-no-reset")
@@ -104,10 +113,17 @@ func TestNoResetTimesStillUseBackoff(t *testing.T) {
 	p.CooldownSoftForModel(uid, 10*time.Minute, time.Time{}, "m", "429 rate limit")
 
 	e := p.byUID[uid]
-	if e.until.IsZero() || !time.Now().Before(e.until) {
-		t.Fatalf("无 resetAt 时应写账号级有界退避，实际 until=%v", e.until)
+	if !e.until.IsZero() {
+		t.Errorf("无 resetAt 时也不得写账号级 until，实际 %v", e.until)
 	}
-	if d := time.Until(e.until); d > p.softRateMaxOr()+time.Second {
+	mc, ok := e.modelCooldowns["m"]
+	if !ok {
+		t.Fatal("无 resetAt 时应把退避写在该模型上")
+	}
+	if !time.Now().Before(mc.Until) {
+		t.Fatalf("模型级退避应仍在生效，实际 until=%v", mc.Until)
+	}
+	if d := time.Until(mc.Until); d > p.softRateMaxOr()+time.Second {
 		t.Errorf("有界退避不得超过 softRateMax(%v)，实际 %v", p.softRateMaxOr(), d)
 	}
 }

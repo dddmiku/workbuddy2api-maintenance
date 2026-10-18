@@ -18,8 +18,8 @@ type lateCooldownCase struct {
 func lateCooldownCases() []lateCooldownCase {
 	return []lateCooldownCase{
 		{"fixed_soft", func(p *Pool) { p.Cooldown("u1", CoolSoft, time.Minute, "late fault") }},
-		{"account_rate", func(p *Pool) { p.CooldownSoftRate("u1", time.Minute, time.Time{}, "late 429") }},
-		{"account_reset", func(p *Pool) { p.CooldownSoftRate("u1", time.Minute, time.Now().Add(time.Minute), "late reset") }},
+		{"account_rate", func(p *Pool) { p.CooldownSoftRateForModel("u1", time.Minute, time.Time{}, CooldownTestModel, "late 429") }},
+		{"account_reset", func(p *Pool) { p.CooldownSoftRateForModel("u1", time.Minute, time.Now().Add(time.Minute), CooldownTestModel, "late reset") }},
 		{"model_without_reset", func(p *Pool) { p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "model", "late 429") }},
 	}
 }
@@ -112,9 +112,9 @@ func TestLateCooldownMergePreservesStrongerRestriction(t *testing.T) {
 }
 
 // TestLateReviveKeepsNewerSoftCooldown 热更新期间，旧（排水中）实例仍以为账号是
-// 余额不足（CoolHard）并完成签到解冻；新实例同时刚记下 429 软冷却（CoolSoft）并落盘。
-// 迟到的解冻不是「限流已恢复」的证据，不得抹掉新实例记的软冷却——否则下次重启/采用
-// 快照后会在被限流的账号上恢复选号（2026-09-30 深度体检发现）。
+// 余额不足（CoolHard）并完成签到解冻；新实例同时刚记下该模型的 429 限流并落盘。
+// 迟到的解冻不是「限流已恢复」的证据，不得抹掉新实例记的模型限流——否则下次重启/
+// 采用快照后会在被限流的模型上恢复选号（2026-09-30 深度体检发现）。
 func TestLateReviveKeepsNewerSoftCooldown(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "state.json")
 	seed := New(file)
@@ -130,7 +130,7 @@ func TestLateReviveKeepsNewerSoftCooldown(t *testing.T) {
 	old, fresh := New(file), New(file)
 	t.Cleanup(old.Close)
 	t.Cleanup(fresh.Close)
-	fresh.CooldownSoftRate("u1", time.Minute, time.Now().Add(30*time.Minute), "429 rate limit")
+	fresh.CooldownSoftRateForModel("u1", time.Minute, time.Now().Add(30*time.Minute), CooldownTestModel, "429 rate limit")
 	fresh.Flush()
 
 	// 旧实例的签到完成得晚：余额恢复 → 只解冻它以为的余额不足冷却。
@@ -138,7 +138,16 @@ func TestLateReviveKeepsNewerSoftCooldown(t *testing.T) {
 	old.Flush()
 
 	after := runtimeReopenStatus(t, file, "u1")
-	if !after.Cooling || after.Until.IsZero() || after.CoolKind != CoolSoft.String() {
-		t.Fatalf("迟到的解冻抹掉了新实例的 429 软冷却: %+v", after)
+	if after.Cooling || after.CreditsExhausted {
+		t.Fatalf("签到解冻应清掉余额不足: %+v", after)
+	}
+	var kept *RateLimitedModel
+	for i := range after.RateLimitedModels {
+		if after.RateLimitedModels[i].Model == CooldownTestModel {
+			kept = &after.RateLimitedModels[i]
+		}
+	}
+	if kept == nil || !time.Now().Before(kept.Until) {
+		t.Fatalf("迟到的解冻抹掉了新实例的模型限流: %+v", after.RateLimitedModels)
 	}
 }

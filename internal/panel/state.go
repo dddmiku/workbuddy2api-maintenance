@@ -33,6 +33,11 @@ type PoolState struct {
 	CoolRemaining any    `json:"coolRemaining"`
 	CoolKind      string `json:"coolKind"`
 	Reason        string `json:"reason"`
+	// CreditsExhausted：余额耗尽（CoolHard），**不是冷却**。上游没有限制这个号，
+	// 只是积分花完，免费模型照常可用。面板据此显示「余额不足」而不是「冷却中」——
+	// 2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，只是没有
+	// 积分余额而已」。见 pool.Status.CreditsExhausted。
+	CreditsExhausted bool `json:"creditsExhausted"`
 	// FreeModelsUsable：该号的冷却只挡扣积分的模型，免费模型照常可用（仅余额不足
 	// 成立）。面板据此把这一行显示成「余额不足（免费模型可用）」，而不是与真正的
 	// 429 冷却混为一谈——2026-10-15 用户反馈「积分不足的号可以用免费模型，但你直接
@@ -84,9 +89,11 @@ type AccountState struct {
 
 // PoolTotals 是全局池统计（直接透传网关 /status 的 pool 段）。
 type PoolTotals struct {
-	Total          any `json:"total"`
-	Healthy        any `json:"healthy"`
-	Cooling        any `json:"cooling"`
+	Total any `json:"total"`
+	Healthy any `json:"healthy"`
+	Cooling any `json:"cooling"`
+	// CreditsExhausted 余额不足的账号数——**不算冷却**（见 pool.Status.CreditsExhausted）。
+	CreditsExhausted any `json:"creditsExhausted"`
 	Disabled       any `json:"disabled"`
 	InFlightFull   any `json:"inFlightFull"`
 	RealmTotals    any `json:"realmTotals"`
@@ -257,6 +264,9 @@ func poolStateFrom(entry map[string]any) PoolState {
 		CoolRemaining:  orZero(entry["cool_remaining_sec"]),
 		CoolKind:       jsonString(entry["cool_kind"]),
 		Reason:         jsonString(entry["reason"]),
+		// 余额不足（CoolHard）不是冷却：上游没限流这个号，只是没积分。
+		// 见 pool.Status.CreditsExhausted。
+		CreditsExhausted: jsonBool(entry["credits_exhausted"], false),
 		// 余额不足但免费模型可用（见 pool.Status.FreeModelsUsable）。
 		FreeModelsUsable: jsonBool(entry["free_models_usable"], false),
 		SuccessCount:     orZero(entry["success_count"]),
@@ -330,13 +340,14 @@ func poolTotalsFrom(pool map[string]any) PoolTotals {
 		return pool[key]
 	}
 	return PoolTotals{
-		Total:          pick("total"),
-		Healthy:        pick("healthy"),
-		Cooling:        pick("cooling"),
-		Disabled:       pick("disabled"),
-		InFlightFull:   pick("in_flight_full"),
-		RealmTotals:    pick("realm_totals"),
-		StickySessions: pick("sticky_sessions"),
+		Total:            pick("total"),
+		Healthy:          pick("healthy"),
+		Cooling:          pick("cooling"),
+		CreditsExhausted: pick("credits_exhausted"),
+		Disabled:         pick("disabled"),
+		InFlightFull:     pick("in_flight_full"),
+		RealmTotals:      pick("realm_totals"),
+		StickySessions:   pick("sticky_sessions"),
 	}
 }
 

@@ -1,21 +1,20 @@
-// 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
+// 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 在途占满过滤）。
 // ═══ 更新日志 ═══
 // 2026-10-10：付费模型（倍率>0）上快过期积分硬优先（issue:积分过期）。
 // 2026-09-25：删除已无调用的旧私有包装，选择与抽签继续复用同一实现，避免静态检查遗留。
 // 2026-09-25：在实际选号锁内记录阶段、排除、权重与成本事实；旧 API 复用同一算法且不增加抽签。
 // 2026-09-19：免费优先保留，每四次普通分配给未知可用账号一次轮询机会；粘性和跨模型流量不干扰探索。
 // 2026-09-18：全冷却兜底仍遵守请求模型的独立冷却，避免重复选择已明确限额或不可用的模型。
+// 2026-10-18：删除账号级冷却兜底（账号级限流冷却取消后该路径恒选不到号）。
 package pool
 
 import (
-	"log"
 	"math"
 	"math/rand/v2"
 	"sort"
 	"time"
 
 	"workbuddy2api/internal/auth"
-	"workbuddy2api/internal/logfmt"
 )
 
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知）。
@@ -78,9 +77,17 @@ func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d
 	}
 	d.stage("available", len(cands))
 	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryWithDecisionLocked(tried, now, reqModel, realm, d)
+		// 无可用候选即返回 nil，不再有「账号冷却兜底」这一层。
+		//
+		// 2026-10-18：账号级限流冷却已删除，兜底原本只在「整号软冷却」和「熔断」
+		// 两类账号里挑截止最早的一个；前者已不存在，后者在扫描里就已被排除，
+		// 于是这条路径恒选不到号。更关键的是它的语义本来就与用户要求相悖——
+		// 「不要账号冷却」意味着被限流的账号只应针对具体模型退避，而不是被
+		// 整号摘掉后再兜底放回。无号可用就如实返回，由上层跨域回落或 503 处理。
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "no_available_account", "none"
+		}
+		return nil
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -306,78 +313,6 @@ func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	return e.a
-}
-
-// pickEarliestExpiryWithDecisionLocked 全冷却兜底：在非禁用的软冷却账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// 熔断期（breakerUntil 未到）**同样排除**（2026-10-15 修正）：熔断是「连续 3 次 5xx」
-// 的强故障信号，上游对这种号往往挂着不回（实测 VPS：熔断中的 8ef5d5ac 被兜底选中，
-// 每次都等满 60s 才回 500 invoke model error，客户端拿到一串 total=60s 的 503）。
-// 保留 CoolSoft 参与（可能已恢复，失败成本仅一轮换）。
-// 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryWithDecisionLocked(tried map[string]bool, now time.Time, reqModel, realm string, d *Decision) *auth.Auth {
-	var best *entry
-	var bestExpiry time.Time
-	d.stage("fallback_evaluated", 0)
-	d.stage("fallback_eligible", 0)
-	for uid, e := range p.byUID {
-		d.increment("fallback_evaluated")
-		if tried != nil && tried[uid] {
-			d.exclude("fallback_already_tried")
-			continue
-		}
-		if realm != "" && e.a.Realm() != realm {
-			d.exclude("fallback_realm_mismatch")
-			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
-		}
-		if e.disabled {
-			d.exclude("fallback_disabled")
-			continue // 禁用的账号永不参与兜底
-		}
-		if e.modelCooled(now, reqModel) {
-			d.exclude("fallback_model_cooldown")
-			continue
-		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			d.exclude("fallback_account_limit")
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
-		}
-		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-			d.exclude("fallback_circuit_breaker")
-			continue // 熔断期号不参与兜底：连续 5xx 的强故障信号，调了大概率再挂一轮
-		}
-		if p.inFlightFull(e) {
-			d.exclude("fallback_in_flight_full")
-			continue
-		}
-		exp := e.expiry(now)
-		if exp.IsZero() {
-			d.exclude("fallback_no_cooldown")
-			continue
-		}
-		d.increment("fallback_eligible")
-		if best == nil || exp.Before(best.expiry(now)) {
-			best = e
-			bestExpiry = exp
-		}
-	}
-	if best == nil {
-		if d != nil {
-			d.ReasonCode, d.SelectionMethod = "no_available_account", "none"
-		}
-		return nil
-	}
-	if d != nil {
-		d.ReasonCode, d.SelectionMethod = "cooldown_fallback", "fallback"
-		d.FallbackKind = best.fallbackKind(now)
-		expires := bestExpiry.UTC()
-		d.FallbackUntil = &expires
-		mc, known := best.modelCostOf(reqModel, now)
-		d.selected(best, decisionCostOf(best, reqModel, now, mc, known), false)
-	}
-	log.Printf("WARN: [账号池] 回落最早到期号 uid=%s 截止=%s 类型=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
-	best.lastUsed = time.Now()
-	return best.a
 }
 
 // inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。

@@ -382,24 +382,31 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	return p.pickByUIDForModelRealm(uid, model, "", nil)
 }
 
-// CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
-// cooling 含常规冷却（until）与熔断期（breakerUntil）。
+// CountsDetailed 返回 total/healthy/cooling/creditsExhausted/disabled/inFlightFull 计数。
+// cooling 只含常规冷却（429 until）与熔断期（breakerUntil）；余额不足单独返回
+// （见 countsDetailedForRealm 注释）。
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
-func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+func (p *Pool) CountsDetailed() (total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
 // realm=="" 退化为全池（现状语义，走同一遍历 helper 避免重复代码）。
 // 双 realm 共存时供 /status 按域分组暴露 CN/global 各自可用性。
-func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm(realm)
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+//
+// cooling 只统计**真正的冷却**：429 软冷却与熔断期。余额不足（CoolHard）单独计入
+// creditsExhausted——上游没有限制这个账号，只是没积分，免费模型照常可用
+// （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的」）。
+// 它仍不属于 healthy（healthy 回答「能不能调扣积分的模型」），所以总量等式
+// total = healthy + cooling + creditsExhausted + disabled 依旧成立。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -408,9 +415,17 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			continue
 		}
 		total++
+		// 分类顺序即优先级：禁用 > 积分不足 > 冷却 > 健康。
+		//
+		// 积分不足必须**先于** healthy() 判定：healthy() 用空模型名走
+		// hardCreditBlocksModel("", …)，那里恒返回 true（「未指定模型时保守拦截」），
+		// 于是余额不足的号会被判成 unhealthy，落进 else 的 cooling 桶——面板上就
+		// 出现了「冷却」而实际只是没积分（用户 2026-10-18 截图指出的显示错误）。
 		switch {
 		case e.disabled:
 			disabled++
+		case now.Before(e.until) && e.coolKind == CoolHard:
+			creditsExhausted++
 		case !e.healthy(now):
 			cooling++
 		default:
@@ -420,7 +435,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			}
 		}
 	}
-	return total, healthy, cooling, disabled, inFlightFull
+	return total, healthy, cooling, creditsExhausted, disabled, inFlightFull
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个（对任意模型）healthy 且未占满在途名额的账号。
@@ -520,12 +535,8 @@ func (p *Pool) RealmRateStateForModel(realm, model string) RealmRateState {
 			state.Unavailable++
 			continue
 		}
-		if e.coolKind == CoolSoft && !e.until.IsZero() && now.Before(e.until) {
-			state.RateLimited++
-			state.Unavailable++
-			continue
-		}
-		// 余额不足（CoolHard）、熔断、在途占满落到这里：不可用，但不是限流。
+		// 账号级 CoolSoft 已取消（2026-10-18），这里只剩模型级限流一种「限流」；
+		// 余额不足（CoolHard）、熔断、在途占满落到下面：不可用，但不是限流。
 		state.Unavailable++
 	}
 	return state
@@ -585,7 +596,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 快过架子集（Credits 的一部分）。写入口 SetCreditsDetailed 已钳到 [0,credits]，
 		// 这里再钳一次，防止持久化恢复或扣减竞态让它短暂超过总量。
 		CreditsExpiring: min(e.creditsExpiring, e.credits),
-		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
+		// Cooling 只表示**真正的账号级限流**（429 软冷却）或熔断。余额不足（CoolHard）
+		// 不算冷却——上游没有限制这个账号，只是积分花完，免费模型照常可用
+		// （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，
+		// 只是没有积分余额而已」）。余额不足由 CreditsExhausted 单独表达。
+		Cooling:         (now.Before(e.until) && e.coolKind != CoolHard) || now.Before(e.breakerUntil),
+		CreditsExhausted: now.Before(e.until) && e.coolKind == CoolHard,
 		Reason:          reason,
 		Disabled:        e.disabled,
 		SuccessCount:    e.successCount,
@@ -624,8 +640,23 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	//
 	// 用 model=="" 调 hardCreditBlocksModel 会恒返回 true（那是「未指定模型」的
 	// 旧语义），所以这里直接判 coolKind 与表是否注入，不走那个函数。
-	if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) && p.paidModels != nil {
-		st.FreeModelsUsable = true
+	if st.CreditsExhausted {
+		if p.paidModels != nil {
+			st.FreeModelsUsable = true
+		}
+		// 余额不足虽然不计入 Cooling，但面板仍要显示「到什么时候恢复」——那是签到
+		// 后的重新查积分时刻，不是上游限流的解除时刻。剩余时长与 Cooling 同口径：
+		// 取 until 与 breakerUntil 中更远的截止（两者可能并存，显示更晚的那个才不
+		// 会误导——这与 Cooling 分支的既有口径一致）。
+		remain := time.Until(e.until)
+		if b := time.Until(e.breakerUntil); b > remain {
+			remain = b
+		}
+		st.CoolRemaining = int64(remain.Seconds() + 0.999)
+		if st.CoolRemaining < 0 {
+			st.CoolRemaining = 0
+		}
+		st.CoolKind = e.coolKind.String()
 	}
 	return st
 }

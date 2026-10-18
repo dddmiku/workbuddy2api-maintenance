@@ -12,20 +12,34 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// 2026-10-18 改：限流只写模型级台账，账号级 until 不再承载 429。
+// 本用例验证两条模型级入口的首轮都被 softRateMax 封顶。
 func TestAuditFirstSoftCooldownHonorsCap(t *testing.T) {
-	for _, modelFallback := range []bool{false, true} {
-		t.Run(map[bool]string{false: "account", true: "model_without_reset"}[modelFallback], func(t *testing.T) {
+	for _, entry := range []string{"soft_rate_for_model", "soft_for_model"} {
+		t.Run(entry, func(t *testing.T) {
 			p := New("")
 			p.Add(&auth.Auth{UID: "u1"})
 			p.SetSoftRateMax(time.Minute)
-			if modelFallback {
+			if entry == "soft_for_model" {
 				p.CooldownSoftForModel("u1", time.Hour, time.Time{}, "model", "429")
 			} else {
-				p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429")
+				p.CooldownSoftRateForModel("u1", time.Hour, time.Time{}, CooldownTestModel, "429")
 			}
-			st, _ := p.Status("u1")
-			if !st.Cooling || time.Until(st.Until) > time.Minute {
-				t.Fatalf("first cooldown must honor one-minute cap, cooling=%t remaining=%s", st.Cooling, time.Until(st.Until))
+			if st, _ := p.Status("u1"); st.Cooling || !st.Until.IsZero() {
+				t.Fatalf("限流不得写账号级冷却: cooling=%t until=%v", st.Cooling, st.Until)
+			}
+			model := "model"
+			if entry == "soft_rate_for_model" {
+				model = CooldownTestModel
+			}
+			p.mu.RLock()
+			mc := p.byUID["u1"].modelCooldowns[model]
+			p.mu.RUnlock()
+			if mc.Until.IsZero() {
+				t.Fatal("首轮冷却应写入模型级台账")
+			}
+			if remaining := time.Until(mc.Until); remaining > time.Minute {
+				t.Fatalf("first cooldown must honor one-minute cap, remaining=%s", remaining)
 			}
 		})
 	}
@@ -45,65 +59,69 @@ func TestAuditAccountCooldownCannotBeExemptedByLateModelLimit(t *testing.T) {
 	}
 }
 
+// 2026-10-18 改：账号级只有积分不足（CoolHard）一种状态；限流全在模型级。
+// 本用例验证签到续期只清「积分不足」，模型限流原样保留。
 func TestAuditCreditRefreshPreservesUnrelatedLimits(t *testing.T) {
-	for _, kind := range []CoolKind{CoolHard, CoolSoft} {
-		t.Run(kind.String(), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "state.json")
-			p := New(path)
-			t.Cleanup(p.Close)
-			p.Add(&auth.Auth{UID: "u1"})
-			p.Cooldown("u1", kind, time.Hour, kind.String())
-			p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "daily-quota", "6004")
-			p.BlockModelBackoff("u1", "unavailable", "11102 model not available")
-			p.ReenableIfCredits("u1", 500)
-			check := func(current *Pool) {
-				t.Helper()
-				st, _ := current.Status("u1")
-				if st.Credits != 500 {
-					t.Errorf("credit refresh was not retained: %d", st.Credits)
-				}
-				if st.Cooling != (kind == CoolSoft) {
-					t.Errorf("credit refresh must only clear balance cooldown, kind=%s cooling=%t", kind.String(), st.Cooling)
-				}
-				for _, model := range []string{"daily-quota", "unavailable"} {
-					if got := current.PickExcludingForRealm(nil, model, "cn"); got != nil {
-						t.Errorf("credit refresh made %s selectable despite independent upstream restriction", model)
-					}
-				}
+	path := filepath.Join(t.TempDir(), "state.json")
+	p := New(path)
+	t.Cleanup(p.Close)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "daily-quota", "6004")
+	p.BlockModelBackoff("u1", "unavailable", "11102 model not available")
+	p.ReenableIfCredits("u1", 500)
+	check := func(current *Pool) {
+		t.Helper()
+		st, _ := current.Status("u1")
+		if st.Credits != 500 {
+			t.Errorf("credit refresh was not retained: %d", st.Credits)
+		}
+		if st.Cooling || st.CreditsExhausted {
+			t.Errorf("credit refresh must clear balance exhaustion: cooling=%t exhausted=%t", st.Cooling, st.CreditsExhausted)
+		}
+		for _, model := range []string{"daily-quota", "unavailable"} {
+			if got := current.PickExcludingForRealm(nil, model, "cn"); got != nil {
+				t.Errorf("credit refresh made %s selectable despite independent upstream restriction", model)
 			}
-			check(p)
-			p.Flush()
-			reloaded := New(path)
-			t.Cleanup(reloaded.Close)
-			reloaded.Add(&auth.Auth{UID: "u1"})
-			check(reloaded)
-		})
+		}
 	}
+	check(p)
+	p.Flush()
+	reloaded := New(path)
+	t.Cleanup(reloaded.Close)
+	reloaded.Add(&auth.Auth{UID: "u1"})
+	check(reloaded)
 }
 
+// 2026-10-18 改：账号级限流已取消，这里改为验证「积分不足」与模型限制正交——
+// 两者互不覆盖，积分恢复后模型限制仍在，且不同模型各自独立。
 func TestAuditAccountCooldownPreservesModelLimits(t *testing.T) {
-	for _, source := range []string{"fixed", "soft_rate", "model_without_reset"} {
+	for _, source := range []string{"hard_credit", "soft_rate", "model_without_reset"} {
 		t.Run(source, func(t *testing.T) {
 			p := New("")
+			// 非空倍率表：other-model 记为免费，积分不足不该拦它。
+			p.SetPaidModels(map[string]bool{"paid-model": true})
 			p.Add(&auth.Auth{UID: "u1"})
 			p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "daily-quota", "6004")
 			p.BlockModelBackoff("u1", "unavailable", "11102 model not available")
 			switch source {
-			case "fixed":
-				p.Cooldown("u1", CoolSoft, time.Minute, "429")
+			case "hard_credit":
+				p.Cooldown("u1", CoolHard, time.Minute, "余额不足")
 			case "soft_rate":
-				p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429")
+				p.CooldownSoftRateForModel("u1", time.Minute, time.Time{}, CooldownTestModel, "429")
 			default:
 				p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "different-model", "429")
 			}
-			p.forceSoftExpired("u1")
 			for _, model := range []string{"daily-quota", "unavailable"} {
-				if got := p.PickExcludingForRealm(nil, model, "cn"); got != nil {
-					t.Errorf("short account cooldown erased longer restriction for %s", model)
+				p.mu.RLock()
+				mc, ok := p.byUID["u1"].modelCooldowns[model]
+				p.mu.RUnlock()
+				if !ok || !time.Now().Before(mc.Until) {
+					t.Errorf("短冷却/积分不足不得抹掉更长的模型限制 %s", model)
 				}
 			}
 			if got := p.PickExcludingForRealm(nil, "other-model", "cn"); got == nil {
-				t.Fatal("unrelated models must recover after the account cooldown expires")
+				t.Fatal("无关模型必须可用（账号未被整体冷却）")
 			}
 		})
 	}

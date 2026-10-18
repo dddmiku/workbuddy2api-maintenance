@@ -13,10 +13,15 @@ import (
 // 修正口径：CoolRemaining = max(time.Until(e.until), time.Until(e.breakerUntil))。
 
 // setCoolWindows 直接写入 until/breakerUntil（绕过触发路径，隔离测试口径本身）。
+//
+// 2026-10-18：账号级 until 现在只承载积分不足（CoolHard），不再有 soft_rate 账号冷却。
+// 直接写 until 而不设 coolKind 时零值即 CoolHard，因此这些用例验证的是
+// 「余额不足 + 熔断并存时 CoolRemaining 取谁」这一口径。
 func setCoolWindows(p *Pool, uid string, until, breakerUntil time.Time) {
 	p.mu.Lock()
 	e := p.byUID[uid]
 	e.until = until
+	e.coolKind = CoolHard // 显式：until 只表示积分不足
 	e.breakerUntil = breakerUntil
 	p.mu.Unlock()
 }
@@ -28,8 +33,9 @@ func breakerCoolRemainingAt(t *testing.T, p *Pool, uid string, want int64, tol i
 	if !ok {
 		t.Fatalf("status(%s) missing", uid)
 	}
-	if !st.Cooling {
-		t.Fatalf("%s should be cooling: %+v", uid, st)
+	// 余额不足不计入 Cooling（不是冷却），但仍要有剩余时长可显示。
+	if !st.Cooling && !st.CreditsExhausted {
+		t.Fatalf("%s should be cooling or credits-exhausted: %+v", uid, st)
 	}
 	if got := st.CoolRemaining; got < want-tol || got > want+tol {
 		t.Errorf("cool_remaining_sec=%d want ~%d (±%d)", got, want, tol)
@@ -44,7 +50,7 @@ func TestCoolRemainingBreakerOnly(t *testing.T) {
 	breakerCoolRemainingAt(t, p, "u1", 30*60, 5)
 }
 
-// 账号级冷却（until 未来、breakerUntil 已过期）→ CoolRemaining > 0（原行为不变）。
+// 积分不足（until 未来、breakerUntil 已过期）→ CoolRemaining > 0（原行为不变）。
 func TestCoolRemainingUntilOnly(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})

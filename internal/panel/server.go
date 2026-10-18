@@ -450,6 +450,8 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, http.StatusOK, s.accountRevive(r.Context(), body))
 	case "/api/account/revive-all":
 		writeJSON(w, http.StatusOK, s.accountReviveAll(r.Context(), body))
+	case "/api/account/probe-model":
+		writeJSON(w, http.StatusOK, s.accountProbeModel(r.Context(), body))
 	case "/api/account/fission":
 		writeJSON(w, http.StatusOK, s.accountFission(r.Context(), body))
 	case "/api/account/delete":
@@ -598,6 +600,7 @@ var actionShapes = map[string][]string{
 	"/api/account/delete":          {"uid"},
 	"/api/account/revive":          {"uid"},
 	"/api/account/revive-all":      {},
+	"/api/account/probe-model":     {"uid", "model"},
 	"/api/account/fission":         {"uid"},
 	"/api/task/run":                {"key"},
 	"/api/task/stop":               {"key"},
@@ -611,7 +614,7 @@ var actionShapes = map[string][]string{
 // stringFields 是必须为字符串的字段。
 var stringFields = map[string]bool{
 	"username": true, "password": true, "current": true, "confirm": true,
-	"realm": true, "uid": true, "key": true, "callback": true,
+	"realm": true, "uid": true, "key": true, "callback": true, "model": true,
 }
 
 var loginIDRe = regexp.MustCompile(`^[a-f0-9]{32}$`)

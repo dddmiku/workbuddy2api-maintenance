@@ -451,8 +451,9 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 		t.Errorf("calls=%v", calls)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.Reason == "" {
-		t.Errorf("bad account should be cooling: %+v", st)
+	// 2026-10-18：积分不足不是「冷却」，而是 CreditsExhausted（免费模型仍可用）。
+	if st.Cooling || !st.CreditsExhausted || st.Reason == "" {
+		t.Errorf("bad account should be credits-exhausted: %+v", st)
 	}
 }
 
@@ -488,12 +489,16 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	// 2026-10-18：限流只记在被限流的模型上，账号本身不被整体冷却。
+	if st.Cooling {
+		t.Fatalf("限流不得把账号整体冷却: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.2" {
+		t.Fatalf("bad 的 glm-5.2 应出现在模型限流台账: %+v", st.RateLimitedModels)
 	}
 	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	if got, max := int64(time.Until(st.RateLimitedModels[0].Until).Seconds()+0.999), int64(soft/time.Second); got <= 0 || got > max {
+		t.Errorf("model cool_remaining_sec=%d want in (0,%d]", got, max)
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -611,8 +616,8 @@ func TestChatAccountFault14017Rotates(t *testing.T) {
 	if st.Disabled {
 		t.Fatalf("bad 不应被禁用（14017 trial 未激活可能自愈）: %+v", st)
 	}
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Errorf("bad 应进入 soft_rate 冷却（14017 软冷却，非禁用）: %+v", st)
+	if st.Cooling || len(st.RateLimitedModels) == 0 || st.RateLimitedModels[0].Model != "glm-5.2" {
+		t.Errorf("bad 的 glm-5.2 应进入模型级冷却（14017 非禁用）: %+v", st)
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -666,11 +671,11 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		if st.Disabled {
 			t.Fatalf("14017 不应禁用: %+v", st)
 		}
-		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Errorf("14017 应 soft_rate 软冷却: %+v", st)
+		if st.Cooling {
+			t.Errorf("14017 不应把账号整体冷却: %+v", st)
 		}
-		if st.Reason == "" {
-			t.Errorf("14017 冷却 reason 不应为空: %+v", st)
+		if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.2" || st.RateLimitedModels[0].Reason == "" {
+			t.Errorf("14017 应记在该模型的限流台账上: %+v", st.RateLimitedModels)
 		}
 	})
 }
@@ -749,8 +754,8 @@ func TestChatRegionRepairFailureFallsBackToRotation(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling {
-		t.Errorf("unrepaired account should still cool down: %+v", st)
+	if st.Cooling || len(st.RateLimitedModels) == 0 {
+		t.Errorf("unrepaired account should still be model-limited: %+v", st)
 	}
 }
 
@@ -763,30 +768,26 @@ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-	// 第 1 次：进入冷却，streak=1，600s（固定基数，无重置时间）。
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+	// 第 1 次：进入模型级冷却，hits=1，600s（固定基数，无重置时间）。
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "glm-5.2")
 	st, _ := p.Status("u1")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("call 1: 应为 soft_rate 冷却: %+v", st)
+	if st.Cooling {
+		t.Fatalf("call 1: 限流不得把账号整体冷却: %+v", st)
 	}
-	if st.SoftStreak != 1 {
-		t.Errorf("call 1: soft_streak=%d want 1", st.SoftStreak)
-	}
-	if st.CoolRemaining < 597 || st.CoolRemaining > 600 {
-		t.Errorf("call 1: cool_remaining_sec=%d want ~600", st.CoolRemaining)
+	mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
+	firstRemain := int64(time.Until(mc.Until).Seconds() + 0.999)
+	if firstRemain < 597 || firstRemain > 600 {
+		t.Fatalf("call 1: model cool_remaining_sec=%d want ~600", firstRemain)
 	}
 
-	// 冷却中重复触发（兜底探测）→ 不翻倍、不推进 streak。
-	before := st.CoolRemaining
+	// 冷却中重复触发（兜底探测）→ 不翻倍、不延后。
 	for n := 0; n < 3; n++ {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "glm-5.2")
 	}
 	st, _ = p.Status("u1")
-	if st.SoftStreak != 1 {
-		t.Fatalf("already-cooling probe must not advance soft_streak, got %d", st.SoftStreak)
-	}
-	if got := st.CoolRemaining; got < before-3 || got > before {
-		t.Errorf("already-cooling probe must not extend, cool_remaining_sec=%d want ~%d", got, before)
+	mc = findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
+	if got := int64(time.Until(mc.Until).Seconds() + 0.999); got > firstRemain+1 {
+		t.Errorf("already-cooling probe must not extend, remaining=%d want ~%d", got, firstRemain)
 	}
 }
 
@@ -809,18 +810,17 @@ func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
 	if !ok {
 		t.Fatal("u1 missing")
 	}
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("应为账号级 soft_rate 冷却: %+v", st)
+	// 2026-10-18：非 6004 的限流同样归到模型维度（账号级限流冷却已取消）。
+	if st.Cooling || !st.Until.IsZero() {
+		t.Fatalf("限流不得写账号级冷却: %+v", st)
 	}
-	if st.SoftStreak != 0 {
-		t.Errorf("带重置时间的 429 绝不 softStreak 堆加，soft_streak=%d want 0", st.SoftStreak)
+	mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.3")
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("模型 until=%v want ~reset=%v（精确对齐，无退避）", mc.Until, reset)
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("账号级 until=%v want ~reset=%v（精确对齐，无退避）", st.Until, reset)
-	}
-	// 非 6004 走账号级，不写模型级台账（不存在切模型豁免）。
-	if len(st.RateLimitedModels) != 0 {
-		t.Errorf("11140 账号级限流不应产生模型级台账: %+v", st.RateLimitedModels)
+	// 上游文案只到秒，ResetAt 保留解析出的墙钟（秒级）。
+	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("ResetAt=%v want ~%v（保留上游原始墙钟）", mc.ResetAt, reset)
 	}
 }
 
@@ -836,19 +836,17 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i := 0; i < 3; i++ {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "glm-5.2")
 		st, _ := p.Status("u1")
-		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
-		}
-		if st.SoftStreak != 0 {
-			t.Errorf("call %d: 404 must not advance soft_streak, got %d", i+1, st.SoftStreak)
+		if st.Cooling {
+			t.Fatalf("call %d: 404 不得把账号整体冷却: %+v", i+1, st)
 		}
 		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m），且固定不翻倍
 		// （冷却中重复 404 是兜底探测，不得把 404 冷却也越堆越厚）。
-		if st.CoolRemaining < notFoundSec-3 || st.CoolRemaining > notFoundSec {
-			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数，非 soft_rate，不翻倍）",
-				i+1, st.CoolRemaining, notFoundSec)
+		mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
+		if got := int64(time.Until(mc.Until).Seconds() + 0.999); got < notFoundSec-3 || got > notFoundSec {
+			t.Errorf("call %d: 404 model cool_remaining_sec=%d want ~%d（固定基数，非 soft_rate，不翻倍）",
+				i+1, got, notFoundSec)
 		}
 	}
 }
@@ -875,11 +873,12 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	if st.Cooling {
+		t.Fatalf("限流不得把账号整体冷却: %+v", st)
 	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
+	mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
+	if got := int64(time.Until(mc.Until).Seconds() + 0.999); got <= 599 || got > 600 {
+		t.Errorf("default soft cooldown model_remaining_sec=%d want 600", got)
 	}
 }
 
@@ -1008,8 +1007,8 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, ok := p.Status("bad")
-	if !ok || !st.Cooling {
-		t.Fatalf("bad should be cooling: %+v ok=%v", st, ok)
+	if !ok || !st.CreditsExhausted {
+		t.Fatalf("bad should be credits-exhausted: %+v ok=%v", st, ok)
 	}
 	if st.Reason != "余额不足" {
 		t.Errorf("reason=%q", st.Reason)
@@ -1024,7 +1023,7 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	}
 	// 立即换号成功：good 被选中。
 	stGood, _ := p.Status("good")
-	if stGood.Cooling || stGood.Disabled {
+	if stGood.Cooling || stGood.CreditsExhausted || stGood.Disabled {
 		t.Errorf("good should stay healthy: %+v", stGood)
 	}
 }
@@ -1675,7 +1674,7 @@ func TestStatusPortraitFields(t *testing.T) {
 	p.NoteSuccess("u1")
 	p.NoteSuccess("u1")
 	p.NoteError("u1") // 记录 last_err + err_total（累计，不冷却）
-	p.Cooldown("u1", pool.CoolSoft, time.Hour, "429 rate limit")
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
@@ -1692,8 +1691,8 @@ func TestStatusPortraitFields(t *testing.T) {
 		t.Fatalf("accounts=%d", len(body.Accounts))
 	}
 	st := body.Accounts[0]
-	if !st.Cooling || st.CoolKind != "soft_rate" || st.CoolRemaining <= 0 {
-		t.Errorf("cooling portrait=%+v", st)
+	if st.Cooling || !st.CreditsExhausted || st.CoolKind != "hard_credit" || st.CoolRemaining <= 0 {
+		t.Errorf("credits-exhausted portrait=%+v", st)
 	}
 	if st.SuccessCount != 2 {
 		t.Errorf("success_count=%d want 2", st.SuccessCount)
@@ -1832,10 +1831,23 @@ func TestChatAllRateLimitedPassesThroughUpstream(t *testing.T) {
 	}
 	// 两个号都被限流冷却（换号过程完整跑完仍无健康号）。
 	for _, uid := range []string{"u1", "u2"} {
-		if st, _ := p.Status(uid); !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Errorf("%s should be soft_rate cooling: %+v", uid, st)
+		st, _ := p.Status(uid)
+		if st.Cooling || len(st.RateLimitedModels) == 0 {
+			t.Errorf("%s should be model-limited (not account-cooled): %+v", uid, st)
 		}
 	}
+}
+
+// findLimitedModel 在 /status 的模型限流台账里找指定模型的条目（找不到即失败）。
+func findLimitedModel(t *testing.T, models []pool.RateLimitedModel, name string) pool.RateLimitedModel {
+	t.Helper()
+	for _, m := range models {
+		if m.Model == name {
+			return m
+		}
+	}
+	t.Fatalf("模型 %s 未出现在限流台账: %+v", name, models)
+	return pool.RateLimitedModel{}
 }
 
 // TestHealthzEmptyPool 空池（healthy=0）→ 503，表示暂不可服务。
@@ -2373,7 +2385,7 @@ func TestStatusRealmTotals(t *testing.T) {
 		&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
 		&auth.Auth{UID: "g2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
 	)
-	p.Cooldown("cn2", pool.CoolSoft, time.Hour, "429 rate limit")
+	p.Cooldown("cn2", pool.CoolHard, time.Hour, "余额不足")
 	p.Disable("g2", "session dead")
 
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
@@ -2383,22 +2395,27 @@ func TestStatusRealmTotals(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	var body struct {
-		Total, Healthy, Cooling, Disabled int
-		RealmTotals                       map[string]map[string]int `json:"realm_totals"`
+		Total            int                    `json:"total"`
+		Healthy          int                    `json:"healthy"`
+		Cooling          int                    `json:"cooling"`
+		CreditsExhausted int                    `json:"credits_exhausted"`
+		Disabled         int                    `json:"disabled"`
+		RealmTotals      map[string]map[string]int `json:"realm_totals"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v body=%s", err, rec.Body)
 	}
-	// 既有汇总键零回归：全池 = 4 账号。
-	if body.Total != 4 || body.Healthy != 2 || body.Cooling != 1 || body.Disabled != 1 {
-		t.Errorf("summary = %d/%d/%d/%d want 4/2/1/1 (zero regression)", body.Total, body.Healthy, body.Cooling, body.Disabled)
+	// 2026-10-18：积分不足从 cooling 拆出来单列（cooling 只剩熔断这一类）。
+	if body.Total != 4 || body.Healthy != 2 || body.Cooling != 0 || body.CreditsExhausted != 1 || body.Disabled != 1 {
+		t.Errorf("summary = %d/%d/%d/%d/%d want 4/2/0/1/1",
+			body.Total, body.Healthy, body.Cooling, body.CreditsExhausted, body.Disabled)
 	}
 	if body.RealmTotals == nil {
 		t.Fatal("realm_totals missing from /status")
 	}
 	cn := body.RealmTotals["cn"]
-	if cn["total"] != 2 || cn["healthy"] != 1 || cn["cooling"] != 1 || cn["disabled"] != 0 {
-		t.Errorf("realm_totals.cn=%v want total=2 healthy=1 cooling=1 disabled=0", cn)
+	if cn["total"] != 2 || cn["healthy"] != 1 || cn["cooling"] != 0 || cn["credits_exhausted"] != 1 || cn["disabled"] != 0 {
+		t.Errorf("realm_totals.cn=%v want total=2 healthy=1 cooling=0 credits_exhausted=1 disabled=0", cn)
 	}
 	g := body.RealmTotals["global"]
 	if g["total"] != 2 || g["healthy"] != 1 || g["cooling"] != 0 || g["disabled"] != 1 {
@@ -2417,8 +2434,11 @@ func TestHealthzRealmServable(t *testing.T) {
 		&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
 		&auth.Auth{UID: "g2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
 	)
-	// global 全冷却（一软一硬），cn 空闲。
-	p.Cooldown("g1", pool.CoolSoft, time.Hour, "429 rate limit")
+	// global 全不可用（一个熔断、一个积分不足），cn 空闲。
+	// 2026-10-18：CoolSoft 账号级冷却已取消，这里用熔断表达「该域没有能用的号」。
+	p.NoteError("g1")
+	p.NoteError("g1")
+	p.NoteError("g1") // 达 breakerThreshold → 熔断
 	p.Cooldown("g2", pool.CoolHard, time.Hour, "余额不足")
 
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
@@ -2549,5 +2569,101 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	}
 	if strings.Contains(out, prompt.Degraded) {
 		t.Errorf("custom request must NOT use Degraded prompt even in degrade period: %s", out)
+	}
+}
+
+// TestProbeModelCoolingRecoversAndKeeps 手动检测模型冷却：
+//   - 上游已放行 → 探测成功，且该模型无上游墙钟的限流记录被清掉；
+//   - 上游仍限流 → 探测确认仍被限流，记录保留（并如实回填新的解除时刻）。
+func TestProbeModelCoolingRecoversAndKeeps(t *testing.T) {
+	cases := []struct {
+		name     string
+		behavior func() (int, string, bool)
+		wantCleared bool
+		wantLimited bool
+	}{
+		{
+			name:     "upstream recovered",
+			behavior: func() (int, string, bool) { return 200, sseOK, true },
+			wantCleared: true,
+			wantLimited: false,
+		},
+		{
+			name: "still rate limited",
+			behavior: func() (int, string, bool) {
+				return 429, `{"code":1,"msg":"The model provider is rate-limiting requests."}`, false
+			},
+			wantCleared: false,
+			wantLimited: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := pool.New("")
+			p.Add(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+			// 无上游墙钟的退避条目（ResetAt 零值）——正是 ClearModelLimit 可清的那类。
+			p.CooldownSoftRateForModel("u1", 30*time.Minute, time.Time{}, "glm-5.2", "429 rate limit")
+			h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+				return tc.behavior()
+			})})
+
+			rec := httptest.NewRecorder()
+			// 管理端点只挂在本机 socket 上，测试走 InternalHandler 注入的上下文。
+			h.InternalHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/accounts/probe-model",
+				strings.NewReader(`{"uid":"u1","model":"glm-5.2"}`)))
+			if rec.Code != 200 {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			var resp struct {
+				OK      bool   `json:"ok"`
+				Limited bool   `json:"limited"`
+				Cleared bool   `json:"cleared"`
+				ProbeOK bool   `json:"probe_ok"`
+				Until   string `json:"until"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+			}
+			if !resp.OK || resp.Limited != tc.wantLimited || resp.Cleared != tc.wantCleared {
+				t.Fatalf("resp=%+v want limited=%t cleared=%t", resp, tc.wantLimited, tc.wantCleared)
+			}
+			_, _, stillLimited := p.ModelLimitedUntil("u1", "glm-5.2")
+			if stillLimited != tc.wantLimited {
+				t.Errorf("pool limited=%t want %t", stillLimited, tc.wantLimited)
+			}
+			if tc.wantLimited && resp.Until == "" {
+				t.Error("仍限流时应回填解除时刻")
+			}
+		})
+	}
+}
+
+// TestProbeModelCoolingKeepsAuthoritativeWindow 带上游权威墙钟的 6004 条目**不因一次成功而清除**：
+// 上游明确说该模型要到某时刻才恢复，本地一次成功不足以推翻（可能是别的副本/通道）。
+func TestProbeModelCoolingKeepsAuthoritativeWindow(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+	reset := time.Now().Add(3 * time.Hour)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.2", "6004 model rate limit")
+	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})})
+
+	rec := httptest.NewRecorder()
+	h.InternalHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/accounts/probe-model",
+		strings.NewReader(`{"uid":"u1","model":"glm-5.2"}`)))
+	var resp struct {
+		Cleared bool `json:"cleared"`
+		Limited bool `json:"limited"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if resp.Cleared || !resp.Limited {
+		t.Fatalf("权威墙钟条目不应被一次成功清除: %+v", resp)
+	}
+	until, _, ok := p.ModelLimitedUntil("u1", "glm-5.2")
+	if !ok || until.Sub(reset).Abs() > time.Second {
+		t.Errorf("条目应保持在上游墙钟 %v，实际 %v ok=%t", reset, until, ok)
 	}
 }

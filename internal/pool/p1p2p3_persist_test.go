@@ -231,20 +231,26 @@ func TestStatusOfClearsExpiredReason(t *testing.T) {
 }
 
 // TestStatusOfKeepsReasonWhenCooling until 在未来时，status 的 reason 正常透出。
+//
+// 2026-10-18 改：账号级 until 只承载积分不足（CoolHard），它不算「冷却」，
+// 但要作为 CreditsExhausted + reason 透出，供面板显示「余额不足 · 免费模型仍可用」。
 func TestStatusOfKeepsReasonWhenCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 
 	st, _ := p.Status("u1")
-	if st.Reason != "429 rate limit" {
-		t.Errorf("冷却中 status reason=%q want %q", st.Reason, "429 rate limit")
+	if st.Reason != "余额不足" {
+		t.Errorf("积分不足 status reason=%q want %q", st.Reason, "余额不足")
 	}
-	if !st.Cooling {
-		t.Error("冷却中 Cooling 应 true")
+	if st.Cooling {
+		t.Error("积分不足不是冷却：Cooling 应 false")
 	}
-	if st.CoolKind != "soft_rate" {
-		t.Errorf("冷却中 CoolKind=%q want soft_rate", st.CoolKind)
+	if !st.CreditsExhausted {
+		t.Error("积分不足应透出 CreditsExhausted=true")
+	}
+	if st.CoolKind != CoolHard.String() {
+		t.Errorf("积分不足 CoolKind=%q want %q", st.CoolKind, CoolHard.String())
 	}
 }
 

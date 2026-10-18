@@ -15,6 +15,13 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// CooldownTestModel 是限流类用例统一使用的模型名。
+//
+// 2026-10-18：账号级限流冷却已删除（用户要求「不要账号冷却，只要模型冷却和积分不足」），
+// pool 不再有 CooldownSoftRate(uid, base, reset, reason) 这种无模型入口——限流一律记在
+// 具体模型上。测试必须显式传模型名，用本常量避免每处重复字面量。
+const CooldownTestModel = "test-model"
+
 // withNoPickGap 临时关闭防并发撞号窗口（minPickGap=0），让纯加权分布测试不受影响。
 func withNoPickGap(t *testing.T) {
 	t.Helper()
@@ -321,8 +328,9 @@ func TestCooldownPersists(t *testing.T) {
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	st, ok := p2.Status("u1")
-	if !ok || !st.Cooling || st.Reason != "余额不足" {
-		t.Fatalf("cooldown lost after reload: %+v ok=%v", st, ok)
+	// 余额不足不是冷却（2026-10-18 取消账号级冷却），由 CreditsExhausted 表达。
+	if !ok || !st.CreditsExhausted || st.Reason != "余额不足" {
+		t.Fatalf("credits-exhausted state lost after reload: %+v ok=%v", st, ok)
 	}
 }
 
@@ -361,8 +369,8 @@ func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 0)
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatal("zero credits should stay cooling")
+	if !st.CreditsExhausted {
+		t.Fatal("zero credits should stay credits-exhausted")
 	}
 }
 
@@ -489,8 +497,8 @@ func TestCoolKindPersistsAcrossReload(t *testing.T) {
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	st, ok := p2.Status("u1")
-	if !ok || !st.Cooling {
-		t.Fatalf("cooldown state lost after reload: %+v ok=%v", st, ok)
+	if !ok || !st.CreditsExhausted {
+		t.Fatalf("credits-exhausted state lost after reload: %+v ok=%v", st, ok)
 	}
 	if st.CoolKind != "hard_credit" {
 		t.Errorf("cool_kind after reload=%q want hard_credit", st.CoolKind)
@@ -630,8 +638,12 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 	if !ok {
 		t.Fatal("no status")
 	}
-	if !st.Cooling {
-		t.Fatalf("should be cooling: %+v", st)
+	// 余额不足不是冷却：Cooling 必须为 false，状态由 CreditsExhausted 表达。
+	if st.Cooling {
+		t.Errorf("余额不足不应标成冷却: %+v", st)
+	}
+	if !st.CreditsExhausted {
+		t.Fatalf("should be credits-exhausted: %+v", st)
 	}
 	if st.Reason != "余额不足" {
 		t.Errorf("reason=%q", st.Reason)
@@ -669,88 +681,101 @@ func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 软冷却指数退避（softStreak）
+// 模型级限流退避（原「账号级软冷却」块，2026-10-18 改为模型维度）
 // ---------------------------------------------------------------------------
+//
+// 账号级限流冷却已删除：429 一律记在被限流的那个模型上，账号对其他模型照常可用。
+// 这些用例因此断言「模型台账的 until」，而不是「账号 Cooling」。
 
-// wantCoolSec 断言账号当前冷却剩余秒数 ≈ want（±tol 秒，容忍测试内的 tick 漂移）。
-func wantCoolSec(t *testing.T, p *Pool, uid string, want int64, tol int64) {
+// wantModelCoolSec 断言账号对 model 的模型级冷却剩余 ≈ want（±tol 秒），
+// 且账号本身**未被整体冷却**。
+func wantModelCoolSec(t *testing.T, p *Pool, uid, model string, want int64, tol int64) {
 	t.Helper()
 	st, ok := p.Status(uid)
 	if !ok {
 		t.Fatalf("status(%s) missing", uid)
 	}
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("%s should be in soft_rate cooling: %+v", uid, st)
+	if st.Cooling {
+		t.Fatalf("%s 不应因模型限流被整体冷却: %+v", uid, st)
 	}
-	if got := st.CoolRemaining; got < want-tol || got > want+tol {
-		t.Errorf("cool_remaining_sec=%d want ~%d (±%d)", got, want, tol)
+	var got int64 = -1
+	for _, m := range st.RateLimitedModels {
+		if m.Model == model {
+			got = int64(time.Until(m.Until).Seconds() + 0.999)
+		}
+	}
+	if got < 0 {
+		t.Fatalf("%s 的模型 %s 未出现在限流台账: %+v", uid, model, st.RateLimitedModels)
+	}
+	if got < want-tol || got > want+tol {
+		t.Errorf("model_remaining_sec=%d want ~%d (±%d)", got, want, tol)
 	}
 }
 
-// TestCooldownSoftBoundedBackoffIfNotCooling 无重置时间的 429 仍有界退避：
-// 软冷却**从非冷却态**触发时按 2 倍指数增长（封顶 1h 本用例不触及），softStreak
-// 计数随新冷却递增。退避只在**进入一次新冷却**时发生——冷却中途的兜底探测不推进
-// （见 TestCooldownSoftRateNoDoubleWhenAlreadyCooling），既保留「无权威时间时的有界
-// 退避」，又废除「越重试越冷」。
+// TestCooldownSoftBoundedBackoffIfNotCooling 无重置时间的 429 在**该模型**上有界退避：
+// 从非冷却态触发时按 2 倍增长（本用例封顶 1h 不触及），命中计数随新冷却递增；
+// 冷却中途的兜底探测不推进（见 TestCooldownSoftRateNoDoubleWhenAlreadyCooling）。
 func TestCooldownSoftBoundedBackoffIfNotCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(time.Hour) // 封顶 1h：本用例三步（600/1200/2400）都不触及
+	p.SetSoftRateMax(time.Hour)
 
 	for i, want := range []int64{600, 1200, 2400} {
-		// 软冷却到期（until 过期）后再触发新冷却 → 退避继续推进。
 		p.forceSoftExpired("u1")
-		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit")
-		wantCoolSec(t, p, "u1", want, 3)
-		if st, _ := p.Status("u1"); st.SoftStreak != i+1 {
-			t.Errorf("after call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+		wantModelCoolSec(t, p, "u1", CooldownTestModel, want, 3)
+		if hits := p.byUID["u1"].modelCooldowns[CooldownTestModel].Hits; hits != i+1 {
+			t.Errorf("after call %d: hits=%d want %d", i+1, hits, i+1)
 		}
 	}
 }
 
-// TestCooldownSoftRateResetTimeAligns 带权威重置时间的账号级软冷却：写 until 对齐到
-// 上游重置墙钟、绝不 touch softStreak（旧实现每次都 softStreak++），且不走退避。
+// TestCooldownSoftRateResetTimeAligns 带权威重置时间的限流：模型级 until 对齐到
+// 上游重置墙钟、不做退避、不碰账号级 until。
 func TestCooldownSoftRateResetTimeAligns(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	reset := time.Now().Add(30 * time.Minute) // 远超 600s 基数，对齐将远超退避基数
-	p.SetSoftRateMax(time.Hour)               // reset 在封顶内，不被截断
+	reset := time.Now().Add(30 * time.Minute)
+	p.SetSoftRateMax(time.Hour)
 
-	p.CooldownSoftRate("u1", 600*time.Second, reset, "429 rate limit")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, reset, CooldownTestModel, "429 rate limit")
 	st, _ := p.Status("u1")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("应为 soft_rate 冷却: %+v", st)
+	if st.Cooling || !st.Until.IsZero() {
+		t.Errorf("限流不得写账号级冷却: %+v", st)
 	}
-	if st.SoftStreak != 0 {
-		t.Errorf("带重置时间的 429 绝不 softStreak 堆加，soft_streak=%d want 0", st.SoftStreak)
+	mc, ok := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+	if !ok {
+		t.Fatal("模型冷却未写入")
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v（精确对齐，无退避）", st.Until, reset)
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("模型 until=%v want ~reset=%v（精确对齐，无退避）", mc.Until, reset)
 	}
-	if len(st.RateLimitedModels) != 0 {
-		t.Errorf("账号级 CooldownSoftRate 不写模型台账: %+v", st.RateLimitedModels)
+	if mc.Hits != 0 {
+		t.Errorf("带重置时间不累计命中次数，hits=%d want 0", mc.Hits)
 	}
 }
 
 // TestCooldownSoftRateNoDoubleWhenAlreadyCooling 核心回归：冷却中的兜底探测再次撞 429
-// **不得**翻倍/延长（旧实现每次都 softStreak++ 指数翻倍，把全池推到 2h 封顶）。
+// **不得**翻倍/延长（旧实现每次都累加指数，把全池推到封顶）。
 func TestCooldownSoftRateNoDoubleWhenAlreadyCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour)
 
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit") // streak=1, until≈now+600s
-	wantCoolSec(t, p, "u1", 600, 3)
-	if st, _ := p.Status("u1"); st.SoftStreak != 1 {
-		t.Fatalf("soft_streak=%d want 1", st.SoftStreak)
-	}
-	// 冷却中重复触发（兜底探测）→ 时长/streak 均不变。
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+	first := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+
+	// 冷却中重复触发（兜底探测）→ 时长与命中次数均不变。
 	for i := 0; i < 3; i++ {
-		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit")
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
 	}
-	wantCoolSec(t, p, "u1", 600, 3)
-	if st, _ := p.Status("u1"); st.SoftStreak != 1 {
-		t.Fatalf("already-cooling probe must not advance soft_streak, got %d", st.SoftStreak)
+	again := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+	if again.Hits != first.Hits {
+		t.Errorf("冷却中探测不得推进命中次数: %d → %d", first.Hits, again.Hits)
+	}
+	if again.Until.After(first.Until.Add(time.Second)) {
+		t.Errorf("冷却中探测不得延长 until: %v → %v", first.Until, again.Until)
 	}
 }
 
@@ -759,14 +784,14 @@ func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(250 * time.Second)
 
-	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 100, 3)
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 100, 3)
 	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 200, 3)
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 200, 3)
 	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 250, 3)
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 250, 3)
 }
 
 func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
@@ -775,10 +800,10 @@ func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	for i, want := range []int64{600, 1200, 2400, 4800, 7200} {
 		p.forceSoftExpired("u1")
-		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-		wantCoolSec(t, p, "u1", want, 3)
-		if st, _ := p.Status("u1"); st.SoftStreak != i+1 {
-			t.Errorf("soft_streak=%d want %d", st.SoftStreak, i+1)
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+		wantModelCoolSec(t, p, "u1", CooldownTestModel, want, 3)
+		if hits := p.byUID["u1"].modelCooldowns[CooldownTestModel].Hits; hits != i+1 {
+			t.Errorf("hits=%d want %d", hits, i+1)
 		}
 	}
 }
@@ -791,121 +816,64 @@ func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 	p.SetSoftRateMax(-time.Second)
 	for i := 0; i < 6; i++ {
 		p.forceSoftExpired("u1")
-		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
 	}
-	wantCoolSec(t, p, "u1", 7200, 3) // 仍是 2h 封顶（第 6 步 19200s → 7200s）
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 7200, 3) // 仍是 2h 封顶
 }
 
 func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
-	// 成功即证明账号恢复 → streak 归零，下次软冷却回到基数。
+	// 成功即证明该模型恢复 → 清掉该模型的限流记录，下次从基数重来。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
 	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 1200, 3)
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 1200, 3)
 
 	p.NoteSuccess("u1")
-	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
-		t.Fatalf("success should reset soft_streak, got %d", st.SoftStreak)
+	// 限流是模型维度的状态，NoteSuccess 不清它（它不知道是哪个模型成功）。
+	// 由 handler 在成功路径调用 ClearModelLimit(uid, model)；这里直接验证该入口。
+	p.ClearModelLimit("u1", CooldownTestModel)
+	if st, _ := p.Status("u1"); len(st.RateLimitedModels) != 0 {
+		t.Fatalf("成功后应清限流台账，仍有 %+v", st.RateLimitedModels)
 	}
 	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
 }
 
 func TestCooldownSoftStreakPreservedByCreditRecovery(t *testing.T) {
-	// 余额查询只证明积分恢复，不能清掉软限流、退避计数或熔断。
+	// 余额查询只证明积分恢复，不能清掉模型限流或熔断。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
 	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
 	failsBefore := p.breakerFails("u1")
 
 	p.ReenableIfCredits("u1", 500)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 2 {
-		t.Errorf("credit recovery should preserve soft_streak=2, got %d", st.SoftStreak)
-	}
-	if !st.Cooling {
-		t.Errorf("credit recovery should preserve rate-limit cooling: %+v", st)
+	if len(st.RateLimitedModels) != 1 {
+		t.Errorf("credit recovery should preserve model rate limit, got %+v", st.RateLimitedModels)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
-
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 1200, 3)
 }
 
-func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
-	// 硬冷却（余额耗尽）时长由签到时点决定，不参与软退避指数。
-	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownUntilTomorrow4AM("u1", "余额不足")
-	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
-		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
-	}
-	// A rate-limit error cannot itself recover an exhausted balance. Observe
-	// actual credit recovery before testing the next independent soft streak.
-	p.ReenableIfCredits("u1", 500)
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
-}
-
-func TestSoftStreakPersistsAcrossReload(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "state.json")
-	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	p.forceSoftExpired("u1")
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	p.Flush()
-
-	raw, err := os.ReadFile(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"soft_streak"`) {
-		t.Fatalf("state.json missing soft_streak:\n%s", raw)
-	}
-
-	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
-	if st, _ := p2.Status("u1"); st.SoftStreak != 2 {
-		t.Fatalf("soft_streak after reload=%d want 2", st.SoftStreak)
-	}
-	// 退避从持久化的 streak 继续：第 3 次 → 2400s。
-	p2.forceSoftExpired("u1")
-	p2.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p2, "u1", 2400, 3)
-}
-
-func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
-	// 旧 state.json 无 soft_streak → 零值兼容，退避从基数重新开始。
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "state.json")
-	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":100}}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
-	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
-		t.Fatalf("legacy file should load soft_streak=0, got %d", st.SoftStreak)
-	}
-	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
-}
-
-// forceSoftExpired 把账号的软冷却强制标记为已到期（until 归零、保留 coolKind=soft），
-// 让下一次 CooldownSoftRate 视作「新限流」继续推进退避，而不依赖真实 sleep。仅测试用。
+// forceSoftExpired 把账号的**账号级**冷却与所有模型级冷却强制标记为已到期，
+// 让下一次 CooldownSoftRateForModel 视作「新限流」继续推进退避，而不依赖真实 sleep。
+// 仅测试用。
 func (p *Pool) forceSoftExpired(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.until = time.Time{}
+		for m := range e.modelCooldowns {
+			mc := e.modelCooldowns[m]
+			mc.Until = time.Time{}
+			e.modelCooldowns[m] = mc
+		}
 	}
 }
 
@@ -959,19 +927,20 @@ func TestCooldownSoftForModelHonorsResetOverSoftRateMax(t *testing.T) {
 }
 
 func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
-	// 无解析时间（resetAt 零值）→ 退回账号级有界退避；冷却中的兜底探测不翻倍。
+	// 无解析时间（resetAt 零值）→ 记在**模型**上做有界退避；冷却中的兜底探测不翻倍。
+	// model 为空时只记观测、不施加冷却（账号级冷却已取消）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour)
-	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
-	wantCoolSec(t, p, "u1", 600, 3)
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
 	// 仍在冷却中：兜底探测不推进退避。
-	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
-	wantCoolSec(t, p, "u1", 600, 3)
-	// 软冷却到期后：续一次新限流 → 退避推进到 1200s。
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+	// 模型冷却到期后：续一次新限流 → 退避推进到 1200s。
 	p.forceSoftExpired("u1")
-	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
-	wantCoolSec(t, p, "u1", 1200, 3)
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 1200, 3)
 }
 
 // TestPickExcludingForModelSkipsSoftCoolingSameModel 冷却中账号（6004 带解析时间，
@@ -1008,18 +977,24 @@ func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
 
 // TestCooldownSoftWithoutModelRecordsNone 非 6004 的普通软冷却（resetAt 零值，
 // 不写 modelCooldowns）→ 退回账号级 until 冷却，不因模型切换而豁免（现状语义）。
+// 没给模型名的限流：只记错误观测，不施加任何冷却。
+//
+// 2026-10-18 改：账号级限流冷却已取消。此前这条路径退回账号级冷却、把整号摘掉，
+// 现在它的语义是「归不到模型 → 不冷却」，账号照常可选。
 func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
 	p.SetCredits("u1", 1000)
-	p.SetCredits("u2", 1)
-	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "429 rate limit")
-	// 冷却中 + 不同 model 请求仍跳过 u1（无模型级冷却条目，不豁免）。
-	got := p.PickExcludingForRealm(nil, "hy3-x", "")
-	if got == nil || got.UID != "u2" {
-		t.Fatalf("no model recorded → must not bypass, got %+v", got)
+	st, _ := p.Status("u1")
+	if st.Cooling || st.CreditsExhausted || !st.Until.IsZero() || len(st.RateLimitedModels) != 0 {
+		t.Errorf("无模型名不得写任何冷却状态: %+v", st)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("仍应记录 last_err")
+	}
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
+		t.Errorf("账号应仍可选，got %+v", got)
 	}
 }
 
@@ -1059,14 +1034,13 @@ func TestServableNowModelExemptCounts(t *testing.T) {
 	}
 }
 
+// 账号级 CoolSoft 已取消：调用它不产生任何不可用，ServableNow 仍为 true。
 func TestServableNowPlainSoftNotExempt(t *testing.T) {
-	// 普通软冷却（无 modelCooldowns，非 6004 模型级）→ 账号级不可用，ServableNow 必须 false。
-	// 守门：豁免不得从模型级泄漏到普通冷却。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
-	if p.ServableNow() {
-		t.Fatal("plain soft cooling (no model) must NOT be servable")
+	if !p.ServableNow() {
+		t.Fatal("账号级 CoolSoft 已取消，不应让池变成不可服务")
 	}
 }
 
@@ -1112,17 +1086,15 @@ func TestModelCooldownsPreservedByPlainCooldown(t *testing.T) {
 	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
 		t.Fatalf("precondition: different-model should bypass, got %+v", got)
 	}
-	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
-	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
+	// 2) 账号级 CoolSoft 已取消：再调一次也不会把整号摘掉。
+	p.NoteSuccess("u1")
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
-	// 3) 换模型请求仍服从账号级冷却。
-	got := p.PickExcludingForRealm(nil, "hy3-x", "")
-	if got == nil || got.UID != "u2" {
-		t.Fatalf("plain cooldown must block other models too, got %+v", got)
+	if st, _ := p.Status("u1"); st.Cooling || !st.Until.IsZero() {
+		t.Fatalf("CoolSoft 不得写账号级冷却: %+v", st)
 	}
-	p.forceSoftExpired("u1")
+	// 3) 换模型请求仍命中旧的 glm-5.3 模型冷却（模型冷却不因账号级调用被清）。
 	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u2" {
-		t.Fatalf("model limit must survive shorter account cooldown, got %+v", got)
+		t.Fatalf("model limit must survive account-cooldown call, got %+v", got)
 	}
 }
 
@@ -1267,7 +1239,7 @@ func TestList(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SetCredits("u1", 42)
-	p.Cooldown("u2", CoolSoft, time.Minute, "429")
+	p.Cooldown("u2", CoolHard, time.Minute, "余额不足")
 	list := p.List()
 	if len(list) != 2 {
 		t.Fatalf("list=%d", len(list))
@@ -1284,7 +1256,8 @@ func TestList(t *testing.T) {
 	if s1.Credits != 42 || s1.Nickname != "nick1" || s1.Disabled || s1.Cooling {
 		t.Errorf("s1=%+v", s1)
 	}
-	if !s2.Cooling || s2.Reason != "429" {
+	// 账号级只剩「积分不足」一种状态：它不是冷却，但要能从 status 读出来。
+	if s2.Cooling || !s2.CreditsExhausted || s2.Reason != "余额不足" {
 		t.Errorf("s2=%+v", s2)
 	}
 }
@@ -1556,71 +1529,62 @@ func TestBreakerExponentialBackoffCapped(t *testing.T) {
 	}
 }
 
-func TestFallbackPicksEarliestExpiry(t *testing.T) {
+// 2026-10-18：账号级冷却（以及随之而来的「全冷却兜底」）已删除。
+// 这一组用例锁定新语义：没有可用账号时如实返回 nil，不再从冷却号里兜底选一个。
+
+// 账号级 until 只表示积分不足；它不会被当成「可兜底」的冷却态。
+func TestNoFallbackForCreditsExhausted(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "late"})
 	p.Add(&auth.Auth{UID: "early"})
-	// 两个都软冷却；early 更早到期 → 兜底选 early。
-	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
-	p.Cooldown("early", CoolSoft, time.Hour, "x")
-	got := p.Pick("")
-	if got == nil || got.UID != "early" {
-		t.Fatalf("fallback should pick earliest expiry (early), got %+v", got)
+	p.Cooldown("early", CoolHard, time.Hour, "余额不足")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("积分不足的号不得被兜底选中，got %+v", got)
 	}
 }
 
 func TestFallbackSkipsDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "cooled"})
 	p.Add(&auth.Auth{UID: "dead"})
-	p.Cooldown("cooled", CoolSoft, time.Hour, "x")
-	p.Disable("dead", "session dead") // 禁用不参与兜底
-	got := p.Pick("")
-	if got == nil || got.UID != "cooled" {
-		t.Fatalf("fallback should skip disabled, got %+v", got)
-	}
-}
-
-func TestFallbackSkipsHardCooldown(t *testing.T) {
-	// D3：余额耗尽（CoolHard）号不参与兜底——调了必 402，浪费轮换并产生噪音日志。
-	p := New("")
-	p.Add(&auth.Auth{UID: "hard"})
-	p.Cooldown("hard", CoolHard, time.Hour, "余额不足")
+	p.Disable("dead", "session dead")
 	if got := p.Pick(""); got != nil {
-		t.Fatalf("hard-cooled account must not be fallback-picked, got %+v", got)
+		t.Fatalf("disabled 号不得被兜底选中，got %+v", got)
 	}
 }
 
-func TestFallbackAllHardReturnsNil(t *testing.T) {
-	// 全 hard 冷却 → 无软冷却/熔断号可兜底 → 返回 nil。
+// 模型级限流不再产生兜底：被限流的号只对该模型退避，Pick("") 传空模型名时不命中
+// modelCooled，仍可正常选出——这正是「不要账号冷却」的体现。
+func TestModelCooldownDoesNotRemoveAccountFromPick(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Hour, time.Now().Add(time.Hour), "glm-5.3", "6004")
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
+		t.Fatalf("空模型名选号不应受模型级冷却影响，got %+v", got)
+	}
+	if got := p.Pick("glm-5.3"); got != nil {
+		t.Fatalf("该模型被限流时应返回 nil（无兜底），got %+v", got)
+	}
+}
+
+func TestFallbackAllUnavailableReturnsNil(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "h1"})
 	p.Add(&auth.Auth{UID: "h2"})
 	p.Cooldown("h1", CoolHard, time.Hour, "x")
 	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
 	if got := p.Pick(""); got != nil {
-		t.Fatalf("all-hard should return nil, got %+v", got)
+		t.Fatalf("全部不可用时应返回 nil，got %+v", got)
 	}
 }
 
-func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
-	// 2026-10-15 语义修订：软冷却号参与兜底，**熔断期号不再参与**。
-	// 实测依据（VPS 事故）：上游对熔断中的号挂着不回——熔断号 8ef5d5ac 被兜底
-	// 选中后每次都等满 60s 才回 500，客户端拿到一串 total=60s 的 503。熔断是
-	// 连续 3 次 5xx 的强故障信号，「可能已恢复」的赌注不该押在它身上。
+// 熔断号同样不参与任何兜底（2026-10-15 起上游对熔断号挂着不回）。
+func TestBreakerAccountsNeverFallbackPicked(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "soft"})
 	p.Add(&auth.Auth{UID: "brk"})
-	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429")
-	p.SetBreaker(2, 5*time.Minute, 5*time.Minute) // 阈值 2：两次 NoteError 即熔断
-	p.NoteError("brk")                           // brk: fails=1
-	p.NoteError("brk")                           // brk: 熔断，breakerUntil=5m（早于 soft 的 10m）
-	got := p.Pick("")
-	if got == nil {
-		t.Fatal("软冷却号仍在兜底池里，应该能选出 soft")
-	}
-	if got.UID != "soft" {
-		t.Fatalf("熔断号 brk 不该参与兜底，应选 soft，got %+v", got)
+	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)
+	p.NoteError("brk")
+	p.NoteError("brk") // 熔断
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("熔断号不得被兜底选中，got %+v", got)
 	}
 }
 
@@ -1834,7 +1798,8 @@ func TestLoadLegacyStateFile(t *testing.T) {
 	// 旧 state.json 只含 credits/until/disabled 等老字段，缺熔断/在途/成功率新字段。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
-	legacy := `{"accounts":{"legacy":{"credits":123,"until":"2027-01-01T04:00:00+08:00","cool_kind":1,"reason":"余额不足"}}}`
+	// cool_kind=0 即 CoolHard（积分不足）——账号级唯一还在的状态。
+	legacy := `{"accounts":{"legacy":{"credits":123,"until":"2027-01-01T04:00:00+08:00","cool_kind":0,"reason":"余额不足"}}}`
 	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1844,7 +1809,7 @@ func TestLoadLegacyStateFile(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy account should load")
 	}
-	if st.Credits != 123 || !st.Cooling || st.Reason != "余额不足" {
+	if st.Credits != 123 || !st.CreditsExhausted || st.Cooling || st.Reason != "余额不足" {
 		t.Errorf("legacy state misloaded: %+v", st)
 	}
 	// 运行态新字段默认零值。
@@ -1977,4 +1942,26 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 		t.Errorf("breaker_fails=%d want 1", st.BreakerFails)
 	}
 	p.Release("u1")
+}
+
+// TestRealmRateStateIgnoresDeadAccountSoftUntil 账号级 until 若残留 CoolSoft
+// （旧版 state.json / 手工写入），不得再被当作「限流」计入 RateLimited：
+// 该字段现在只承载积分不足。模型级限流才是唯一的限流维度。
+func TestRealmRateStateIgnoresDeadAccountSoftUntil(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.mu.Lock()
+	p.byUID["u1"].until = time.Now().Add(time.Hour)
+	p.byUID["u1"].coolKind = CoolSoft
+	p.mu.Unlock()
+
+	state := p.RealmRateStateForModel("cn", "glm-5.3")
+	if state.RateLimited != 0 {
+		t.Fatalf("残留的账号级 CoolSoft 不应计入限流: %+v", state)
+	}
+	// 且它也不再让账号不可用：账号级限流冷却已不存在，旧字段是惰性残留。
+	// （读盘时 coolKind 会被规整，见 transition.go。）
+	if state.Available != 1 || state.Unavailable != 0 {
+		t.Fatalf("残留字段不得继续摘掉账号: %+v", state)
+	}
 }

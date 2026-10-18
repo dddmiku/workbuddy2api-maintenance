@@ -38,9 +38,9 @@ func newRealmTestPool(t *testing.T, realms ...string) (*Pool, []*auth.Auth) {
 
 func TestRealmRateStateAllRateLimited(t *testing.T) {
 	p, accounts := newRealmTestPool(t, "global", "global", "cn")
-	// 两个 global 都进入软冷却（无重置时间的 429 口径）。
+	// 两个 global 的**该模型**都进入软冷却（无重置时间的 429 口径）。
 	for _, account := range accounts[:2] {
-		p.CooldownSoftRate(account.UID, time.Minute, time.Time{}, "429 rate limit")
+		p.CooldownSoftRateForModel(account.UID, time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
 	}
 	state := p.RealmRateStateForModel("global", "deepseek-v4.1-flash")
 	if !state.AllRateLimited() {
@@ -61,7 +61,7 @@ func TestRealmRateStateAllRateLimited(t *testing.T) {
 func TestRealmRateStateAllowsFallbackOnBreaker(t *testing.T) {
 	p, accounts := newRealmTestPool(t, "global", "global", "cn")
 	// 一个软冷却、一个熔断：两个都不可用 → 该域没有可服务号 → 应允许回落。
-	p.CooldownSoftRate(accounts[0].UID, time.Minute, time.Time{}, "429 rate limit")
+	p.CooldownSoftRateForModel(accounts[0].UID, time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
 	p.NoteError(accounts[1].UID)
 	p.NoteError(accounts[1].UID)
 	p.NoteError(accounts[1].UID) // 达 breakerThreshold 触发熔断
@@ -112,7 +112,7 @@ func TestRealmRateStateKeepsFallbackBlockedWhenOneAccountWorks(t *testing.T) {
 	p.NoteError(accounts[1].UID)
 	p.NoteError(accounts[1].UID)
 	p.NoteError(accounts[1].UID) // 熔断
-	p.CooldownSoftRate(accounts[2].UID, time.Minute, time.Time{}, "429 rate limit")
+	p.CooldownSoftRateForModel(accounts[2].UID, time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
 
 	state := p.RealmRateStateForModel("global", "deepseek-v4.1-flash")
 	if state.Available != 1 {

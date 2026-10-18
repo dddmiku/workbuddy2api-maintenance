@@ -299,6 +299,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /accounts/revive", h.requireInternal(h.reviveAccount))
 	// 一键复活全部被停用账号（面板「全部复活」按钮）。与单号复位同族、同鉴权边界。
 	h.mux.HandleFunc("POST /accounts/revive-all", h.requireInternal(h.reviveAllAccounts))
+	// 手动检测模型冷却（面板账号行「检测模型」按钮）：对该 (账号, 模型) 发一次极小
+	// 真实请求，用来证伪「上游其实已经放行」——模型级限流没有权威到期前的自查手段，
+	// 只能靠探测。探测成功即清掉该模型的限流记录（ClearModelLimit 的同一证伪口径）。
+	h.mux.HandleFunc("POST /accounts/probe-model", h.requireInternal(h.probeModelCooling))
 	// 重复推理保护的「命中后怎么办」热切换，同样只走本机管理通道：它改变的是所有
 	// 调用方看到的行为，不能让任一调用密钥自己改。
 	h.mux.HandleFunc("GET /features/reasoning-loop", h.requireInternal(h.reasoningLoopFeature))
@@ -589,6 +593,126 @@ func (h *Handler) reviveAllAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// probeModelCooling 手动探测 (账号, 模型) 是否仍被上游限流。
+//
+// 为什么需要它：模型级冷却的时长来自上游文案里的重置墙钟，但那个墙钟只说明
+// 「上游说会在那时恢复」，并不能证明它一定会恢复。冷却期间唯一的确定性证据
+// 是发一次真实请求——成功即证伪，失败则如实延长/保持。
+//
+// 探测请求刻意做得很小（单条 user 消息、极小 max_tokens），代价是一点点积分。
+// 判定复用 Classify，与正常流量同一口径：只有 ErrSoftRate/ErrModelBlocked 之类
+// 才续期，其它成功或不可归类错误都不会误清。
+//
+// 返回 {ok, limited, cleared, until, reason, detail}：
+//   - limited=true 表示探测确认仍被限流（until/reason 回填最新状态）；
+//   - cleared=true 表示探测成功且已清掉该模型的限流记录。
+func (h *Handler) probeModelCooling(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Pool == nil || h.cfg.Upstream == nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "账号池或上游不可用"})
+		return
+	}
+	var body struct {
+		UID   string `json:"uid"`
+		Model string `json:"model"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "读取请求体失败"})
+		return
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &body); err != nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体必须是 JSON 对象"})
+		return
+	}
+	uid, model := strings.TrimSpace(body.UID), strings.TrimSpace(body.Model)
+	if uid == "" || model == "" {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "需要 uid 与 model"})
+		return
+	}
+	acct := h.cfg.Pool.AuthByUID(uid)
+	if acct == nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "账号不存在"})
+		return
+	}
+	// 去掉可能带的域前缀（global:/cn:），探测发给账号所属域的同名模型。
+	bareModel := trimRealmPrefix(model)
+	payload, err := json.Marshal(map[string]any{
+		"model":      bareModel,
+		"stream":     true,
+		"max_tokens": 1,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+	})
+	if err != nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "构造探测请求失败"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(ctx, acct, payload, "", upstream.ChatMeta{
+		GatewayRequestID: "probe-" + uid,
+	})
+	if rc != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<16))
+		_ = rc.Close()
+	}
+	detail := strings.TrimSpace(string(respBody))
+	if len(detail) > 400 {
+		detail = detail[:400] + "…"
+	}
+	// 判定：只有「明确仍是限流」才续期，其它 (成功 / 401 / 404 / 5xx / 网络错误)
+	// 都不能当成「已恢复」的证据——清掉限流记录必须有成功证据。
+	limited := false
+	if terr != nil {
+		var ue *upstream.Error
+		if errors.As(terr, &ue) {
+			limited = ue.Kind == upstream.ErrSoftRate || ue.Kind == upstream.ErrModelBlocked
+		}
+	} else if status >= 200 && status < 300 {
+		limited = false
+	} else {
+		kind := upstream.Classify(status, detail)
+		limited = kind == upstream.ErrSoftRate || kind == upstream.ErrModelBlocked
+	}
+	if limited {
+		// 探测撞上限流 → 如实把该模型重新记上（沿用入口的退避/上游墙钟口径）。
+		h.applyErrorPolicy(uid, upstream.ErrSoftRate, detail, bareModel)
+	}
+	succeeded := terr == nil && status >= 200 && status < 300
+	cleared := false
+	if succeeded {
+		// 成功即证伪：清掉该模型无上游墙钟的限流条目（有权威墙钟的仍保留）。
+		before, _, had := h.cfg.Pool.ModelLimitedUntil(uid, bareModel)
+		h.cfg.Pool.ClearModelLimit(uid, bareModel)
+		after, _, still := h.cfg.Pool.ModelLimitedUntil(uid, bareModel)
+		cleared = had && (!still || !after.Equal(before))
+	}
+	until, reason, stillLimited := h.cfg.Pool.ModelLimitedUntil(uid, bareModel)
+	result := map[string]any{
+		"ok":       true,
+		"limited":  stillLimited,
+		"cleared":  cleared,
+		"status":   status,
+		"model":    bareModel,
+		"detail":   detail,
+		"probe_ok": succeeded,
+	}
+	if stillLimited {
+		result["until"] = until.Format(time.RFC3339)
+		result["reason"] = reason
+	}
+	_ = writeJSON(w, http.StatusOK, result)
+}
+
+// trimRealmPrefix 去掉模型名里的域前缀（global:/cn:/trae:）。
+func trimRealmPrefix(model string) string {
+	for _, prefix := range []string{"global:", "cn:", "trae:"} {
+		if strings.HasPrefix(model, prefix) {
+			return strings.TrimPrefix(model, prefix)
+		}
+	}
+	return model
+}
+
 // updateCheck 查询远端最新版本（只读，不改动任何东西）。
 func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Update == nil {
@@ -683,7 +807,7 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
-	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
+	total, healthy, _, _, _, _ := h.cfg.Pool.CountsDetailed()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
@@ -711,7 +835,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+	total, healthy, cooling, creditsExhausted, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
@@ -727,15 +851,16 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		realmTotals[realm] = countsMapFrom(h.cfg.Pool.CountsDetailedForRealm(realm))
 	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
-		"realm_totals":    realmTotals,
-		"sticky_sessions": sticky,
-		"redis_mode":      redisMode,
+		"accounts":          h.cfg.Pool.List(),
+		"total":             total,
+		"healthy":           healthy,
+		"cooling":           cooling,
+		"credits_exhausted": creditsExhausted,
+		"disabled":          disabled,
+		"in_flight_full":    inFlightFull,
+		"realm_totals":      realmTotals,
+		"sticky_sessions":   sticky,
+		"redis_mode":        redisMode,
 		// paid_models：当前判定为付费（积分倍率 > 0）的模型数，以及其中本域可服务的
 		// 模型名（供运维确认「付费模型优先消耗快过期积分」是否真的生效）。
 		// 只读展示，不影响任何选号状态；未注入倍率表时为 0。
@@ -743,14 +868,15 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
-func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
+// countsMapFrom 把 CountsDetailed 六元组编码为 /status realm_totals 的字段对象。
+func countsMapFrom(total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) map[string]int {
 	return map[string]int{
-		"total":          total,
-		"healthy":        healthy,
-		"cooling":        cooling,
-		"disabled":       disabled,
-		"in_flight_full": inFlightFull,
+		"total":             total,
+		"healthy":           healthy,
+		"cooling":           cooling,
+		"credits_exhausted": creditsExhausted,
+		"disabled":          disabled,
+		"in_flight_full":    inFlightFull,
 	}
 }
 
@@ -2125,6 +2251,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.cfg.Pool.NoteSuccess(acct.UID)
 			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			// 成功即证明该模型已恢复：清掉无上游墙钟的限流条目（见 ClearModelLimit）。
+			h.cfg.Pool.ClearModelLimit(acct.UID, bareModel)
 			flagReviewRejectedPeers(h.cfg.Pool, reviewRejectedUIDs, acct.UID, bareModel)
 			// 绑定用 stickyKey（含无显式会话标识客户端的正文回退键）。
 			if stickyKey != "" && h.cfg.Session != nil {
@@ -2229,6 +2357,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+		h.cfg.Pool.ClearModelLimit(acct.UID, bareModel)
 		flagReviewRejectedPeers(h.cfg.Pool, reviewRejectedUIDs, acct.UID, bareModel)
 		if stickyKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(stickyKey, acct.UID)
@@ -2317,34 +2446,30 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
-		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
-		// softStreak 指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
-		//     豁免（既有 issue #31 语义）。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
-		//     （普通账号级限流不该因切模型绕过）。
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，都精确冷却
+		// 到该墙钟、绝不 softStreak 指数堆加。
+		//
+		// 2026-10-18：**所有限流都记在模型维度**（用户要求「不要账号冷却，只要模型
+		// 冷却和积分不足」）。6004 与非 6004 的差别只是「要不要额外核对模型名」，
+		// 作用域都是被限流的那个模型——上游文案本身就在说「可以换用其他模型」。
+		// 此前非 6004 走账号级 CooldownSoftRate，会把整号对所有模型摘掉。
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			if upstream.IsModelRateLimit(body) {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
-				return
-			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 			return
 		}
 		// 6004 但没解析出重置时间（文案变体没被正则覆盖）：仍是模型级信号——账号
 		// 对其他模型健康，冷却整号会让选号池白白少一个号。走 BlockModelBackoff
 		// 的模型级有界退避（6h 基数、不写账号级 until）。此前这里无差别落进
 		// CooldownSoftRate 账号级冷却，正是「模型限流却在号上标冷却」的来源
-		// （2026-10-14 用户反馈）。已知后果：该模型 6h 内不再选这个号（宁可保守，
-		// 也不把 resetAt 臆造成零值——上游没给时间就不猜）。
+		// （2026-10-14 用户反馈）。
 		if upstream.IsModelRateLimit(body) {
 			h.cfg.Pool.BlockModelBackoff(uid, model, "6004 model rate limit (no reset time)")
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
-		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
+		// 无重置时间、也没有明确的模型级标记：仍按模型记录有界退避（base 起翻倍、
+		// 封顶 soft_rate_max）。model 为空时该入口只记错误观测、不写任何冷却——
+		// 没有模型名就无法把一次限流归到具体模型上，写账号级会误伤其他模型。
+		h.cfg.Pool.CooldownSoftRateForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "429 rate limit")
 	case upstream.ErrSessionDead:
 		// 走连续计数而非直接禁用：12153 会被临时性触发（网络抖动/上游闪断/refresh
 		// 竞态），一次即永久杀号会误杀健康号——pool.NoteSessionDead 的注释记录了
@@ -2353,9 +2478,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// Disable 叠加，使一次误判就永久停号）。连续 sessionDeadThreshold 次才禁用。
 		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrNotFound:
-		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
-		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+		// 404 短冷却，防雪崩。账号级冷却已取消（见 applyErrorPolicy 顶部），
+		// 改为**模型级**短避让：这个模型在这条路径上缺，不代表其他模型不行。
+		// 固定 notFoundCooldown，不随 soft_rate 退避——偶发路径缺失不是限流信号。
+		h.cfg.Pool.CooldownSoftRateForModel(uid, notFoundCooldown, time.Time{}, model, "upstream 404")
 	case upstream.ErrAccountFault:
 		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
 		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
@@ -2363,8 +2489,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     （NoteAccountFault）——上游也会用同一条码回内容审核拒绝，单次即杀会误伤
 		//     健康号（2026-09-27 实测两个号因此被停用）。/status 以 disabled +
 		//     disabled_reason 呈现。
-		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
-		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
+		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈。
+		//     **保持避让**（禁用会让用户补完 register 后仍无法用），但作用域收窄到模型：
+		//     账号级冷却已取消（2026-10-18），这里改记模型级。
 		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
@@ -2373,7 +2500,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.NoteAccountFault(uid)
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+		h.cfg.Pool.CooldownSoftRateForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)

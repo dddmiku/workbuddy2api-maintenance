@@ -194,16 +194,11 @@ func mergeStateAccount(base, current, latest stateAccount, intent *stateIntent) 
 		result.Disabled, result.Reason = true, latest.Reason
 		result.Until, result.CoolKind, result.SoftStreak = time.Time{}, 0, 0
 		result.ModelCooldowns = nil
-	} else if !result.Disabled && latest.CoolKind == CoolHard && time.Now().Before(latest.Until) && current.CoolKind == CoolSoft {
-		result.CoolKind, result.Until, result.Reason = latest.CoolKind, latest.Until, latest.Reason
-		result.SoftStreak = latest.SoftStreak
-	} else if !result.Disabled && latest.CoolKind == CoolSoft && time.Now().Before(latest.Until) &&
-		base.CoolKind == CoolHard && current.CoolKind == 0 {
-		// The draining instance only revived the exhausted-balance cooldown it still
-		// held in memory; that is not evidence the rate limit the other instance
-		// recorded afterwards went away. Without this branch the late revive's forced
-		// clear overwrites the newer on-disk soft cooldown, and the next restart
-		// resumes selection on a rate-limited account (2026-09-30 深度体检发现).
+	} else if !result.Disabled && latest.CoolKind == CoolHard && time.Now().Before(latest.Until) &&
+		current.CoolKind != CoolHard {
+		// 账号级只剩积分不足（CoolHard）一种状态。2026-10-18 起 CoolSoft 不再写入
+		// 账号级 until，原先两条「软冷却 vs 余额不足」的合并分支随之失效：迟到的
+		// 解冻不可能再用旧实例的软冷却覆盖新实例的余额不足。
 		result.CoolKind, result.Until, result.Reason = latest.CoolKind, latest.Until, latest.Reason
 		result.SoftStreak = latest.SoftStreak
 	}

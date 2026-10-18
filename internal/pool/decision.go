@@ -147,26 +147,38 @@ func (d *Decision) unavailableSticky(reason string) {
 }
 
 // This is the shared first-failure predicate for health and selection.
-// It preserves the existing priority: disabled, account cooldown, breaker,
-// model cooldown. No raw state reason (which could contain secrets) is copied.
+// Model-level limits and credit exhaustion are the only account-side gates;
+// there is no account-wide rate-limit cooldown (see below).
 //
 // model 非空时，「余额不足」这类账号级硬冷却对**免费模型**豁免：余额耗尽的账号
 // 只是调不了扣积分的模型，免费模型（倍率 x0.00）照常可用——把整个账号从池里摘掉
 // 会让 7 个号白白闲置（2026-10-11 用户反馈：余额不足的号仍能用免费模型）。
 // 判定用的是注入的倍率表（见 modelIsPaid），未注入时该特性整体关闭、行为不变。
+//
+// ═══ 2026-10-18：取消账号级冷却 ═══
+//
+// 用户要求「不要账号冷却，只要模型冷却和积分不足」。此前 429 无重置时间的分支会写
+// 账号级 until（CooldownSoftRate 的有界退避），把整个号从池里摘掉；而 prod 实测
+// 30 个号**全部**是 CoolHard（积分不足）、没有一个真正的账号级 429 冷却——说明这层
+// 状态在实际使用中既没被用上，又会在命中时误伤其他模型。
+//
+// 现在账号只剩三类不可用原因：
+//   - disabled：账号被停用/需重登；
+//   - circuit_breaker：连续 5xx 的强故障信号（与限流无关，仍保留）；
+//   - model_cooldown：该模型被上游限流（唯一的限流维度）；
+// 外加「积分不足」只拦扣积分的模型（不是不可用，是这一层筛选）。
 func (e *entry) unavailableReason(now time.Time, model string) string {
 	if e.disabled {
 		return "disabled"
 	}
-	// 余额不足（CoolHard）只拦扣积分的模型；免费模型不因余额被拦，但**仍要**继续
+	// 积分不足（CoolHard）只拦扣积分的模型；免费模型不因余额被拦，但**仍要**继续
 	// 判熔断与模型冷却。早先这里在免费模型分支直接 return ""，会跳出整个函数，
 	// 把后面的 breaker / modelCooled 一并跳过——「余额不足 + 该模型又被 6004
 	// 限流」的账号于是在免费模型上被放行、直接撞上游 429。注释声称「继续往下判」，
 	// 代码却没做到（2026-10-18 由模型级隔离测试发现）。
-	if !e.until.IsZero() && now.Before(e.until) {
-		if e.coolKind != CoolHard {
-			return "account_cooldown"
-		}
+	//
+	// 注意：账号级 CoolSoft（429 软冷却）已取消，这里只判 CoolHard（积分不足）。
+	if !e.until.IsZero() && now.Before(e.until) && e.coolKind == CoolHard {
 		if e.p.hardCreditBlocksModel(e.a.Realm(), model) {
 			return "account_limit"
 		}

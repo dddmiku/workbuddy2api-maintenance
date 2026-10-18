@@ -361,19 +361,26 @@ func TestServableNowModelCooldownStillServable(t *testing.T) {
 // 独立冷却：账号级 until 未到期的账号，即使该模型没有 6004 独立冷却也不可选
 // （旧实现先查 modelCooled 再查 healthy，逻辑上等价的短路位置不同；锁死新语义：
 // 全账号冷却优先）。
-func TestHealthyForModelAccountCooledBeatsModelNotCooled(t *testing.T) {
+// 2026-10-18 改：账号级限流冷却已取消，「账号冷却优先」这条前提不存在了。
+// 现在账号级 until 只表示积分不足（CoolHard），它对付费模型拦截、对免费模型放行，
+// 且模型限流在这一层之后单独判定。
+func TestHealthyForModelCreditsExhaustedBeatsModelNotCooled(t *testing.T) {
 	p := New("")
+	p.SetPaidModels(map[string]bool{"cn\x00glm-5.3": true, "cn\x00hy3-x": false})
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 全账号级 until 冷却，无 modelCooldowns
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.mu.RLock()
 	e := p.byUID["u1"]
 	p.mu.RUnlock()
 
 	if e.healthyForModel(time.Now(), "glm-5.3") {
-		t.Fatal("全账号 until 冷却中且模型无独立冷却：该模型也不可选（全账号冷却优先）")
+		t.Fatal("积分不足时付费模型不可选")
+	}
+	if !e.healthyForModel(time.Now(), "hy3-x") {
+		t.Fatal("积分不足不影响免费模型")
 	}
 	if e.healthyForModel(time.Now(), "") {
-		t.Fatal("空模型名同样不可选（等价 healthy 短路到全账号冷却）")
+		t.Fatal("空模型名视为未指定模型，按保守口径拦截")
 	}
 }
 
@@ -442,47 +449,47 @@ func TestHealthyForModelHealthyAccountNoModelCooldown(t *testing.T) {
 
 // TestHealthyForModelAccountCooledAllowsNothingAfterUntil 优先级锁死的另一端：
 // 全账号 until 冷却到期后，模型无独立冷却的请求恢复正常（模型级判定接管）。
-func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
+// 积分不足到期后自动恢复（等签到重新查积分）。
+func TestHealthyForModelCreditsExhaustedRecoversAfterUntil(t *testing.T) {
 	p := New("")
+	p.SetPaidModels(map[string]bool{"cn\x00glm-5.3": true})
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
+	p.Cooldown("u1", CoolHard, time.Millisecond, "余额不足")
 	p.mu.RLock()
 	e := p.byUID["u1"]
 	p.mu.RUnlock()
-	// until 尚未到期：不可选（优先级：全账号级先判）。
 	if e.healthyForModel(time.Now(), "glm-5.3") {
-		t.Fatal("until 冷却内不可选")
+		t.Fatal("积分不足有效期内付费模型不可选")
 	}
-	// 等 until 过期：模型无独立冷却 → 恢复可选。
 	time.Sleep(10 * time.Millisecond)
 	if !e.healthyForModel(time.Now(), "glm-5.3") {
 		t.Fatal("until 过期后应恢复可选")
 	}
 }
 
-// TestHealthyForModelPriorityViaPick 端到端：全账号冷却中的账号即使对某模型无独立冷却
-// 也不被选出；健康 + 仅该模型 6004 的账号走模型豁免（同一账号对不同模型口径分离）。
+// TestHealthyForModelPriorityViaPick 端到端：被该模型限流的账号不会被选出，
+// 而同一账号对其他模型照常可用（模型级隔离，账号不被整体摘掉）。
 func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "cooled"})
-	p.Add(&auth.Auth{UID: "exempt"})
-	p.SetCredits("cooled", 100)
-	p.SetCredits("exempt", 50)
-	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 cooled
-	p.Cooldown("cooled", CoolSoft, time.Hour, "429")    // 全账号级冷却，无模型级记录
-	p.CooldownSoftForModel("exempt", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	p.Add(&auth.Auth{UID: "limited"})
+	p.Add(&auth.Auth{UID: "healthy"})
+	p.SetCredits("limited", 100)
+	p.SetCredits("healthy", 50)
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 limited
+	p.CooldownSoftForModel("limited", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 
-	// 请求 other：cooled 被全账号冷却拦截（即使无模型独立冷却），exempt 模型豁免
-	// （6004 只锁 glm-5.3）→ 唯一候选 exempt。
-	if got := p.PickExcludingForRealm(nil, "other", ""); got == nil || got.UID != "exempt" {
-		t.Fatalf("other 模型请求应豁免 exempt（全账号冷却的 cooled 仍拦截），got %+v", got)
+	// 请求 other：limited 未被该模型限流 → 按权重选最高分的 limited。
+	if got := p.PickExcludingForRealm(nil, "other", ""); got == nil || got.UID != "limited" {
+		t.Fatalf("other 模型请求应选到权重最高的 limited，got %+v", got)
 	}
-	// 请求 glm-5.3：cooled 全账号冷却拦截；exempt 自身 6004 拦截 → 无健康候选 →
-	// 全冷却兜底只认账号级冷却（exempt 无 until/breakerUntil,expiry 零值被排除），
-	// 选 cooled（软冷却参与兜底）。
-	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "cooled" {
-		t.Fatalf("glm-5.3 请求：exempt 被自身 6004 拦截，兜底应选全账号冷却的 cooled，got %+v", got)
+	// 请求 glm-5.3：limited 被自身 6004 拦截 → 只剩 healthy。
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "healthy" {
+		t.Fatalf("glm-5.3 请求应避开被限流的 limited，got %+v", got)
+	}
+	// 账号级不被摘掉：全池对 other 仍可服务。
+	if !p.ServableNow() {
+		t.Fatal("单模型限流不应让全池不可服务")
 	}
 }
 
@@ -589,19 +596,22 @@ func TestModelCooldownsPersistRestartSkipsCooled(t *testing.T) {
 // TestCooldownSoftForModelResetNoZombieReason 带解析时间分支只写 modelCooldowns，
 // 不碰账号级 coolKind/reason 域（模型级冷却不该污染账号级 coolKind/reason）。
 // 修复 54 个号 state.json 残留「until=0001 零值 + reason=6004 model rate limit」的不一致快照。
+// 模型级限流不得污染账号级 until/coolKind（两者正交）。
+//
+// 2026-10-18 改：账号级 CoolSoft 已取消，这里改用积分不足（CoolHard）作为账号级状态，
+// 验证 6004 的重置时间分支只写 modelCooldowns、不动账号级字段。
 func TestCooldownSoftForModelResetNoZombieReason(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	// 先置一个账号级冷却（reason="429 rate limit"），再触发带解析时间的 6004。
-	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	p.Cooldown("u1", CoolHard, time.Minute, "余额不足")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	coolKind := p.byUID["u1"].coolKind
 	reason := p.byUID["u1"].reason
 	p.mu.RUnlock()
 	// 重置时间分支不应覆盖账号级 coolKind/reason（正交）。
-	if coolKind != CoolSoft || reason != "429 rate limit" {
-		t.Errorf("重置分支污染账号级域: coolKind=%v reason=%q want CoolSoft/429 rate limit", coolKind, reason)
+	if coolKind != CoolHard || reason != "余额不足" {
+		t.Errorf("重置分支污染账号级域: coolKind=%v reason=%q want CoolHard/余额不足", coolKind, reason)
 	}
 }
 
@@ -631,7 +641,11 @@ func TestPersistLazilyClearsZombieReason(t *testing.T) {
 }
 
 // TestModelCooldownsPersistCompatOldState 旧 state.json 无 modelCooldowns 字段正常加载
-// （缺字段零值，模型冷却清零退化为账号级，向后兼容）。
+// （缺字段零值 → modelCooldowns 为空）。
+//
+// 同时锁住 2026-10-18 的规整：旧文件里的 cool_kind=1（CoolSoft，账号级限流冷却）
+// 已被取消，读入时必须丢弃。否则重启后该账号会被旧代码路径当成「账号级限流」
+// 继续摘掉，与写侧（永远不会再写 CoolSoft）不一致。
 func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
@@ -644,12 +658,23 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	until := p.byUID["u1"].until
+	kind := p.byUID["u1"].coolKind
 	p.mu.RUnlock()
 	if n != 0 {
 		t.Errorf("旧文件加载后 modelCooldowns=%d want 0", n)
 	}
-	if until.IsZero() {
-		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
+	if !until.IsZero() || kind != 0 {
+		t.Errorf("旧文件的账号级 CoolSoft 必须被丢弃: until=%v kind=%v", until, kind)
+	}
+	// 余额不足（CoolHard）仍然照常恢复。
+	hard := `{"accounts":{"u2":{"credits":0,"until":"2099-01-01T00:00:00Z","cool_kind":0}}}`
+	if err := os.WriteFile(fp, []byte(hard), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u2"})
+	if st, _ := p2.Status("u2"); !st.CreditsExhausted {
+		t.Errorf("CoolHard 应照常恢复: %+v", st)
 	}
 }
 

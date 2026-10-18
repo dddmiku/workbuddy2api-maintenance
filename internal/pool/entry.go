@@ -43,13 +43,22 @@ type Status struct {
 	// CreditsExpiring 即将过期的积分子集（Credits 的一部分），由签到/积分任务按
 	// expiring_soon 窗口判定。选号权重对它额外加成以优先消耗——面板据此提示
 	// 「其中 N 即将过期」，让运维知道有积分要作废（issue:积分过期）。
-	CreditsExpiring int64     `json:"credits_expiring,omitempty"`
-	Cooling         bool      `json:"cooling"`
-	CoolKind        string    `json:"cool_kind,omitempty"`
-	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
-	Until           time.Time `json:"until,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
+	Cooling         bool  `json:"cooling"`
+	// CreditsExhausted 余额耗尽（CoolHard）。它**不算冷却**：上游没有限制这个账号，
+	// 只是积分花完了，免费模型（倍率 x0.00）照常可用，付费模型才被拦。
+	//
+	// 2026-10-18 用户看截图后指出：「账号级冷却其实没有存在的必要，都是针对模型的，
+	// 只是没有积分余额而已了」。此前把 CoolHard 也算作 Cooling，面板显示
+	// 「冷却中 · 剩 13 小时 55 分 · 余额不足（免费模型仍可用）」——「冷却中」三个字
+	// 与后面那句「免费模型仍可用」自相矛盾，且让运维以为账号被上游限流。
+	// 现在 Cooling 只表示真正的账号级限流（429）；余额不足单独由本字段表达。
+	CreditsExhausted bool      `json:"credits_exhausted,omitempty"`
+	CoolKind         string    `json:"cool_kind,omitempty"`
+	CoolRemaining    int64     `json:"cool_remaining_sec,omitempty"`
+	Until            time.Time `json:"until,omitempty"`
+	Reason           string    `json:"reason,omitempty"`
+	SoftStreak       int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// FreeModelsUsable 为 true 表示「这个号的冷却只挡住扣积分的模型，免费模型照常可用」。
 	//
 	// 只对 CoolHard（余额耗尽）成立：余额耗尽的号调不了扣积分的模型，但免费模型
@@ -279,34 +288,6 @@ func (e *entry) trimModelCooldowns() {
 		delete(e.modelCooldowns, m)
 	}
 }
-
-// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
-// 供全冷却兜底选取"最早到期"账号用。
-func (e *entry) expiry(now time.Time) time.Time {
-	var t time.Time
-	if !e.until.IsZero() && now.Before(e.until) {
-		t = e.until
-	}
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if t.IsZero() || e.breakerUntil.Before(t) {
-			t = e.breakerUntil
-		}
-	}
-	return t
-}
-
-// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryWithDecisionLocked 排除）。判定口径：
-// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
-func (e *entry) fallbackKind(now time.Time) string {
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until) {
-			return "breaker"
-		}
-	}
-	return "soft"
-}
-
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
 	Credits      int64     `json:"credits"`

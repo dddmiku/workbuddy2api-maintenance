@@ -561,6 +561,10 @@ function renderMetrics(){
   var off = a.length - on;
   var total = Number(p.total) || 0, healthy = Number(p.healthy) || 0;
   var cooling = Number(p.cooling) || 0, dis = Number(p.disabled) || 0;
+  // 余额不足（CoolHard）不是冷却——上游没限流这个号，只是没积分，免费模型照常可用。
+  // 单独计数并单独显示，避免「冷却中 N」把这两类完全不同的情况混在一起
+  // （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的」）。
+  var exhausted = Number(p.creditsExhausted) || 0;
   var runs = taskList().filter(function(t){ return t.running; }).length;
   var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
   var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
@@ -596,8 +600,11 @@ function renderMetrics(){
   } else {
     var unusable = total - healthy;
     poolSub = cooling
-      ? (unusable + ' 个不可用（' + cooling + ' 冷却中）')
-      : (unusable + ' 个不可用');
+      ? (unusable + ' 个不可用（' + cooling + ' 冷却中' +
+         (exhausted ? '、' + exhausted + ' 余额不足' : '') + '）')
+      : (exhausted
+          ? (unusable + ' 个不可用（' + exhausted + ' 余额不足）')
+          : (unusable + ' 个不可用'));
     poolCls = healthy ? 'w' : 'e';
   }
 
@@ -668,7 +675,8 @@ function renderStrip(){
 function renderPool(){
   var p = S.data.pool || {};
   var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
-  var off = Math.max(0, total - healthy - cooling - dis);
+  var exhausted = p.creditsExhausted || 0;
+  var off = Math.max(0, total - healthy - cooling - exhausted - dis);
   function w(n){ return total ? (n / total * 100) : 0; }
   // 池数据缺失（网关未就绪 / 首屏还没拿到 /status）时给一个明确的空态，
   // 而不是渲染「0 / 0 健康」加一条全空的进度条——那看起来像「池子空了」，
@@ -821,6 +829,11 @@ function acctState(a){
   if (p.disabled) return { cls:'n', text:'已停用' };
   if (a.disabled) return { cls:'n', text:'已停用' };
   if (!p.inPool) return { cls:'w', text:'不在池中' };
+  // 余额不足不是冷却：上游没限流这个号，只是没积分，免费模型照常可用。
+  // 2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，
+  // 只是没有积分余额而已」——此前这里显示「冷却中」，与同行的
+  // 「（免费模型仍可用）」自相矛盾。先判余额，再判真冷却。
+  if (p.creditsExhausted) return { cls:'w', text:'余额不足' };
   if (p.cooling) return { cls:'w', text:'冷却中' };
   if (!p.healthy) return { cls:'e', text:'异常' };
   return { cls:'ok', text:'正常' };
@@ -906,8 +919,18 @@ function renderAccounts(){
     // 侧对它豁免，见 pool.hardCreditBlocksModel）。旧文案只写「冷却中 · 余额不足」，
     // 用户会以为整个号废了、白占着名额——2026-10-15 反馈：「这种积分不足的账号，
     // 是可以用免费模型的，但是你直接冷却了，后续怎么进来这个号呢」。
+    //
+    // 2026-10-18：余额不足现在**不算冷却**（后端 creditsExhausted 单独表达），
+    // 这一行改由余额分支渲染，措辞里不再出现「冷却」二字——用户指出
+    // 「账号级冷却其实没有存在的必要，都是针对模型的，只是没有积分余额而已」。
     var freeUsable = p.freeModelsUsable === true;
     if (freeUsable) coolReasonTxt = (coolReasonTxt || '余额不足') + '（免费模型仍可用）';
+    var exhaustedSub = p.creditsExhausted
+      ? '<span class="sub" data-cool-end="' + coolEnd +
+        '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
+        esc('余额不足 · 免费模型仍可用' +
+            (p.coolRemaining ? '（' + coolLeft(p.coolRemaining) + '后重新查积分）' : '')) + '</span>'
+      : '';
     var coolSub = p.cooling
       ? '<span class="sub" data-cool-end="' + coolEnd +
         '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
@@ -939,19 +962,24 @@ function renderAccounts(){
             ? (resetTxt + '（先避让到 ' + untilTxt + '）')
             : untilTxt;
           var sec = Math.max(0, Math.ceil((new Date(m.until).getTime() - Date.now()) / 1000));
+          // 2026-10-18：模型级限流只能靠真实请求证伪（上游给的重置墙钟不保证会兑现），
+          // 每个模型行配一个「检测」按钮，发一次极小真实请求确认是否已恢复。
           return '<span class="sub rlm" title="' +
             esc(modelLimitTitle(m)) + '">' +
-            esc('模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）') + '</span>';
+            esc('模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）') +
+            '<button class="btn sm probe" data-probe="' + esc(a.uid) + '" data-probe-model="' +
+            esc(m.model || '') + '" title="发一次极小请求，确认该模型是否已恢复">检测</button>' +
+            '</span>';
         }).join('')
       : '';
-    var credSub = (!p.cooling && !rlm.length && left != null)
+    var credSub = (!p.cooling && !p.creditsExhausted && !rlm.length && left != null)
       ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
       : '';
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
       '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + realmTag(a.realm) + '</div></td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
-      coolSub + rlmSub + credSub +
+      exhaustedSub + coolSub + rlmSub + credSub +
       '</span></td>' +
       '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
       '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +
@@ -1355,6 +1383,8 @@ $('#acctRows').addEventListener('click', function(e){
   if (rv) return actRevive(rv.getAttribute('data-revive'));
   var fs = e.target.closest('[data-fission]');
   if (fs) return actFission(fs.getAttribute('data-fission'));
+  var pb = e.target.closest('[data-probe]');
+  if (pb) return actProbeModel(pb.getAttribute('data-probe'), pb.getAttribute('data-probe-model'));
   var t = e.target.closest('[data-toggle]');
   if (t) return actToggle(t.getAttribute('data-toggle'), t.getAttribute('data-disabled') === '0');
   var d = e.target.closest('[data-del]');
@@ -1595,6 +1625,21 @@ function actRevive(uid){
       }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
       finally{ busy(false); }
     });
+}
+// actProbeModel 手动检测某账号在某模型上的冷却是否已解除。
+//
+// 模型级限流没有权威到期前的自查手段：上游给的「将在 … 重置」只是它的预期，
+// 是否真放行只能发一次极小真实请求验证。成功即清掉该模型的限流记录
+// （网关侧 ClearModelLimit 的同一证伪口径），失败则如实给出新的解除时刻。
+function actProbeModel(uid, model){
+  if (!model) return;
+  busy(true);
+  api('api/account/probe-model', { uid:uid, model:model }).then(function(r){
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) loadAll();
+  }, function(err){
+    toast('检测失败：' + (err && err.message || err), 'err');
+  }).then(function(){ busy(false); });
 }
 function actFission(uid){
   ask('补发邀请奖励',

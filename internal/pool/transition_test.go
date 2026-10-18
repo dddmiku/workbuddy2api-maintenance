@@ -32,15 +32,16 @@ func coolingDomain(t *testing.T, p *Pool, uid string) (until time.Time, coolKind
 	return e.until, e.coolKind, e.reason, e.softStreak, len(e.modelCooldowns)
 }
 
-// TestTransitionDisableClearsCoolingDomain 疑点 4 修正：先冷却（软冷却 + 6004 模型级
+// TestTransitionDisableClearsCoolingDomain 疑点 4 修正：先冷却（积分不足 + 6004 模型级
 // 冷却）再 Disable → 冷却域全清（until/coolKind/reason/softStreak/modelCooldowns），
 // 只留 disabled 终态。旧实现只置 disabled+reason，会出现「disabled=true 但 cooling=true」
 // 与残留 modelCooldowns 的杂交态。
 func TestTransitionDisableClearsCoolingDomain(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")                                          // until + coolKind=soft + softStreak=1
-	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004") // modelCooldowns=1（softStreak 增到 2）
+	// 账号级只剩积分不足（CoolHard）；限流只在模型维度。
+	p.Cooldown("u1", CoolHard, 600*time.Second, "余额不足")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004") // modelCooldowns=1
 
 	_, _, reason, _, mc := coolingDomain(t, p, "u1")
 	if reason == "" || mc != 1 {
@@ -108,10 +109,10 @@ func TestTransitionDisablePreservesBreaker(t *testing.T) {
 func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 软冷却中
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足") // 积分不足中
 	until, _, _, _, _ := coolingDomain(t, p, "u1")
 	if until.IsZero() {
-		t.Fatal("precondition: 应处于软冷却")
+		t.Fatal("precondition: 应处于积分不足冷却期")
 	}
 
 	// 逐次断言：写成 `a || b || !c` 会在前两次任一为真时短路，后面对第 3 次的

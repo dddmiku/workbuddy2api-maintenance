@@ -1,18 +1,23 @@
 // 账号状态机迁移的唯一权威实现。
 //
-// entry 的「可选择性」由四个正交维度决定：禁用(disabled)、账号级冷却(until/coolKind)、
+// entry 的「可选择性」由四个正交维度决定：禁用(disabled)、积分不足(until/coolKind=CoolHard)、
 // 模型级冷却(modelCooldowns)、熔断(breakerUntil)。维度之间以「迁移原语」收拢，
 // 禁止在其他文件散写这些字段——所有入口（applyErrorPolicy / refresh / keepalive /
 // 签到 / 选号）对状态的改动都必须经本文件的原语或经 Cooldown/NoteError/NoteSuccess 等
 // 封装（它们在持锁下调用本文件原语）。
 //
+// ═══ 2026-10-18：账号级限流冷却已取消 ═══
+//
+// 用户要求「不要账号冷却，只要模型冷却和积分不足」。因此 until/coolKind 现在**只**
+// 表示 CoolHard（积分不足，等签到后重新查积分），不再承载 429 软冷却；限流一律记在
+// modelCooldowns 上。新增代码不得再把 CoolSoft 写进账号级字段（Cooldown 已直接忽略）。
+//
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
-//	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
+//	until/coolKind     ← 仅 Cooldown(CoolHard=积分不足，到次日 04:00)
 //	modelCooldowns     ← 模型限额或负缓存；到期、禁用或对应模型成功时清理
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 喂入）；NoteSuccess 清
-//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/禁用清理
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：

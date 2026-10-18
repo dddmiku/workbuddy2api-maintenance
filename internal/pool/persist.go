@@ -176,14 +176,22 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				errorEMA = float64(errTotal) / float64(obs)
 			}
 		}
+		// 账号级 until/coolKind 现在只承载积分不足（CoolHard）。旧版 state.json 里可能
+		// 残留 CoolSoft（账号级限流冷却），读入时必须丢弃：否则它会让
+		// RealmRateState/counts 等按「账号级软冷却」分支处理的旧代码继续把账号判成
+		// 不可用，而写侧已经永远不会再产生这种状态（2026-10-18 取消账号级冷却）。
+		kind, until := s.CoolKind, s.Until
+		if kind != CoolHard {
+			kind, until = 0, time.Time{}
+		}
 		e := &entry{
 			p:                 p,
 			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:           s.Credits,
 			disabled:          s.Disabled,
 			reason:            s.Reason,
-			until:             s.Until,
-			coolKind:          s.CoolKind,
+			until:             until,
+			coolKind:          kind,
 			successCount:      s.SuccessCount,
 			errTotal:          errTotal,
 			successEMA:        successEMA,

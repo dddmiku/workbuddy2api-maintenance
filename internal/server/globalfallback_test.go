@@ -33,9 +33,9 @@ func fallbackPool(t *testing.T, fallback bool) (*pool.Pool, apikeys.Info) {
 		&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai", AccessToken: "at-g2", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "c1", Domain: "www.codebuddy.cn", AccessToken: "at-c1", ExpiresAt: 9999999999},
 	)
-	// 两个 global 号都进入账号级软冷却（无重置时间的 429 口径）→ 满足回落前提。
+	// 两个 global 号的该模型都进入模型级软冷却（无重置时间的 429 口径）→ 满足回落前提。
 	for _, uid := range []string{"g1", "g2"} {
-		p.CooldownSoftRate(uid, time.Minute, time.Time{}, "429 rate limit")
+		p.CooldownSoftRateForModel(uid, time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
 	}
 	value := fallback
 	return p, apikeys.Info{ID: "key_test", Name: "fallback", GlobalFallbackToCN: &value}
@@ -188,5 +188,44 @@ func TestGlobalFallbackBlockedWhenGlobalStillServable(t *testing.T) {
 		if authz == "Bearer at-c1" {
 			t.Fatalf("global 还有可用号时不得改道 CN：used=%v", used)
 		}
+	}
+}
+
+// TestGlobalFallbackOnCreditsExhaustedAndModelLimit 线上真实形态：global 域没有
+// 一个号真的在被「账号级限流」——全部是积分不足 + 部分模型级限流。回落判据必须
+// 在这种混合态下仍然成立。
+//
+// 这是 2026-10-18 重构后最容易漏的一条：账号级冷却已删除，若判据仍要求
+// 「全部因限流不可用」，余额不足的号会把等式打破（历史上 VPS 实测 13+7≠23），
+// CN 回落将永不触发。
+func TestGlobalFallbackOnCreditsExhaustedAndModelLimit(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	p := testPoolWith(
+		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-g1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai", AccessToken: "at-g2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "c1", Domain: "www.codebuddy.cn", AccessToken: "at-c1", ExpiresAt: 9999999999},
+	)
+	p.SetPaidModels(map[string]bool{"global\x00deepseek-v4.1-flash": true, "cn\x00deepseek-v4.1-flash": true})
+	// g1：积分不足（付费模型被拦）；g2：该模型被限流。两种都不可用。
+	p.Cooldown("g1", pool.CoolHard, time.Hour, "余额不足")
+	p.CooldownSoftRateForModel("g2", time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
+
+	value := true
+	info := apikeys.Info{ID: "key_test", Name: "fallback", GlobalFallbackToCN: &value}
+	var used []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		used = append(used, authz)
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, fallbackRequest(info))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(used) == 0 || used[0] != "Bearer at-c1" {
+		t.Fatalf("积分不足 + 模型限流的混合态必须回落 CN，used=%v", used)
 	}
 }

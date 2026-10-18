@@ -215,6 +215,48 @@ func (s *Server) accountReviveAll(ctx context.Context, body map[string]any) map[
 	return map[string]any{"ok": true, "message": formatMessage("已复活 %d 个账号（共 %d 个）", revived, total)}
 }
 
+// accountProbeModel 手动检测某账号在某模型上的冷却是否已经解除（面板「检测模型」按钮）。
+//
+// 模型级限流没有「上游说恢复就一定会恢复」的保证，冷却期间唯一能被证伪的方式
+// 是发一次真实请求。这里把网关的 POST /accounts/probe-model 结果翻成一句人话：
+// 探测成功且确有记录被清 → 已恢复；仍限流 → 给出新的解除时刻。
+func (s *Server) accountProbeModel(ctx context.Context, body map[string]any) map[string]any {
+	uid := jsonString(body["uid"])
+	model := jsonString(body["model"])
+	if uid == "" || model == "" {
+		return map[string]any{"ok": false, "message": "需要账号与模型"}
+	}
+	ok, payload := s.gateway.PostJSON(ctx, "/accounts/probe-model", map[string]any{"uid": uid, "model": model})
+	if !ok {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(payload)}
+	}
+	if !jsonBool(payload["ok"], false) {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "检测失败")}
+	}
+	if jsonBool(payload["limited"], false) {
+		until := jsonString(payload["until"])
+		reason := jsonString(payload["reason"])
+		msg := "探测确认该模型仍被限流"
+		if until != "" {
+			msg += "，解除 " + until
+		}
+		if reason != "" {
+			msg += "（" + reason + "）"
+		}
+		return map[string]any{"ok": true, "limited": true, "message": formatMessage("%s", msg)}
+	}
+	if jsonBool(payload["cleared"], false) {
+		return map[string]any{"ok": true, "limited": false, "cleared": true,
+			"message": formatMessage("探测成功：%s 的模型冷却已解除", model)}
+	}
+	if jsonBool(payload["probe_ok"], false) {
+		return map[string]any{"ok": true, "limited": false,
+			"message": formatMessage("探测成功：%s 本来就可用，无需解除", model)}
+	}
+	return map[string]any{"ok": true, "limited": false,
+		"message": formatMessage("探测未成功（上游返回 %d），冷却保持不变", jsonInt64(payload["status"]))}
+}
+
 // accountFission 补发 Trae 邀请奖励（面板「补发邀请奖励」按钮）。
 //
 // 背景：面板上的邀请记录停在「邀请中」，不是服务端没发，而是**发奖动作在 TRAE 桌面端
