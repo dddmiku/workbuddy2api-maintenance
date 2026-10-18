@@ -1154,6 +1154,48 @@ return $('#acctRows').innerHTML;
         self.assertIn(">B<", result)
         self.assertIn(">C<", result)
 
+    def test_default_sort_puts_unlimited_first(self):
+        """默认排序下没有被限流的号排最前（2026-10-18 用户：「没有被限流的号不应该
+        在最前面吗」）。
+
+        此前 acctSort='' 直接沿用后端顺序（账号文件名顺序），被限流的号碰巧排在
+        前面时看起来像「限流优先」，与「谁现在能用」的直觉相反。现在显式分档：
+        健康 → 余额不足 → 账号级约束 → 模型限流 → 停用。
+
+        注意 A/B 都各有一条 unavailable（11102）条目——那类不算限流，不能把它们
+        挤到 C 后面。
+        """
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # C 没有任何限流 → 必须在最前。
+        self.assertLess(result.index(">C<"), result.index(">A<"))
+        self.assertLess(result.index(">C<"), result.index(">B<"))
+
+    def test_default_sort_orders_disabled_last(self):
+        """停用的号排在所有在用号后面；余额不足排在模型限流前。"""
+        result = self.run_frontend("""
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[
+ {uid:'off',nickname:'OFF',realm:'cn',disabled:true,pool:{disabled:true}},
+ {uid:'lim',nickname:'LIM',realm:'cn',pool:{inPool:true,rateLimitedModels:[
+   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004',kind:'rate'}]}},
+ {uid:'poor',nickname:'POOR',realm:'cn',pool:{inPool:true,creditsExhausted:true}},
+ {uid:'ok',nickname:'OK',realm:'cn',pool:{inPool:true,healthy:true}}
+]};
+S.acctSort='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertLess(result.index(">OK<"), result.index(">POOR<"),
+                        "健康号应排在余额不足之前")
+        self.assertLess(result.index(">POOR<"), result.index(">LIM<"),
+                        "余额不足只影响付费模型，应排在模型限流之前")
+        self.assertLess(result.index(">LIM<"), result.index(">OFF<"),
+                        "停用需要人工介入，排最后")
+
     def test_model_options_come_from_pool_not_hardcoded(self):
         """下拉选项必须来自当前池子里**正在被限流**的模型，不写死模型清单。"""
         result = self.run_frontend(self._accounts() + """

@@ -626,6 +626,32 @@ function acctOffKind(a){
   return '';
 }
 
+// acctRank 账号页默认排序的档位（小的在前）：
+//
+//	0 健康：能正常服务付费与免费模型
+//	1 余额不足：只是没积分，免费模型照常可用（CreditsExhausted 而非 Cooling）
+//	2 账号级约束：熔断（连续 5xx）或真正的账号级限流
+//	3 模型级限流：只有个别模型在倒计时，其余模型可用
+//	4 停用
+//
+// 为什么余额不足排在模型限流前面：前者对「用免费模型」的调用方毫无影响，
+// 后者会让指定模型直接不可用；反过来排会把一批其实健康的号压到后面。
+// 停用排最后——它需要人工介入，不属于「现在能不能用」的答案。
+//
+// 同档内不比较其他字段：调用方用 Array.prototype.sort（V8 上是稳定排序），
+// 保持后端返回的活跃度顺序，避免每次刷新顺序抖动。
+function acctRank(a){
+  if (acctOff(a)) return 4;
+  var p = a.pool || {};
+  if (p.cooling) return 2;
+  if (p.creditsExhausted) return 1;
+  var hasLimit = rlmOf(a).some(function(m){
+    return rlmKind(m) !== 'unavailable' && m.until;
+  });
+  if (hasLimit) return 3;
+  return 0;
+}
+
 function renderMetrics(){
   var d = S.data, a = d.accounts || [], p = d.pool || {};
   var on = a.filter(function(x){ return !acctOff(x); }).length;
@@ -991,14 +1017,20 @@ function renderAccounts(){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
            (a.uid || '').toLowerCase().indexOf(q) >= 0;
   });
-  // 排序。两种都以「有约束的号在前」为前提：运维来这一页通常是要找「谁卡住了、
-  // 什么时候能好」，把健康的号排前面只是噪音。
+  // 排序。默认（''）按「可用性」分档，健康的号在最前：
+  //
+  // 2026-10-18 用户反馈「没有被限流的号不应该在最前面吗」。此前 '' 走的是后端
+  // 返回顺序（= 账号文件名顺序），碰巧被限流的号排在前面看起来就像「限流优先」。
+  // 现在显式分档：健康 → 只用得起免费模型（余额不足）→ 熔断/账号级限流 →
+  // 模型限流 → 停用。同档内保持后端顺序（它是最近的活跃度顺序，不该被重排）。
   //
   // 'limit'：按解除时刻升序（最快解除的在前）。没有模型限流的号用 Infinity 排最后。
   //          同刻到期的按昵称稳定排序，避免每次刷新顺序抖动。
   // 'credit'：按可用积分降序；查不到积分的（undefined）排最后而不是当 0 ——
   //          「查不到」与「确实是 0」是两件事，混在一起会让 0 分号被埋掉。
-  if (S.acctSort === 'limit'){
+  if (S.acctSort === '') {
+    list.sort(function(x, y){ return acctRank(x) - acctRank(y); });
+  } else if (S.acctSort === 'limit'){
     var lim = Object.create(null);
     list.forEach(function(a){ lim[a.uid] = modelLimitEnd(a, S.acctModel); });
     list.sort(function(x, y){

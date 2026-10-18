@@ -131,8 +131,15 @@ def sha(path):
 
 
 # ── build ───────────────────────────────────────────────────────────────────
-def build(version, commit):
-    """构建两个架构的运行包。产物落在 OUT/<version>/assets/。"""
+def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
+    """构建运行包。产物落在 OUT/<version>/assets/。
+
+    arches 默认是部署用的两个 64 位目标。要发 Release 给行空板（armv7，
+    DFRobot UNIHIKER M10）时传
+    (("arm64","arm64"), ("amd64","amd64"), ("armv7","arm"))，
+    脚本会自动补 GOARM=7——资产名必须是 wb2api-runtime-linux-armv7.tar.gz，
+    与 hotupdate 的 runtimeArchName() 对齐，否则板子找不到本机架构的资产。
+    """
     assets = OUT / version / "assets"
     if assets.exists() and any(assets.iterdir()):
         raise SystemExit("产物已存在，先清理：%s" % assets)
@@ -144,12 +151,17 @@ def build(version, commit):
                     GOTOOLCHAIN="go1.26.8",
                     HTTP_PROXY=os.environ.get("HTTP_PROXY", ""),
                     HTTPS_PROXY=os.environ.get("HTTPS_PROXY", ""))
-    for arch, goarch in (("arm64", "arm64"), ("amd64", "amd64")):
+    for arch, goarch in arches:
         stage = OUT / version / ("runtime-" + arch)
         stage.mkdir(parents=True, exist_ok=True)
         flags = "-s -w -X workbuddy2api/internal/version.Version=%s -X workbuddy2api/internal/version.Commit=%s -X workbuddy2api/internal/version.BuiltAt=%s" % (
             version, commit, built_at)
         env = dict(env_base, GOARCH=goarch)
+        # 32 位 ARM 必须显式给 GOARM：Go 的 arm 目标有 v5/v6/v7 三个 ABI，
+        # 而 hotupdate 的 goarmVersion() 运行期读的也是 GOARM——两端必须一致，
+        # 否则资产名（wb2api-runtime-linux-armv7.tar.gz）对不上。
+        if goarch == "arm":
+            env["GOARM"] = "7"
         targets = [("wb2api", "./cmd/server", flags)]
         for name, pkg in HELPERS:
             targets.append((name, "./cmd/" + pkg, "-s -w"))
