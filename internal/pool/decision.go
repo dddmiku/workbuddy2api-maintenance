@@ -158,15 +158,19 @@ func (e *entry) unavailableReason(now time.Time, model string) string {
 	if e.disabled {
 		return "disabled"
 	}
+	// 余额不足（CoolHard）只拦扣积分的模型；免费模型不因余额被拦，但**仍要**继续
+	// 判熔断与模型冷却。早先这里在免费模型分支直接 return ""，会跳出整个函数，
+	// 把后面的 breaker / modelCooled 一并跳过——「余额不足 + 该模型又被 6004
+	// 限流」的账号于是在免费模型上被放行、直接撞上游 429。注释声称「继续往下判」，
+	// 代码却没做到（2026-10-18 由模型级隔离测试发现）。
 	if !e.until.IsZero() && now.Before(e.until) {
-		if e.coolKind == CoolHard {
-			// 余额不足：仅对扣积分的模型拦截；免费模型放行（见 hardCreditBlocksModel）。
-			if !e.p.hardCreditBlocksModel(e.a.Realm(), model) {
-				return "" // 免费模型：余额不足不影响可用性，继续往下判熔断/模型冷却
-			}
+		if e.coolKind != CoolHard {
+			return "account_cooldown"
+		}
+		if e.p.hardCreditBlocksModel(e.a.Realm(), model) {
 			return "account_limit"
 		}
-		return "account_cooldown"
+		// 免费模型 + 余额不足：不返回，继续判熔断/模型冷却。
 	}
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		return "circuit_breaker"
