@@ -21,6 +21,7 @@ import (
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/session"
 )
 
 // fallbackPool 造一个 global 全限流、CN 可用的池，返回池与请求用的密钥信息。
@@ -227,5 +228,108 @@ func TestGlobalFallbackOnCreditsExhaustedAndModelLimit(t *testing.T) {
 	}
 	if len(used) == 0 || used[0] != "Bearer at-c1" {
 		t.Fatalf("积分不足 + 模型限流的混合态必须回落 CN，used=%v", used)
+	}
+}
+
+// TestGlobalFallbackStopsOnceGlobalRecovers 回落不是粘性的：global 域一恢复可用，
+// 下一个请求必须立刻切回 global，而不是继续留在 CN。
+//
+// 用户 2026-10-18 的质疑：「global 如果有解除限流的号，还会继续路由吗，继续路由的话
+// 不是太不合理了吗」。判据必须是**每次请求实时重算**——只要 global.Available > 0
+// 就不回落；而模型级限流到期后 healthyForModel 自然为真，配额也回到 global 的号上。
+func TestGlobalFallbackStopsOnceGlobalRecovers(t *testing.T) {
+	p, info := fallbackPool(t, true)
+	var used []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		used = append(used, authz)
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	// 第一次：global 两个号都被限流 → 回落 CN。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, fallbackRequest(info))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(used) != 1 || used[0] != "Bearer at-c1" {
+		t.Fatalf("global 全限流时应回落 CN，used=%v", used)
+	}
+
+	// global 的限流解除（模拟上游重置，或面板「检测」探测成功后 ClearModelLimit）
+	// → 下一个请求必须回 global。
+	for _, uid := range []string{"g1", "g2"} {
+		p.ClearModelLimit(uid, "deepseek-v4.1-flash")
+	}
+
+	used = nil
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, fallbackRequest(info))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if len(used) == 0 || used[0] == "Bearer at-c1" {
+		t.Fatalf("global 恢复后必须切回 global，实际仍用 CN：used=%v", used)
+	}
+}
+
+// TestGlobalFallbackNotStuckBySessionBinding 回落成功后会把会话粘到**实际服务的
+// CN 账号**。这不能变成「一旦回落就永远回落」：下一次请求先按完整模型名
+// （带 global: 前缀）解析粘性号，realm 过滤会把它限定在 global 集合；global 恢复
+// 后解析不到 CN 号，于是重新走 normal 选号并选回 global。
+func TestGlobalFallbackNotStuckBySessionBinding(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	p := testPoolWith(
+		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-g1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "c1", Domain: "www.codebuddy.cn", AccessToken: "at-c1", ExpiresAt: 9999999999},
+	)
+	p.CooldownSoftRateForModel("g1", time.Minute, time.Time{}, "deepseek-v4.1-flash", "429 rate limit")
+
+	// 可用集合按 realm 过滤——与 cmd/server/wiring.go 的 realmAwareAvailableForModel 同口径。
+	available := func(model string) []string {
+		realm, bare := resolveModel(model)
+		return p.AvailableUIDsForModelRealm(bare, realm)
+	}
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     newBindStore(),
+		Available: func() []string { return []string{"g1", "c1"} },
+		AvailableForModel: available,
+	})
+	var used []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		used = append(used, authz)
+		return 200, sseOK, true
+	})
+	value := true
+	info := apikeys.Info{ID: "key_test", Name: "fallback", GlobalFallbackToCN: &value}
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+
+	body := func() string {
+		return `{"model":"global:deepseek-v4.1-flash","stream":false,"conversationId":"conv-1","messages":[{"role":"user","content":"hi"}]}`
+	}
+	req := func() *http.Request {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body()))
+		return r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, info))
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req())
+	if rec.Code != http.StatusOK || len(used) != 1 || used[0] != "Bearer at-c1" {
+		t.Fatalf("首次应回落 CN：code=%d used=%v", rec.Code, used)
+	}
+
+	// global 恢复（限流解除）。
+	p.ClearModelLimit("g1", "deepseek-v4.1-flash")
+
+	used = nil
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if len(used) == 0 || used[0] == "Bearer at-c1" {
+		t.Fatalf("会话粘性不得把请求钉在 CN：used=%v", used)
 	}
 }
