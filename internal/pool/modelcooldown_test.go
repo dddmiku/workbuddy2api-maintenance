@@ -93,13 +93,14 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelHonorsResetAtKeepsResetAt 6004 写 modelCooldowns：
+// until 直接等于上游重置墙钟（2026-10-18 起不再截断到 soft_rate_max），
+// reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
+func TestCooldownSoftForModelHonorsResetAtKeepsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(2 * time.Hour) // 超出旧封顶 → 新口径按上游 2h 冷却
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -107,8 +108,9 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := time.Until(mc.Until); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("Until 应等于上游墙钟 %v，实际 %v（soft_rate_max=%v 不该截断）",
+			reset, mc.Until, 10*time.Minute)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)

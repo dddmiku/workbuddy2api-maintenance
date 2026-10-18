@@ -940,20 +940,21 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 模型级冷却 until 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelHonorsResetOverSoftRateMax(t *testing.T) {
+	// 解析时间超出 soft_rate_max → 2026-10-18 起按上游实际时间冷却（不再截断）。
+	// 截断会让号在「假恢复 → 再撞 6004」之间循环：实测上游要 18h，本地只冷 2h。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
-	before := time.Now()
+	reset := time.Now().Add(2 * time.Hour) // 远超旧封顶 10m
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
 	}
-	if d := st.RateLimitedModels[0].Until.Sub(before); d > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want 上游墙钟 %v（不截断到 soft_rate_max=10m）",
+			st.RateLimitedModels[0].Until, reset)
 	}
 }
 
@@ -1194,13 +1195,13 @@ func TestRateLimitedModelsInStatus(t *testing.T) {
 	}
 }
 
-// TestRateLimitedModelsRetainsUncappedResetAt soft_rate_max 截断了 until，
-// 但台账必须保留上游未截断的原始重置墙钟（issue #36：运维按真实恢复时刻观察）。
-func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
+// TestRateLimitedModelsHonorsUncappedResetAt 2026-10-18 起 until 不再被 soft_rate_max
+// 截断：台账与冷却截止都等于上游原始重置墙钟（运维按真实恢复时刻观察）。
+func TestRateLimitedModelsHonorsUncappedResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 10m
+	reset := time.Now().Add(2 * time.Hour) // 远超旧封顶 10m
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 
 	st, _ := p.Status("u1")
@@ -1208,15 +1209,15 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
-	if rem := time.Until(row.Until); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
+	// row.Until = 该模型的冷却截止 = 上游墙钟（不再截断）。
+	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("row.until=%v want 上游墙钟 %v", row.Until, reset)
 	}
 	// 6004 模型级冷却不写账号级 until：st.Until 为零值。
 	if !st.Until.IsZero() {
 		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
 	}
-	// reset_at 保留原始 2h 墙钟（未被截断）。
+	// reset_at 保留原始 2h 墙钟。
 	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("reset_at=%v want ~2h 后=%v", row.ResetAt, reset)
 	}

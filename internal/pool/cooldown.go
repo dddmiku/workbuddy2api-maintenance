@@ -84,9 +84,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
 // 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
+//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = resetAt（按上游实际
+//     重置时间，**不再**截断到 softRateMax），ResetAt 记录上游原始墙钟（台账 ResetAt）。
+//     不写 until（全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
 //   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
 //     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
 //     冷却越堆越厚）。不记录模型（不豁免）。
@@ -213,7 +213,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 //
 // 语义：
 //   - resetAt 非零（上游带权威重置时间，无论 6004 还是 11140 rate-limiting）→
-//     账号级直到该墙钟（截断到 softRateMax，绝不指数堆加）；**不**在
+//     账号级直到该墙钟（**按上游实际时间，不截断**，绝不指数堆加）；**不**在
 //     modelCooldowns 记模型（账号级语义，不产生切模型豁免，保持与旧
 //     CooldownSoftForModel 无解析分支一致——普通账号级限流不该因切模型绕过）。
 //   - resetAt 零值且**不在冷却中**（首次/恢复后的新限流）→ 有界退避：按 softStreak
@@ -245,21 +245,34 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	}
 }
 
-// cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
-// 取较早者）。resetAt 已过期（时钟偏移/文案过期）时日长短钳到时间零点附近，立即恢复。
+// cappedSoftUntilLocked 把上游重置墙钟换算成本地冷却截止。
+//
+// 2026-10-18 改口径：**按上游实际重置时间冷却，不再截断到 softRateMax**。
+//
+// 旧实现取 min(resetAt, now+softRateMax)，把上游「明天 02:30 重置」砍成 2 小时。
+// 实测后果（prod，global:deepseek-v4.1-flash）：2 小时一到号被放回池子，立刻再撞
+// 6004，再冷却 2 小时，如此往复——用户看到的是「号池里大部分号看着健康、但整个
+// 模型用不了」，而真实的限流窗口是 18 小时。冷却时长必须服从上游权威墙钟，
+// 否则就是自己制造「假恢复」。
+//
+// 保留的两条边界：
+//   - resetAt 已过期（时钟偏移 / 文案陈旧）→ 立即恢复（now+1ms），不把号钉死。
+//   - resetAt 离谱地远（> maxSoftResetWindow，只可能来自错误解析或严重时钟漂移）
+//     → 钳到该上限，避免一个坏字符串把账号永久锁死。
+//
 // 调用方必须已持有 p.mu。
 func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
-	cap := now.Add(p.softRateMaxOr())
-	if resetAt.After(cap) {
-		return cap
-	}
 	if resetAt.After(now) {
+		if far := now.Add(maxSoftResetWindow); resetAt.After(far) {
+			return far
+		}
 		return resetAt
 	}
 	return now.Add(time.Millisecond)
 }
 
-// softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供封顶计算。
+// softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供**无上游重置时间**的
+// 指数退避封顶使用。有上游重置时间的冷却不走这里（见 cappedSoftUntilLocked）。
 // 调用方必须已持有 p.mu。
 func (p *Pool) softRateMaxOr() time.Duration {
 	if p.softRateMax > 0 {

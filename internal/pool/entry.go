@@ -415,9 +415,19 @@ const (
 	defaultBreakerCooldownMax = 6 * time.Hour
 )
 
-// defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，
+// defaultSoftRateMax 软冷却**指数退避**的默认封顶：softRateMax 未注入（<=0）时按此值算，
 // 避免测试/裸用池时退避无上限。
+//
+// 注意：它只约束「没有上游重置时间」的有界退避，**不**再截断上游给出的权威重置墙钟
+// （2026-10-18 改：截断会导致冷却远短于真实限流窗口，号在假恢复与再限流之间循环）。
 const defaultSoftRateMax = 2 * time.Hour
+
+// maxSoftResetWindow 是「尊重上游重置时间」的合理性上限。
+//
+// 上游 6004/限流文案里的重置时间实测跨度 2~20 小时，正常不会超过一天。超过这个
+// 上限只可能来自解析错误或严重时钟漂移——一个坏字符串不该把账号锁死整整一周，
+// 因此在 cappedSoftUntilLocked 里钳到该值。它不是业务冷却时长，只是防呆边界。
+const maxSoftResetWindow = 7 * 24 * time.Hour
 
 // 11102「该后端无此模型」负缓存的退避参数（吸收 model_blocks.py 语义，复用 modelCooldowns
 // 机制承载）。首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），

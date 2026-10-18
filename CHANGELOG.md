@@ -38,6 +38,45 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
    直接拒绝发版，不再靠自觉；
 2. 下一次含新能力的发版走 **v2.7.0**。
 
+## v3.10.17 — 2026-10-18
+
+### 修复：限流冷却按上游实际重置时间，不再固定截断到 2 小时
+
+用户报告：「号池只有几个号的 global 4.1 进入冷却，但是整体却无法使用了」。
+
+复现（prod，真实请求 `global:deepseek-v4.1-flash`）拿到上游原文：
+
+```
+429 {"code":6004,"msg":"usage exceeds frequency limit, but don't worry,
+     your usage will reset at 2026-10-19 04:10:46 UTC+8,
+     alternatively, you can switch to the other models to continue using it."}
+```
+
+号池其实把 6 个 global 号都试了一遍（`max_rotate: 6`），每个都 6004。
+`decisions` 显示当时 `available=13 healthy=13`，即**大部分号看着是健康的**——
+矛盾点就在这里。
+
+根因在 `cappedSoftUntilLocked`：
+
+```go
+cap := now.Add(p.softRateMaxOr())   // soft_rate_max 默认 2h
+if resetAt.After(cap) { return cap }   // ← 上游要 18h，被砍成 2h
+```
+
+于是号在「冷却 2h → 放回池子 → 立刻再撞 6004 → 再冷 2h」之间无限循环。
+真实限流窗口是 18 小时，本地冷却只有 2 小时，等于自己制造假恢复。
+
+修复：有上游重置时间就按该时间冷却，`soft_rate_max` 只用于「没有上游时间」
+的指数退避。保留一条防呆边界 `maxSoftResetWindow = 7 天`，只拦解析错误/时钟
+漂移导致的离谱值；上游时间已过期则立即恢复。
+
+验证（dev，v3.10.17）：17 条 6004 冷却的剩余时长从 0.19h 到 **19.41h** 均有分布，
+与上游各自给出的墙钟一一对应（修复前全部 ≤2h）。
+
+### 修复：nil ctx 调用观察器会 panic
+
+`observeChatAttempt(nil, ...)` 直接 `ctx.Value` 触发空指针。补 nil 判断。
+
 ## v3.10.16 — 2026-10-18
 
 ### 修复：trae 请求的用量完全不落账（积分与 token 一起丢）
