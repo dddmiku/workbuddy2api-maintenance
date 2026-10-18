@@ -1186,6 +1186,10 @@ func (h *Handler) modelList() []map[string]any {
 func (h *Handler) traeCatalog() ([]trae.CatalogModel, error) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", trae.Realm)
 	if acct == nil {
+		// 同 CN/global：目录探测只读，健康号全冷却时回退到任意号。
+		acct = h.cfg.Pool.PickAnyForRealm(trae.Realm)
+	}
+	if acct == nil {
 		return nil, nil
 	}
 	return trae.FetchCatalog(context.Background(), acct)
@@ -1202,6 +1206,11 @@ func (h *Handler) traeCatalog() ([]trae.CatalogModel, error) {
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	if acct == nil {
+		// 同 fetchDynamicModels：目录探测是只读的，健康号全冷却时回退到任意号，
+		// 否则 global 名单会凭空消失（客户端看到模型全没了）。
+		acct = h.cfg.Pool.PickAnyForRealm("global")
+	}
 	if acct == nil {
 		return nil, nil
 	}
@@ -1253,7 +1262,17 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
+	// 目录探测优先用健康号；没有健康号时回退到任意未禁用号。
+	//
+	// 为什么必须回退：读目录是只读探测，不扣额度。此前只走健康口径，一旦该域
+	// 账号全部在冷却（实测 dev 6 个 CN 号同时 hard_credit 冷却），这里返回 nil，
+	// /v1/models 就一个 CN 模型都不公布——客户端看起来像「模型全没了」，而上游
+	// 目录其实一直是好的（同一账号手动拉 /v3/config 拿到 37 个）。目录公布与否
+	// 不该由账号冷却状态决定。
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
+	if acct == nil {
+		acct = h.cfg.Pool.PickAnyForRealm("cn")
+	}
 	if acct == nil {
 		return nil
 	}
