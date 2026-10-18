@@ -1273,43 +1273,18 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	h.syncPaidModels()
-	h.pruneRetiredModelCooldowns(infos)
 	return infos
 }
 
-// pruneRetiredModelCooldowns 按刚刷新到的目录清掉「已下线模型」的 11102 台账条目。
+// 2026-10-18 撤回：这里曾调用 pruneRetiredModelCooldowns 按目录清理 11102 条目，
+// 但「目录」到底取哪一份并不确定——企业端点（17 个）与 /v1/models 的并集
+// （v3 + 企业，50 个）差别很大：deep-model / glm-4.6 / kimi-k2-thinking 等
+// 只存在于 v3 面，用企业端点判定会把它们当成已下线而误删仍在生效的避让。
 //
-// 目录是权威事实：模型不在目录里，说明客户端在用一个已下线的旧名字，那条
-// (账号,模型) 负缓存对任何账号都没有意义，留着只会把面板刷成一片「模型不可用」
-// 并占满 maxModelCooldowns 预算（详见 pool.PruneRetiredModelCooldowns）。
-//
-// 只在目录**成功刷新**后调用（本函数由 fetchDynamicModels 调用），失败路径不碰：
-// 拉取失败时的空/旧目录不能当作「模型都下线了」的证据。
-func (h *Handler) pruneRetiredModelCooldowns(infos []upstream.ModelInfo) {
-	if h.cfg.Pool == nil || len(infos) == 0 {
-		return
-	}
-	keep := make(map[string]bool, len(infos)*2)
-	for _, mi := range infos {
-		if mi.ID == "" {
-			continue
-		}
-		keep[mi.ID] = true
-		keep[trimRealmPrefix(stripModelAlias(mi.ID))] = true
-	}
-	// global 目录里的同名模型也要保住：同名模型两域上线节奏不同，CN 目录里没有
-	// 不代表 global 也没有（global 条目在 CachedGlobalModelInfos 里）。
-	for _, mi := range h.cfg.Upstream.CachedGlobalModelInfos() {
-		if mi.ID == "" {
-			continue
-		}
-		keep[mi.ID] = true
-		keep[trimRealmPrefix(stripModelAlias(mi.ID))] = true
-	}
-	if n := h.cfg.Pool.PruneRetiredModelCooldowns(keep); n > 0 {
-		log.Printf("模型目录刷新：清理了 %d 条已下线模型的避让记录（11102）", n)
-	}
-}
+// 现在改为只做「写入侧」判定（applyErrorPolicy 的 modelCatalogState，取并集，
+// 与 /v1/models 同一份事实），不再主动删已有条目：条目有 TTL（6h 起、24h 封顶）
+// 会自然过期，误删的代价（把真在限流的模型放回轮询）比多留几条更大。
+// 若将来要做清理，判据必须与 /v1/models 的并集完全一致，并有测试锁住。
 
 // modelCatalogState 报告某个模型名在当前上游模型目录里的状态。
 //
