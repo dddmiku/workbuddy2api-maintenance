@@ -14,6 +14,7 @@ package panel
 
 import (
 	"context"
+	"strings"
 )
 
 // PoolState 是账号在网关账号池里的状态（对应 /status 的 accounts[] 条目）。
@@ -55,6 +56,20 @@ type PoolState struct {
 	RateLimitedModels []RateLimitedModel `json:"rateLimitedModels,omitempty"`
 }
 
+// modelLimitKind 把模型级台账条目的 reason 归成两类，供面板分别措辞。
+//
+// 判定按 reason 前缀，因为网关侧写入时就是这两个常量：
+// pool.BlockModelBackoff(..., upstream.ModelBlockReason) → "11102 model not available"；
+// 其余（6004 / 429 / 404 / account fault）都是真正的限流或短避让。
+//
+// 刻意不判 until：两类条目都有 until，语义差别在 reason 里。
+func modelLimitKind(reason string) string {
+	if strings.HasPrefix(reason, "11102") {
+		return "unavailable"
+	}
+	return "rate"
+}
+
 // RateLimitedModel 与网关 /status 的 accounts[].rate_limited_models[] 同构
 // （internal/pool.RateLimitedModel 的 JSON 形态）。
 type RateLimitedModel struct {
@@ -62,6 +77,19 @@ type RateLimitedModel struct {
 	Until   any    `json:"until,omitempty"`
 	ResetAt any    `json:"reset_at,omitempty"`
 	Reason  string `json:"reason,omitempty"`
+	// Kind 把两类完全不同的「模型级避让」分开，供面板用不同措辞展示。
+	//
+	// 2026-10-18：用户看到 CN 账号下每个模型各列一行「模型限流 … 解除 22:53」，
+	// 问「为什么 cn 全列出来了」。根因不是记录错了——实测那批模型对**全部** 6 个
+	// CN 账号都返回 11102「service info not found」，是模型本身在当前上游不存在，
+	// 网关按 (账号,模型) 负缓存避让是对的。错的是展示：11102 被当成「限流」，
+	// 还配了一个由本地指数退避推算出来的「解除时间」，读起来像「等到 22:53 就能用」，
+	// 实际上到点重试仍然 11102。
+	//
+	//   "rate"     —— 上游限流（6004/429），until 有真实语义，到点确实可能恢复；
+	//   "unavailable" —— 11102「该后端无此模型」，until 只是本地退避窗口，
+	//                    语义是「这段时间别白试」，不是「到点就能用」。
+	Kind string `json:"kind,omitempty"`
 }
 
 // CreditState 是账号的积分信息。
@@ -281,11 +309,13 @@ func poolStateFrom(entry map[string]any) PoolState {
 			if !ok {
 				continue
 			}
+			reason := jsonString(row["reason"])
 			models = append(models, RateLimitedModel{
 				Model:   jsonString(row["model"]),
 				Until:   row["until"],
 				ResetAt: row["reset_at"],
-				Reason:  jsonString(row["reason"]),
+				Reason:  reason,
+				Kind:    modelLimitKind(reason),
 			})
 		}
 		if len(models) > 0 {

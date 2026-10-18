@@ -268,6 +268,54 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.markStateModelLocked(uid, model)
 }
 
+// PruneRetiredModelCooldowns 按上游模型目录清理「已下线模型」的台账条目。
+//
+// 背景（2026-10-18）：11102 负缓存是按 (账号, 模型) 记的，而模型名由客户端自选。
+// 客户端用过一批后来被上游下线的旧名字（实测 CN：glm-4.6 / kimi-k2-thinking /
+// minimax-m2.5 / deepseek-v3-1-volc 等 10 个，全部已不在目录里），每条都在
+// 6h/12h/24h 的退避里反复续期，于是面板上每个 CN 账号都挂 6~9 行「模型不可用」，
+// 把真正在倒计时的限流挤得看不见，还占满 maxModelCooldowns 的条目预算。
+//
+// 判据用「目录里没有这个名字」而不是 reason：reason 只能说明「上游回了 11102」，
+// 分不出「模型下线」与「该账号无权限」——后者必须留着避让（换个账号就能用）。
+// 目录是权威事实，也是客户端模型下拉的来源，口径一致。
+//
+// 只清 11102 条目：6004/429 那些是真实限流，与目录无关，即便模型名已下线
+// 也不该被这里顺手抹掉（它们的 until 有上游墙钟语义）。
+//
+// keep 为目录里仍然存在的模型名集合；空集合表示目录未就绪，直接返回不动。
+// 返回清理掉的条目数（供调用方记日志）。
+func (p *Pool) PruneRetiredModelCooldowns(keep map[string]bool) int {
+	if len(keep) == 0 {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	removed := 0
+	for uid, e := range p.byUID {
+		if len(e.modelCooldowns) == 0 {
+			continue
+		}
+		changed := false
+		for model, mc := range e.modelCooldowns {
+			if !strings.HasPrefix(mc.Reason, "11102") {
+				continue // 真实限流，保留
+			}
+			if keep[model] {
+				continue
+			}
+			delete(e.modelCooldowns, model)
+			removed++
+			changed = true
+			p.markStateModelLocked(uid, model)
+		}
+		if changed && len(e.modelCooldowns) == 0 {
+			e.modelCooldowns = nil
+		}
+	}
+	return removed
+}
+
 // CooldownSoftRateForModel 把一次限流记录在**具体模型**上（唯一的限流维度）。
 //
 // ═══ 2026-10-18：账号级限流冷却已删除 ═══

@@ -207,7 +207,26 @@ type Handler struct {
 	// 选号热路径每轮都要读，避免每次解引用指针 + 判空。
 	slotWait         time.Duration
 	requestLogErrors atomic.Uint64
+	// retiredModelSeen 记录「客户端请求了已下线模型名」的最近一次日志时刻
+	// （模型名 → 时刻），用于按小时去重。见 noteRetiredModel。
+	//
+	// 为什么要去重：模型名来自客户端请求，某个旧配置会反复重试同一个已下线的名字，
+	// 每请求一行会把日志刷满；这条日志的用途是提示运维「上游改名了」，不是审计。
+	retiredModelMu   sync.Mutex
+	retiredModelSeen map[string]time.Time
 }
+
+// modelCatalogStatus 模型名在当前上游目录里的状态（见 Handler.modelCatalogState）。
+type modelCatalogStatus int
+
+const (
+	// modelCatalogUnknown 目录尚未就绪，无法判断。调用方按「保守」处理（照旧记避让）。
+	modelCatalogUnknown modelCatalogStatus = iota
+	// modelInCatalog 目录里明确存在该模型：11102 属账号级权限差异。
+	modelInCatalog
+	// modelRetired 目录已就绪且明确不含该模型：已下线/改名，与账号无关。
+	modelRetired
+)
 
 // SetReasoningLoopStopOnly 运行期切换「命中循环后是否只停不重发」，立即作用于后续
 // 请求；已经开始的那次请求沿用开始时读到的值。
@@ -1254,7 +1273,138 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	h.syncPaidModels()
+	h.pruneRetiredModelCooldowns(infos)
 	return infos
+}
+
+// pruneRetiredModelCooldowns 按刚刷新到的目录清掉「已下线模型」的 11102 台账条目。
+//
+// 目录是权威事实：模型不在目录里，说明客户端在用一个已下线的旧名字，那条
+// (账号,模型) 负缓存对任何账号都没有意义，留着只会把面板刷成一片「模型不可用」
+// 并占满 maxModelCooldowns 预算（详见 pool.PruneRetiredModelCooldowns）。
+//
+// 只在目录**成功刷新**后调用（本函数由 fetchDynamicModels 调用），失败路径不碰：
+// 拉取失败时的空/旧目录不能当作「模型都下线了」的证据。
+func (h *Handler) pruneRetiredModelCooldowns(infos []upstream.ModelInfo) {
+	if h.cfg.Pool == nil || len(infos) == 0 {
+		return
+	}
+	keep := make(map[string]bool, len(infos)*2)
+	for _, mi := range infos {
+		if mi.ID == "" {
+			continue
+		}
+		keep[mi.ID] = true
+		keep[trimRealmPrefix(stripModelAlias(mi.ID))] = true
+	}
+	// global 目录里的同名模型也要保住：同名模型两域上线节奏不同，CN 目录里没有
+	// 不代表 global 也没有（global 条目在 CachedGlobalModelInfos 里）。
+	for _, mi := range h.cfg.Upstream.CachedGlobalModelInfos() {
+		if mi.ID == "" {
+			continue
+		}
+		keep[mi.ID] = true
+		keep[trimRealmPrefix(stripModelAlias(mi.ID))] = true
+	}
+	if n := h.cfg.Pool.PruneRetiredModelCooldowns(keep); n > 0 {
+		log.Printf("模型目录刷新：清理了 %d 条已下线模型的避让记录（11102）", n)
+	}
+}
+
+// modelCatalogState 报告某个模型名在当前上游模型目录里的状态。
+//
+// 用于 11102 分流：目录里没有该名字 → 模型已下线/改名，与账号无关，不该写
+// (账号,模型) 负缓存；目录里有 → 说明是账号权限差异，按原逻辑避让。
+//
+// 三个返回值刻意分开，而不是 bool：
+//   - modelInCatalog  目录里明确存在（含别名/裸名两种拼写）；
+//   - modelRetired    目录已就绪，且明确不包含该名字；
+//   - modelCatalogUnknown 目录尚未拉取成功（启动初期 / 刷新失败），无法判断。
+//
+// 为什么 unknown 不能当成 retired：把「还不知道」当成「不存在」会漏记真实的
+// 账号级权限问题——那个账号之后每次被选中都会再撞一次 11102，白白拖慢请求。
+// 保守方向应当是「宁可多记一条避让」，等目录就绪后自然不再新增。
+//
+// 目录来源与 /v1/models 完全相同（CN 用 dynamicModelsCache，global 用
+// CachedGlobalModelInfos），所以判据与「客户端能选到哪些模型」是同一份事实。
+func (h *Handler) modelCatalogState(model string) modelCatalogStatus {
+	name := strings.TrimSpace(model)
+	if name == "" {
+		return modelCatalogUnknown
+	}
+	// 别名与裸名都算命中：目录里既可能有 "cn:glm-5.3" 形态，也可能有裸名。
+	//
+	// stripModelAlias 只去掉 [effort] 后缀；这里还要处理网关对外暴露的
+	// "realm:name" 拼写（如 "cn:glm-5.3"）——客户端可以带前缀请求，目录里
+	// 通常是裸名，不剥前缀会把一个存在的模型误判成已下线（见 trimRealmPrefix）。
+	bare := trimRealmPrefix(stripModelAlias(name))
+
+	// CN 目录：fetchDynamicModels 的缓存（1 小时 TTL，纯读，不触发上游请求）。
+	dynamicModelsCache.RLock()
+	cnReady := len(dynamicModelsCache.ids) > 0
+	cnHit := false
+	if cnReady {
+		for _, mi := range dynamicModelsCache.ids {
+			if mi.ID == name || mi.ID == bare || stripModelAlias(mi.ID) == bare {
+				cnHit = true
+				break
+			}
+		}
+	}
+	dynamicModelsCache.RUnlock()
+
+	// global 目录：探测缓存（纯读，未探测返回 nil）。
+	globalInfos := h.cfg.Upstream.CachedGlobalModelInfos()
+	globalReady := len(globalInfos) > 0
+	globalHit := false
+	if globalReady {
+		for _, mi := range globalInfos {
+			if mi.ID == name || mi.ID == bare || stripModelAlias(mi.ID) == bare {
+				globalHit = true
+				break
+			}
+		}
+	}
+
+	switch {
+	case cnHit || globalHit:
+		// 任一域目录里有这个名字就算存在：同名模型在不同域的上线节奏不同，
+		// 在 CN 已下线但 global 仍在的情况不该被当成「模型不存在」。
+		return modelInCatalog
+	case cnReady || globalReady:
+		return modelRetired
+	default:
+		return modelCatalogUnknown
+	}
+}
+
+// noteRetiredModel 记录一次「客户端在用已下线的模型名」观测。
+//
+// 每个模型名每小时最多一行：客户端（或某个旧配置）会反复重试同一个旧名字，
+// 每请求一行会把日志刷满。这条日志的价值是提示运维「上游改了模型名」，
+// 而不是逐次审计，所以按小时去重足够。
+func (h *Handler) noteRetiredModel(model string) {
+	const retiredLogInterval = time.Hour
+	h.retiredModelMu.Lock()
+	if h.retiredModelSeen == nil {
+		h.retiredModelSeen = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := h.retiredModelSeen[model]; ok && now.Sub(last) < retiredLogInterval {
+		h.retiredModelMu.Unlock()
+		return
+	}
+	h.retiredModelSeen[model] = now
+	// 顺手清理过期条目，避免客户端传任意模型名把这张表撑大（与
+	// maxModelCooldowns 同一类风险：模型名是客户端自选字段）。
+	for k, t := range h.retiredModelSeen {
+		if now.Sub(t) >= retiredLogInterval {
+			delete(h.retiredModelSeen, k)
+		}
+	}
+	h.retiredModelMu.Unlock()
+	log.Printf("模型已下线：%q 不在当前上游目录里（11102），不记账号级避让；"+
+		"请更新客户端模型名或网关模型别名", model)
 }
 
 // syncPaidModels 把「有正积分倍率的模型」推给号池，供付费模型的快过期优先硬过滤使用
@@ -2521,7 +2671,31 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
 		// 24h）。选号侧 healthyForModel 对该账号自动避开该模型；切模型/切账号即可用。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
-		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		//
+		// 2026-10-18：**先查模型目录**再决定要不要写这条负缓存。
+		//
+		// 动机（用户：「cn 和 global 获取模型列表时也是自动获取列表里的，而不是列出
+		// 被隐藏的，看看有没有接口」）：模型名是客户端自选字段，客户端传一个已经下线
+		// 的旧名字（实测 CN 台账里 10 个模型——glm-4.6 / kimi-k2-thinking / minimax-m2.5
+		// 等——在当前目录里**一个都不存在**）时，上游回 11102 是「这个模型没了」，
+		// 不是「这个账号用不了这个模型」。按 (账号,模型) 记负缓存等于给每个账号各记
+		// 一条永久无效条目，面板上就是一片「模型不可用」，还占用有限的条目预算
+		// （maxModelCooldowns）把真正在倒计时的限流挤掉。
+		//
+		// 目录里没有 → 不写负缓存（换号也没用，模型本身不存在），只让这次请求失败。
+		// 目录里**有** → 说明是该账号对这个模型没有权限，按原逻辑记 (账号,模型) 避让。
+		// 目录缓存未就绪（启动初期/刷新失败）→ 返回 unknown，按原逻辑记录（保守：
+		// 宁可多避让一个模型，也不要让一个真正无权限的账号被反复选中重试）。
+		switch h.modelCatalogState(model) {
+		case modelInCatalog:
+			h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		case modelRetired:
+			// 模型已不在当前目录：这条错误与账号无关，不写任何避让。
+			// 记一行日志便于发现「客户端在用旧模型名」（每个模型每小时最多一行）。
+			h.noteRetiredModel(model)
+		default:
+			h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		}
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

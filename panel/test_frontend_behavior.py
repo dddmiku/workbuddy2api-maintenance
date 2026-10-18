@@ -1061,6 +1061,11 @@ class AccountLimitSortTest(FrontendHarness, unittest.TestCase):
     需求来源（2026-10-18）：「账户页面价格排序，解除模型限流的时间来，要求可以筛选模型」。
     排序键用 until（网关避让截止）而不是 resetAt：until 才是网关真的会再试的时刻，
     resetAt 是上游承诺的重置墙钟，在 soft_rate_max 截断时比 until 晚、不兑现也常见。
+
+    同批修正：11102「该后端无此模型」（kind='unavailable'）与真正的限流
+    （kind='rate'）必须分开——用户看到 CN 账号下每个模型各列一行「模型限流 …
+    解除 22:53」问「为什么 cn 全列出来了」。实测那批模型对**全部** 6 个 CN 账号都
+    返回 11102，是模型下线/改名，不是等待。
     """
 
     def _accounts(self):
@@ -1070,10 +1075,10 @@ class AccountLimitSortTest(FrontendHarness, unittest.TestCase):
 var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
 S.data={accounts:[
  {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
-   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004'}]}},
+   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004',kind:'rate'}]}},
  {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
-   {model:'m2',until:new Date(BASE+9*H).toISOString(),reason:'11102'},
-   {model:'m1',until:new Date(BASE+5*H).toISOString(),reason:'6004'}]}},
+   {model:'m2',until:new Date(BASE+9*H).toISOString(),reason:'11102 model not available',kind:'unavailable'},
+   {model:'m1',until:new Date(BASE+5*H).toISOString(),reason:'6004',kind:'rate'}]}},
  {uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true}}
 ]};
 """
@@ -1088,15 +1093,51 @@ return $('#acctRows').innerHTML;
         self.assertLess(result.index(">A<"), result.index(">B<"))
         self.assertLess(result.index(">B<"), result.index(">C<"))
 
-    def test_filters_by_model_and_uses_that_models_release_time(self):
+    def test_unavailable_entry_does_not_claim_a_release_time(self):
+        """11102 不得显示成「解除 X」——它没有可解除的时刻。"""
         result = self.run_frontend(self._accounts() + """
-S.acctSort='limit'; S.acctModel='m2';
+S.acctSort='limit'; S.acctModel='';
 renderAccounts();
 return $('#acctRows').innerHTML;
 """)
-        # 只有 B 有 m2；A（只有 m1）与 C（无限流）都必须被筛掉。
+        self.assertIn("模型不可用 m2", result)
+        self.assertIn("上游无此模型", result)
+        # m2 是 11102，绝不能出现在「解除」句式里。
+        self.assertNotIn("模型限流 m2", result)
+        self.assertNotIn("解除 " + "m2", result)
+        # m1 是真正的限流，仍用「解除」措辞。
+        self.assertIn("模型限流 m1", result)
+
+    def test_unavailable_is_excluded_from_model_picker(self):
+        """模型下拉只收限流类：11102 的模型混进来会让人以为等到点就能用。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return $('#acctModel').innerHTML;
+""")
+        self.assertIn("m1", result)
+        self.assertNotIn('value="m2"', result, "11102 的模型不该进「限流解除」下拉")
+
+    def test_filtering_by_rate_model_excludes_unavailable_only_accounts(self):
+        """筛 m1（限流）时，只有 m2（11102）的号不该出现。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m1';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn(">A<", result)
         self.assertIn(">B<", result)
-        self.assertNotIn(">A<", result)
+        self.assertNotIn(">C<", result)
+
+    def test_filters_by_model_and_uses_that_models_release_time(self):
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m1';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # 只有 A 与 B 有 m1；C（无限流）必须被筛掉。
+        self.assertIn(">A<", result)
+        self.assertIn(">B<", result)
         self.assertNotIn(">C<", result)
 
     def test_model_filter_ignored_unless_sorting_by_limit(self):
@@ -1119,7 +1160,6 @@ return {html:$('#acctModel').innerHTML, disabled:$('#acctModel').disabled,
         value:$('#acctModel').value};
 """)
         self.assertIn("m1", result["html"])
-        self.assertIn("m2", result["html"])
         self.assertNotIn('value="m3"', result["html"])
         self.assertFalse(result["disabled"])
         self.assertEqual(result["value"], "")
@@ -1137,12 +1177,110 @@ return {disabled:$('#acctModel').disabled, html:$('#acctModel').innerHTML};
     def test_switching_away_from_limit_sort_clears_model_filter(self):
         """切走「限流解除」时必须清掉模型筛选，否则切回来会莫名其妙只剩几行。"""
         result = self.run_frontend(self._accounts() + """
-S.acctSort='limit'; S.acctModel='m2';
+S.acctSort='limit'; S.acctModel='m1';
 var handler=$('#acctSort').events.click;
 handler({target:{closest:function(){return {getAttribute:function(){return 'credit'}}}}});
 return {sort:S.acctSort, model:S.acctModel};
 """)
         self.assertEqual(result, {"sort": "credit", "model": ""})
+
+    def test_kind_falls_back_to_reason_when_backend_omits_it(self):
+        """老后端不带 kind 时按 reason 前缀兜底，前后端可独立升级。"""
+        result = self.run_frontend("""
+return {a:rlmKind({reason:'11102 model not available'}),
+        b:rlmKind({reason:'6004 model rate limit'}),
+        c:rlmKind({reason:'11102 model not available', kind:'rate'})};
+""")
+        self.assertEqual(result["a"], "unavailable")
+        self.assertEqual(result["b"], "rate")
+        # 显式 kind 优先于 reason 推断。
+        self.assertEqual(result["c"], "rate")
+
+
+class DomainWideUnavailableTest(FrontendHarness, unittest.TestCase):
+    """域级共同的 11102 折叠成一行提示，不在每个账号行重复。
+
+    用户 2026-10-18：「为什么 cn 全列出来了」。实测那批模型（glm-4.6 /
+    kimi-k2-thinking / minimax-m2.5 …）对**全部** CN 账号都返回 11102，是模型
+    下线/改名。每行各列一遍就是一片「模型不可用」，把真正在倒计时的限流淹没。
+    """
+
+    def _fixture(self, same_models=True):
+        # 两个 CN 号：要么命中同一批 11102（应折叠），要么各命中不同模型（不该折叠）。
+        m_b = "['glm-4.6','kimi-k2-thinking']" if same_models else "['minimax-m2.5']"
+        return """
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+function unavail(names){ return names.map(function(n){
+  return {model:n, until:new Date(BASE+6*H).toISOString(),
+          reason:'11102 model not available', kind:'unavailable'}; }); }
+S.data={accounts:[
+ {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
+   unavail(['glm-4.6','kimi-k2-thinking'])}},
+ {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
+   unavail(%s)}}
+]};
+""" % m_b
+
+    def test_common_unavailable_folds_into_one_note(self):
+        result = self.run_frontend(self._fixture(True) + """
+S.acctSort=''; S.acctModel='';
+renderAccounts();
+return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML,
+        shown:$('#acctUnavailable').style.display};
+""")
+        # 提示条说明「对所有账号一致，非账号问题」。
+        self.assertIn("上游已无此模型", result["note"])
+        self.assertIn("非账号问题", result["note"])
+        self.assertIn("glm-4.6", result["note"])
+        self.assertNotEqual(result["shown"], "none")
+        # 行内不再重复这两条（否则 CN 每个号都挂一串）。
+        self.assertNotIn("模型不可用 glm-4.6", result["rows"])
+        self.assertNotIn("模型不可用 kimi-k2-thinking", result["rows"])
+
+    def test_account_specific_unavailable_stays_in_row(self):
+        """只部分账号命中的 11102 不折叠——那可能是该账号的权限差异。"""
+        result = self.run_frontend(self._fixture(False) + """
+S.acctSort=''; S.acctModel='';
+renderAccounts();
+return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML};
+""")
+        # 两个号各命中不同模型 → 没有交集 → 不折叠，行内保留。
+        self.assertIn("模型不可用 glm-4.6", result["rows"])
+        self.assertIn("模型不可用 minimax-m2.5", result["rows"])
+        self.assertNotIn("上游已无此模型", result["note"])
+
+    def test_note_respects_realm_filter(self):
+        """筛了某个域时，提示条只说该域的事，不串域。"""
+        result = self.run_frontend("""
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+function unavail(n){ return [{model:n, until:new Date(BASE+6*H).toISOString(),
+  reason:'11102 model not available', kind:'unavailable'}]; }
+S.data={accounts:[
+ {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('cn-gone')}},
+ {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('cn-gone')}},
+ {uid:'g1',nickname:'G1',realm:'global',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('g-gone')}},
+ {uid:'g2',nickname:'G2',realm:'global',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('g-gone')}}
+]};
+S.realm='global'; S.acctSort=''; S.acctModel='';
+renderAccounts();
+return $('#acctUnavailable').innerHTML;
+""")
+        self.assertIn("g-gone", result)
+        self.assertNotIn("cn-gone", result)
+
+    def test_single_account_domain_never_folds(self):
+        """只有一个账号时「全部命中」退化成它自己，折叠等于隐藏信息。"""
+        result = self.run_frontend("""
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[{uid:'a',nickname:'A',realm:'trae',pool:{inPool:true,healthy:true,
+ rateLimitedModels:[{model:'x-gone', until:new Date(BASE+6*H).toISOString(),
+   reason:'11102 model not available', kind:'unavailable'}]}}]};
+S.realm=''; S.acctSort=''; S.acctModel='';
+renderAccounts();
+return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML};
+""")
+        self.assertIn("模型不可用 x-gone", result["rows"])
+        self.assertNotIn("上游已无此模型", result["note"])
 
 
 class RealmBreakdownCompletenessTest(unittest.TestCase):
