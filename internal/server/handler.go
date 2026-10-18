@@ -216,18 +216,6 @@ type Handler struct {
 	retiredModelSeen map[string]time.Time
 }
 
-// modelCatalogStatus 模型名在当前上游目录里的状态（见 Handler.modelCatalogState）。
-type modelCatalogStatus int
-
-const (
-	// modelCatalogUnknown 目录尚未就绪，无法判断。调用方按「保守」处理（照旧记避让）。
-	modelCatalogUnknown modelCatalogStatus = iota
-	// modelInCatalog 目录里明确存在该模型：11102 属账号级权限差异。
-	modelInCatalog
-	// modelRetired 目录已就绪且明确不含该模型：已下线/改名，与账号无关。
-	modelRetired
-)
-
 // SetReasoningLoopStopOnly 运行期切换「命中循环后是否只停不重发」，立即作用于后续
 // 请求；已经开始的那次请求沿用开始时读到的值。
 func (h *Handler) SetReasoningLoopStopOnly(enabled bool) {
@@ -680,17 +668,26 @@ func (h *Handler) probeModelCooling(w http.ResponseWriter, r *http.Request) {
 	}
 	// 判定：只有「明确仍是限流」才续期，其它 (成功 / 401 / 404 / 5xx / 网络错误)
 	// 都不能当成「已恢复」的证据——清掉限流记录必须有成功证据。
+	//
+	// 2026-10-18：11102「该后端无此模型」**不算限流**，不续期。
+	// 它表示模型本身不存在（下线/改名），与账号无关，本地退避只是「别再立刻重试」
+	// 的节流；把它当限流续期会让面板上堆出一排「模型不可用」，把真正在倒计时的
+	// 6004 淹没（用户截图反馈）。探测遇到 11102 时按「该模型不可用」如实回报，
+	// 不改动任何冷却记录。
 	limited := false
+	modelGone := false
 	if terr != nil {
 		var ue *upstream.Error
 		if errors.As(terr, &ue) {
-			limited = ue.Kind == upstream.ErrSoftRate || ue.Kind == upstream.ErrModelBlocked
+			limited = ue.Kind == upstream.ErrSoftRate
+			modelGone = ue.Kind == upstream.ErrModelBlocked
 		}
 	} else if status >= 200 && status < 300 {
 		limited = false
 	} else {
 		kind := upstream.Classify(status, detail)
-		limited = kind == upstream.ErrSoftRate || kind == upstream.ErrModelBlocked
+		limited = kind == upstream.ErrSoftRate
+		modelGone = kind == upstream.ErrModelBlocked
 	}
 	if limited {
 		// 探测撞上限流 → 如实把该模型重新记上（沿用入口的退避/上游墙钟口径）。
@@ -714,6 +711,11 @@ func (h *Handler) probeModelCooling(w http.ResponseWriter, r *http.Request) {
 		"model":    bareModel,
 		"detail":   detail,
 		"probe_ok": succeeded,
+	}
+	// 11102：模型本身不存在（下线/改名），不是账号或限流问题。面板据此提示
+	// 「该模型不可用」而不是「仍在限流」，也不显示解除时刻（根本没有）。
+	if modelGone {
+		result["model_unavailable"] = true
 	}
 	if stillLimited {
 		result["until"] = until.Format(time.RFC3339)
@@ -1293,83 +1295,6 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.Unlock()
 	h.syncPaidModels()
 	return infos
-}
-
-// 2026-10-18 撤回：这里曾调用 pruneRetiredModelCooldowns 按目录清理 11102 条目，
-// 但「目录」到底取哪一份并不确定——企业端点（17 个）与 /v1/models 的并集
-// （v3 + 企业，50 个）差别很大：deep-model / glm-4.6 / kimi-k2-thinking 等
-// 只存在于 v3 面，用企业端点判定会把它们当成已下线而误删仍在生效的避让。
-//
-// 现在改为只做「写入侧」判定（applyErrorPolicy 的 modelCatalogState，取并集，
-// 与 /v1/models 同一份事实），不再主动删已有条目：条目有 TTL（6h 起、24h 封顶）
-// 会自然过期，误删的代价（把真在限流的模型放回轮询）比多留几条更大。
-// 若将来要做清理，判据必须与 /v1/models 的并集完全一致，并有测试锁住。
-
-// modelCatalogState 报告某个模型名在当前上游模型目录里的状态。
-//
-// 用于 11102 分流：目录里没有该名字 → 模型已下线/改名，与账号无关，不该写
-// (账号,模型) 负缓存；目录里有 → 说明是账号权限差异，按原逻辑避让。
-//
-// 三个返回值刻意分开，而不是 bool：
-//   - modelInCatalog  目录里明确存在（含别名/裸名两种拼写）；
-//   - modelRetired    目录已就绪，且明确不包含该名字；
-//   - modelCatalogUnknown 目录尚未拉取成功（启动初期 / 刷新失败），无法判断。
-//
-// 为什么 unknown 不能当成 retired：把「还不知道」当成「不存在」会漏记真实的
-// 账号级权限问题——那个账号之后每次被选中都会再撞一次 11102，白白拖慢请求。
-// 保守方向应当是「宁可多记一条避让」，等目录就绪后自然不再新增。
-//
-// 目录来源与 /v1/models 完全相同（CN 用 dynamicModelsCache，global 用
-// CachedGlobalModelInfos），所以判据与「客户端能选到哪些模型」是同一份事实。
-func (h *Handler) modelCatalogState(model string) modelCatalogStatus {
-	name := strings.TrimSpace(model)
-	if name == "" {
-		return modelCatalogUnknown
-	}
-	// 别名与裸名都算命中：目录里既可能有 "cn:glm-5.3" 形态，也可能有裸名。
-	//
-	// stripModelAlias 只去掉 [effort] 后缀；这里还要处理网关对外暴露的
-	// "realm:name" 拼写（如 "cn:glm-5.3"）——客户端可以带前缀请求，目录里
-	// 通常是裸名，不剥前缀会把一个存在的模型误判成已下线（见 trimRealmPrefix）。
-	bare := trimRealmPrefix(stripModelAlias(name))
-
-	// CN 目录：fetchDynamicModels 的缓存（1 小时 TTL，纯读，不触发上游请求）。
-	dynamicModelsCache.RLock()
-	cnReady := len(dynamicModelsCache.ids) > 0
-	cnHit := false
-	if cnReady {
-		for _, mi := range dynamicModelsCache.ids {
-			if mi.ID == name || mi.ID == bare || stripModelAlias(mi.ID) == bare {
-				cnHit = true
-				break
-			}
-		}
-	}
-	dynamicModelsCache.RUnlock()
-
-	// global 目录：探测缓存（纯读，未探测返回 nil）。
-	globalInfos := h.cfg.Upstream.CachedGlobalModelInfos()
-	globalReady := len(globalInfos) > 0
-	globalHit := false
-	if globalReady {
-		for _, mi := range globalInfos {
-			if mi.ID == name || mi.ID == bare || stripModelAlias(mi.ID) == bare {
-				globalHit = true
-				break
-			}
-		}
-	}
-
-	switch {
-	case cnHit || globalHit:
-		// 任一域目录里有这个名字就算存在：同名模型在不同域的上线节奏不同，
-		// 在 CN 已下线但 global 仍在的情况不该被当成「模型不存在」。
-		return modelInCatalog
-	case cnReady || globalReady:
-		return modelRetired
-	default:
-		return modelCatalogUnknown
-	}
 }
 
 // noteRetiredModel 记录一次「客户端在用已下线的模型名」观测。
@@ -2680,16 +2605,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 目录里**有** → 说明是该账号对这个模型没有权限，按原逻辑记 (账号,模型) 避让。
 		// 目录缓存未就绪（启动初期/刷新失败）→ 返回 unknown，按原逻辑记录（保守：
 		// 宁可多避让一个模型，也不要让一个真正无权限的账号被反复选中重试）。
-		switch h.modelCatalogState(model) {
-		case modelInCatalog:
-			h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
-		case modelRetired:
-			// 模型已不在当前目录：这条错误与账号无关，不写任何避让。
-			// 记一行日志便于发现「客户端在用旧模型名」（每个模型每小时最多一行）。
-			h.noteRetiredModel(model)
-		default:
-			h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
-		}
+		// 2026-10-18（用户：「只有被使用的模型，被明确告知冷却，才在账号里显示模型级
+		// 的冷却」）：11102 一律**不写模型冷却台账**。
+		//
+		// 11102 的语义是「该后端无此模型」——模型不存在或已改名，与账号无关，上游也
+		// 没给任何恢复时刻。它此前写进 modelCooldowns（与 6004 同表），面板就把它当
+		// 限流列出来，每个账号挂 3~4 行「模型不可用 · 上游无此模型」，把真正在倒计时
+		// 的 6004 淹没。而它到点重试仍然是 11102，列出来毫无运维价值。
+		//
+		// 现在只记一行日志（按模型每小时去重）便于发现「客户端在用旧模型名」。
+		// 选号侧影响：该账号下次仍可能被选中去打这个模型——代价是再吃一次 11102
+		// 后换号，远小于给每个账号刷一片假限流。真正的账号级权限差异会由
+		// ErrAccountFault（11140）那条路径处理。
+		h.noteRetiredModel(model)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

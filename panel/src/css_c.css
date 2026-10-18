@@ -44,17 +44,6 @@
 .sel{height:28px;max-width:200px;padding:0 8px;border:1px solid var(--line);border-radius:var(--r2);
   background:var(--sunken);color:var(--ink);font:inherit;font-size:12.5px;cursor:pointer}
 .sel:disabled{opacity:.5;cursor:not-allowed}
-/* 「模型不可用」（11102 上游无此模型）与「模型限流」是两种事：前者等再久也不会恢复，
-   视觉上弱化，避免一片红字把真正在倒计时的限流淹没（2026-10-18 用户反馈 CN 账号
-   每个模型都列一行）。 */
-.sub.rlm.na{color:var(--ink-3)}
-/* 域级「模型不可用」提示条：表格上方一行，说明「这些模型对所有账号都不存在」。
-   它替代了原先每行重复 6~9 条「模型不可用」，让行内只剩真正在倒计时的限流。 */
-.acct-unavail{display:flex;gap:8px;align-items:flex-start;margin:0 0 10px;
-  padding:8px 10px;border:1px solid var(--line);border-radius:var(--r2);
-  background:var(--sunken);font-size:12px;color:var(--ink-2);line-height:1.6}
-.acct-unavail-ico{flex:none;color:var(--ink-3);margin-top:1px}
-.acct-unavail-item b{color:var(--ink);font-weight:500}
 .sw{width:32px;height:18px;flex:none;border-radius:999px;background:var(--line-2);position:relative;
   transition:background .15s var(--ease)}
 .sw::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;

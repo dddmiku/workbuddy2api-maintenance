@@ -140,11 +140,16 @@ func TestAuditBlockedModelBackoffSurvivesHalfOpenPick(t *testing.T) {
 		t.Fatal("expired model restriction must allow a recovery probe")
 	}
 	p.BlockModelBackoff("u1", "unavailable", "11102 model not available")
+	// 11102 不进限流台账（2026-10-18：模型不存在 ≠ 账号被限流），但退避本身仍要
+	// 按指数累积——这是「别再立刻重试」的节流，与台账展示是两件事。
 	st, _ := p.Status("u1")
-	if len(st.RateLimitedModels) != 1 {
-		t.Fatal("repeated model restriction missing")
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("11102 不应进限流台账，got %+v", st.RateLimitedModels)
 	}
-	remaining := time.Until(st.RateLimitedModels[0].Until)
+	p.mu.Lock()
+	mc = p.byUID["u1"].modelCooldowns["unavailable"]
+	remaining := time.Until(mc.Until)
+	p.mu.Unlock()
 	if remaining < 12*time.Hour-time.Second || remaining > 12*time.Hour {
 		t.Fatalf("failed half-open probe lost its backoff history: remaining=%s want 12h", remaining)
 	}

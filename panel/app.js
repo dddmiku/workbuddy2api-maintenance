@@ -225,46 +225,6 @@ function modelLimitEnd(a, model){
   }
   return best;
 }
-// ACCT_WIDE_UNAVAIL 当前渲染轮次里的「域级共同 11102」快照（realm → {model:true}）。
-// 由 renderAccounts 每轮算一次，行渲染直接读，避免逐行重算。
-var ACCT_WIDE_UNAVAIL = Object.create(null);
-// domainWideUnavailable 找出「该域全部账号都命中」的 11102 模型。
-//
-// 为什么要这一层：11102「该后端无此模型」是**模型级全局事实**，不是账号级问题。
-// 实测（2026-10-18，dev 的 6 个 CN 账号）glm-4.6 / kimi-k2-thinking / minimax-m2.5
-// 等对**每一个** CN 账号都返回 11102——模型已下线或改名。每个账号行各列一遍，
-// 屏幕上就是一片「模型不可用」，把真正在倒计时的限流淹没（用户：「为什么 cn 全
-// 列出来了」）。
-//
-// 口径：某模型在该域**所有在池账号**上都有限流条目时才折叠。只部分账号命中时
-// 不折叠——那可能是账号权限差异，属于该账号的真实状态，必须留在行内。
-// 只有一个账号时永不折叠（"全部"退化成它自己，折叠等于隐藏信息）。
-function domainWideUnavailable(accounts){
-  var byRealm = Object.create(null);
-  (accounts || []).forEach(function(a){
-    var r = realmOf(a);
-    (byRealm[r] = byRealm[r] || []).push(a);
-  });
-  var out = Object.create(null);   // realm -> {model: true}
-  Object.keys(byRealm).forEach(function(r){
-    var list = byRealm[r];
-    if (list.length < 2) return;
-    var common = null;
-    list.forEach(function(a){
-      var names = Object.create(null);
-      rlmOf(a).forEach(function(m){
-        if (rlmKind(m) === 'unavailable' && m.model) names[m.model] = 1;
-      });
-      if (common === null){
-        common = names;
-      } else {
-        Object.keys(common).forEach(function(k){ if (!names[k]) delete common[k]; });
-      }
-    });
-    if (common && Object.keys(common).length) out[r] = common;
-  });
-  return out;
-}
 // limitedModels 汇总当前池子里所有被避让的模型名（去重、按名排序）。
 // 供模型筛选下拉框的选项来源——不写死模型表，模型名是客户端自选字段，池子里
 // 出现过哪些才列哪些。
@@ -1011,7 +971,6 @@ function renderAccounts(){
   // 不随 innerHTML 变化，所以必须显式同步，否则点了排序按钮看不出选中的是哪个）。
   syncAcctSortControls(all);
   // 域级共同的 11102 每轮只算一次：行渲染要按它做过滤，逐行重算会 O(n²)。
-  ACCT_WIDE_UNAVAIL = domainWideUnavailable(all);
   var q = S.q.trim().toLowerCase();
   if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
   if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
@@ -1068,8 +1027,7 @@ function renderAccounts(){
     $('#acctRows').innerHTML = '<tr><td colspan="5" data-l="">' +
       emptyBox(IC.users, '没有匹配的账号', scoped.length ? '换个关键词或筛选条件' : '用右上角添加账号') +
       '</td></tr>';
-    renderAcctUnavailableNote(all);
-    return;
+      return;
   }
   $('#acctRows').innerHTML = list.map(function(a){
     var st = acctState(a), c = a.credits || {}, p = Object.assign({}, a.pool || {});
@@ -1143,45 +1101,28 @@ function renderAccounts(){
         '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
         esc(coolLeft(p.coolRemaining) + (coolReasonTxt ? ' · ' + coolReasonTxt : '')) + '</span>'
       : '';
-    // 模型级台账：**两类语义必须分开说**（2026-10-18 用户反馈「为什么 cn 全列出来了」）。
+    // 模型级台账：只显示**上游明确告知的限流**（2026-10-18 用户要求：
+    // 「只有被使用的模型，被明确告知冷却，才在账号里显示模型级的冷却」）。
     //
-    //   rate（6004/429 等）  → 「模型限流 m · 解除 22:53（剩 5 小时）」：
-    //                           until 是真实的恢复时刻，到点确实可能能用。
-    //   unavailable（11102）→ 「模型不可用 m」：上游明确答复「该后端无此模型」。
-    //                           台账里的 until 只是本地退避窗口（6h/12h/24h 指数），
-    //                           写「解除 22:53」会让人以为到点就能用——实测那批模型
-    //                           对**全部** CN 账号都返回 11102，是模型下线/改名，
-    //                           等多久都不会恢复。所以这里只报事实 + 下次重试窗口，
-    //                           并把重试窗口标注为「本地」而不是「解除」。
+    //   rate（6004/429 等）→ 「模型限流 m · 解除 22:53（剩 5 小时）」：
+    //                        until 是上游给的恢复时刻，到点确实可能能用。
     //
-    // 两类都保留「检测」按钮：11102 也可能只是该账号暂时没权限，真实请求是唯一
-    // 能证伪的方式（探测成功会自动清掉这条负缓存）。
-    var rlm = rlmOf(a);
-    // 域级共同的 11102 已在表格上方的提示条里统一说明，行内不再重复——
-    // 否则 CN 每个号都挂 6~9 行「模型不可用」，真正在倒计时的限流被淹没。
-    var wide = ACCT_WIDE_UNAVAIL[realmOf(a)] || {};
-    rlm = rlm.filter(function(m){
-      return !(rlmKind(m) === 'unavailable' && wide[m.model]);
-    });
+    // 11102「该后端无此模型」整类不渲染（用户：「甚至连这句话都不需要显示出来」）：
+    // 它表示模型本身不存在/已改名，与账号无关，上游也没给恢复时刻；列出来只会让
+    // 每个账号挂 3~4 行「模型不可用」，把真正在倒计时的限流淹没。后端已不再下发
+    // 这类条目（见 pool.rateLimitedModelsLocked 的 11102 排除），这里再挡一层，
+    // 避免旧版 state.json 恢复的存量条目漏出来。
+    var rlm = rlmOf(a).filter(function(m){ return rlmKind(m) !== 'unavailable'; });
     var rlmSub = (rlm.length)
       ? rlm.map(function(m){
-          var kind = rlmKind(m);
           var sec = Math.max(0, Math.ceil((new Date(m.until).getTime() - Date.now()) / 1000));
-          var label, cls;
-          if (kind === 'unavailable'){
-            // 不写「解除」：这个 until 不是上游承诺的恢复时刻。
-            label = '模型不可用 ' + (m.model || '?') + ' · 上游无此模型（本地 ' + coolLeft(sec) + '后重试）';
-            cls = 'sub rlm na';
-          } else {
-            var untilTxt = fmtLimitWhen(m.until);
-            var resetTxt = m.resetAt ? fmtLimitWhen(m.resetAt) : '';
-            var when = (resetTxt && resetTxt !== untilTxt)
-              ? (resetTxt + '（先避让到 ' + untilTxt + '）')
-              : untilTxt;
-            label = '模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）';
-            cls = 'sub rlm';
-          }
-          return '<span class="' + cls + '" title="' +
+          var untilTxt = fmtLimitWhen(m.until);
+          var resetTxt = m.resetAt ? fmtLimitWhen(m.resetAt) : '';
+          var when = (resetTxt && resetTxt !== untilTxt)
+            ? (resetTxt + '（先避让到 ' + untilTxt + '）')
+            : untilTxt;
+          var label = '模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）';
+          return '<span class="sub rlm" title="' +
             esc(modelLimitTitle(m)) + '">' + esc(label) +
             '<button class="btn sm probe" data-probe="' + esc(a.uid) + '" data-probe-model="' +
             esc(m.model || '') + '" title="发一次极小请求，确认该模型是否已恢复">检测</button>' +
@@ -1227,34 +1168,8 @@ function renderAccounts(){
       '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
       '" title="删除">' + svg(IC.trash, 13) + '</button></div></td></tr>';
   }).join('');
-  renderAcctUnavailableNote(all);
 }
 
-// renderAcctUnavailableNote 渲染「域级模型不可用」提示条（表格上方，一行）。
-//
-// 被折叠的 11102 不在各账号行里重复显示（见 domainWideUnavailable），但也不能
-// 悄悄消失——运维需要知道「这个域里有模型已经下线了」。所以在这里按域汇总一次。
-//
-// 提示条只在**当前筛选口径**下出现：筛了 Global 就只说 Global 的事，否则切域后
-// 还挂着 CN 的提示，读起来像「Global 也有这个问题」。
-function renderAcctUnavailableNote(all){
-  var el = $('#acctUnavailable');
-  if (!el) return;
-  var wide = domainWideUnavailable(all);
-  var realms = S.realm ? [S.realm] : REALM_ORDER;
-  var parts = [];
-  realms.forEach(function(r){
-    var models = wide[r];
-    if (!models) return;
-    var names = Object.keys(models).sort();
-    if (!names.length) return;
-    parts.push('<span class="acct-unavail-item"><b>' + esc(realmShort(r)) + '</b>：' +
-      esc(names.join('、')) + ' 上游已无此模型（对所有账号一致，非账号问题）</span>');
-  });
-  if (!parts.length){ el.innerHTML = ''; el.style.display = 'none'; return; }
-  el.style.display = '';
-  el.innerHTML = '<span class="acct-unavail-ico">' + svg(IC.warn, 13) + '</span>' + parts.join('');
-}
 
 /* ── 积分有效期页 ─────────────────────────────────────
  * 数据来源：账号的 credits.expiry（cmd/credit 直查上游 billing/meter 得到的分档）。

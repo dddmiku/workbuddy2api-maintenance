@@ -123,12 +123,19 @@ func TestCooldownSoftForModelRecordsLastErr(t *testing.T) {
 	assertModelLimited(t, p, "glm-5.3", "6004 model rate limit")
 }
 
-// 11102 负缓存（该账号无此模型）同样留观测。
+// 11102 负缓存仍留观测（last_err），但**不进限流台账**。
+//
+// 2026-10-18 用户要求：「只有被使用的模型，被明确告知冷却，才在账号里显示模型级的
+// 冷却」。11102「该后端无此模型」是模型本身不存在/已改名，与账号无关，上游也没给
+// 恢复时刻——列进台账会让每个账号挂一排「模型不可用」，把真正的限流淹没。
 func TestBlockModelBackoffRecordsLastErr(t *testing.T) {
 	p := newObservedPool(t)
 	p.BlockModelBackoff("u1", "hy3-x", "11102 model blocked")
 	assertObservedLastErr(t, p)
-	assertModelLimited(t, p, "hy3-x", "11102 model blocked")
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("11102 不应进限流台账，got %+v", st.RateLimitedModels)
+	}
 }
 
 // 观测要落盘：重启后「最近活动」不能回到「从未」，积分不足状态也要保留。

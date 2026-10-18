@@ -11,6 +11,7 @@ package pool
 
 import (
 	"sort"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -711,20 +712,39 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	rows := make([]RateLimitedModel, 0, len(models))
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
-		if !mc.Until.IsZero() && now.Before(mc.Until) {
-			row := RateLimitedModel{
-				Model:  m,
-				Until:  mc.Until,
-				Reason: mc.Reason,
-			}
-			// 上游「将在 … 重置」的原始墙钟：无论是否被 soft_rate_max 截断都透出——
-			// 未截断时 Until==ResetAt（两者同值），截断时 ResetAt 是真实恢复时刻，
-			// 台账据此始终可见上游权威时点（omitempty 仅在无 ResetAt 的旧数据上省略）。
-			if !mc.ResetAt.IsZero() {
-				row.ResetAt = mc.ResetAt
-			}
-			rows = append(rows, row)
+		if mc.Until.IsZero() || !now.Before(mc.Until) {
+			continue
 		}
+		// 台账只列「上游明确告知的模型级限制」，排除 11102。
+		//
+		// 2026-10-18 用户反馈（截图：「模型不可用 deepseek-r1-0528 · 上游无此模型」）：
+		// modelCooldowns 同时承载两类语义完全不同的条目，此前一并列出，面板上就出现
+		// 一堆「模型不可用」，把真正在倒计时的限流淹没。
+		//
+		// 11102「该后端无此模型」的语义是模型本身不存在/已改名，与账号无关，上游也
+		// 没给任何恢复时刻；本地退避只是「别再立刻重试」的节流，到点重试仍然是 11102。
+		// 它不该出现在账号的限流台账里（用户原话：「只有被使用的模型，被明确告知冷却，
+		// 才在账号里显示模型级的冷却」）。
+		//
+		// 其余条目**保留**：6004 模型限流（带上游重置墙钟）、14017 trial 未激活、
+		// 429 来源限流等，都是上游明确对「该账号 + 该模型」给出的限制，属于台账该展示的
+		// 内容。因此这里按 reason 前缀精确排除 11102，而不是要求「必须有 ResetAt」——
+		// 后者会把 14017 与无墙钟的 6004 一并砍掉。
+		if strings.HasPrefix(mc.Reason, "11102") {
+			continue
+		}
+		row := RateLimitedModel{
+			Model:  m,
+			Until:  mc.Until,
+			Reason: mc.Reason,
+		}
+		// 上游「将在 … 重置」的原始墙钟：无论是否被 soft_rate_max 截断都透出——
+		// 未截断时 Until==ResetAt（两者同值），截断时 ResetAt 是真实恢复时刻，
+		// 台账据此始终可见上游权威时点（omitempty 仅在无 ResetAt 的旧数据上省略）。
+		if !mc.ResetAt.IsZero() {
+			row.ResetAt = mc.ResetAt
+		}
+		rows = append(rows, row)
 	}
 	if len(rows) == 0 {
 		return nil

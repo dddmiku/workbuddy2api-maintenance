@@ -1093,18 +1093,21 @@ return $('#acctRows').innerHTML;
         self.assertLess(result.index(">A<"), result.index(">B<"))
         self.assertLess(result.index(">B<"), result.index(">C<"))
 
-    def test_unavailable_entry_does_not_claim_a_release_time(self):
-        """11102 不得显示成「解除 X」——它没有可解除的时刻。"""
+    def test_unavailable_entry_is_not_rendered_at_all(self):
+        """11102 整类不渲染（2026-10-18 用户：「甚至连这句话都不需要显示出来」）。
+
+        它表示模型本身不存在/已改名，与账号无关，上游也没给恢复时刻；列出来只会让
+        每个账号挂一排「模型不可用」，把真正在倒计时的限流淹没。后端已不再下发这类
+        条目，前端再挡一层，避免旧 state.json 的存量条目漏出来。
+        """
         result = self.run_frontend(self._accounts() + """
 S.acctSort='limit'; S.acctModel='';
 renderAccounts();
 return $('#acctRows').innerHTML;
 """)
-        self.assertIn("模型不可用 m2", result)
-        self.assertIn("上游无此模型", result)
-        # m2 是 11102，绝不能出现在「解除」句式里。
+        self.assertNotIn("模型不可用 m2", result)
+        self.assertNotIn("上游无此模型", result)
         self.assertNotIn("模型限流 m2", result)
-        self.assertNotIn("解除 " + "m2", result)
         # m1 是真正的限流，仍用「解除」措辞。
         self.assertIn("模型限流 m1", result)
 
@@ -1197,17 +1200,19 @@ return {a:rlmKind({reason:'11102 model not available'}),
         self.assertEqual(result["c"], "rate")
 
 
-class DomainWideUnavailableTest(FrontendHarness, unittest.TestCase):
-    """域级共同的 11102 折叠成一行提示，不在每个账号行重复。
+class UnavailableModelsHiddenTest(FrontendHarness, unittest.TestCase):
+    """11102「该后端无此模型」整类不在账号页出现。
 
-    用户 2026-10-18：「为什么 cn 全列出来了」。实测那批模型（glm-4.6 /
-    kimi-k2-thinking / minimax-m2.5 …）对**全部** CN 账号都返回 11102，是模型
-    下线/改名。每行各列一遍就是一片「模型不可用」，把真正在倒计时的限流淹没。
+    2026-10-18 用户两轮反馈：
+      1.「只有被使用的模型，被明确告知冷却，才在账号里显示模型级的冷却」
+      2.「甚至连这句话都不需要显示出来」
+    实测那批模型（glm-4.6 / kimi-k2-thinking / minimax-m2.5 …）是模型下线/改名，
+    与账号无关，上游也没给恢复时刻。列出来就是一片「模型不可用」，把真正在倒计时
+    的 6004 淹没。后端已不再下发这类条目（pool.rateLimitedModelsLocked 按 reason
+    前缀排除 11102），前端再挡一层，防止旧 state.json 的存量条目漏出来。
     """
 
-    def _fixture(self, same_models=True):
-        # 两个 CN 号：要么命中同一批 11102（应折叠），要么各命中不同模型（不该折叠）。
-        m_b = "['glm-4.6','kimi-k2-thinking']" if same_models else "['minimax-m2.5']"
+    def _fixture(self):
         return """
 var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
 function unavail(names){ return names.map(function(n){
@@ -1217,59 +1222,35 @@ S.data={accounts:[
  {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
    unavail(['glm-4.6','kimi-k2-thinking'])}},
  {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
-   unavail(%s)}}
+   unavail(['glm-4.6','minimax-m2.5'])}},
+ {uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'deepseek-v4.1-flash', until:new Date(BASE+18*H).toISOString(),
+    resetAt:new Date(BASE+18*H).toISOString(), reason:'6004 model rate limit', kind:'rate'}]}}
 ]};
-""" % m_b
+"""
 
-    def test_common_unavailable_folds_into_one_note(self):
-        result = self.run_frontend(self._fixture(True) + """
+    def test_no_unavailable_rows_in_account_table(self):
+        result = self.run_frontend(self._fixture() + """
 S.acctSort=''; S.acctModel='';
 renderAccounts();
-return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML,
-        shown:$('#acctUnavailable').style.display};
+return $('#acctRows').innerHTML;
 """)
-        # 提示条说明「对所有账号一致，非账号问题」。
-        self.assertIn("上游已无此模型", result["note"])
-        self.assertIn("非账号问题", result["note"])
-        self.assertIn("glm-4.6", result["note"])
-        self.assertNotEqual(result["shown"], "none")
-        # 行内不再重复这两条（否则 CN 每个号都挂一串）。
-        self.assertNotIn("模型不可用 glm-4.6", result["rows"])
-        self.assertNotIn("模型不可用 kimi-k2-thinking", result["rows"])
+        for name in ("glm-4.6", "kimi-k2-thinking", "minimax-m2.5"):
+            self.assertNotIn("模型不可用 " + name, result)
+        self.assertNotIn("上游无此模型", result)
 
-    def test_account_specific_unavailable_stays_in_row(self):
-        """只部分账号命中的 11102 不折叠——那可能是该账号的权限差异。"""
-        result = self.run_frontend(self._fixture(False) + """
+    def test_real_rate_limit_still_rendered(self):
+        """6004 是上游明确告知的模型限流，必须保留（截图 39 那种形态）。"""
+        result = self.run_frontend(self._fixture() + """
 S.acctSort=''; S.acctModel='';
 renderAccounts();
-return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML};
+return $('#acctRows').innerHTML;
 """)
-        # 两个号各命中不同模型 → 没有交集 → 不折叠，行内保留。
-        self.assertIn("模型不可用 glm-4.6", result["rows"])
-        self.assertIn("模型不可用 minimax-m2.5", result["rows"])
-        self.assertNotIn("上游已无此模型", result["note"])
+        self.assertIn("模型限流 deepseek-v4.1-flash", result)
+        self.assertIn("解除", result)
 
-    def test_note_respects_realm_filter(self):
-        """筛了某个域时，提示条只说该域的事，不串域。"""
-        result = self.run_frontend("""
-var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
-function unavail(n){ return [{model:n, until:new Date(BASE+6*H).toISOString(),
-  reason:'11102 model not available', kind:'unavailable'}]; }
-S.data={accounts:[
- {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('cn-gone')}},
- {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('cn-gone')}},
- {uid:'g1',nickname:'G1',realm:'global',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('g-gone')}},
- {uid:'g2',nickname:'G2',realm:'global',pool:{inPool:true,healthy:true,rateLimitedModels:unavail('g-gone')}}
-]};
-S.realm='global'; S.acctSort=''; S.acctModel='';
-renderAccounts();
-return $('#acctUnavailable').innerHTML;
-""")
-        self.assertIn("g-gone", result)
-        self.assertNotIn("cn-gone", result)
-
-    def test_single_account_domain_never_folds(self):
-        """只有一个账号时「全部命中」退化成它自己，折叠等于隐藏信息。"""
+    def test_legacy_state_entries_do_not_leak(self):
+        """旧 state.json 恢复的存量 11102 条目也不渲染（前端兜底）。"""
         result = self.run_frontend("""
 var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
 S.data={accounts:[{uid:'a',nickname:'A',realm:'trae',pool:{inPool:true,healthy:true,
@@ -1277,10 +1258,10 @@ S.data={accounts:[{uid:'a',nickname:'A',realm:'trae',pool:{inPool:true,healthy:t
    reason:'11102 model not available', kind:'unavailable'}]}}]};
 S.realm=''; S.acctSort=''; S.acctModel='';
 renderAccounts();
-return {rows:$('#acctRows').innerHTML, note:$('#acctUnavailable').innerHTML};
+return $('#acctRows').innerHTML;
 """)
-        self.assertIn("模型不可用 x-gone", result["rows"])
-        self.assertNotIn("上游已无此模型", result["note"])
+        self.assertNotIn("模型不可用 x-gone", result)
+        self.assertNotIn("上游无此模型", result)
 
 
 class RealmBreakdownCompletenessTest(unittest.TestCase):
