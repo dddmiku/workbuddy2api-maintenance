@@ -296,10 +296,43 @@ print(json.dumps([m['id'] for m in data['data']]))
         return []
 
 
-def verify(env, version, models=None, realm=None):
-    """冒烟：healthz + 三域 + 逐个模型真调一次。失败返回非零。
+def _smoke_subset(models):
+    """从 /v1/models 里挑每个域 1~2 个**对话**模型做冒烟。
 
-    models 省略时从 /v1/models 现取（只测公布的）；realm 可限定 trae/cn/global。
+    为什么不全量遍历：verify 是部署后的必经步骤，它会真调上游。全量遍历
+    119 个模型（其中大量是 space-bunny / kling-video / minimax-video 这类
+    非对话模型）会让每个账号被喂 9~10 次 11134（ErrServer），而
+    breaker_threshold=3 → 每个 CN 号各熔断 3 轮、breaker_until 推到 30 分钟后。
+    2026-10-18 prod 实测：部署后 realm_servable.cn=false，6 个积分
+    4178~5425、直连上游 200 的 CN 号全被自己的冒烟脚本打成「不可服务」。
+    冒烟的目的是「验证网关能服务」，不是「验证上游每个模型都活着」——后者
+    是非对话模型，本来就该 400/503，把它算成失败既误报又伤账号。
+    """
+    picks = []
+    by_realm = {}
+    for m in models:
+        realm = "trae" if ":" not in m else m.split(":")[0]
+        by_realm.setdefault(realm, []).append(m)
+    # 优先挑已知能对话的模型；没有就取该域前两个。
+    prefer = {
+        "cn": ["cn:glm-5.3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash"],
+        "global": ["global:deepseek-v4.1-flash", "global:deepseek-v4.1-pro"],
+        "trae": ["deepseek-v4.1-flash"],
+    }
+    for realm, cands in by_realm.items():
+        chosen = [m for m in prefer.get(realm, []) if m in cands][:2]
+        if not chosen:
+            chosen = cands[:1]
+        picks.extend(chosen)
+    return picks
+
+
+def verify(env, version, models=None, realm=None, all_models=False):
+    """冒烟：healthz + 三域 + 每个域代表模型真调一次。失败返回非零。
+
+    models 省略时从 /v1/models 现取，默认只取每域 1~2 个对话模型（见
+    _smoke_subset 的说明：全量遍历会把账号熔断器喂满）；all_models=True
+    才逐个遍历（诊断用，会在生产上伤账号，慎用）。realm 可限定 trae/cn/global。
     """
     cli = connect(env)
     failures = []
@@ -325,13 +358,23 @@ def verify(env, version, models=None, realm=None):
                     todo = [m for m in todo
                             if m.split(":")[0] == realm or (realm == "trae" and ":" not in m)]
                 print("models from /v1/models: %d" % len(todo))
+                if not all_models:
+                    todo = _smoke_subset(todo)
+                    print("smoke subset: %s" % ", ".join(todo))
             for name in todo:
                 rc, out, _ = run(cli, _curl_chat(key, name), timeout=180)
                 status = out.strip().splitlines()[-1] if out.strip() else ""
                 ok = status.startswith("200")
                 print("  %-46s %s" % (name, status or "no response"))
+                # 只有「该模型本来能对话」时 200 才是硬要求。全量遍历模式下列表里
+                # 混着 space-bunny / kling-video / minimax-video 等非对话模型，它们
+                # 返回 4xx/5xx 是正确行为；把这类算失败会让人误以为部署坏了。
+                # 单模型失败仍要记录，但不计入退出码（诊断信息照常打印）。
                 if not ok:
-                    failures.append("%s -> %s" % (name, status))
+                    if all_models:
+                        print("    (non-chat model or upstream fault; not counted as failure)")
+                    else:
+                        failures.append("%s -> %s" % (name, status))
         finally:
             if key_id:
                 _revoke_key(cli, key_id)
@@ -448,6 +491,8 @@ def main():
     ap.add_argument("--commit")
     ap.add_argument("--models", nargs="*")
     ap.add_argument("--realm", choices=["trae", "cn", "global"])
+    ap.add_argument("--all-models", action="store_true",
+                    help="逐个遍历 /v1/models 全部模型（诊断用；会在生产上把账号熔断器喂满）")
     args = ap.parse_args()
 
     if args.action == "build":
@@ -463,7 +508,7 @@ def main():
     if args.action == "verify":
         if not args.env:
             ap.error("verify 需要 --env dev|prod")
-        return verify(args.env, args.version, args.models, args.realm)
+        return verify(args.env, args.version, args.models, args.realm, args.all_models)
     if args.action == "promote":
         return promote(args.version, expect_commit=args.commit)
     return 0

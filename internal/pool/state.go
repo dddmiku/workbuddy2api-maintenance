@@ -665,7 +665,18 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
-		st.CoolKind = e.coolKind.String()
+		// cool_kind 只在 until 真在生效时才有意义。
+		//
+		// 2026-10-18 实测（prod）：6 个 CN 号积分 4178~5425 充足、直连上游正常，
+		// 却全显示 cool_kind=hard_credit（「余额不足」）。真因是**纯熔断**时
+		// until 是零值，而 e.coolKind 是 CoolKind 的零值 = CoolHard（见 entry.go
+		// 的 iota 声明）。本分支只要 Cooling=true（熔断也会置真）就无条件把
+		// e.coolKind.String() 写进结果，于是熔断被显示成余额不足。
+		// 判据与 CreditsExhausted（同样要求 now.Before(until)）统一：until 不生效
+		// → 不输出 kind，面板按 cooling + breaker_until 显示「熔断中」。
+		if now.Before(e.until) {
+			st.CoolKind = e.coolKind.String()
+		}
 	}
 	// 「余额不足但免费模型可用」：只有 CoolHard 且倍率表已注入时成立。判据与
 	// hardCreditBlocksModel 同源——它用 modelIsPaid 判某个具体模型，这里回答的是

@@ -21,7 +21,7 @@ type CoolKind int
 
 const (
 	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
-	CoolSoft                 // 429 → 短冷却
+	CoolSoft                 // 429 → 短冷却（账号级已取消，仅模型级在用）
 )
 
 func (k CoolKind) String() string {

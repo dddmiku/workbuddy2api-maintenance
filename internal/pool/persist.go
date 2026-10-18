@@ -180,8 +180,16 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		// 残留 CoolSoft（账号级限流冷却），读入时必须丢弃：否则它会让
 		// RealmRateState/counts 等按「账号级软冷却」分支处理的旧代码继续把账号判成
 		// 不可用，而写侧已经永远不会再产生这种状态（2026-10-18 取消账号级冷却）。
+		//
+		// 2026-10-18 修复（prod 实测）：CoolHard 是 iota 的 0，与 JSON 缺字段的零值
+		// 完全同值，所以 `kind != CoolHard` 永远拦不住零值——**每个** state.json 条目
+		// 都被恢复成「余额不足」。它只在 statusOf 的 Cooling 分支被读取，而 Cooling
+		// 也包含纯熔断（breakerUntil 未来、until 零值），于是 6 个积分 4178~5425、
+		// 直连上游正常的 CN 号全被显示成 hard_credit。
+		// 真正的判据只能是 until：零值 = 从未冷却过（或已过期），此时 kind 没有意义；
+		// 只有 until 在生效时 kind 才承载「这是余额不足」。
 		kind, until := s.CoolKind, s.Until
-		if kind != CoolHard {
+		if kind != CoolHard || until.IsZero() {
 			kind, until = 0, time.Time{}
 		}
 		e := &entry{
