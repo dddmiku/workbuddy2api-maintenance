@@ -919,10 +919,19 @@ function renderAccounts(){
     // 限流解除时间」而不是只有剩余秒——剩余秒每秒都在变，绝对时刻才能一眼判断
     // 「等到几点」）。reset_at 是上游权威重置墙钟；until 是网关避让截止（被
     // soft_rate_max 截断时更早）。展示优先 reset_at，截断场景两者都给。
-    // 与账号级冷却（coolSub）互斥不叠——同时出现时账号级冷却已涵盖整号，模型行
-    // 不再重复。
+    // 与账号级冷却（coolSub）**可以并存**，不是互斥。
+    //
+    // 早先这里是 `(!p.cooling && rlm.length)`，理由是「账号级冷却已涵盖整号，
+    // 模型行不再重复」。这个前提只在账号级冷却真的封死整号时成立——而
+    // CoolHard（余额不足）恰恰不封整号：它只挡扣积分的模型，免费模型照常可用
+    // （见 pool.hardCreditBlocksModel，面板上也写了「免费模型仍可用」）。
+    // 于是「余额不足 + 某免费模型又被 6004 限流」的号在面板上只剩「冷却中 ·
+    // 余额不足」，用户完全看不到那个模型其实还要限流 16 小时——2026-10-18
+    // 用户反馈「还是显示的账号级冷却，模型没有单独冷却」。
+    //
+    // 现在两者都显示：账号级一行 + 模型级若干行。模型级用缩进和不同语气区分。
     var rlm = (p.rateLimitedModels || []).filter(function(m){ return m && m.until; });
-    var rlmSub = (!p.cooling && rlm.length)
+    var rlmSub = (rlm.length)
       ? rlm.map(function(m){
           var untilTxt = fmtLimitWhen(m.until);
           var resetTxt = m.resetAt ? fmtLimitWhen(m.resetAt) : '';
