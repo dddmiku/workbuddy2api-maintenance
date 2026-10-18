@@ -39,6 +39,11 @@
 .seg button[aria-pressed=true]{background:var(--surface);color:var(--ink);font-weight:500;box-shadow:var(--shadow)}
 .seg.grow{display:flex}
 .seg.grow button{flex:1;text-align:center}
+/* 账号页的模型筛选下拉。与 .seg 同高同边框，视觉上并入同一排控件；
+   max-width 防止超长模型名（客户端自选字段，可能很长）把工具栏撑变形。 */
+.sel{height:28px;max-width:200px;padding:0 8px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);color:var(--ink);font:inherit;font-size:12.5px;cursor:pointer}
+.sel:disabled{opacity:.5;cursor:not-allowed}
 .sw{width:32px;height:18px;flex:none;border-radius:999px;background:var(--line-2);position:relative;
   transition:background .15s var(--ease)}
 .sw::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;

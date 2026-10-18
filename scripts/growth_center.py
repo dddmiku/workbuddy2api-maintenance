@@ -314,12 +314,14 @@ def main():
 
     for auth in auths:
         uid8 = (auth.get("uid") or "")[:8]
-        # global 门控：连登兑换/补签/抽奖都打 CN 端点（copilot.tencent.com），
-        # 与 Go 侧 scheduler.go:674 口径一致——global 账号 GET /activity/growth/streak
-        # 返回 500，应明确跳过、不发起任何请求，避免每轮非零退出与无谓的风控流量
-        # （2026-10-02 第二轮体检发现 20）。
-        if tc.auth_is_global(auth):
-            print("[skip] " + uid8 + " global realm 不适用 CN 成长中心")
+        # 非 cn 域（global / trae）门控：连登兑换/补签/抽奖都打 CN 端点
+        # （copilot.tencent.com），与 Go 侧 growth_center.go 的
+        # `!a.IsWorkBuddy() || a.Realm() == auth.RealmGlobal` 口径一致。
+        # - global：GET /activity/growth/streak 返回 500；
+        # - trae：端点族完全不同，打 codebuddy.cn 必然 401。
+        # 两者都必须明确跳过、不发起任何请求（trae 早先漏挡，2026-10-18 实测确认）。
+        if tc.auth_skips_cn_task(auth):
+            print("[skip] " + uid8 + " " + tc.auth_realm(auth) + " realm 不适用 CN 成长中心")
             continue
         print("[" + uid8 + "] " + str(auth.get("nick") or ""))
 

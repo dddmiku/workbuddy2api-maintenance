@@ -147,6 +147,14 @@
               <button data-r="global">Global</button>
               <button data-r="trae">Trae</button>
             </div>
+            <div class="seg" id="acctSort" title="排序方式">
+              <button data-s="" aria-pressed="true">默认</button>
+              <button data-s="limit" title="按「解除模型限流」的时刻升序：最快恢复的排最前；未限流的排最后">限流解除</button>
+              <button data-s="credit" title="按可用积分从多到少；查不到积分的排最后">积分</button>
+            </div>
+            <select id="acctModel" class="sel" title="只显示该模型被限流的账号（需先选「限流解除」排序）" disabled>
+              <option value="">全部模型</option>
+            </select>
             <span class="sp"></span>
             <span class="sub" id="acctCount"></span>
             <button class="btn sm" id="btnReviveAll" title="清除所有被停用账号的停用标记，让它们重新参与调度">

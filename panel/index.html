@@ -309,6 +309,11 @@ code,pre,.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .seg button[aria-pressed=true]{background:var(--surface);color:var(--ink);font-weight:500;box-shadow:var(--shadow)}
 .seg.grow{display:flex}
 .seg.grow button{flex:1;text-align:center}
+/* 账号页的模型筛选下拉。与 .seg 同高同边框，视觉上并入同一排控件；
+   max-width 防止超长模型名（客户端自选字段，可能很长）把工具栏撑变形。 */
+.sel{height:28px;max-width:200px;padding:0 8px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);color:var(--ink);font:inherit;font-size:12.5px;cursor:pointer}
+.sel:disabled{opacity:.5;cursor:not-allowed}
 .sw{width:32px;height:18px;flex:none;border-radius:999px;background:var(--line-2);position:relative;
   transition:background .15s var(--ease)}
 .sw::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;
@@ -1026,6 +1031,14 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
               <button data-r="global">Global</button>
               <button data-r="trae">Trae</button>
             </div>
+            <div class="seg" id="acctSort" title="排序方式">
+              <button data-s="" aria-pressed="true">默认</button>
+              <button data-s="limit" title="按「解除模型限流」的时刻升序：最快恢复的排最前；未限流的排最后">限流解除</button>
+              <button data-s="credit" title="按可用积分从多到少；查不到积分的排最后">积分</button>
+            </div>
+            <select id="acctModel" class="sel" title="只显示该模型被限流的账号（需先选「限流解除」排序）" disabled>
+              <option value="">全部模型</option>
+            </select>
             <span class="sp"></span>
             <span class="sub" id="acctCount"></span>
             <button class="btn sm" id="btnReviveAll" title="清除所有被停用账号的停用标记，让它们重新参与调度">
@@ -1696,8 +1709,52 @@ function modelLimitTitle(m){
   var when = (reset && reset !== until) ? ('上游重置 ' + reset + '，网关先避让到 ' + until) : ('恢复时刻 ' + until);
   return why + '；' + when;
 }
-// fmtLimitWhen 把限流解除时刻格式化成本地「HH:MM」（跨天才带日期）。
-// 时间串来自后端（RFC3339）；浏览器按本地时区解释，面板用户看的就是本机时间。
+// rlmOf 取账号的模型级限流台账（已过滤掉无 until 的残缺条目）。
+//
+// 台账形状来自网关 /status 的 accounts[].rate_limited_models[]：
+// {model, until, reset_at?, reason}。until 是网关避让截止，resetAt 是上游权威
+// 重置墙钟（截断场景下 until 更早）。排序/筛选统一用 until——它是「网关什么时候
+// 会再试这个模型」的真实时刻；resetAt 只用于展示补充。
+function rlmOf(a){
+  var p = (a && a.pool) || {};
+  return (p.rateLimitedModels || []).filter(function(m){ return m && m.until; });
+}
+// modelLimitEnd 取该账号在指定模型下的解除时刻（毫秒）。model 为空时取**最早**
+// 解除的那个模型——「这个号最快多久能恢复某个模型」正是运维排序时想要的语义。
+// 没有匹配记录 → Infinity（排到最后，等价于「不受此约束」）。
+function modelLimitEnd(a, model){
+  var list = rlmOf(a);
+  if (model){
+    for (var i = 0; i < list.length; i++){
+      if (String(list[i].model || '') === model){
+        var t = new Date(list[i].until).getTime();
+        return isNaN(t) ? Infinity : t;
+      }
+    }
+    return Infinity;
+  }
+  var best = Infinity;
+  list.forEach(function(m){
+    var t = new Date(m.until).getTime();
+    if (!isNaN(t) && t < best) best = t;
+  });
+  return best;
+}
+// limitedModels 汇总当前池子里所有「正在被限流」的模型名（去重、按名排序）。
+// 供模型筛选下拉框的选项来源——不写死模型表，模型名是客户端自选字段，池子里
+// 出现过哪些才列哪些。
+function limitedModels(accounts){
+  var seen = Object.create(null), out = [];
+  (accounts || []).forEach(function(a){
+    rlmOf(a).forEach(function(m){
+      var name = String(m.model || '');
+      if (name && !seen[name]){ seen[name] = 1; out.push(name); }
+    });
+  });
+  out.sort();
+  return out;
+}
+// fmtLimitWhen 把限流解除时刻格式化成本地「HH:MM」（跨天才带日期）。// 时间串来自后端（RFC3339）；浏览器按本地时区解释，面板用户看的就是本机时间。
 function fmtLimitWhen(raw){
   var t = new Date(raw);
   if (isNaN(t.getTime())) return String(raw || '');
@@ -1731,7 +1788,13 @@ var IC = {
 };
 
 /* ── 状态 ─────────────────────────────────────────── */
-var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'', logLines:120, loadRevision:0, loadedAt:0 };
+// acctSort：账号页排序键。'' = 保持后端顺序（最近活动优先，后端已排好）。
+//   'limit'  → 按「解除模型限流的时间」升序：最快解除的排最前，没有限流的排最后。
+//   'credit' → 按可用积分降序：找「该用哪个号跑大活」时最常看的维度。
+// acctModel：模型筛选。空 = 不限；非空时只显示「该模型当前被限流」的账号
+//   （仅在 acctSort='limit' 时有意义——其它排序下筛模型会得到一张看不出顺序的表）。
+var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'',
+          acctSort:'', acctModel:'', logLines:120, loadRevision:0, loadedAt:0 };
 var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
 
 // REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
@@ -2379,18 +2442,81 @@ function acctState(a){
   if (!p.healthy) return { cls:'e', text:'异常' };
   return { cls:'ok', text:'正常' };
 }
+// syncAcctSortControls 同步账号页排序组与模型下拉的 UI 状态。
+//
+// 单独抽出来是因为它同时被两处驱动：renderAccounts（数据刷新后重绘）与
+// 排序按钮的点击处理。模型选项必须来自**当前池子**——模型名是客户端自选字段，
+// 写死一份模型清单必然与上游脱节；只列正被限流的模型，才让下拉框的长度有意义。
+function syncAcctSortControls(all){
+  $$('#acctSort button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x.getAttribute('data-s') === S.acctSort));
+  });
+  var sel = $('#acctModel');
+  if (!sel) return;
+  var models = limitedModels(all);
+  // 重新填充前记住当前选项：数据刷新后仍要保持用户的选择。
+  // 之前选的模型已经没号被限流了 → 回落到「全部模型」，否则下拉框会显示一个
+  // 不存在的选项（浏览器默认选第一项，看起来像筛了却什么都没筛）。
+  var keep = S.acctModel;
+  if (keep && models.indexOf(keep) < 0){ keep = ''; S.acctModel = ''; }
+  sel.innerHTML = '<option value="">全部模型</option>' + models.map(function(m){
+    return '<option value="' + esc(m) + '">' + esc(m) + '</option>';
+  }).join('');
+  sel.value = keep;
+  // 「限流解除」排序才有模型筛选的意义：其它排序下禁用，并给出原因（title）。
+  var usable = S.acctSort === 'limit';
+  sel.disabled = !usable || models.length === 0;
+  sel.title = !models.length
+    ? '当前没有模型处于限流状态'
+    : (usable ? '只显示该模型被限流的账号' : '先选择「限流解除」排序');
+}
 function renderAccounts(){
   var all = S.data.accounts || [];
   var list = all.slice();
+  // 排序控件的选中态与模型下拉在这里刷新（重绘会重建表格，控件是同一批 DOM，
+  // 不随 innerHTML 变化，所以必须显式同步，否则点了排序按钮看不出选中的是哪个）。
+  syncAcctSortControls(all);
   var q = S.q.trim().toLowerCase();
   if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
   if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
   // 按域筛选：接入 trae 后池子里有三种来源，全混在一张表里看不出「哪个域的号出问题了」。
   if (S.realm) list = list.filter(function(a){ return realmOf(a) === S.realm; });
+  // 模型筛选：只在「按解除限流时间排序」下生效。选中某模型时只留该模型正被限流的号
+  // ——这正是「哪些号还要等多久才能用这个模型」的答案。
+  // 其它排序下不筛：一张按积分排、却只剩被限流账号的表读不出任何意义。
+  if (S.acctSort === 'limit' && S.acctModel){
+    list = list.filter(function(a){
+      return rlmOf(a).some(function(m){ return String(m.model || '') === S.acctModel; });
+    });
+  }
   if (q) list = list.filter(function(a){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
            (a.uid || '').toLowerCase().indexOf(q) >= 0;
   });
+  // 排序。两种都以「有约束的号在前」为前提：运维来这一页通常是要找「谁卡住了、
+  // 什么时候能好」，把健康的号排前面只是噪音。
+  //
+  // 'limit'：按解除时刻升序（最快解除的在前）。没有模型限流的号用 Infinity 排最后。
+  //          同刻到期的按昵称稳定排序，避免每次刷新顺序抖动。
+  // 'credit'：按可用积分降序；查不到积分的（undefined）排最后而不是当 0 ——
+  //          「查不到」与「确实是 0」是两件事，混在一起会让 0 分号被埋掉。
+  if (S.acctSort === 'limit'){
+    var lim = Object.create(null);
+    list.forEach(function(a){ lim[a.uid] = modelLimitEnd(a, S.acctModel); });
+    list.sort(function(x, y){
+      var dx = lim[x.uid], dy = lim[y.uid];
+      if (dx !== dy) return dx - dy;
+      return String(x.nickname || '').localeCompare(String(y.nickname || ''));
+    });
+  } else if (S.acctSort === 'credit'){
+    list.sort(function(x, y){
+      var cx = (x.credits || {}).remain, cy = (y.credits || {}).remain;
+      var hasX = typeof cx === 'number', hasY = typeof cy === 'number';
+      if (hasX !== hasY) return hasX ? -1 : 1;   // 能查到分的排前面
+      if (hasX && cx !== cy) return cy - cx;      // 分多的在前
+      return String(x.nickname || '').localeCompare(String(y.nickname || ''));
+    });
+  }
   // 计数按当前域口径给出：筛选到 CN 时，「共 N 个」应当指 CN 的号，不是全池。
   var scoped = S.realm ? all.filter(function(a){ return realmOf(a) === S.realm; }) : all;
   var countEl = $('#acctCount');
@@ -2878,6 +3004,20 @@ $('#acctFilter').addEventListener('click', function(e){
   renderAccounts();
 });
 // 域筛选：与状态筛选相互独立（两个维度同时生效），只重绘表格不动整页。
+// 排序与模型筛选。两者是一组：只有「限流解除」排序下模型筛选才启用——
+// 其它排序里按模型过滤会得到一张顺序毫无意义的表（见 renderAccounts 注释）。
+$('#acctSort').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-s]'); if (!b) return;
+  S.acctSort = b.getAttribute('data-s');
+  // 切走「限流解除」时清掉模型筛选：留着会让下次切回来时莫名其妙只剩几行，
+  // 而用户以为自己选的是「全部模型」。
+  if (S.acctSort !== 'limit' && S.acctModel) S.acctModel = '';
+  renderAccounts();
+});
+$('#acctModel').addEventListener('change', function(e){
+  S.acctModel = e.target.value || '';
+  renderAccounts();
+});
 $('#acctRealm').addEventListener('click', function(e){
   var b = e.target.closest('button[data-r]'); if (!b) return;
   S.realm = b.getAttribute('data-r');

@@ -842,10 +842,12 @@ def main():
         sys.exit(1)
 
     for auth in auths:
-        # global realm 不适用 CN 开学季任务/转盘：明确跳过、不发起任何请求。
-        if tc.auth_is_global(auth):
+        # 非 cn 域（global / trae）不适用 CN 开学季任务/转盘：明确跳过、不发起任何请求。
+        # trae 必须一起挡（auth_skips_cn_task 判 realm != cn）；只用 auth_is_global
+        # 会让 trae 号落进 CN 分支去打 codebuddy.cn，必然 401。
+        if tc.auth_skips_cn_task(auth):
             uid8 = (auth.get("uid") or "")[:8] or "?"
-            print(f"[skip] {uid8} global realm 不适用 CN 任务")
+            print(f"[skip] {uid8} {tc.auth_realm(auth)} realm 不适用 CN 任务")
             stats["skip"] += 1
             continue
         try:

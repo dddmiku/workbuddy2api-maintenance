@@ -1055,6 +1055,96 @@ return $('#taskList').innerHTML;
                       "Trae 签到应有自己的手动触发按钮")
 
 
+class AccountLimitSortTest(FrontendHarness, unittest.TestCase):
+    """账号页「按解除模型限流的时间排序」+ 模型筛选。
+
+    需求来源（2026-10-18）：「账户页面价格排序，解除模型限流的时间来，要求可以筛选模型」。
+    排序键用 until（网关避让截止）而不是 resetAt：until 才是网关真的会再试的时刻，
+    resetAt 是上游承诺的重置墙钟，在 soft_rate_max 截断时比 until 晚、不兑现也常见。
+    """
+
+    def _accounts(self):
+        # 三个号：A 的 m1 最早解除、B 的 m2 最晚、C 完全没被限流。
+        # 用固定墙钟，避免 Date.now() 漂移让断言变得不确定。
+        return """
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[
+ {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004'}]}},
+ {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'m2',until:new Date(BASE+9*H).toISOString(),reason:'11102'},
+   {model:'m1',until:new Date(BASE+5*H).toISOString(),reason:'6004'}]}},
+ {uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true}}
+]};
+"""
+
+    def test_sorts_by_earliest_limit_release(self):
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # A 最早解除（2h），B 次之（最早 5h），C 无限制排最后。
+        self.assertLess(result.index(">A<"), result.index(">B<"))
+        self.assertLess(result.index(">B<"), result.index(">C<"))
+
+    def test_filters_by_model_and_uses_that_models_release_time(self):
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m2';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # 只有 B 有 m2；A（只有 m1）与 C（无限流）都必须被筛掉。
+        self.assertIn(">B<", result)
+        self.assertNotIn(">A<", result)
+        self.assertNotIn(">C<", result)
+
+    def test_model_filter_ignored_unless_sorting_by_limit(self):
+        """非「限流解除」排序下模型筛选不生效——按积分排却只剩被限流的号没有意义。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort=''; S.acctModel='m2';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn(">A<", result)
+        self.assertIn(">B<", result)
+        self.assertIn(">C<", result)
+
+    def test_model_options_come_from_pool_not_hardcoded(self):
+        """下拉选项必须来自当前池子里**正在被限流**的模型，不写死模型清单。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit';
+renderAccounts();
+return {html:$('#acctModel').innerHTML, disabled:$('#acctModel').disabled,
+        value:$('#acctModel').value};
+""")
+        self.assertIn("m1", result["html"])
+        self.assertIn("m2", result["html"])
+        self.assertNotIn('value="m3"', result["html"])
+        self.assertFalse(result["disabled"])
+        self.assertEqual(result["value"], "")
+
+    def test_model_picker_disabled_when_nothing_is_limited(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true}}]};
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return {disabled:$('#acctModel').disabled, html:$('#acctModel').innerHTML};
+""")
+        self.assertTrue(result["disabled"])
+        self.assertNotIn("<option value=\"m", result["html"])
+
+    def test_switching_away_from_limit_sort_clears_model_filter(self):
+        """切走「限流解除」时必须清掉模型筛选，否则切回来会莫名其妙只剩几行。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m2';
+var handler=$('#acctSort').events.click;
+handler({target:{closest:function(){return {getAttribute:function(){return 'credit'}}}}});
+return {sort:S.acctSort, model:S.acctModel};
+""")
+        self.assertEqual(result, {"sort": "credit", "model": ""})
+
+
 class RealmBreakdownCompletenessTest(unittest.TestCase):
     """概览里的分域小计必须覆盖**全部域**，顺序与文案统一。
 
@@ -1203,7 +1293,12 @@ return $('#creditPanel').innerHTML;
         self.assertIn("占 75%", result)
 
     def test_zero_value_cells_still_render_meaningful_zeros(self):
-        """停用 0 / 冷却 0 要渲染（那是「健康」的证明）；快过期 0 不渲染。"""
+        """停用 0 / 熔断 0 要渲染（那是「健康」的证明）；快过期 0 不渲染。
+
+        2026-10-18：账号级限流冷却已删除，只剩熔断（breaker）与停用两种账号级
+        不可用原因，池子卡片的这一格随之从「冷却中」改名为「熔断中」。
+        旧断言按「冷却中」匹配会一直失败（本条在改动前即已红）。
+        """
         result = self.run_frontend("""
 S.data={accounts:[
   {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,expiring:0}}
@@ -1212,7 +1307,7 @@ renderPool(); var pool=$('#poolPanel').innerHTML;
 renderCredit(); var credit=$('#creditPanel').innerHTML;
 return {pool:pool, credit:credit};
 """)
-        self.assertIn("冷却中", result["pool"], "冷却 0 保留——它是健康状态的说明")
+        self.assertIn("熔断中", result["pool"], "熔断 0 保留——它是健康状态的说明")
         self.assertIn("已停用", result["pool"], "停用 0 保留")
         self.assertNotIn("快过期", result["credit"], "没有快过期积分时不该出现这个格子")
         self.assertNotIn("状态", result["credit"], "无错误/无查询中时不该有状态行")
@@ -1819,11 +1914,17 @@ return {card: end > 0 ? rest.slice(0, end) : rest};
         self.assertNotIn("全部可用", card)
 
     def test_partly_unavailable_counts_them(self):
-        """真实线上口径：24/34 必须说出「10 个不可用」，而不是沉默或说全部可用。"""
+        """真实线上口径：24/34 必须说出「10 个不可用」，而不是沉默或说全部可用。
+
+        2026-10-18：余额不足（CoolHard）不再算「不可用」——账号可用性只由停用与
+        熔断决定，积分只影响能调哪些模型（用户：「可不可用是针对账号的，冷却和积分
+        余额是模型使用方面的」）。所以不可用 = total - healthy，可由熔断 + 停用解释；
+        本用例的 3 必须显示成「熔断中」而不是「冷却中」。
+        """
         card = self._card("S.data={accounts:[],pool:{total:34,healthy:24,cooling:3,disabled:7}};renderMetrics();")
         self.assertIn("24 / 34", card)
         self.assertIn("10 个不可用", card)
-        self.assertIn("3 冷却中", card)
+        self.assertIn("3 熔断中", card)
         self.assertNotIn("全部可用", card)
 
     def test_fully_available_only_when_every_account_is_healthy(self):

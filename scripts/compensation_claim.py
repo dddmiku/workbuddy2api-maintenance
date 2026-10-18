@@ -46,7 +46,7 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
-from task_common import (all_auth_files, auth_is_global, do_post, load_auth,
+from task_common import (all_auth_files, auth_realm, do_post, load_auth,
                          billing_base)
 
 PATH_STATUS = "/billing/meter/compensation-status"
@@ -82,10 +82,13 @@ def claim(auth) -> tuple:
 def process(auth, dry_run: bool) -> tuple:
     """处理单个账号，返回 (状态词, 说明)。"""
     # 补偿活动只面向 CN 站；global/trae 账号打该端点必然 401，属预期而非故障。
-    if CN_ONLY and auth_is_global(auth):
-        return "skip", "非 CN 账号，该活动不适用"
+    # 统一用 auth_realm 判定：trae 的 realm 既不是 cn 也不是 global，早先只判
+    # auth_is_global 时靠下面那道 `realm not in ("cn","")` 才勉强挡住，
+    # 两处判据各写一份容易再次分叉（2026-10-18 统一）。
+    if CN_ONLY and auth_realm(auth) != "cn":
+        return "skip", f"{auth_realm(auth)} 账号，该活动不适用"
     realm = (auth.get("realm") or "").strip().lower()
-    if realm and realm not in ("cn", ""):
+    if not CN_ONLY and realm and realm not in ("cn", ""):
         return "skip", f"realm={realm}，该活动不适用"
     ok, status = fetch_status(auth)
     if not ok:

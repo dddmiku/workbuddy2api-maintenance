@@ -122,17 +122,53 @@ def load_auth(uid_or_file: str) -> dict:
             "file": os.path.basename(p), "realm": realm}
 
 
+def auth_realm(auth: dict) -> str:
+    """归一化账号域：trae / global / cn，与 Go auth.Realm() 同口径。
+
+    trae 必须最先判：它的 domain 是 https://api.trae.com.cn，既不匹配 .workbuddy.ai
+    （global），也不该落进 cn——落进 cn 就会拿 Trae 的 Cloud-IDE-JWT 去打
+    codebuddy.cn，每个号每次任务都 401，日志里看不出真正原因（实测 6/31 个号中招）。
+    Go 侧对应 internal/auth/auth.go 的 Realm()：先判 RealmTrae，再判 global。
+    """
+    if (auth.get("realm") or "").strip().lower() == "trae":
+        return "trae"
+    if (auth.get("realm") or "").strip().lower() == "global":
+        return "global"
+    d = (auth.get("domain") or "").strip().lower()
+    if d == "workbuddy.ai" or d.endswith(".workbuddy.ai"):
+        return "global"
+    return "cn"
+
+
 def auth_is_global(auth: dict) -> bool:
     """判定账号是否属于 global realm：realm==global 或 domain 后缀 .workbuddy.ai。
 
     与 Go auth.Realm() 的判定口径一致（显式 realm 优先于 domain 回落）。
     供 CN-only 任务脚本跳过 global 账号、明确提示，避免把 global token 打向
     copilot.tencent.com/codebuddy.cn（全球版无任务中心，打 CN 端点属错误行为）。
+
+    注意 trae 不算 global：它与 global 是两套端点族，调用方若要跳过非 CN 账号，
+    应当用 auth_realm(...) != "cn" —— 只用 auth_is_global 会让 6 个 trae 号
+    落到 CN 分支（2026-10-18 实测确认）。
     """
-    if (auth.get("realm") or "").strip().lower() == "global":
-        return True
-    d = (auth.get("domain") or "").strip().lower()
-    return d == "workbuddy.ai" or d.endswith(".workbuddy.ai")
+    return auth_realm(auth) == "global"
+
+
+def auth_is_trae(auth: dict) -> bool:
+    """判定账号是否属于 trae 域（完全不同的端点族与鉴权头）。"""
+    return auth_realm(auth) == "trae"
+
+
+def auth_skips_cn_task(auth: dict) -> bool:
+    """该账号是否应当跳过**所有 CN 任务中心**（global / trae 都跳）。
+
+    CN 任务（task_runner / school / growth / compensation）只服务 cn 账号：
+      - global：无任务体系（实测 /billing/meter/daily-checkin 返回
+        code 10001「签到活动未开启或已过期」，任务中心同类接口一律 500/不适用）；
+      - trae：端点族完全不同，token 打 codebuddy.cn 只会 401。
+    两个域都必须跳过，否则每轮都产生一批必然失败的请求，把真实问题埋掉。
+    """
+    return auth_realm(auth) != "cn"
 
 
 def chat_base(auth: dict) -> str:

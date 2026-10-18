@@ -1038,10 +1038,13 @@ def main():
             stats["fail"] += 1
             continue
         stats["accounts"] += 1
-        # global realm 不适用 CN 任务中心：明确跳过、不发起任何请求（P2 门控结论）。
-        if tc.auth_is_global(c):
+        # 非 cn 域（global / trae）不适用 CN 任务中心：明确跳过、不发起任何请求。
+        # trae 必须一起挡：它的 realm 既不是 global 也不是 cn，早先用 auth_is_global
+        # 单独判定时 6 个 trae 号全部落进 CN 分支，每轮拿 Trae 的 JWT 去打
+        # codebuddy.cn（必然 401）——2026-10-18 实测确认。
+        if tc.auth_skips_cn_task(c):
             uid8 = (c.get("uid") or "")[:8] or "?"
-            print(f"[skip] {uid8} global realm 不适用 CN 任务")
+            print(f"[skip] {uid8} {tc.auth_realm(c)} realm 不适用 CN 任务")
             stats["skip"] += 1
             continue
         # 单账号内部任何异常（如 task_status 在上游非 200 时抛 RuntimeError）都按既有约定

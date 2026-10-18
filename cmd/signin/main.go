@@ -44,7 +44,7 @@ func main() {
 	up.GlobalEnabled = true
 
 	var rows []row
-	okN, alreadyN, failN := 0, 0, 0
+	okN, alreadyN, failN, skipN := 0, 0, 0, 0
 	for _, f := range files {
 		r := row{file: filepath.Base(f)}
 		// #nosec G304,G703 -- auth 文件路径来自命令行参数
@@ -91,18 +91,35 @@ func main() {
 			}
 		}
 
-		err = up.DailyCheckin(a)
-		r.status = checkinStatusOf(err)
-		if err != nil {
+		// global 域没有签到体系：**不发起签到调用**，但余额照查。
+		//
+		// 实测（2026-10-18，dev 上的 19 个 global 号）：接口本身存在，
+		// https://www.workbuddy.ai/billing/meter/daily-checkin 与 /v2/... 两条路径
+		// 都返回 HTTP 400 {"code":10001,"msg":"签到活动未开启或已过期"}；同一时刻
+		// CN 号返回的是 {"code":10001,"msg":"今天已签到，请明天再来"}。
+		// 两者业务码完全相同，仅凭 code 分不开「今天已签」与「本域无此活动」，
+		// 所以不能靠 checkinStatusOf 的错误分类兜底（那会把 19 个 global 号
+		// 每轮都记成 ALREADY，看着像签到成功，实际什么都没发生）。
+		//
+		// 口径与调度器 scheduler.go checkinAll 的
+		// `if isWorkBuddy && a.Realm() != auth.RealmGlobal` 保持一致：
+		// 手动工具与定时任务对同一件事必须给出同一个结论。
+		if a.Realm() == auth.RealmGlobal {
+			r.status = "SKIP"
+			r.detail = "global 域无签到活动（不发起签到，余额照查）"
+			skipN++
+		} else if err := up.DailyCheckin(a); err != nil {
+			r.status = checkinStatusOf(err)
 			r.detail = short(err.Error())
-		}
-		switch r.status {
-		case "OK":
+			switch r.status {
+			case "ALREADY":
+				alreadyN++
+			default:
+				failN++
+			}
+		} else {
+			r.status = checkinStatusOf(nil)
 			okN++
-		case "ALREADY":
-			alreadyN++
-		default:
-			failN++
 		}
 		// 顺手查余额
 		if remain, qerr := up.UserResource(a); qerr == nil {
@@ -122,7 +139,7 @@ func main() {
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
 			logfmt.Truncate(r.uid, 36), logfmt.Truncate(r.nick, 11), r.status, remain, r.detail)
 	}
-	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
+	fmt.Printf("\ntotal=%d ok=%d already=%d skip=%d fail=%d\n", len(rows), okN, alreadyN, skipN, failN)
 }
 
 // idempotentCodes 幂等/不适用**业务码数字**（裸数字，同时覆盖 doJSON 拼出的
