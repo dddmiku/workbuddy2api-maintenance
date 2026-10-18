@@ -253,8 +253,14 @@ func (s *Server) accountProbeModel(ctx context.Context, body map[string]any) map
 		return map[string]any{"ok": true, "limited": false,
 			"message": formatMessage("探测成功：%s 本来就可用，无需解除", model)}
 	}
+	// 走到这里 = 探测没成功、且台账里也没有该模型的限流条目。
+	//
+	// 2026-10-18 起，没有精确恢复时刻的 429（14003 Model busy / 来源限流）只记
+	// 观测时间、不产生冷却条目——上游没给恢复时刻，任何本地推算的「解除时刻」
+	// 都是臆造。这种情形不能说「冷却保持不变」（本来就没有冷却），如实说明原因。
 	return map[string]any{"ok": true, "limited": false,
-		"message": formatMessage("探测未成功（上游返回 %d），冷却保持不变", jsonInt64(payload["status"]))}
+		"message": formatMessage("探测未成功（上游返回 %d）：上游未给出精确恢复时刻，不记冷却",
+			jsonInt64(payload["status"]))}
 }
 
 // accountFission 补发 Trae 邀请奖励（面板「补发邀请奖励」按钮）。

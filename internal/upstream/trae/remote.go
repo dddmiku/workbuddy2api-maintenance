@@ -646,6 +646,13 @@ func maxModeFields(custom map[string]any) map[string]any {
 
 // createRemoteSession 建会话（两步协议的第 1 步）。
 func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remoteSession, error) {
+	// 排障开关：WB2API_DUMP_REMOTE_BODY=1 时把建会话体整段打进日志。
+	//
+	// 为什么需要：判断「服务端会话能否复用」只能看真实出站体里 chat_session_id
+	// 的位置与其余字段的同形程度。2026-10-18 排查 TTFB 时，仅凭代码无法确认
+	// 网关发出的 initial_message 与官方客户端差在哪些字段。
+	// 该开关默认关闭（body 含完整历史，日志会很大）。
+	dumpRemoteBody(a.UID, body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		RemoteBaseVar+remoteCreatePath, bytes.NewReader(body))
 	if err != nil {
@@ -691,6 +698,40 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 // BuildRemoteBodyForProbe 导出建会话体构造（排障探针用，生产走 ChatStreamRemote）。
 func BuildRemoteBodyForProbe(ctx context.Context, a *auth.Auth, prepared []byte, models []CatalogModel) ([]byte, string, bool, error) {
 	return buildRemoteBodyWithCatalog(ctx, a, prepared, models)
+}
+
+// dumpRemoteBody 在 WB2API_DUMP_REMOTE_BODY=1 时把建会话体写进日志。
+//
+// 只打字段骨架（chat_session_id / query 长度 / 六件套），不打完整历史——
+// 完整历史几十万字符，刷屏且会把用户内容写进日志。要看全量时设 =2。
+func dumpRemoteBody(uid string, body []byte) {
+	mode := strings.TrimSpace(os.Getenv("WB2API_DUMP_REMOTE_BODY"))
+	if mode != "1" && mode != "2" {
+		return
+	}
+	if mode == "2" {
+		log.Printf("[dump] remote create uid=%s body=%s", logUID(uid), string(body))
+		return
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		log.Printf("[dump] remote create uid=%s body-parse-fail len=%d", logUID(uid), len(body))
+		return
+	}
+	init, _ := parsed["initial_message"].(map[string]any)
+	q, _ := init["query"].(string)
+	log.Printf("[dump] remote create uid=%s chat_session_id=%q agent_type=%v model_name=%v "+
+		"strategy=%v query_len=%d keys=%d",
+		logUID(uid), init["chat_session_id"], init["agent_type"], init["model_name"],
+		init["model_selection_strategy"], len(q), len(init))
+}
+
+// logUID 只保留 UID 前 8 位（与包内其他日志同口径）。
+func logUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[:8]
 }
 
 // remoteHTTPError / remoteBizError 建会话失败的两类形态。

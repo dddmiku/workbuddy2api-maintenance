@@ -499,6 +499,56 @@ func IsModelRateLimit(body string) bool {
 	return reModelRateLimit.MatchString(body)
 }
 
+// transientBusyCode 模型后端瞬时拥塞的业务 code（14003 的两种形态之一）。
+const transientBusyCode = "14003"
+
+// transientBusyMarker 14003「模型忙」形态的确定性文案。
+//
+// ═══ 为什么必须把它和真限流分开（2026-10-18 生产实测） ═══
+//
+// 上游 14003 承载两种语义完全不同的答复，主 msg 逐字相同（都是 "too many requests"），
+// 只有 displayMsg 不同：
+//
+//	{"code":14003,"msg":"too many requests",
+//	 "displayMsg":{"en":"Model busy. Please switch models or retry later", ...}}
+//	→ 模型后端此刻排队/拥塞。与账号无关、与来源无关，几秒到几十秒自行恢复。
+//
+//	{"code":14003,"msg":"too many requests",
+//	 "displayMsg":{"en":"Too many requests. Please retry later.", ...}}
+//	→ 来源级限流（出口 IP/指纹维度），按 realm 暂停选号才合理。
+//
+// 此前两者都被 softRateRule 判成 ErrSoftRate，于是「模型忙」被写成账号级模型冷却：
+// 24 小时内 10 个不同账号各中 2~6 次，全部是 Model busy。实测反证：uid=5e3a1b37
+// 22:32:59 撞 Model busy，26 秒后同一账号同一模型即 200 成功——若真被限流，
+// 600 秒冷却期内不可能恢复。用户看到的就是「刚注册的号被标成限流」。
+//
+// 判定口径：**只有拿到精确恢复时刻的才算真限流**（用户明确要求）。14003 两种形态
+// 都不带重置墙钟，因此一律不写冷却；差别只在于是否计入来源闸门：
+//   - Model busy  → 模型后端问题，连来源闸门也不该计入（否则一个模型忙会把整个
+//     域的选号暂停 30 秒，误伤其他模型）。
+//   - 其余 14003 → 保持既有来源级语义（NoteSourceRateLimit）。
+const transientBusyMarker = "model busy"
+
+// IsTransientModelBusy 报告 body 是否是「模型后端忙」的瞬时拥塞答复（14003 Model busy）。
+//
+// 只认 code 精确为 14003 **且** displayMsg/msg 命中 "model busy" 这一窄短语：
+// 宽泛匹配 "busy" 会把其他业务的忙等文案卷进来（与 IsModelBlocked 的宁缺毋滥同口径）。
+// 只看 429：其他状态码上的 14003 尚未观测到，不臆造。
+func IsTransientModelBusy(status int, body string) bool {
+	if status != http.StatusTooManyRequests || body == "" {
+		return false
+	}
+	// 轻量预检：既无 code 也无 marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, transientBusyCode) ||
+		!strings.Contains(strings.ToLower(body), transientBusyMarker) {
+		return false
+	}
+	if upstreamErrorCode(body) != 14003 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(body), transientBusyMarker)
+}
+
 // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
 const modelBlockCode = "11102"
 

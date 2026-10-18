@@ -458,9 +458,12 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 }
 
 // TestChatSoftCoolsOnRateLimitBody 端到端回归 issue #28：上游用非 429 状态码
-// （400 + 限流文案）表达模型侧限流时，该账号必须进入 CoolSoft 冷却，而不是只换号。
-// 修复前 Classify 归 ErrClient → applyErrorPolicy 走 default 分支只换号不罚，
-// 账号留在可用池里，下一个请求仍会被选中。
+// （400 + 限流文案）表达模型侧限流时，Classify 必须归 ErrSoftRate（而不是 ErrClient）。
+//
+// 2026-10-18 口径变更（用户：「必须要获取精确的冷却时间的号才计入真限流」）：
+// 这类答复**不带重置墙钟**，因此不再写冷却台账——上游没给恢复时刻，任何本地推算的
+// until 都是臆造。账号仍然换号重试（本次请求由 good 号成功），坏号只记「最近活动」。
+// 旧断言（进入模型冷却 + 冷却期内不再被选中）已随之失效。
 func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -477,8 +480,7 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	// 让 bad 积分更高被先选中（与 TestChatRotatesOnHardCredit 同一确定性手法）。
 	p.SetCredits("bad", 2000)
 	p.SetCredits("good", 1000)
-	const soft = 45 * time.Second
-	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 45 * time.Second})
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
@@ -489,27 +491,28 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
 	st, _ := p.Status("bad")
-	// 2026-10-18：限流只记在被限流的模型上，账号本身不被整体冷却。
+	// 限流不得把账号整体冷却。
 	if st.Cooling {
 		t.Fatalf("限流不得把账号整体冷却: %+v", st)
 	}
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.2" {
-		t.Fatalf("bad 的 glm-5.2 应出现在模型限流台账: %+v", st.RateLimitedModels)
+	// 没有精确恢复时刻 → 不写模型限流台账（这正是「刚注册的号被标成限流」的根因）。
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("无恢复时刻的限流不得进台账: %+v", st.RateLimitedModels)
 	}
-	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if got, max := int64(time.Until(st.RateLimitedModels[0].Until).Seconds()+0.999), int64(soft/time.Second); got <= 0 || got > max {
-		t.Errorf("model cool_remaining_sec=%d want in (0,%d]", got, max)
+	// 但必须留下观测时间，面板「最近活动」才能显示这次失败。
+	if st.LastErrTime.IsZero() {
+		t.Error("限流应记录最近活动时间")
 	}
 
-	// 冷却生效：同一账号在冷却期内不得再被选中。
+	// 没有冷却 → 该号仍可被选中（换号只发生在本次请求内）。
 	before := calls["Bearer at-bad"]
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec2.Code != 200 {
 		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
 	}
-	if calls["Bearer at-bad"] != before {
-		t.Errorf("冷却中的账号不应再次被选中: calls=%v", calls)
+	if calls["Bearer at-bad"] == before {
+		t.Errorf("无恢复时刻不应产生冷却，该号应仍可被选中: calls=%v", calls)
 	}
 }
 
@@ -759,35 +762,40 @@ func TestChatRegionRepairFailureFallsBackToRotation(t *testing.T) {
 	}
 }
 
-// TestApplyErrorPolicySoftRateNoDoubleWhenCooling handler 层回归：无重置时间的 429
-// 保留有界冷却，但**冷却中的兜底探测不得翻倍**（这正是旧实现「越重试越冷」的根因，
-// 全池被推到 2h 封顶的元凶）。时长断言全部取自注入值，不依赖真实等待。
-// Classify→applyErrorPolicy 的接线由 TestChatSoftCoolsOnRateLimitBody 端到端覆盖。
-func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
+// TestApplyErrorPolicySoftRateNoResetWritesNoCooldown handler 层回归（2026-10-18 新口径）：
+// 无重置墙钟的 429 **不写任何冷却**，只记观测时间。
+//
+// 历史：此前这里走「有界退避」（base 起按命中次数翻倍、封顶 soft_rate_max），并有一条
+// 「冷却中的兜底探测不得翻倍」的回归。那条逻辑的前提是「没有上游时间时，本地退避
+// 至少能少撞几次墙」——但生产实测推翻了它：14003 的 Model busy 形态是**模型后端瞬时
+// 拥塞**，uid=5e3a1b37 撞上后 26 秒同号同模型即成功，600 秒冷却期内根本不可能恢复。
+// 退避记录既误导运维（面板显示「解除 22:55」），又把健康号从池里摘掉。
+//
+// 用户口径：「必须要获取精确的冷却时间的号才计入真限流」。因此现在只记 last_err。
+func TestApplyErrorPolicySoftRateNoResetWritesNoCooldown(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-	// 第 1 次：进入模型级冷却，hits=1，600s（固定基数，无重置时间）。
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "glm-5.2")
-	st, _ := p.Status("u1")
-	if st.Cooling {
-		t.Fatalf("call 1: 限流不得把账号整体冷却: %+v", st)
-	}
-	mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
-	firstRemain := int64(time.Until(mc.Until).Seconds() + 0.999)
-	if firstRemain < 597 || firstRemain > 600 {
-		t.Fatalf("call 1: model cool_remaining_sec=%d want ~600", firstRemain)
-	}
-
-	// 冷却中重复触发（兜底探测）→ 不翻倍、不延后。
-	for n := 0; n < 3; n++ {
+	for n := 0; n < 4; n++ {
 		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "glm-5.2")
 	}
-	st, _ = p.Status("u1")
-	mc = findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
-	if got := int64(time.Until(mc.Until).Seconds() + 0.999); got > firstRemain+1 {
-		t.Errorf("already-cooling probe must not extend, remaining=%d want ~%d", got, firstRemain)
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if st.Cooling {
+		t.Fatalf("无恢复时刻的限流不得冷却账号: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("无恢复时刻的限流不得写模型台账（重复 %d 次后仍应为空）: %+v", 4, st.RateLimitedModels)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("应记录最近活动时间，供面板显示")
+	}
+	// 熔断也不能被喂：限流是配额信号，不是账号失败。
+	if st.BreakerFails != 0 {
+		t.Errorf("限流不得喂熔断: BreakerFails=%d", st.BreakerFails)
 	}
 }
 
@@ -851,7 +859,11 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	}
 }
 
-// TestNewHandlerSoftCooldownDefault 端到端：未注入 SoftCooldown 时基数回落到 600s（原为 60s）。
+// TestNewHandlerSoftCooldownDefault 端到端：429 且无重置墙钟时，默认配置下也**不写冷却**。
+//
+// 2026-10-18 口径变更：SoftCooldown 只在「上游给了精确恢复时刻」时作为**封顶基数**
+// 参与计算（见 CooldownSoftForModel），无墙钟的 429 一律不产生冷却条目。本测试因此
+// 改为断言「账号仍可用、台账为空」，与 TestChatSoftCoolsOnRateLimitBody 同口径。
 func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-bad" {
@@ -876,9 +888,11 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if st.Cooling {
 		t.Fatalf("限流不得把账号整体冷却: %+v", st)
 	}
-	mc := findLimitedModel(t, st.RateLimitedModels, "glm-5.2")
-	if got := int64(time.Until(mc.Until).Seconds() + 0.999); got <= 599 || got > 600 {
-		t.Errorf("default soft cooldown model_remaining_sec=%d want 600", got)
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("无恢复时刻的 429 不得写模型台账: %+v", st.RateLimitedModels)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("应记录最近活动时间")
 	}
 }
 
@@ -1117,12 +1131,15 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	if st.Cooling {
 		t.Fatalf("model 6004 must not cool the whole account: %+v", st)
 	}
-	// 模型级台账在 /status 里按模型点名（面板据此显示「模型限流 glm-5.3」）。
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
-		t.Fatalf("want glm-5.3 model cooldown row, got %+v", st.RateLimitedModels)
+	// 2026-10-18 口径变更（用户：「必须要获取精确的冷却时间的号才计入真限流」）：
+	// 这个 6004 答复**不带重置墙钟**，因此不写模型台账，只记观测时间。旧断言
+	// （BlockModelBackoff 写 6h 退避条目）已失效——那种本地推算的 until 会显示成
+	// 「解除 00:21」，而到点重试结果未知，属于臆造。
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("无恢复时刻的 6004 不得写台账: %+v", st.RateLimitedModels)
 	}
-	if !strings.Contains(st.RateLimitedModels[0].Reason, "6004") {
-		t.Fatalf("reason should name 6004: %+v", st.RateLimitedModels[0])
+	if st.LastErrTime.IsZero() {
+		t.Error("应记录最近活动时间")
 	}
 }
 
@@ -1829,11 +1846,18 @@ func TestChatAllRateLimitedPassesThroughUpstream(t *testing.T) {
 	if !strings.Contains(e.Error.Message, "req-abc-123") {
 		t.Errorf("requestId must be preserved in message: %s", e.Error.Message)
 	}
-	// 两个号都被限流冷却（换号过程完整跑完仍无健康号）。
+	// 两个号都被判成限流、都换了号，但**都不写冷却台账**（2026-10-18：无精确恢复
+	// 时刻的 429 不记限流）。它们仍留在池里，下个请求照常参与选号。
 	for _, uid := range []string{"u1", "u2"} {
 		st, _ := p.Status(uid)
-		if st.Cooling || len(st.RateLimitedModels) == 0 {
-			t.Errorf("%s should be model-limited (not account-cooled): %+v", uid, st)
+		if st.Cooling {
+			t.Errorf("%s 不得被账号级冷却: %+v", uid, st)
+		}
+		if len(st.RateLimitedModels) != 0 {
+			t.Errorf("%s 无恢复时刻的限流不得写台账: %+v", uid, st.RateLimitedModels)
+		}
+		if st.LastErrTime.IsZero() {
+			t.Errorf("%s 应记录最近活动时间", uid)
 		}
 	}
 }

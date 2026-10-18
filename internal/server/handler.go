@@ -691,6 +691,10 @@ func (h *Handler) probeModelCooling(w http.ResponseWriter, r *http.Request) {
 	}
 	if limited {
 		// 探测撞上限流 → 如实把该模型重新记上（沿用入口的退避/上游墙钟口径）。
+		// 2026-10-18 起该入口自身会按「有没有精确恢复时刻」决定是否真的写冷却：
+		// 没有墙钟的 429（Model busy / 来源限流）只记观测时间，不产生限流条目。
+		// 因此这里回给面板的 limited 必须以**台账里是否真的存在条目**为准，
+		// 否则会报「仍被限流」而台账里什么都没有。
 		h.applyErrorPolicy(uid, upstream.ErrSoftRate, detail, bareModel)
 	}
 	succeeded := terr == nil && status >= 200 && status < 300
@@ -2167,8 +2171,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 2 分钟内打中十余个不同账号，是出口/来源限流而非账号问题。先记账，
 			// 达到阈值即开闸门，后续请求在选号前就被拦住，不再逐号送死。
 			// 带重置时间的 6004 不参与：那是模型级限额，按既有模型豁免切号即可。
+			//
+			// 2026-10-18：14003 的「Model busy」形态也**不参与**。它表示该模型后端
+			// 此刻拥塞（displayMsg 明写 "Please switch models"），与出口来源无关；
+			// 计入闸门会让一个模型忙把整个 realm 的选号暂停 30 秒，连带误伤其他模型。
+			// 只有不带重置时刻的**真来源限流**（"Too many requests. Please retry later."）
+			// 才走这条路径——见 upstream.IsTransientModelBusy。
 			if kind == upstream.ErrSoftRate {
-				if _, hasReset := upstream.ParseRateReset(string(respBody)); !hasReset {
+				if _, hasReset := upstream.ParseRateReset(string(respBody)); !hasReset &&
+					!upstream.IsTransientModelBusy(status, string(respBody)) {
 					if h.cfg.Pool.NoteSourceRateLimit(realm, acct.UID) {
 						log.Printf("WARN: [服务] 检测到来源级限流 uid=%s 域=%s — pausing selection for this realm",
 							logfmt.UID8(acct.UID), realm)
@@ -2488,9 +2499,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // 七条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
-//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
+//   - ErrSoftRate → **只有拿到精确恢复时刻才写冷却**（用户口径，2026-10-18）。
+//     带「将在 … 重置」→ 模型级冷却精确对齐该墙钟，绝不指数堆加；没有墙钟 →
+//     只记观测时间、不写任何冷却（6004 无时间、14003 Model busy / 来源限流都属此类）。
+//     历史：此前无墙钟时走 SoftCooldown 起的有界退避，生产实测把「模型忙」误记成
+//     账号限流（10 个号 24h 内各中 2~6 次），而实测 26 秒后同号即恢复。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不施冷却/熔断；但会累计「连续审核拒绝」计数，达到阈值
@@ -2499,12 +2512,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //   - ErrBadParams → 不罚账号，直接回 400 并保留脱敏后的诊断。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
-//     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
+//   - ErrModelBlocked → 只记日志（11102 是「模型不存在」，与账号无关，不写台账）。
 //   - ErrClient 在调用前直接回 400；其他未知错误不喂熔断。
 //
-// body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
-// 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
+// body 仅在 ErrSoftRate 分支使用：解析上游重置墙钟（ParseRateReset）决定是否冷却，
+// 以及识别 14003 Model busy 形态用于日志措辞；model 为请求携带的模型名。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
@@ -2526,19 +2538,31 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 			return
 		}
-		// 6004 但没解析出重置时间（文案变体没被正则覆盖）：仍是模型级信号——账号
-		// 对其他模型健康，冷却整号会让选号池白白少一个号。走 BlockModelBackoff
-		// 的模型级有界退避（6h 基数、不写账号级 until）。此前这里无差别落进
-		// CooldownSoftRate 账号级冷却，正是「模型限流却在号上标冷却」的来源
-		// （2026-10-14 用户反馈）。
-		if upstream.IsModelRateLimit(body) {
-			h.cfg.Pool.BlockModelBackoff(uid, model, "6004 model rate limit (no reset time)")
-			return
+		// ═══ 2026-10-18：没有精确恢复时刻的限流一律**不写冷却** ═══
+		//
+		// 用户口径：「必须要获取精确的冷却时间的号才计入真限流」。
+		//
+		// 依据（生产实测，24 小时窗口）：上游 14003 的两种形态主 msg 逐字相同
+		// （"too many requests"），只有 displayMsg 区分语义：
+		//   Model busy. Please switch models or retry later   → 模型后端瞬时拥塞
+		//   Too many requests. Please retry later.            → 来源级限流
+		// 两者都**不带重置墙钟**。此前一律按 SoftCooldown 起指数退避写进
+		// modelCooldowns，于是「模型忙」被记成账号限流：10 个不同账号各中 2~6 次，
+		// 面板上全是「模型限流 deepseek-v4.1-flash · 解除 22:55（剩 6:08）」。
+		// 反证：uid=5e3a1b37 22:32:59 撞 Model busy，26 秒后同号同模型即 200 成功——
+		// 600 秒冷却期内不可能恢复，说明这条冷却记录本身就是错的。
+		//
+		// 现在的处置：只记「最近活动」观测时间（面板显示，不参与选号），不写任何
+		// 冷却、不计入熔断。代价是模型确实持续限流时会被反复选中重试；这是可接受
+		// 的——上游没给出恢复时刻，任何本地推算的 until 都是臆造，而臆造出来的
+		// 「解除 22:55」既误导运维，又把健康号从池里摘掉。
+		h.cfg.Pool.NoteTransientError(uid)
+		reason := "429 without reset time (not recorded as rate limit)"
+		if upstream.IsTransientModelBusy(http.StatusTooManyRequests, body) {
+			reason = "429 model busy (transient, not recorded as rate limit)"
 		}
-		// 无重置时间、也没有明确的模型级标记：仍按模型记录有界退避（base 起翻倍、
-		// 封顶 soft_rate_max）。model 为空时该入口只记错误观测、不写任何冷却——
-		// 没有模型名就无法把一次限流归到具体模型上，写账号级会误伤其他模型。
-		h.cfg.Pool.CooldownSoftRateForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "429 rate limit")
+		log.Printf("INFO: [服务] 限流无精确恢复时刻，不记冷却 uid=%s 模型=%s 判据=%s",
+			logfmt.UID8(uid), model, reason)
 	case upstream.ErrSessionDead:
 		// 走连续计数而非直接禁用：12153 会被临时性触发（网络抖动/上游闪断/refresh
 		// 竞态），一次即永久杀号会误杀健康号——pool.NoteSessionDead 的注释记录了
@@ -2586,36 +2610,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
-		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
-		// 24h）。选号侧 healthyForModel 对该账号自动避开该模型；切模型/切账号即可用。
-		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
-		//
-		// 2026-10-18：**先查模型目录**再决定要不要写这条负缓存。
-		//
-		// 动机（用户：「cn 和 global 获取模型列表时也是自动获取列表里的，而不是列出
-		// 被隐藏的，看看有没有接口」）：模型名是客户端自选字段，客户端传一个已经下线
-		// 的旧名字（实测 CN 台账里 10 个模型——glm-4.6 / kimi-k2-thinking / minimax-m2.5
-		// 等——在当前目录里**一个都不存在**）时，上游回 11102 是「这个模型没了」，
-		// 不是「这个账号用不了这个模型」。按 (账号,模型) 记负缓存等于给每个账号各记
-		// 一条永久无效条目，面板上就是一片「模型不可用」，还占用有限的条目预算
-		// （maxModelCooldowns）把真正在倒计时的限流挤掉。
-		//
-		// 目录里没有 → 不写负缓存（换号也没用，模型本身不存在），只让这次请求失败。
-		// 目录里**有** → 说明是该账号对这个模型没有权限，按原逻辑记 (账号,模型) 避让。
-		// 目录缓存未就绪（启动初期/刷新失败）→ 返回 unknown，按原逻辑记录（保守：
-		// 宁可多避让一个模型，也不要让一个真正无权限的账号被反复选中重试）。
-		// 2026-10-18（用户：「只有被使用的模型，被明确告知冷却，才在账号里显示模型级
-		// 的冷却」）：11102 一律**不写模型冷却台账**。
+		// 11102「该后端无此模型」：只记日志，**不写任何冷却台账**。
 		//
 		// 11102 的语义是「该后端无此模型」——模型不存在或已改名，与账号无关，上游也
-		// 没给任何恢复时刻。它此前写进 modelCooldowns（与 6004 同表），面板就把它当
+		// 没给任何恢复时刻。它曾经写进 modelCooldowns（与 6004 同表），面板就把它当
 		// 限流列出来，每个账号挂 3~4 行「模型不可用 · 上游无此模型」，把真正在倒计时
-		// 的 6004 淹没。而它到点重试仍然是 11102，列出来毫无运维价值。
+		// 的限流淹没。而它到点重试仍然是 11102，列出来毫无运维价值。
+		//
+		// 2026-10-18 用户两次反馈后定为：**只有被使用、且上游明确告知恢复时刻的模型
+		// 才在账号里显示模型级冷却**（「甚至连这句话都不需要显示出来」）。
 		//
 		// 现在只记一行日志（按模型每小时去重）便于发现「客户端在用旧模型名」。
 		// 选号侧影响：该账号下次仍可能被选中去打这个模型——代价是再吃一次 11102
-		// 后换号，远小于给每个账号刷一片假限流。真正的账号级权限差异会由
+		// 后换号，远小于给每个账号刷一片假限流。真正的账号级权限差异由
 		// ErrAccountFault（11140）那条路径处理。
 		h.noteRetiredModel(model)
 	default:
