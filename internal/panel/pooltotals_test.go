@@ -62,3 +62,37 @@ func TestPoolTotalsFromNestedStatus(t *testing.T) {
 		t.Errorf("嵌套形态: Total=%v Healthy=%v want 10/8", got.Total, got.Healthy)
 	}
 }
+
+// TestPoolStateFromCreditsExhaustedStaysHealthy 余额不足的账号仍然「可用」。
+//
+// 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+// 用户截图指出 global 域 19 个号里 11 个积分不足被显示成「11 个不可用」——那些号
+// 其实都在正常服务免费模型。PoolState.Healthy 只由「在池 / 停用 / 熔断」决定。
+func TestPoolStateFromCreditsExhaustedStaysHealthy(t *testing.T) {
+	// 网关 /status 里一个积分不足、未停用、未熔断的账号。
+	st := poolStateFrom(map[string]any{
+		"uid":               "u1",
+		"credits_exhausted": true,
+		"cooling":           false,
+		"disabled":          false,
+	})
+	if !st.Healthy {
+		t.Errorf("余额不足的账号应仍为可用（healthy=true）: %+v", st)
+	}
+	if !st.CreditsExhausted {
+		t.Error("credits_exhausted 应原样透传，供面板显示余额不足标记")
+	}
+
+	// 对照：熔断 / 停用才是账号级不可用。
+	for _, tc := range []struct {
+		name  string
+		entry map[string]any
+	}{
+		{"breaker", map[string]any{"cooling": true}},
+		{"disabled", map[string]any{"disabled": true}},
+	} {
+		if got := poolStateFrom(tc.entry); got.Healthy {
+			t.Errorf("%s 应判为不可用: %+v", tc.name, got)
+		}
+	}
+}

@@ -7,12 +7,12 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// TestCountsDetailedForRealm 混合池（cn+global 账号，部分不可用/禁用）各域计数独立正确，
+// TestCountsDetailedForRealm 混合池（cn+global 账号，部分余额不足/禁用）各域计数独立正确，
 // 且全池总计数与分域之和一致。
 //
-// 2026-10-18 改：账号级限流冷却已取消（用户要求「不要账号冷却，只要模型冷却和积分不足」），
-// 账号级 until 现在只表示积分不足（CoolHard）。本用例用 CoolHard 构造不可用账号，
-// 并断言新增的 creditsExhausted 维度：total = healthy + cooling + creditsExhausted + disabled。
+// 2026-10-18 口径（用户：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」）：
+// 分桶只按**账号级**事实 —— total = healthy + cooling + disabled。
+// 余额不足（CoolHard）的账号仍然计入 healthy，它只作为 creditsExhausted 子集另记。
 func TestCountsDetailedForRealm(t *testing.T) {
 	withNoPickGap(t)
 	auth.SetGlobalEnabled(true)
@@ -32,20 +32,25 @@ func TestCountsDetailedForRealm(t *testing.T) {
 	p.Cooldown("cn2", CoolHard, time.Hour, "余额不足")
 	p.Disable("g2", "session dead")
 
+	// cn：cn1 健康、cn2 余额不足 → 两个都算 healthy（账号都可用），余额不足记 1。
 	total, healthy, cooling, exhausted, disabled, inFlightFull := p.CountsDetailedForRealm("cn")
-	if total != 2 || healthy != 1 || cooling != 0 || exhausted != 1 || disabled != 0 || inFlightFull != 0 {
-		t.Errorf("CountsDetailedForRealm(cn) = (%d,%d,%d,%d,%d,%d) want (2,1,0,1,0,0)",
+	if total != 2 || healthy != 2 || cooling != 0 || exhausted != 1 || disabled != 0 || inFlightFull != 0 {
+		t.Errorf("CountsDetailedForRealm(cn) = (%d,%d,%d,%d,%d,%d) want (2,2,0,1,0,0)",
 			total, healthy, cooling, exhausted, disabled, inFlightFull)
 	}
+	// global：g1 健康、g2 停用 → 1 健康 1 停用。
 	total, healthy, cooling, exhausted, disabled, _ = p.CountsDetailedForRealm("global")
 	if total != 2 || healthy != 1 || cooling != 0 || exhausted != 0 || disabled != 1 {
 		t.Errorf("CountsDetailedForRealm(global) = (%d,%d,%d,%d,%d) want (2,1,0,0,1)",
 			total, healthy, cooling, exhausted, disabled)
 	}
-	// 全池汇总 = 分域之和。
+	// 全池汇总 = 分域之和；等式 total = healthy + cooling + disabled。
 	gt, gh, gc, ge, gd, _ := p.CountsDetailed()
-	if gt != 4 || gh != 2 || gc != 0 || ge != 1 || gd != 1 {
-		t.Errorf("CountsDetailed() = (%d,%d,%d,%d,%d) want (4,2,0,1,1)", gt, gh, gc, ge, gd)
+	if gt != 4 || gh != 3 || gc != 0 || ge != 1 || gd != 1 {
+		t.Errorf("CountsDetailed() = (%d,%d,%d,%d,%d) want (4,3,0,1,1)", gt, gh, gc, ge, gd)
+	}
+	if gt != gh+gc+gd {
+		t.Errorf("账号级分桶必须自洽：total=%d != healthy(%d)+cooling(%d)+disabled(%d)", gt, gh, gc, gd)
 	}
 }
 
@@ -80,23 +85,45 @@ func TestCountsDetailedForRealmInFlightFull(t *testing.T) {
 	}
 }
 
-// TestCreditsExhaustedNotCountedAsCooling 余额不足不得被算进 cooling 桶。
+// TestCreditsExhaustedCountsAsHealthy 余额不足的账号仍然「可用」。
 //
-// 2026-10-18 用户截图指出面板把「余额不足」显示成「冷却中」。根因在分类顺序：
-// healthy() 用空模型名走 hardCreditBlocksModel("", …)，那里恒返回 true（「未指定
-// 模型时保守拦截」），于是积分不足的号被判成 unhealthy、落进 cooling 桶。
-// 分类必须先看 until+coolKind，再落到 healthy()。
-func TestCreditsExhaustedNotCountedAsCooling(t *testing.T) {
+// 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+// 余额不足只说明这个号此刻调不动扣积分的模型，账号本身没有被上游限制、也没有熔断，
+// 因此必须计入 healthy，只作为 creditsExhausted 子集另记。
+//
+// 此前它被算成不可用（先落进 cooling 桶、后落进「不可用」），面板于是显示
+// 「11 个不可用」——用户截图指出这是错的。
+func TestCreditsExhaustedCountsAsHealthy(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 
 	total, healthy, cooling, exhausted, disabled, _ := p.CountsDetailed()
-	if total != 1 || healthy != 0 || cooling != 0 || exhausted != 1 || disabled != 0 {
-		t.Fatalf("counts = total=%d healthy=%d cooling=%d exhausted=%d disabled=%d want 1/0/0/1/0",
+	if total != 1 || healthy != 1 || cooling != 0 || exhausted != 1 || disabled != 0 {
+		t.Fatalf("counts = total=%d healthy=%d cooling=%d exhausted=%d disabled=%d want 1/1/0/1/0",
 			total, healthy, cooling, exhausted, disabled)
 	}
-	if _, _, realmCooling, realmExhausted, _, _ := p.CountsDetailedForRealm("cn"); realmCooling != 0 || realmExhausted != 1 {
-		t.Fatalf("realm counts: cooling=%d exhausted=%d want 0/1", realmCooling, realmExhausted)
+	_, realmHealthy, realmCooling, realmExhausted, _, _ := p.CountsDetailedForRealm("cn")
+	if realmHealthy != 1 || realmCooling != 0 || realmExhausted != 1 {
+		t.Fatalf("realm counts: healthy=%d cooling=%d exhausted=%d want 1/0/1", realmHealthy, realmCooling, realmExhausted)
+	}
+	// 账号级可用 ≠ 探活可用：倍率表未注入时无从判断是否存在免费模型，
+	// 该号（唯一的号）不能服务任何请求，/healthz 必须仍是 503。
+	if p.ServableNow() {
+		t.Error("余额不足且无免费模型可判定时，探活不应报可服务")
+	}
+}
+
+// TestServableWhenFreeModelAvailable 同上，但倍率表注入了免费模型：
+// 余额不足的号仍能调免费模型，探活应报可服务（账号可用 + 有模型可调）。
+func TestServableWhenFreeModelAvailable(t *testing.T) {
+	p := New("")
+	// 显式登记一个免费模型（false）与一个付费模型（true）。
+	p.SetPaidModels(map[string]bool{"cn\x00free-model": false, "cn\x00paid-model": true})
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+
+	if !p.ServableNow() {
+		t.Fatal("存在免费模型时，余额不足的号仍可服务，探活应为 true")
 	}
 }

@@ -2116,14 +2116,26 @@ function renderMetrics(){
     poolSub = '全部可用';
     poolCls = 'ok';
   } else {
+    // 不可用 = 账号级不可用（熔断 + 停用 + 未入池），**不含余额不足**。
+    // 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+    // 此前把余额不足算进不可用，global 域 19 个号里 11 个积分不足就被显示成
+    // 「11 个不可用」（用户截图指出）——它们其实都在正常服务免费模型。
     var unusable = total - healthy;
-    poolSub = cooling
-      ? (unusable + ' 个不可用（' + cooling + ' 冷却中' +
-         (exhausted ? '、' + exhausted + ' 余额不足' : '') + '）')
-      : (exhausted
-          ? (unusable + ' 个不可用（' + exhausted + ' 余额不足）')
-          : (unusable + ' 个不可用'));
-    poolCls = healthy ? 'w' : 'e';
+    var bits = [];
+    if (unusable) {
+      if (cooling) bits.push(cooling + ' 熔断中');
+      var offCnt = Math.max(0, unusable - cooling);
+      if (offCnt) bits.push(offCnt + ' 停用');
+    }
+    if (unusable) {
+      poolSub = unusable + ' 个不可用' + (bits.length ? '（' + bits.join('、') + '）' : '');
+    } else if (exhausted) {
+      // 账号全部可用，只是有号缺积分——这是模型层面的提示，不算「不可用」。
+      poolSub = '全部可用（' + exhausted + ' 个余额不足，仅影响付费模型）';
+    } else {
+      poolSub = '全部可用';
+    }
+    poolCls = unusable ? (healthy ? 'w' : 'e') : 'ok';
   }
 
   $('#metrics').innerHTML = [
@@ -2194,7 +2206,9 @@ function renderPool(){
   var p = S.data.pool || {};
   var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
   var exhausted = p.creditsExhausted || 0;
-  var off = Math.max(0, total - healthy - cooling - exhausted - dis);
+  // 2026-10-18：余额不足**不再**从 healthy 里扣——它属于模型维度，账号本身可用。
+  // 进度条只反映账号级状态：可用 / 熔断 / 停用。
+  var off = Math.max(0, total - healthy - cooling - dis);
   function w(n){ return total ? (n / total * 100) : 0; }
   // 池数据缺失（网关未就绪 / 首屏还没拿到 /status）时给一个明确的空态，
   // 而不是渲染「0 / 0 健康」加一条全空的进度条——那看起来像「池子空了」，
@@ -2219,8 +2233,11 @@ function renderPool(){
     '</div>' +
     '<div class="mcells">' +
       mcell('池内总数', String(total)) +
-      mcell('冷却中', cooling ? String(cooling) : '0', cooling ? 'w' : 'ok') +
+      mcell('熔断中', cooling ? String(cooling) : '0', cooling ? 'w' : 'ok') +
       mcell('已停用', dis ? String(dis) : '0', dis ? 'e' : '') +
+      // 余额不足是**模型维度**的提示：账号可用，只是付费模型扣不动积分。
+      // 仍然显示（运维要看到），但不计入「不可用」。
+      mcell('余额不足', exhausted ? String(exhausted) : '0', exhausted ? 'w' : '') +
       mcell('并发占满', p.inFlightFull ? String(p.inFlightFull) : '0', p.inFlightFull ? 'w' : '') +
       mcell('粘性会话', p.stickySessions ? String(p.stickySessions) : '0') +
     '</div>';
@@ -2240,8 +2257,13 @@ function renderPool(){
       tot = Number(v) || 0; ok = tot; cls = tot ? 'ok' : 'e';
       if (!tot) return;
     }
-    tiles += mtile(k, String(ok), '/ ' + tot, ok / tot * 100,
-      { text: ok === tot ? '全部可用' : (ok ? (tot - ok) + ' 个不可用' : '全部不可用') });
+    // 2026-10-18：瓷片只反映账号级可用性（余额不足的号也算可用）。
+    // 该域的余额不足数在下面一行单独提示，避免和「不可用」混为一谈。
+    var rq = Number(v && v.credits_exhausted) || 0;
+    var sub = ok === tot
+      ? (rq ? ('全部可用（' + rq + ' 个余额不足）') : '全部可用')
+      : (ok ? ((tot - ok) + ' 个不可用' + (rq ? '（另 ' + rq + ' 个余额不足）' : '')) : '全部不可用');
+    tiles += mtile(k, String(ok), '/ ' + tot, ok / tot * 100, { text: sub });
     realms++;
   });
   if (realms) html += mgroup('按区域', realms + ' 个域', '<div class="mtiles">' + tiles + '</div>');
@@ -2347,12 +2369,13 @@ function acctState(a){
   if (p.disabled) return { cls:'n', text:'已停用' };
   if (a.disabled) return { cls:'n', text:'已停用' };
   if (!p.inPool) return { cls:'w', text:'不在池中' };
-  // 余额不足不是冷却：上游没限流这个号，只是没积分，免费模型照常可用。
-  // 2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，
-  // 只是没有积分余额而已」——此前这里显示「冷却中」，与同行的
-  // 「（免费模型仍可用）」自相矛盾。先判余额，再判真冷却。
-  if (p.creditsExhausted) return { cls:'w', text:'余额不足' };
-  if (p.cooling) return { cls:'w', text:'冷却中' };
+  // 冷却（熔断）与余额不足都**不是账号不可用**：
+  //   - cooling 只表示熔断器打开（连续 5xx），账号本身没被停用；
+  //   - creditsExhausted 只表示积分花完，付费模型扣不动、免费模型照常。
+  // 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+  // 所以这里先给出账号级结论（正常），把余额不足/冷却作为**附注**放在状态格下方
+  // 的独立一行（见 renderAccounts 的 exhaustedSub/coolSub），不再冒充「不可用」。
+  if (p.cooling) return { cls:'w', text:'熔断中' };
   if (!p.healthy) return { cls:'e', text:'异常' };
   return { cls:'ok', text:'正常' };
 }

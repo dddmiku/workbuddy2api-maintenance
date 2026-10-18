@@ -292,8 +292,13 @@ func poolStateFrom(entry map[string]any) PoolState {
 			state.RateLimitedModels = models
 		}
 	}
-	// healthy = 在池里 且 没冷却 且 没被池级停用。三个条件都要看：只看 inPool
-	// 会把「上游封禁但还在池里」显示成健康，只看 cooling 会漏掉停用。
+	// healthy = 在池里 且 没冷却 且 没被池级停用。
+	//
+	// 2026-10-18 口径：余额不足（CreditsExhausted）**不影响**这里。账号是否可用
+	// 只由「是否被停用 / 是否熔断」决定；积分余额与模型冷却属于「这个号此刻能调
+	// 哪些模型」，是模型使用层面的事（用户：「可不可用是针对账号的，冷却和积分余额
+	// 是模型使用方面的」）。面板会把余额不足作为该行的一个标记显示，而不是把它
+	// 算进「不可用」。
 	state.Healthy = state.InPool && !state.Cooling && !state.Disabled
 	return state
 }

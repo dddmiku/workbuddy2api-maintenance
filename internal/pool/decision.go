@@ -167,6 +167,24 @@ func (d *Decision) unavailableSticky(reason string) {
 //   - circuit_breaker：连续 5xx 的强故障信号（与限流无关，仍保留）；
 //   - model_cooldown：该模型被上游限流（唯一的限流维度）；
 // 外加「积分不足」只拦扣积分的模型（不是不可用，是这一层筛选）。
+// accountUsable 报告**账号本身**是否可用——只由账号级事实决定：
+// 未被停用，且熔断器未打开。
+//
+// 它与 unavailableReason 分层不同：后者回答「这个账号能不能服务**这个模型**」，
+// 因此还要叠加余额不足（只挡付费模型）与模型级限流。面板的「可用 / 不可用」
+// 与 /status 的 healthy 计数必须用本函数——账号没被停用、没在熔断就是可用的，
+// 积分只决定它此刻能调哪些模型（用户 2026-10-18：
+// 「可不可用是针对账号的，冷却和积分余额是模型使用方面的」）。
+func (e *entry) accountUsable(now time.Time) bool {
+	if e.disabled {
+		return false
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return false
+	}
+	return true
+}
+
 func (e *entry) unavailableReason(now time.Time, model string) string {
 	if e.disabled {
 		return "disabled"

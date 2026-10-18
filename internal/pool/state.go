@@ -383,11 +383,24 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 }
 
 // CountsDetailed 返回 total/healthy/cooling/creditsExhausted/disabled/inFlightFull 计数。
-// cooling 只含常规冷却（429 until）与熔断期（breakerUntil）；余额不足单独返回
-// （见 countsDetailedForRealm 注释）。
-// 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
-// inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
-// 与 ServableNow 的区别见该函数注释。
+//
+// ═══ 维度分层（2026-10-18 用户口径）═══
+//
+// 「账号可用性」与「模型可用性」是两件事，不能混在一个计数里：
+//   - 账号级：disabled（被停用）、cooling（熔断器打开）、healthy（其余，账号本身可用）；
+//   - 模型级：creditsExhausted（余额不足，只挡扣积分的模型）、以及按模型的限流台账。
+//
+// 用户明确指出：「积分不足账号标记还是设置为正常，现在是直接显示不可用，可不可用是
+// 针对账号的，冷却和积分余额是模型使用方面的」。因此余额不足的账号**计入 healthy**
+// ——它没有被上游限制，账号本身是好的，只是付费模型暂时扣不动积分而已。
+// creditsExhausted 是 healthy 的**子集**（不是对立桶），面板据此在账号上标「余额不足」
+// 而不把它算进「不可用」。
+//
+// healthz 的可用性判定不走这里（见 ServableNow：它按 chat 的真实可达性算，
+// 余额不足且没有任何免费模型可用时确实服务不了请求）。
+//
+// 注意：healthy 口径不含 inFlight 维度（状态机权威判定）；inFlightFull 是 healthy 的
+// 子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
@@ -401,11 +414,15 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, cr
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
 //
-// cooling 只统计**真正的冷却**：429 软冷却与熔断期。余额不足（CoolHard）单独计入
-// creditsExhausted——上游没有限制这个账号，只是没积分，免费模型照常可用
-// （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的」）。
-// 它仍不属于 healthy（healthy 回答「能不能调扣积分的模型」），所以总量等式
-// total = healthy + cooling + creditsExhausted + disabled 依旧成立。
+// 分桶只按**账号级**事实：
+//
+//	disabled  — 被网关停用（真正的不可用）
+//	cooling   — 熔断器打开（连续 5xx，账号暂时不可信）
+//	healthy   — 其余全部，含「余额不足」的号
+//
+// 余额不足（CoolHard）**不参与分桶**，只在 creditsExhausted 里另行计数（它是
+// healthy 的子集）。理由：账号没有被上游限制，积分只决定「哪些模型这次能调」。
+// 总量等式：total = healthy + cooling + disabled。
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, creditsExhausted, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -415,18 +432,16 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, cr
 			continue
 		}
 		total++
-		// 分类顺序即优先级：禁用 > 积分不足 > 冷却 > 健康。
-		//
-		// 积分不足必须**先于** healthy() 判定：healthy() 用空模型名走
-		// hardCreditBlocksModel("", …)，那里恒返回 true（「未指定模型时保守拦截」），
-		// 于是余额不足的号会被判成 unhealthy，落进 else 的 cooling 桶——面板上就
-		// 出现了「冷却」而实际只是没积分（用户 2026-10-18 截图指出的显示错误）。
+		// 余额不足只是「模型维度受限」，不影响账号可用性：先记一笔子集计数，
+		// 再按账号级事实（禁用 / 熔断 / 其余）分桶。
+		creditsExhaustedNow := now.Before(e.until) && e.coolKind == CoolHard
+		if creditsExhaustedNow {
+			creditsExhausted++
+		}
 		switch {
 		case e.disabled:
 			disabled++
-		case now.Before(e.until) && e.coolKind == CoolHard:
-			creditsExhausted++
-		case !e.healthy(now):
+		case !e.accountUsable(now):
 			cooling++
 		default:
 			healthy++
@@ -438,13 +453,29 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, cr
 	return total, healthy, cooling, creditsExhausted, disabled, inFlightFull
 }
 
-// ServableNow 报告池当前是否可服务：存在至少一个（对任意模型）healthy 且未占满在途名额的账号。
-// 与 CountsDetailed 的 healthy 口径不同：healthy 只看 disabled/until/breakerUntil（状态机权威判定），
-// 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
-// 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
+// ServableNow 报告池当前是否**真能服务请求**：存在至少一个未停用、未熔断、
+// 未占满在途名额，且至少有一个模型可调的账号。
 //
-// 单模型限制不改变 healthy，因此仍可服务其他模型；并发错误产生账号冷却与模型
-// 限制并存时，必须服从账号级冷却，不能让模型记录反过来制造可用性。
+// 这是 /healthz 的口径，回答的是「现在发一个请求过来会不会 503」，与面板上的
+// 「账号可用」是两个问题：
+//   - 账号可用（CountsDetailed.healthy）只看 disabled/熔断——余额不足的号也是可用的；
+//   - 真能服务还要求「有模型可调」：余额不足且倍率表里没有免费模型时，这个号
+//     确实调不动任何东西，探活不该报 200。
+//
+// 因此这里显式判两件事，而不是复用 healthy()（那个函数用空模型名走
+// hardCreditBlocksModel("", …)，恒返回 true，语义会被误读成「账号不可用」）。
+func (p *Pool) servableAccount(e *entry, now time.Time) bool {
+	if !e.accountUsable(now) {
+		return false
+	}
+	// 余额不足：只有在「确实存在免费模型可调」时才算能服务。
+	// 倍率表未注入（nil）时无法判断，按不能服务处理——与 hardCreditBlocksModel
+	// 的保守口径一致。
+	if now.Before(e.until) && e.coolKind == CoolHard {
+		return e.p.hasFreeModelLocked(e.a.Realm())
+	}
+	return true
+}
 func (p *Pool) ServableNow() bool {
 	return p.servableLocked("")
 }
@@ -543,8 +574,10 @@ func (p *Pool) RealmRateStateForModel(realm, model string) RealmRateState {
 }
 
 // servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
-// 存在至少一个（realm 匹配、未占满在途名额、healthy）的账号即 true。
-// realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。
+// 存在至少一个（realm 匹配、未占满在途名额、真能服务请求）的账号即 true。
+//   - realm=="" 不加 realm 谓词（全池）；调用方必须不持锁。
+//   - 「真能服务」见 servableAccount：账号可用 + 有模型可调（余额不足时要求该域
+//     存在免费模型）。这与面板的「账号可用」不同，是探活专用的可达性口径。
 func (p *Pool) servableLocked(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -556,7 +589,7 @@ func (p *Pool) servableLocked(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) {
+		if p.servableAccount(e, now) {
 			return true
 		}
 	}

@@ -2405,17 +2405,18 @@ func TestStatusRealmTotals(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v body=%s", err, rec.Body)
 	}
-	// 2026-10-18：积分不足从 cooling 拆出来单列（cooling 只剩熔断这一类）。
-	if body.Total != 4 || body.Healthy != 2 || body.Cooling != 0 || body.CreditsExhausted != 1 || body.Disabled != 1 {
-		t.Errorf("summary = %d/%d/%d/%d/%d want 4/2/0/1/1",
+	// 2026-10-18：余额不足的号**仍算可用**（账号没有被上游限制），
+	// 只作为 credits_exhausted 子集单列。账号级等式 total = healthy + cooling + disabled。
+	if body.Total != 4 || body.Healthy != 3 || body.Cooling != 0 || body.CreditsExhausted != 1 || body.Disabled != 1 {
+		t.Errorf("summary = %d/%d/%d/%d/%d want 4/3/0/1/1",
 			body.Total, body.Healthy, body.Cooling, body.CreditsExhausted, body.Disabled)
 	}
 	if body.RealmTotals == nil {
 		t.Fatal("realm_totals missing from /status")
 	}
 	cn := body.RealmTotals["cn"]
-	if cn["total"] != 2 || cn["healthy"] != 1 || cn["cooling"] != 0 || cn["credits_exhausted"] != 1 || cn["disabled"] != 0 {
-		t.Errorf("realm_totals.cn=%v want total=2 healthy=1 cooling=0 credits_exhausted=1 disabled=0", cn)
+	if cn["total"] != 2 || cn["healthy"] != 2 || cn["cooling"] != 0 || cn["credits_exhausted"] != 1 || cn["disabled"] != 0 {
+		t.Errorf("realm_totals.cn=%v want total=2 healthy=2 cooling=0 credits_exhausted=1 disabled=0", cn)
 	}
 	g := body.RealmTotals["global"]
 	if g["total"] != 2 || g["healthy"] != 1 || g["cooling"] != 0 || g["disabled"] != 1 {
@@ -2455,8 +2456,9 @@ func TestHealthzRealmServable(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 	}
-	if resp.Healthy != 1 {
-		t.Errorf("healthy=%d want 1 (only cn1)", resp.Healthy)
+	// cn2 虽然余额不足，但账号本身可用（熔断/停用才是账号级不可用），故计 2。
+	if resp.Healthy != 2 {
+		t.Errorf("healthy=%d want 2 (cn1 healthy + cn2 credits-exhausted but account usable)", resp.Healthy)
 	}
 	if resp.RealmServable["cn"] != true {
 		t.Errorf("realm_servable.cn=%v want true", resp.RealmServable["cn"])

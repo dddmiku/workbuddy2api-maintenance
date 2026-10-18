@@ -147,6 +147,35 @@ func (p *Pool) PaidModelSummary() map[string]any {
 	return map[string]any{"count": len(keys), "models": keys}
 }
 
+// hasFreeModelLocked 报告「该 realm 下是否存在至少一个免费（倍率 x0.00）模型」。
+//
+// 只用于判断「余额不足的号此刻还能不能服务任何请求」：如果倍率表里该域所有模型
+// 都是付费的，积分耗尽的号就真的调不动任何模型，探活不该报可用。
+//
+// 口径与 modelIsPaid 一致：优先看 realm 精确键，裸名键也算（SetPaidModels 的调用方
+// 可能只按裸名登记）。倍率表未注入时返回 false——无从判断，按不能服务处理。
+//
+// 调用方必须已持有 p.mu（读锁即可）。
+func (p *Pool) hasFreeModelLocked(realm string) bool {
+	if p.paidModels == nil {
+		return false
+	}
+	for key, paid := range p.paidModels {
+		if paid {
+			continue
+		}
+		// 免费条目：键要么是裸名，要么是 "realm\x00name"。
+		if strings.Contains(key, "\x00") {
+			if r, _, ok := strings.Cut(key, "\x00"); ok && r != realm {
+				continue
+			}
+		}
+		return true
+	}
+	// 表里没有任何免费条目 → 该域所有模型都要积分。
+	return false
+}
+
 // paidModelKey 付费判定用的键：realm + 裸模型名。空 realm（未分池调用）时退化为
 // 只看裸名——那种调用不区分域，用任一域的判定都比完全不判更接近意图。
 func paidModelKey(realm, model string) string {
