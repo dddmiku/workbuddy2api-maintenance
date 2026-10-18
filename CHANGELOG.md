@@ -40,359 +40,49 @@ v2.6.20 → v2.6.28 这一天连发了 9 个**补丁号**，但其中至少 4 �
 
 ## v3.10.19 — 2026-10-18
 
-### 修复：面板在账号级冷却时隐藏了模型级限流
-
-用户截图反馈：「还是显示的账号级冷却，模型没有单独冷却」。
-
-后端 `/status` 其实一直返回了完整的两层数据：
-
-```json
-{"cooling":true,"cool_kind":"hard_credit","free_models_usable":true,
- "rate_limited_models":[{"model":"deepseek-v4.1-flash",
-                          "until":"2026-10-18T20:25:12+08:00", ...}]}
-```
-
-问题在面板前端的渲染条件（`panel/app.js`）：
-
-```js
-var rlmSub = (!p.cooling && rlm.length) ? ... : '';
-```
-
-`!p.cooling` 把「模型限流」整行隐藏了。当初的假设是「账号级冷却已涵盖整号，
-模型行不必重复」，但 **CoolHard（余额不足）并不封死整号**——它只挡扣积分的
-模型，免费模型照常可用（面板上那句「免费模型仍可用」正是这个意思）。于是
-「余额不足 + 某免费模型又被 6004 限流」的账号只显示余额不足，用户看不到那个
-模型其实还要限流 16 小时。
-
-修复：去掉 `!p.cooling`，账号级与模型级两层同时展示。
-
-验证（VPS，`780ea508` 实测）：该号 `until=2026-10-19T04:00`（余额不足）且
-`deepseek-v4.1-flash` 限流到 `2026-10-19T05:13:32`（6004，+16.1h），
-修复后两行都显示。
+面板在账号级冷却时不再隐藏模型级限流。余额不足只挡扣积分的模型，被 6004 限流的
+免费模型此前整行不显示；现在两层各显示一行。
 
 ## v3.10.18 — 2026-10-18
 
-### 修复：余额不足的账号不得绕过模型级冷却
-
-`unavailableReason` 的「CoolHard + 免费模型」分支原本直接 `return ""`，这会
-**跳出整个函数**，把后面的 `breakerUntil` 与 `modelCooled` 判断一并跳过。于是
-`credits=0` 的账号即使某个免费模型已因 6004 处于冷却，仍被判为可用并派出去
-撞 429——现象是「提示 19 小时后重置，号却还在用」。
-
-注释当时写的是「继续往下判熔断/模型冷却」，实现并没有（由新增的模型级隔离
-测试发现）。修复后免费模型只跳过余额这一层，熔断与模型冷却照常生效。
-
-验证（prod，同一批账号）：
-
-| 模型 | 结果 |
-|---|---|
-| `global:deepseek-v4.1-flash` | 429（该模型 19h 冷却，正确拦下） |
-| `global:glm-5.3` | 200 |
-| `global:kimi-k3` | 200 |
-| `global:glm-5.2` | 200 |
-
-新增 `modelisolation_20261018_test.go` 三个用例锁住语义。
+修 `unavailableReason` 在「余额不足 + 免费模型」分支提前 return：跳过了熔断与模型
+冷却判断，已被限流的免费模型仍会被派出去。
 
 ## v3.10.17 — 2026-10-18
 
-### 修复：限流冷却按上游实际重置时间，不再固定截断到 2 小时
-
-用户报告：「号池只有几个号的 global 4.1 进入冷却，但是整体却无法使用了」。
-
-复现（prod，真实请求 `global:deepseek-v4.1-flash`）拿到上游原文：
-
-```
-429 {"code":6004,"msg":"usage exceeds frequency limit, but don't worry,
-     your usage will reset at 2026-10-19 04:10:46 UTC+8,
-     alternatively, you can switch to the other models to continue using it."}
-```
-
-号池其实把 6 个 global 号都试了一遍（`max_rotate: 6`），每个都 6004。
-`decisions` 显示当时 `available=13 healthy=13`，即**大部分号看着是健康的**——
-矛盾点就在这里。
-
-根因在 `cappedSoftUntilLocked`：
-
-```go
-cap := now.Add(p.softRateMaxOr())   // soft_rate_max 默认 2h
-if resetAt.After(cap) { return cap }   // ← 上游要 18h，被砍成 2h
-```
-
-于是号在「冷却 2h → 放回池子 → 立刻再撞 6004 → 再冷 2h」之间无限循环。
-真实限流窗口是 18 小时，本地冷却只有 2 小时，等于自己制造假恢复。
-
-修复：有上游重置时间就按该时间冷却，`soft_rate_max` 只用于「没有上游时间」
-的指数退避。保留一条防呆边界 `maxSoftResetWindow = 7 天`，只拦解析错误/时钟
-漂移导致的离谱值；上游时间已过期则立即恢复。
-
-验证（dev，v3.10.17）：17 条 6004 冷却的剩余时长从 0.19h 到 **19.41h** 均有分布，
-与上游各自给出的墙钟一一对应（修复前全部 ≤2h）。
-
-### 修复：余额不足的账号在免费模型上绕过模型级冷却
-
-`unavailableReason` 里「余额不足（CoolHard）+ 免费模型」分支原本直接 `return ""`，
-这会**跳出整个函数**，把后面的 `breakerUntil` 与 `modelCooled` 判断一并跳过。
-后果：一个 `credits=0` 的账号，即使某个免费模型已因 6004 处于冷却中，仍会被判为
-可用并选中，直接把请求送上去撞 429——用户看到的就是「明明提示 19 小时后重置，
-号却还在被派出去」。
-
-代码注释当时写的是「免费模型：余额不足不影响可用性，继续往下判熔断/模型冷却」，
-但实现没有继续往下判（2026-10-18 由模型级隔离测试发现）。
-
-修复后免费模型只跳过**余额**这一层，熔断与模型冷却照常生效。
-
-验证（prod，v3.10.17，同一批账号）：
-
-| 模型 | 结果 |
-|---|---|
-| `global:deepseek-v4.1-flash` | 429（该模型有 19h 模型级冷却） |
-| `global:glm-5.3` | 200 |
-| `global:kimi-k3` | 200 |
-| `global:glm-5.2` | 200 |
-
-另补三个测试锁住这条语义（`modelisolation_20261018_test.go`）：
-模型冷却只锁被限流的那个模型、选号侧同样只跳过该模型、余额不足不能越过模型冷却。
-
-### 修复：nil ctx 调用观察器会 panic
-
-`observeChatAttempt(nil, ...)` 直接 `ctx.Value` 触发空指针。补 nil 判断。
+- 限流冷却按上游给的重置时间，不再截断到 `soft_rate_max`（默认 2h）。此前号在
+  「冷却 2h → 假恢复 → 再撞 6004」之间循环，整个模型跟着不可用。
+- `observeChatAttempt(nil, ...)` 补 nil 判断，避免空指针。
 
 ## v3.10.16 — 2026-10-18
 
-### 修复：trae 请求的用量完全不落账（积分与 token 一起丢）
-
-接上一版：积分查到了、日志也打了 `扣费 1.1300`，但 `usage.json` 里那个密钥
-条目根本不存在。继续往下挖，根因在更早一层。
-
-handler 的 `recordUsage` 以 `st.upstreamStarted` 为前置条件（语义是「没打过
-上游的请求不记用量」），而这个标记**只由** `upstream.observeChatAttempt("start")`
-置位。Trae 域在 `ChatStreamContext` 里提前 return、不走 WorkBuddy 的出站循环，
-于是这一句从来没执行过——所有 trae 请求的 `upstream_started` 恒为 false，
-`recordUsage` 整段被跳过。
-
-实测证据（dev，v3.10.15）：
-
-| 观测点 | 结果 |
-|---|---|
-| 容器日志 | `INFO: [trae] Remote 扣费 1.1300（模型=GLM-5.3 …）` ← 查到了 |
-| `usage.json` 该密钥条目 | **不存在** ← 没写进去 |
-| `requests.jsonl` 该记录 | `"upstream_started": false` ← 根因 |
-
-修复：Trae 分支补发 `start` / `headers` 两个尝试事件。这同时修正了请求日志的
-`pre=` 耗时列（此前 trae 请求恒为 `-`）。
-
-验证（dev，v3.10.16）：同一请求后 `usage.json` 出现完整条目：
-
-```json
-{"name":"creditkeep","totals":{"requests":1,"prompt_tokens":20779,
- "cached_tokens":20736,"completion_tokens":44,"total_tokens":20823,"credit":1.16},
- "models":{"trae:glm-5.3":{...,"credit":1.16}},
- "days":{"2026-10-18":{...,"credit":1.16}}}
-```
-
-日志里的 `WARN: 上游返回用量但无扣费` 同时消失。
+修 trae 请求用量不落账：`recordUsage` 依赖 `upstream_started`，Trae 分支提前
+return 没有置位，积分与 token 一起丢。顺带修正请求日志的 `pre=` 列。
 
 ## v3.10.15 — 2026-10-18
 
-### 修复：积分列恒为「—」——上游不带 credit，改查商业用量接口
-
-面板「积分」列对 trae 请求恒为「—」，日志刷「上游返回用量但无扣费」。
-
-根因：`llm_utils_chat` 的 `token_usage` 事件**只有 token 数、没有 credit 字段**
-（原始事件逐字确认）：
-
-```
-event:token_usage
-data:{"prompt_tokens":17,"completion_tokens":21,"total_tokens":38,
-      "cache_read_input_tokens":0,"reasoning_tokens":17,"cluster":"normal_context"}
-```
-
-网关账本读的是 `usage.credit`，上游不给就永远记不到；成本账本
-（`NoteModelCost`）也因此从不更新，选号无法按「免费/便宜优先」排序。
-
-官方客户端另打 `POST /api/v1/commercial/get_session_usage`
-`{"session_id":"<turn id>"}` 取真实账单。实测（dev 真实上游）：
-
-```json
-{"user_usage_group_by_session":{"amount_float":0.07,"credits_float":0.07,
- "extra_info":{"input_token":17,"output_token":84},"model_name":"GLM-5.3",
- "use_max_mode":false,"session_id":"creditprobe-..."}}
-```
-
-两个关键事实：**turn id 就是我们发出去的 request_id**（上游 metadata 原样
-回显）；**没有结算延迟**（连续三次轮询值一致，首次即可用），所以不需要参考
-实现那套指数退避轮询。
-
-实现：
-
-1. 新增 `session_usage.go`：`FetchSessionCredit` 查扣费，5s 超时兜底；
-   缺失/非数值/HTTP 失败一律 `ok=false`（缺失≠0，绝不把查不到记成免费）。
-2. `translator` 挂流尾回调：发 usage 帧前查一次，把真实 credits 写进
-   `usage.credit`。token 数仍取事件流的值，不被覆盖。
-3. 两条路径各自传 turn id：legacy = 我们的 `request_id`，Remote = `message_id`
-   （商业接口按单轮消息记账，`chat_session_id` 是整个会话）。
-4. `use_max_mode` 一并解析并记日志——确认「默认 1M 档」是否真的按 max 计费。
+面板积分列不再恒为「—」。上游 `token_usage` 事件不带 credit，改按每轮
+`session_id` 查商业用量接口取真实扣费；查不到记「无」，不记 0。
 
 ## v3.10.14 — 2026-10-18
 
-### 修复：所有两档模型默认走 1M（`__max`），此前恒发 200K（`__dev`）
-
-用户报「客户端声明了 1M，实际还是 200K 档」。根因在出站模型名：
-
-目录（`batch_get_detail_param`）里同一模型分两档，真名与上限都不同：
-
-| function | max_mode | 真名 | prompt_max_tokens |
-|---|---|---|---|
-| `solo_work_lite`（旧默认表） | false | `glm-5.3__dev` | 168000 |
-| `solo_agent` | **true** | `glm-5.3__dev` / `glm-5.3__max` | 168000 / **936000** |
-| `solo_work_remote` | false | `glm-5.3__dev` | 168000 |
-
-网关此前只有请求名带 `-max` 后缀才发 `__max`，默认一律 `__dev`。于是客户端看到
-1M 窗口、网关也确实能收 1M，但模型实际按 168000（≈200K）档跑——用户观察到的
-「只有 200K」正是这一档。
-
-改动：
-
-1. **默认档改 max**（`catalog.go` 新增 `ResolveRequestedTier`）。两档模型不带后缀
-   即发 `__max`；要普通档写 `<model>-dev` / `<model>_dev` / `<model>__dev`；
-   `<model>-max` 仍可显式要求。目录没标 `max_mode` 或没给 `__max` 真名的模型**不**
-   强行套档（绝不凭空造 1M）。
-2. **选表跟着档位走**（`FunctionForModelTier`）。默认表 `solo_work_lite` 只有
-   `__dev`，留在那张表里就算换成 `__max` 真名也会 `config item is empty`。
-   要 max 时必须发到**给了 `__max` 真名**的那张表（`solo_agent` 等）。
-3. **Remote 路径同步**：max 档改走 `solo_agent_remote`（只有它给了 `__max`），
-   并套 max 六件套（`context_window_size` 1M / `prompt_max_tokens` 936000）。
-   工具请求默认也这样——Agent 档工具语义的代价见 `WB2API_TRAE_MAX_TIER` 开关。
-
-### 验证（Oracle dev，真实上游）
-
-`traeprobe maxprobe glm-5.3`：
-
-```
-解析: 请求="glm-5.3" → config_name="glm-5.3" wantMax=true function="solo_agent"
-目录标记: max_mode=true dev="glm-5.3__dev" max="glm-5.3__max" devMax=100000 maxMax=936000
-llm_utils_chat 出站体: model=glm-5.3__max config_name=glm-5.3 function=solo_agent
-Remote: agent_type=solo_agent_remote maxApplied=true model_name=glm-5.3__max strategy=max
-        context_window=1e+06 prompt_max=936000
-```
-
-`--post` 真发：`llm_utils_chat HTTP 200`，事件流里
-`provider_model_name: glm-5.3` —— 上游接受 `__max` 真名（此前 `__max` 的证据只来自
-Solo 会话抓包，`llm_utils_chat` 的抓包 body 是加密的，这次补上了直接证据）。
+两档模型默认走 1M（`__max`），此前恒发 `__dev`（约 200K）。请求名带 `-max` 仍
+可显式要求 max，带 `-dev` 取普通档；目录里没标 `max_mode` 的模型不套档。
 
 ## v3.10.13 — 2026-10-18
 
-### 修复：`trae:glm-5.3` 带图必然 400（转写图片后重发）
-
-用户在 Claude Code 长会话里给 `trae:glm-5.3` 贴图，得到
-`400 code=3004 "We're sorry, your requests have exceeded the rate limit."`，
-而同一账号在 Trae 官方客户端用 GLM-5.3 Max 贴图能正常得到图片描述。
-
-A/B 对照（Oracle dev，同一张 384×384 结构化 PNG：蓝底 + 红圆 + 绿矩形）：
-
-| 请求 | 结果 |
-|---|---|
-| `trae:glm-5.3` 带图 | **502**（code 3004） |
-| `trae:glm-5.3` 纯文本 | 200「你好」 |
-| `trae:glm-5.3-flash` 带图 | 200 正确读图 |
-| `trae:deepseek-v4.1-flash` 带图 | 200 正确读图 |
-| `trae:multimodal_image_kimi-k2.5` 带图 | 200 正确读图 |
-| 转写文字再喂 `trae:glm-5.3` | 200 正确回答 |
-
-结论：**3004 在带图请求上的含义是「该模型没有视觉能力」，不是工具轮次超限**。
-上游的文案（rate limit）把人引向「等一会 / 换号」，两条都是错的方向——纯文本
-同模型同账号正常，说明既不是限流也不是封号。
-
-官方客户端也不是让 glm-5.3 直接看图：它用
-`read_tool_image_to_text_config_name: "multimodal_image_kimi-k2.5"` 把图**转成
-文字**再喂主模型。网关此前缺了这一步，且带图请求又禁止回落 Remote（Remote 读
-不到内联图片），于是必然 400、无任何出路。
-
-改动（`internal/upstream/trae/imagetext.go`）：
-
-1. 带图请求被 3004 拒绝且尚未交付内容时，用 `multimodal_image_kimi-k2.5` 逐张
-   转写图片，替换成文本块后用**同一个主模型**重发；
-2. 转写失败或重发仍失败时，返回可执行的说明（改用支持图片的模型 / 去掉图片），
-   而不是原样透出「rate limit」；
-3. 转写路径**不回落 Remote**——那会静默丢图，用户拿到「没看图」的回答却无从察觉。
-
-判据仍用 `freshInputHasImages`（只看本轮新输入）：历史里贴过图不该永久禁用回落。
-不带图的 3004 仍走原来的 Remote 回落（那才是真正的工具轮次超限）。
-
-顺带清掉 `stream.go` 里承诺 `flattenToolTurnsForLegacy` 的陈旧注释——该函数已在
-`6ab4c42` 删除（当时实测「扁平化后重发仍被拒」，因为根因不是工具轮次，而是图片）。
-
-### 转写链路自身的两个坑（同日实测）
-
-首版跑起来后连挂两次，都是「响应 200 但取不到正文」，值得记下来：
-
-1. **上游回的是 Trae 原生事件，不是 OpenAI 形状**。转写请求打的是同一个
-   `llm_utils_chat`，正文在 `event: output` 的 `response` 字段里，且可能是
-   **累计快照**。首版只按 `choices[].delta.content` 解析，日志表现为
-   `转写模型返回空正文：id:1`。现在两种形态都认，快照按前缀/重叠合并
-   （`蓝` → `蓝色` → `色背景` 得 `蓝色背景`，不是 `蓝色色背景`）。
-2. **转写请求必须经 `BuildChatBodyWithCatalog` 构造**。手搓 body 没有 `function`
-   字段，上游回 `code 2001 "[LLMUtilsChat.resolveByUsage] function is empty"`，
-   响应体里同样没有正文。目录里 `multimodal_image_kimi-k2.5` 只在 `multimodal`
-   表，function 必须按表选。
-
-失败日志现在会把原始响应的前 400 字节一并打出来——首版只写「空正文」，白排查一轮。
-
-### 验证
-
-dev（Oracle VPS）实测，同一张 384×384 PNG：
-
-| 请求 | 修复前 | 修复后 |
-|---|---|---|
-| `trae:glm-5.3` 带图 | 502（3004） | **200**「纯蓝色背景、左上红圆、右下绿矩形」 |
-| `trae:glm-5.3` 纯文本 | 200 | 200（未受影响） |
-| `trae:glm-5.3-flash` 带图 | 200 | 200 |
-| `trae:deepseek-v4.1-flash` 带图 | 200 | 200 |
-
-日志确认走了新链路：
-`已转写 1 张图片为文本（失败 0），用同一模型重发` →
-`带图请求被 3004 拒绝（模型无视觉能力），已转写图片后用同一模型重发`。
-
-代价：带图 + 不支持视觉的模型会多一跳转写（实测约 3s），且该轮的回答质量取决于
-转写模型。支持视觉的模型（glm-5.3-flash / deepseek-v4.1-flash）仍是一跳，不受影响。
+修 `trae:glm-5.3` 带图必然 400（code 3004）。该模型没有视觉能力，官方客户端是
+先用 `multimodal_image_kimi-k2.5` 把图转成文字再喂主模型；网关补上这一步后用同一
+模型重发。
 
 ## v3.10.12 — 2026-10-18
 
-### 修复：Trae 专用表模型必然 502
+修 Trae 专用表模型必然 502。同一个 `config_name` 在不同 function 表里对应不同出站
+真名，网关此前只留一份且写死 `solo_work_lite`；改为按 function 各存一份并按表选，
+`is_invisible_to_user` 只影响 `/v1/models` 公布、不再丢弃模型。实测 40 个公布模型
+39 个返回 200（`doubao_1_8` 是上游目录死条目）。
 
-上游 `llm_utils_chat` 要求 `function` 与 `model` 同属一张目录表，且**同一个
-`config_name` 在不同表里对应不同的 `model_name`**：
-
-| config_name | 表 | 真名 |
-|---|---|---|
-| `code-review-judge` | code_reviewer | `deepseek-V3.1__dev` |
-| `Doubao-Seed-2.0-Code` | solo_work_lite | `Doubao-Seed-2.1-Turbo__dev` |
-| `glm-5v-turbo` | chat | 裸名 → 4023 model unknown |
-| `glm-5v-turbo` | solo_coder | `glm-5v-turbo__dev` ✅ |
-
-网关把目录按 `config_name` 合并时只保留一份出站真名，又写死
-`function=solo_work_lite`，所以只在 `code_reviewer` / `git_ai` / `multimodal` /
-`chat_v3` 里的模型一律回 `config item is empty for config opt`。
-
-改动：
-
-1. `CatalogModel.Profiles` 按 function 各存一份出站真名，
-   `OutboundModelNameFor(function, wantMax)` 按表取；
-2. `FunctionForModel` 选一张确实含该模型的表，优先有 `__dev` 真名的表；
-3. `model_detail_list` 里的裸名、`__v2` 变体也记为普通档真名
-   （`chat` / `git_ai` / `multimodal` 这几张表没有 `__dev` 后缀）；
-4. `is_invisible_to_user` 不再整条丢弃，改为标记 `Hidden` —— 语义是「Trae 界面
-   不显示」而非「不可调用」，`Hidden` 只影响 `/v1/models` 公布；
-5. Remote 侧：模型只在非 Remote 表里时直接放弃 Remote、走 legacy。
-
-实测（Oracle + 华为云，40 个公布模型逐个调用）：**39 个 200**。唯一失败的
-`doubao_1_8` 是上游自己回 `model is unknown` —— 它只存在于 `chat` 表，表里
-`doubao_1_8` 与 `doubao_1_8__v2` 两个名字上游都不认，属目录死条目。
-
-### 修复：日志 TTFB 改用秒
-
-`TTFB=25180ms` → `TTFB=25.2s`，与同行 `total=` 同口径。长上下文请求的首字节
-经常是几十秒，毫秒值要数位数。面板 `logparse` 取的是 `[^|]*?`，两种单位都能解析。
+日志 TTFB 改用秒，与同行 `total=` 同口径。
 
 ## v3.9.4 — 2026-10-17
 
