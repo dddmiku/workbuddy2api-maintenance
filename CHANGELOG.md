@@ -1,5 +1,22 @@
 # 版本变更
 
+## v3.12.9 — 2026-10-19
+
+上下文压不进 Remote 上限时改走 llm_utils_chat，修掉切到 `trae:deepseek-v4.1-flash`
+后的 502。事故形态：建会话成功、事件流空结束（`Trae upstream returned no data
+events`），换号重试三次同样空流。拆开那个 2,429,895 字节的建会话体：`query`
+1,101,077 字符，且只有 **2 段 system**（934,956 + 52,051）——Claude Code 把整个
+环境说明塞进 system，而 `boundedRemoteQuery` 按对话轮次成对丢弃非 system 消息，
+全 system 的请求 `nonSystem==0`，循环第一次判断就返回，一个字符都没裁掉；987K
+远超 460K 上限，上游按既有口径（>500K 静默断流）空结束。
+
+同一个 body 走 `llm_utils_chat` 是通的：实测 1,105,264 字节 / 204,033
+prompt_tokens 返回 200（27.4s），该端点没有 Remote 那种扁平化 query 的字符上限。
+新增 `remoteQueryUnbounded`，复用出站同一条 `prepareRemoteMessages →
+compactRemoteHistory → boundedRemoteQuery` 链路做判定，所以判据不会与实际发出的
+body 漂移。判据是「压不进上限」而不是「体积大」：668KB 但可成对丢弃的多轮对话
+仍走 Remote。
+
 ## v3.12.8 — 2026-10-18
 
 只有上游给出精确恢复时刻的限流才写冷却。此前任何 429 都会按 `soft_rate` 起、
