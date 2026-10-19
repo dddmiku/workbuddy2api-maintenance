@@ -260,6 +260,10 @@ func (s *Scheduler) taskDisabled(k taskKind) bool {
 		return s.cfg.GrowthDisabled
 	case taskBalance:
 		return s.cfg.BalanceDisabled
+	case taskRunner:
+		// 一次性任务：与 taskCompensation 同样没有开关字段。返回 false（未停用）
+		// 让面板能手动触发；它不进 nextWake 候选，所以不会定时执行。
+		return false
 	case taskCompensation:
 		// 一次性任务没有开关字段：它的启停由「是否还能领」决定，不由配置决定。
 		// 返回 false（未停用）让面板能手动触发它；它不进 nextWake 候选，
@@ -356,6 +360,19 @@ const (
 	taskCat
 	taskGrowth
 	taskBalance
+	// taskRunner 成长任务点亮（task_runner.py ALL --yes）。
+	//
+	// 与 taskGrowth 的分工：growth 是 Go 原生流水线，只做「accept → 已完成任务的
+	// claim」，不伪造任何事件；真正把 create_canvas / chat_5 / template_5 /
+	// expert_5 / WorkBuddy_Valorant 等 16 种任务做成 completed 的，是
+	// scripts/task_runner.py。此前这段只由 taskCat 以 `--only black_cat` 调用，
+	// 其余 15 种任务在网关里没有入口（2026-10-19 用户要求补齐）。
+	//
+	// **一次性任务，不进 nextWake 候选**（2026-10-19 用户明确：这些不用设置时间，
+	// 手动执行即可）。理由：任务点亮本身就是「补齐当前缺口」的动作，缺口有多大
+	// 取决于上游当天发了什么活动，定时跑只会在没缺口时白打一遍上游事件。
+	// 面板以「跑一次」提供，与 taskCompensation 同一形态。
+	taskRunner
 	// taskCompensation 补偿积分领取（一次性任务，无排程时点）。
 	//
 	// 它没有小时配置：补偿是限时活动（实测 end_time 2026-10-22 23:59:59），
@@ -571,6 +588,8 @@ func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 		s.runGrowthCenter(ctx)
 	case taskBalance:
 		s.runBalance(ctx)
+	case taskRunner:
+		s.runRunner(ctx)
 	case taskCompensation:
 		s.runCompensation(ctx)
 	}

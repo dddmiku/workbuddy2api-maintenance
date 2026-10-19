@@ -27,6 +27,12 @@ const (
 	TaskKeyCat       TaskKey = "cat"        // 夜猫子任务
 	TaskKeyGrowth    TaskKey = "growth"     // 成长中心流水线（旅行/任务奖/补登/兑换/抽奖/Buddy盲盒）
 	TaskKeyBalance   TaskKey = "balance"    // 余额刷新（纯读；快过期优先消耗的数据来源）
+	// TaskKeyRunner 成长任务点亮（scripts/task_runner.py ALL --yes）。
+	//
+	// 与 growth 的区别：growth 只领「真完成」的任务，runner 负责把能伪造的
+	// 16 种任务做成 completed（画布/模板/专家/技能/皮肤/资料库…）。两者是
+	// 「先点亮、再领奖」的顺序关系，排程小时必须错开。
+	TaskKeyRunner TaskKey = "runner"
 	// TaskKeyCompensation 补偿积分领取（**一次性任务**，无排程小时）。
 	// 限时活动，到期即无；面板以「跑一次」提供，不进定时候选。
 	TaskKeyCompensation TaskKey = "compensation"
@@ -81,6 +87,8 @@ func (k taskKind) key() TaskKey {
 		return TaskKeyGrowth
 	case taskBalance:
 		return TaskKeyBalance
+	case taskRunner:
+		return TaskKeyRunner
 	case taskCompensation:
 		return TaskKeyCompensation
 	}
@@ -108,6 +116,8 @@ func kindOf(key string) (taskKind, bool) {
 		return taskGrowth, true
 	case TaskKeyBalance:
 		return taskBalance, true
+	case TaskKeyRunner:
+		return taskRunner, true
 	case TaskKeyCompensation:
 		return taskCompensation, true
 	}
@@ -136,6 +146,8 @@ func describe(k TaskKey) (string, string) {
 		return "成长中心", "一轮跑完七段：领旅行礼物/派 Buddy → 任务接单与领奖 → 补登卡自动补 → 连登兑换 → 盲盒抽奖 → 能量开 Buddy 盲盒 → 能量与连签展示"
 	case TaskKeyBalance:
 		return "余额刷新", "只读查询各账号积分余额与快过期分桶，驱动「优先消耗快过期积分」选号；关掉签到也建议保留本任务"
+	case TaskKeyRunner:
+		return "成长任务点亮", "一次性任务：把能伪造的成长任务做成已完成（画布/模板/专家/技能/皮肤/资料库等 16 种），跑全部 CN 号；点亮后由「成长中心」领奖"
 	case TaskKeyCompensation:
 		return "补偿积分领取", "一次性任务：领取上游发放的限时补偿积分（如模型服务异常补偿）。每个账号只能领一次，重复运行会跳过已领账号"
 	}
@@ -166,6 +178,9 @@ func realmsOf(k TaskKey) []string {
 		return []string{"cn", "global"}
 	case TaskKeyCompensation:
 		// 补偿活动只挂在 CN 站；global/trae 打该端点会拿到 401 授权页（实测）。
+		return []string{"cn"}
+	case TaskKeyRunner:
+		// task_runner.py 内部用 auth_skips_cn_task 排除 global/trae，只跑 CN。
 		return []string{"cn"}
 	}
 	// 其余任务只服务 CN：global 在实现里被精确排除。
@@ -205,6 +220,9 @@ func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
 		return s.cfg.GrowthHours, enabled
 	case TaskKeyBalance:
 		return s.cfg.BalanceHours, enabled
+	case TaskKeyRunner:
+		// 一次性任务：没有排程小时。返回 nil 小时 = 面板显示「手动」且无下次时点。
+		return nil, enabled
 	case TaskKeyCompensation:
 		// 一次性任务：没有排程小时。返回 nil 小时 = 面板显示「手动」且无下次时点。
 		return nil, enabled
@@ -223,7 +241,7 @@ func (s *Scheduler) TaskSnapshot() []TaskInfo {
 	keys := []TaskKey{
 		TaskKeyCheckin, TaskKeyTraeCheck, TaskKeyTravel, TaskKeyActivity,
 		TaskKeyKeepalive, TaskKeySchool, TaskKeyCat,
-		TaskKeyGrowth, TaskKeyBalance, TaskKeyCompensation,
+		TaskKeyGrowth, TaskKeyBalance, TaskKeyRunner, TaskKeyCompensation,
 	}
 	out := make([]TaskInfo, 0, len(keys))
 	for _, key := range keys {

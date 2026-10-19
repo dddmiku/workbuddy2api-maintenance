@@ -15,8 +15,9 @@ func TestTaskSnapshotOrderAndSwitches(t *testing.T) {
 	snap := s.TaskSnapshot()
 	// 2026-10-14：redeem/lottery/makeup 合并为 growth，故 11 → 9 类。
 	// 2026-10-16：新增 compensation（一次性任务），故 9 → 10 类。
+	// 2026-10-19：新增 runner（成长任务点亮，一次性任务），故 10 → 11 类。
 	wantKeys := []string{"checkin", "trae_check", "travel", "activity", "keepalive", "school", "cat",
-		"growth", "balance", "compensation"}
+		"growth", "balance", "runner", "compensation"}
 	if len(snap) != len(wantKeys) {
 		t.Fatalf("应返回 %d 类任务，实际 %d", len(wantKeys), len(snap))
 	}

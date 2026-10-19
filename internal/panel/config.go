@@ -46,6 +46,12 @@ var taskEnableKey = map[string]string{
 	// 登记在这里的唯一目的是让面板的 KnownTask 白名单放行它的「跑一次 / 停止」，
 	// 否则前端点按钮会吃「任务标识不正确」。
 	"compensation": "",
+	// runner：成长任务点亮（**一次性任务**，2026-10-19）。
+	//
+	// 与 compensation 同样没有 config.json 开关字段——空串表示「不可开关，只能
+	// 手动跑一次」。登记的目的是让 KnownTask 放行「跑一次 / 停止」，否则前端点
+	// 按钮会吃「任务标识不正确」。
+	"runner": "",
 }
 
 // TaskKeys 返回面板接受的任务标识（顺序固定，便于测试与日志）。

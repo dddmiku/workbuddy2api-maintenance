@@ -149,3 +149,22 @@ func (s *Scheduler) runCat(ctx context.Context) {
 		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
 	})
 }
+
+// RunRunnerNow 立即执行成长任务点亮：task_runner.py ALL --yes。
+//
+// 一次性任务（无排程小时），只由面板「跑一次」触发。跑全部 CN 号——
+// task_runner.py 内部用 auth_skips_cn_task 跳过 global/trae，所以这里传 ALL
+// 不会把 Trae 的 JWT 打向 codebuddy.cn。
+//
+// 不加 --only：全量才覆盖 create_canvas / template_5 / expert_5 /
+// WorkBuddy_Valorant 等 16 种任务；带 --only 就退化成 cat 那种单任务形态了。
+func (s *Scheduler) RunRunnerNow() {
+	s.runRunner(context.Background())
+}
+
+func (s *Scheduler) runRunner(ctx context.Context) {
+	root := repoRoot()
+	runScriptContext(ctx, "runner", root, [][]string{
+		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes"},
+	})
+}
