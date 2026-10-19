@@ -62,9 +62,11 @@ jobs:
       - name: Resolve version metadata
         id: meta
         run: |
-          # 本仓库没有 VERSION 文件，版本只能从 git 推导：
+          # 版本从 git 推导，不读仓库根 VERSION：VERSION 是「下一个要发的版本」，
+          # 而定时构建拿到的是 main 上的代码，往往已经领先该 tag 若干提交。
+          # 直接读 VERSION 会让镜像谎报成 v3.14.2，实际内容却是 v3.14.2+6。
           #   1) 打 tag 时用 tag 名（最准）
-          #   2) 否则用最近 tag + 提交距离（v3.14.2-12-gabc1234 这种）
+          #   2) 否则用最近 tag + 提交距离（v3.14.2-6-g5018cf2 这种）
           #   3) 仓库没有任何 tag 时用短 SHA
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VER="${GITHUB_REF_NAME}"

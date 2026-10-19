@@ -77,7 +77,12 @@ type Release struct {
 	SumsSigURL    string `json:"sums_sig_url,omitempty"`
 }
 
-// UpdateAvailable 按稳定版本号判断是否可自动升级；其他自定义标签沿用名称比较。
+// UpdateAvailable 判断远端发布是否比当前运行版本新。
+//
+// 两边都能解析成 vX.Y.Z[-N-gSHA] 时按语义比较（见 buildVersion.compare）：
+// 镜像 CI 注入的 `v3.14.2-6-gabc` 与 Release 的 `v3.14.2` 不是同一个版本，
+// 前者更新，不能被判成「已是最新」而挡住后续升级。
+// 任一边无法解析时退回名称比较——宁可让用户自己判断，也不静默认为最新。
 func (r Release) UpdateAvailable() bool {
 	current := strings.TrimSpace(version.Version)
 	if r.Tag == "" {
@@ -87,32 +92,84 @@ func (r Release) UpdateAvailable() bool {
 		// 开发构建：只要远端有 tag 就认为可更新，交由使用者判断。
 		return true
 	}
-	if candidate, ok := stableVersion(r.Tag); ok {
-		if running, ok := stableVersion(current); ok {
-			for i := range candidate {
-				if candidate[i] != running[i] {
-					return candidate[i] > running[i]
-				}
-			}
-			return false
+	if candidate, ok := parseBuildVersion(r.Tag); ok {
+		if running, ok := parseBuildVersion(current); ok {
+			return candidate.compare(running) > 0
 		}
 	}
 	return strings.TrimPrefix(r.Tag, "v") != strings.TrimPrefix(current, "v")
 }
 
-func stableVersion(tag string) ([3]uint64, bool) {
-	var out [3]uint64
-	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(tag), "v"), ".")
-	if len(parts) != len(out) {
+// buildVersion 是「可比较的版本」：vX.Y.Z 加上可选的 git describe 后缀。
+//
+// 后缀形态来自 `git describe --tags`：`-6-g5018cf2` 表示距 v3.14.2 有 6 个
+// 提交、当前提交是 5018cf2；`-dirty` 表示工作区有改动。镜像 CI 注入的就是
+// 这种版本（见 .github/workflows/docker-image.yml），所以解析必须认它。
+type buildVersion struct {
+	nums  [3]uint64
+	ahead uint64 // 距 tag 的提交数；0 表示就是该 tag
+	dirty bool
+}
+
+// compare 返回 -1 / 0 / 1。
+//
+// 规则：先比数字段；数字相同再看提交距离——`v3.14.2-6-gabc` 比 `v3.14.2`
+// 新，`v3.14.2` 比 `v3.14.2-6-gabc` 旧。忽略 dirty 与具体提交号：它们只
+// 说明构建来源，不构成版本先后。
+func (v buildVersion) compare(o buildVersion) int {
+	for i := range v.nums {
+		if v.nums[i] != o.nums[i] {
+			if v.nums[i] < o.nums[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if v.ahead != o.ahead {
+		if v.ahead < o.ahead {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// parseBuildVersion 解析 vX.Y.Z[-N-gSHA][-dirty]。
+//
+// 不接受其他形态（如 `dev`、`v0.0.0-abcdef` 里的纯 SHA 后缀无法还原提交
+// 距离）——返回 false 让调用方退回字符串比较，而不是猜。
+func parseBuildVersion(s string) (buildVersion, bool) {
+	var out buildVersion
+	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	if strings.HasSuffix(s, "-dirty") {
+		out.dirty = true
+		s = strings.TrimSuffix(s, "-dirty")
+	}
+	parts := strings.SplitN(s, "-", 2)
+	nums := strings.Split(parts[0], ".")
+	if len(nums) != len(out.nums) {
 		return out, false
 	}
-	for i, part := range parts {
-		value, err := strconv.ParseUint(part, 10, 64)
+	for i, n := range nums {
+		value, err := strconv.ParseUint(n, 10, 64)
 		if err != nil {
 			return out, false
 		}
-		out[i] = value
+		out.nums[i] = value
 	}
+	if len(parts) == 1 {
+		return out, true
+	}
+	// 后缀必须是 N-gSHA；缺 g 前缀的（例如纯 SHA）无法解释成提交距离。
+	tail := strings.SplitN(parts[1], "-g", 2)
+	if len(tail) != 2 || tail[1] == "" {
+		return out, false
+	}
+	ahead, err := strconv.ParseUint(tail[0], 10, 64)
+	if err != nil {
+		return out, false
+	}
+	out.ahead = ahead
 	return out, true
 }
 
