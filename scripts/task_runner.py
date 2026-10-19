@@ -337,7 +337,15 @@ def build_dynamic_spec(t):
 
 
 def _fetch_market_experts(auth, team_only=False, keyword=None):
-    """运行时专家市场 POST expert/list -> [(ex_id, meta)]。team_only 只留 expert_type=team。"""
+    """运行时专家市场 POST expert/list -> [(ex_id, meta)]。team_only 只留 expert_type=team。
+
+    keyword 必须是**字符串**：上游对 `{"keyword": ["拼豆"]}` 返回 400，对
+    `{"keyword": "拼豆"}` 返回精确匹配（实测 4 条，第一条正是目标专家）。
+    传 list 时上游直接报错，等于没过滤——2026-10-19 实测踩到。
+    调用方传 list（spec["kws"]）时这里取第一个。
+    """
+    if isinstance(keyword, (list, tuple)):
+        keyword = keyword[0] if keyword else None
     out, seen = [], set()
     try:
         for page in range(1, 4):
@@ -370,6 +378,13 @@ def _fetch_market_experts(auth, team_only=False, keyword=None):
         print(f"  [warn] 专家市场拉取失败({ex})，回落内置表")
     # COS 静态清单补足（expert_center.json）：团队专家市场列表很薄（250 个里仅 2 个 team），
     # M4 实测 COS 有 52 个 team，作为 team_only 的主/补来源；普通专家用市场 ex_ id。
+    #
+    # 有 keyword 时**不补**：关键词查询的目标是精确命中某一个专家，把 COS 的几百个
+    # 无关专家追加进来会把真实结果挤出前 N 个，上报到错误对象后 progress 恒 0
+    # （2026-10-19 实测：keyword=拼豆 命中 4 条，但补足后列表变成 429 条，
+    #  前 5 个全是 ContentCreator 这类内置专家）。
+    if keyword:
+        return out
     try:
         req = urllib.request.Request(COS_EXPERT_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=20) as rr:
