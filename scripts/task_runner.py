@@ -62,7 +62,7 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go �
     machineId/sessionId 由 uid+盐 md5 稳定派生，勿每次随机）；library 走 web 域 web 指纹。
   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
 """
-import sys, os, json, time, argparse, urllib.request
+import sys, os, json, time, argparse, urllib.request, re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc
@@ -88,6 +88,10 @@ MAPPING = {
     "Hp_Appearance":          {"kind": "skin",       "target": 1, "src": "主题 resourceKey"},
     "chat_5":                 {"kind": "chat",       "target": 5, "src": "无(独立会话)"},
     "Model_chat_GLM5.2":      {"kind": "glmchat",    "target": 1, "src": "无(glm-5.2)"},
+    # 活动类专家任务（2026-10-19 实测：专家 ID 走 market/expert/list 关键词搜真实 ex_ id）
+    # 动态任务由 --discover 自动补全，MAPPING 只是静态兜底；新活动不必改这里。
+    "WorkBuddy_Valorant":      {"kind": "expert_task", "target": 1,
+                                "kw": "拼豆", "src": "market/expert/list keyword"},
     # 特殊：时段敏感（夜猫窗口 23-08 CST），窗口内最多补 1 次
     "black_cat":              {"kind": "cat",        "target": 3, "src": "无(glm-5.2 夜猫)"},
     # 桌面指纹 6 连对话事件链（fork DesktopChatSequence，三账号实测点亮）
@@ -255,6 +259,83 @@ def _fetch_scenes(auth):
     return out
 
 
+# --------------------------------------------------------------------------
+# 动态任务发现：成长中心任务每日可能增删，硬编码 MAPPING 必然漏。
+# 策略：list_tasks 拉全量 -> 已映射的直接用；未映射的按 title/task_desc 文本特征
+# 自动推断 kind（infer_kind）-> 生成 spec交给同一套accept/report/claim 链路。
+# 关键约束（2026-10-19 实测）：
+#   - 服务端校验真实对象 id，伪造 id 会 report 200 但 progress 恒 0
+#   - accept 必须先于 report（顺序反了 progress 永远不动）
+#   - claim 只看 progress，不看 accept_status
+# --------------------------------------------------------------------------
+# 文本特征 -> kind。顺序敏感：越具体的规则越靠前。
+KIND_RULES = [
+    #（正则, kind, 目标 id 抽取方式）
+    (r"外观|主题|皮肤|appearance",       "skin",       None),
+    (r"发现应用|Buddy\s*应用|应用.*进入",  "buddy5",     None),
+    (r"资料库|读.*文档",                   "library",    None),
+    (r"专家团|团队.*专家|专家.*团队",      "team",       None),
+    (r"技能|尝鲜|热门",                    "skill",      None),
+    (r"自动化|定时任务|周期任务",          "automation", None),
+    (r"模板|场景",                         "template",   None),
+    (r"画布|canvas|设计",                 "canvas",     None),
+    (r"灵感|playbook|案例",               "playbook",   None),
+    (r"夜猫|黑猫",                         "cat",        None),
+    (r"对话|聊天|发消息",                  "chat",       None),
+    (r"专家|expert",                      "expert_task", "expert"),
+]
+
+# 明确不可自动化的任务（正文含真人操作/长时等待）
+UNFORGEABLE_HINTS = [
+    (r"公众号|关注.*满\s*\d+\s*小时", "需真人关注公众号并等待时长，服务端按时间判定"),
+    (r"捐赠|捐款|下单|支付|购买|充值",   "涉及真实资金/订单副作用"),
+]
+
+
+def infer_kind(title, desc=""):
+    """按标题+描述文本推断任务类型。返回 (kind, extra) 或 (None, reason)。"""
+    blob = f"{title} {desc}"
+    for pat, reason in UNFORGEABLE_HINTS:
+        if re.search(pat, blob, re.I):
+            return None, reason
+    for pat, kind, extra in KIND_RULES:
+        if re.search(pat, blob, re.I):
+            return kind, extra
+    return None, "文本特征无法推断事件类型"
+
+
+# 从 task_desc / title 抽专家搜索关键词（"体验「XXX」专家" -> ["XXX"]）
+def extract_expert_keyword(title, desc=""):
+    m = re.search(r"[「\[]([^」\]]{2,20})[」\]]\s*专家", f"{title} {desc}")
+    if m:
+        return [m.group(1)]
+    m = re.search(r"(?:召唤|搜索并召唤)\s*「?([^「」，。]{2,20})」?", f"{title} {desc}")
+    if m:
+        return [m.group(1)]
+    return []
+
+
+def build_dynamic_spec(t):
+    """为未映射任务构造 spec。返回 (spec, note)。"""
+    title = t.get("title") or ""
+    desc = t.get("task_desc") or t.get("description") or ""
+    code = t.get("task_code")
+    kind, extra = infer_kind(title, desc)
+    if kind is None:
+        return None, extra
+    spec = {"kind": kind, "target": 1,
+            "src": f"动态推断({kind})", "dynamic": True,
+            "title": title}
+    if kind == "expert_task":
+        kws = extract_expert_keyword(title, desc)
+        if not kws:
+            return None, "专家类任务但抽不出关键词（task_desc 无「XXX」格式）"
+        spec["kw"] = kws[0]
+        spec["kws"] = kws
+        spec["src"] = f"market/expert/list keyword={kws[0]}"
+    return spec, f"动态推断 kind={kind}"
+
+
 def _fetch_market_experts(auth, team_only=False, keyword=None):
     """运行时专家市场 POST expert/list -> [(ex_id, meta)]。team_only 只留 expert_type=team。"""
     out, seen = [], set()
@@ -403,7 +484,7 @@ def _dedup_slice(src, offset, need):
     return final[offset:offset + need]
 
 
-def ids_for(kind, auth, need, offset=0):
+def ids_for(kind, auth, need, offset=0, spec_kws=None):
     """返回需要上报的对象 id 列表 [(obj_id, meta)]（按源顺序，偏移 cur 避免复用）。"""
     if need <= 0:
         return []
@@ -424,6 +505,11 @@ def ids_for(kind, auth, need, offset=0):
         return _dedup_slice(_fetch_lighthouse(auth), offset, need)
     if kind == "skin":
         return _dedup_slice(_fetch_pe_theme(auth), offset, need)
+    if kind == "expert_task":
+        # 动态专家任务：用 task_desc 抽出的关键词去市场搜真实 ex_ id
+        #（2026-10-19 实测：伪造 id 会 report 200 但 progress 恒 0，服务端校验真实 id）
+        kws = spec_kws if spec_kws else None
+        return _dedup_slice(_fetch_market_experts(auth, keyword=kws), offset, need)
     if kind in ("chat", "glmchat", "automation", "cat"):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
@@ -671,6 +757,17 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "vipLevel": m.get("vipLevel") or "free", "series": m.get("series") or "craft",
                 "type": "unknown", "name": m.get("name") or obj_id, "userId": uid}
 
+    # 活动类专家任务：事件形状与 expert 一致，区别只在 obj_id 由关键词搜真实 ex_ id
+    if kind == "expert_task":
+        return {"eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+                "mode": "CLOUD", "id": obj_id, "name": m.get("name") or obj_id,
+                "expertTitle": m.get("name") or "", "type": m.get("category") or "",
+                "expertType": m.get("expertType") or "agent", "source": "builtin",
+                "version": m.get("version") or "", "cost": 0, "characterCount": 12,
+                "conversationId": cid, "requestId": rid, "messageId": rid,
+                "requestModelId": "deepseek-v4-flash", "requestModelName": "DeepSeek V4 Flash",
+                "userId": uid}
+
     if kind in ("chat", "glmchat", "cat"):
         model_id = "glm-5.2" if kind in ("glmchat", "cat") else "deepseek-v4-flash"
         model_name = "GLM-5.2" if kind in ("glmchat", "cat") else "DeepSeek V4 Flash"
@@ -700,18 +797,39 @@ def _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=False):
     tag = " web" if via_web else ""
     if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
         msg = r.get("msg") if isinstance(r, dict) else r
-        print(f"[task_runner] {uid8} {code}: 领奖{tag} 失败 {st} {msg}")
+        print(f"[task_runner] {uid8} {code}: claim{tag} {st} {msg} -> ERR")
         stats["fail"] += 1
         return 0
     data = r.get("data") or {}
     credit = data.get("credit") or 0
     energy = data.get("energy") or 0
+    # 2026-10-19 HAR 逆向发现：claim 除credit/energy 外还可能发badge（徽章）、
+    # buddy（皮肤）、share_uuid（分享卡）。这些是独立于积分的资产，原实现全丢弃。
+    badge = data.get("badge") or {}
+    buddy = data.get("bonus") or data.get("buddy") or {}
+    extras = []
+    if badge:
+        extras.append(f"badge={badge.get('name') or badge.get('id')}")
+    if buddy:
+        tpl = (buddy.get("template") or {}) if isinstance(buddy, dict) else {}
+        extras.append(f"buddy={tpl.get('name') or buddy.get('id')}")
+    if data.get("share_uuid"):
+        extras.append("share_uuid")
+    if data.get("reward_popup_redirect_url"):
+        extras.append(f"popup={data['reward_popup_redirect_url'][:60]}")
+    ext = (" | " + " ".join(extras)) if extras else ""
+    stats.setdefault("badge", 0)
+    stats.setdefault("buddy", 0)
+    if badge:
+        stats["badge"] += 1
+    if buddy:
+        stats["buddy"] += 1
     if data.get("already_claimed"):
-        print(f"[task_runner] {uid8} {code}: 领奖{tag} 已领过（积分 +{credit} 能量 +{energy}）")
+        print(f"[task_runner] {uid8} {code}: claim{tag} 200 already_claimed(credit=+{credit} energy=+{energy}){ext}")
         stats["already"] += 1
         time.sleep(gap)
         return 2
-    print(f"[task_runner] {uid8} {code}: 领奖{tag} 成功（积分 +{credit} 能量 +{energy}）")
+    print(f"[task_runner] {uid8} {code}: claim{tag} 200 ok(credit=+{credit} energy=+{energy}){ext}")
     stats["ok"] += 1
     stats["credit"] += credit
     stats["energy"] += energy
@@ -730,21 +848,20 @@ def _claim_via_web(auth, code, uid8, stats, gap):
 def claim_one(auth, code, uid8, stats, gap):
     """领单个任务。返回 1=新入账 2=already_claimed 0=失败。
 
-    chat 域（M15 实测成功）先行；400 则自动降级 web 域带完整头（web_claim_fallback）。
-    幂等语义保持：already_claimed 不算失败（返回 2）。
+    2026-10-19 HAR 逆向（9 份成长中心抓包）证实：网页版 claim **不带Authorization**，
+    仅靠 Cookie + x-client-platform: web + Origin/Referer 就是 200。因此 web 域提为主路径，
+    chat 域降级为备选（少数任务 chat 域才认）。幂等语义不变：already_claimed 不算失败。
     """
-    st, r = tc.do_post(auth, tc.chat_base(auth),
-                       f"/activity/growth/tasks/{code}/claim", None)
-    if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
-        msg = r.get("msg") if isinstance(r, dict) else r
-        # 400 降级到 web 域（fork 实测 Web 成长中心端点）：chat 域路径对部分任务 400
-        if st == 400:
-            print(f"[task_runner] {uid8} {code}: claim 400 {msg} -> 降级 web 域")
-            return _claim_via_web(auth, code, uid8, stats, gap)
-        print(f"[task_runner] {uid8} {code}: 领奖失败 {st} {msg}")
-        stats["fail"] += 1
-        return 0
-    return _claim_parse(auth, code, uid8, stats, gap, st, r)
+    st, r = _claim_via_web(auth, code, uid8, stats, gap)
+    if st == 200 and isinstance(r, dict) and r.get("code") == 0:
+        return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
+    # web 域未果再试 chat 域（保留旧行为兜底）
+    st2, r2 = tc.do_post(auth, tc.chat_base(auth),
+                         f"/activity/growth/tasks/{code}/claim", None)
+    if st2 == 200 and isinstance(r2, dict) and r2.get("code") == 0:
+        return _claim_parse(auth, code, uid8, stats, gap, st2, r2, via_web=False)
+    # 两边都失败：报 web 域的错误（信息量更大：含 "task not completed"）
+    return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
 
 
 # --------------------------------------------------------------------------
@@ -754,10 +871,15 @@ def process_task(auth, code, t, opts, stats):
     uid8 = auth["uid"][:8]
     spec = MAPPING.get(code)
     if spec is None:
-        print(f"[task_runner] {uid8} {code}: query 非映射任务，skip")
-        stats["total"] += 1
-        stats["skip"] += 1
-        return
+        # 动态推断：任务每日可能增删，硬编码必然漏。按标题/描述文本特征自动定kind。
+        spec, note = build_dynamic_spec(t)
+        if spec is None:
+            print(f"[task_runner] {uid8} {code}: query 非映射且{note}，skip"
+                  f" (title={t.get('title')!r})")
+            stats["total"] += 1
+            stats["skip"] += 1
+            return
+        print(f"[task_runner] {uid8} {code}: {note} (title={t.get('title')!r}) 自动处理")
     ast = t.get("accept_status")
     prog = t.get("progress") or {}
     cur = prog.get("current") or 0
@@ -826,7 +948,7 @@ def process_task(auth, code, t, opts, stats):
         return
 
     if not opts.yes:
-        ids = ids_for(spec["kind"], auth, need, offset=cur)
+        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws"))
         shown = [i for i, _ in ids][:6]
         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮 need={need} "
               f"id源={spec['src']} ids={shown}，dry-run 跳过")
@@ -843,11 +965,21 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
     if ast == "not_accepted":
         st_a, r_a = tc.accept_tasks(auth, [code])
         msg = r_a.get("msg") if isinstance(r_a, dict) else r_a
-        print(f"[task_runner] {uid8} {code}: 接单 {st_a} {msg}")
+        print(f"[task_runner] {uid8} {code}: accept {st_a} {msg}")
         time.sleep(opts.gap)
         if st_a != 200:
             stats["fail"] += 1
             return
+        # 2026-10-19 实测：accept 返回 200 不等于已报名成功，必须回读确认。
+        # 静默失败时后续 report 会全部白打（progress 恒 0），此处短路并如实标注。
+        st_chk = tc.task_status(auth, code)
+        ast_chk = (st_chk or {}).get("accept_status") or "?"
+        if ast_chk == "not_accepted":
+            print(f"[task_runner] {uid8} {code}: accept {st_a} {msg} 但回读仍 not_accepted"
+                  f" -> accept 未生效，短路（避免无效 report）")
+            stats["fail"] += 1
+            return
+        print(f"[task_runner] {uid8} {code}: accept 确认生效 accept_status={ast_chk}")
 
     t_now = tc.task_status(auth, code) or {}
     prog = t_now.get("progress") or {}
@@ -867,8 +999,8 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
             msg = f"req-{ms}-{i}-user"
             events = desktop_chat_sequence(auth, conv, req, msg, "fast-model", "fast-model")
             st_r, sc = report_desktop_events(auth, events)
-            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
-                  f"桌面对话链 conv={conv}")
+            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
+                  f"deskchain conv={conv}")
             if i < need - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
@@ -886,10 +1018,10 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                           "elementName": buddy_name, "position": 1,
                           "isFirstPage": "0", "userId": auth["uid"]}
                 st2, sc2 = report_desktop_events(auth, [single])
-                print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
+                print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
                       f"buddy5 失败 -> 降级单发 {st2} code={sc2}")
             else:
-                print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
+                print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
                       f"buddy5 id={buddy_id}")
             if i < need - 1:
                 time.sleep(opts.gap)
@@ -899,22 +1031,24 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
         for i in range(need):
             st_r, sc = report_web_event(auth, "web_element_click", LIBRARY_DOC_URL,
                                         "library_doc_intro_click", "WorkBuddy资料库介绍")
-            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} "
-                  f"web 元素点击")
+            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
+                  f"web_element_click")
             if i < need - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
     else:
-        ids = ids_for(spec["kind"], auth, need, offset=cur)
+        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws"))
         if not ids:
             print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
             stats["fail"] += 1
             return
         for i, (obj_id, m) in enumerate(ids):
             ev = build_event(auth, spec["kind"], obj_id, m, i)
-            st_r, r_r = tc.do_post(auth, tc.billing_base(auth), tc.PATH_REPORT, [ev])
+            # 2026-10-19 实测：accept 走 chat 域而report 走 billing 域属跨域不一致，
+            # 服务端收得到但不归账。统一改走 chat 域。
+            st_r, r_r = tc.do_post(auth, tc.chat_base(auth), tc.PATH_REPORT, [ev])
             sc = r_r.get("code") if isinstance(r_r, dict) else r_r
-            print(f"[task_runner] {uid8} {code}: 上报 {i + 1}/{need} {st_r} code={sc} id={obj_id}")
+            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} id={obj_id}")
             if i < len(ids) - 1:
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
@@ -924,7 +1058,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
     prog2 = (t2.get("progress") or {}) if t2 else {}
     cur2 = prog2.get("current", 0)
     ast2 = t2.get("accept_status") if t2 else "?"
-    print(f"[task_runner] {uid8} {code}: 回读进度 {cur2}/{prog2.get('target', tgt)} 接单状态={ast2}")
+    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', tgt)} accept_status={ast2}")
     if ast2 != "claimed" and cur2 >= prog2.get("target", tgt):
         claim_one(auth, code, uid8, stats, opts.gap)
     elif ast2 != "claimed":
@@ -937,13 +1071,13 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
 # --------------------------------------------------------------------------
 def process_account(auth, opts, stats):
     uid8 = auth["uid"][:8]
-    print(f"== 账号 {uid8}（{auth['nick']}）==")
+    print(f"== {uid8} ({auth['nick']}) ==")
     # 只读 oracle：能量余额（上下文参考，dry-run/REAL 都显示）
     try:
         st_e, r_e = tc.do_get(auth, tc.chat_base(auth), PATH_ENERGY)
         if st_e == 200 and isinstance(r_e, dict) and r_e.get("code") == 0:
             bal = (r_e.get("data") or {}).get("balance", "?")
-            print(f"[task_runner] {uid8} 查能量 余额={bal}")
+            print(f"[task_runner] {uid8} query energy balance={bal}")
     except Exception:
         pass
     try:
@@ -957,20 +1091,18 @@ def process_account(auth, opts, stats):
     if opts.only_codes:
         codes = opts.only_codes
     else:
-        codes = list(MAPPING)
-        # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
-        for t in tasks:
-            c = t.get("task_code")
-            if c and c not in MAPPING:
-                ast = t.get("accept_status")
-                if ast == "claimed":
-                    print(f"[task_runner] {uid8} {c}: query claimed -> 已领，跳过(非映射任务)")
-                    stats["total"] += 1
-                    stats["already"] += 1
-                else:
-                    print(f"[task_runner] {uid8} {c}: query {ast} -> 非映射任务，skip")
-                    stats["total"] += 1
-                    stats["skip"] += 1
+        # 全量：以服务端返回为准，而非 MAPPING。
+        # 2026-10-19 实测任务列表每日增删（15 -> 16 个，新增 WorkBuddy_Valorant），
+        # 硬编码 MAPPING 会漏掉新活动；改为「已映射 ∪ 服务端实际返回」。
+        codes = [t.get("task_code") for t in tasks if t.get("task_code")]
+        mapped = [c for c in codes if c in MAPPING]
+        dynamic = [c for c in codes if c not in MAPPING]
+        print(f"[task_runner] {uid8}: 服务端任务 {len(codes)} 个"
+              f"（已映射 {len(mapped)}，动态 {len(dynamic)}: {dynamic or '无'}）")
+        # MAPPING 里有但服务端没有的（活动下线）——如实标注，不静默
+        for c in MAPPING:
+            if c not in by_code and not MAPPING[c].get("unforgeable"):
+                print(f"[task_runner] {uid8} {c}: query 任务不存在(活动可能已下线)")
 
     for code in codes:
         t = by_code.get(code)
@@ -982,14 +1114,52 @@ def process_account(auth, opts, stats):
         process_task(auth, code, t, opts, stats)
 
 
+def discover_report(auth):
+    """--discover：只读列出服务端全部任务 + 动态推断结论，不发起任何写操作。
+
+    用于「任务每日增删」的日常巡检：新增活动能立刻看出 kind 推断是否正确。
+    """
+    uid8 = auth["uid"][:8]
+    print(f"== {uid8} ({auth['nick']}) DISCOVER ==")
+    tasks = tc.list_tasks(auth)
+    print(f"[discover] 服务端共{len(tasks)} 个任务\n")
+    dyn = 0
+    for t in tasks:
+        code = t.get("task_code")
+        title = t.get("title") or ""
+        ast = t.get("accept_status")
+        prog = t.get("progress") or {}
+        cur, tgt = prog.get("current"), prog.get("target")
+        end = t.get("valid_end") or "-"
+        if code in MAPPING:
+            tag = f"映射({MAPPING[code].get('kind')})"
+        else:
+            spec, note = build_dynamic_spec(t)
+            if spec:
+                dyn += 1
+                tag = f"动态[{spec['kind']}]"
+            else:
+                tag = f"跳过({note})"
+        print(f"  {code:<28} {ast:<12} {str(cur)+'/'+str(tgt):<8} 截止={end[:10]:<11} {tag}")
+        print(f"      {title}")
+    print(f"\n[discover] 静态映射命中 {len(tasks) - dyn} 个，动态推断 {dyn} 个，"
+          f"共 {len(tasks)} 个")
+    return tasks
+
+
 # --------------------------------------------------------------------------
 # 汇总
 # --------------------------------------------------------------------------
 def print_summary(stats):
-    print(f"task_runner 执行完成：账号={stats['accounts']} 总计={stats['total']} "
+    extra = ""
+    if stats.get("badge"):
+        extra += f" badge=+{stats['badge']}"
+    if stats.get("buddy"):
+        extra += f" buddy=+{stats['buddy']}"
+    print(f"task_runner done: accounts={stats['accounts']} total={stats['total']} "
           f"ok={stats['ok']} already={stats['already']} skipped={stats['skip']} "
           f"pending={stats['pending']} fail={stats['fail']} "
-          f"credit=+{stats['credit']} energy=+{stats['energy']}")
+          f"credit=+{stats['credit']} energy=+{stats['energy']}{extra}")
 
 
 def main():
@@ -1001,13 +1171,16 @@ def main():
     ap.add_argument("--only-claim", action="store_true",
                     help="只领奖不点亮（已完成任务直接 claim，已领幂等）")
     ap.add_argument("--gap", type=float, default=1.0, help="动作间隔秒数（默认 1.0）")
+    ap.add_argument("--discover", action="store_true",
+                    help="只读探测：列出服务端当前全部任务及动态推断结果，不做任何写操作")
     a = ap.parse_args()
 
     if a.gap < 1.0:
         a.gap = 1.0  # 写操作间隔 ≥1s
 
     stats = {"accounts": 0, "total": 0, "ok": 0, "already": 0,
-             "skip": 0, "pending": 0, "fail": 0, "credit": 0, "energy": 0}
+             "skip": 0, "pending": 0, "fail": 0, "credit": 0, "energy": 0,
+             "badge": 0, "buddy": 0}
 
     prefixes = []
     for acc in a.accounts:
@@ -1024,9 +1197,9 @@ def main():
             seen.add(p)
             prefixes2.append(p)
 
-    mode = "REAL" if a.yes else "DRY-RUN"
-    print(f"模式={mode} 账号={prefixes2} 仅指定={a.only_codes or 'all'} "
-          f"仅领奖={a.only_claim} 间隔={a.gap}")
+    mode = "DISCOVER" if a.discover else ("REAL" if a.yes else "DRY-RUN")
+    print(f"mode={mode} accounts={prefixes2} only={a.only_codes or 'all'} "
+          f"only_claim={a.only_claim} gap={a.gap}")
     if a.yes and len(prefixes2) > 2 and not a.only_codes and not a.only_claim:
         print("WARN: 全量批量 + --yes 未限定 --only，注意 54 号批量——请确认 Hermes 决策后再跑")
 
@@ -1034,14 +1207,16 @@ def main():
         try:
             c = tc.load_auth(p)
         except SystemExit as e:
-            print(f"错误：{e}")
+            print(f"ERR: {e}")
             stats["fail"] += 1
             continue
         stats["accounts"] += 1
         # 非 cn 域（global / trae）不适用 CN 任务中心：明确跳过、不发起任何请求。
-        # trae 必须一起挡：它的 realm 既不是 global 也不是 cn，早先用 auth_is_global
+        # trae 必须一起挡：它的 realm 既不是 global 也不是 cn，用 auth_is_global
         # 单独判定时 6 个 trae 号全部落进 CN 分支，每轮拿 Trae 的 JWT 去打
         # codebuddy.cn（必然 401）——2026-10-18 实测确认。
+        # 2026-10-19 从下载版合并时此处曾被回退成 auth_is_global，已修回；
+        # 服务器 35 个账号里 6 个是 trae，回退会让它们每轮产生 6 次必然失败。
         if tc.auth_skips_cn_task(c):
             uid8 = (c.get("uid") or "")[:8] or "?"
             print(f"[skip] {uid8} {tc.auth_realm(c)} realm 不适用 CN 任务")
@@ -1051,6 +1226,9 @@ def main():
         # 计入 fail 并继续下一个账号：此前只 except SystemExit，异常逃逸会中断整轮 ALL、
         # 丢弃后续账号且不打印汇总（2026-10-02 第二轮体检发现 17）。
         try:
+            if a.discover:
+                discover_report(c)
+                continue
             process_account(c, a, stats)
         except Exception as e:
             uid8 = (c.get("uid") or "")[:8] or "?"
