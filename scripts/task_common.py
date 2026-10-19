@@ -232,8 +232,15 @@ def list_tasks(auth) -> list:
     return tasks
 
 
-def task_status(auth, task_code) -> dict | None:
-    """查单个任务当前状态；找不到返回 None。"""
+def task_status(auth, task_code):
+    """查单个任务当前状态；找不到返回 None。
+
+    返回注解刻意不写 `-> dict | None`：PEP 604 的 `X | Y` 是 **Python 3.10+**
+    语法，在 3.8/3.9 上模块导入阶段就抛
+    `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`
+    ——整个脚本连第一行都跑不到。2026-10-19 行空板（Python 3.9）实测撞上。
+    部署形态里有 3.8/3.9 的板子，所以这里保持无注解（与文件内其余函数一致）。
+    """
     for t in list_tasks(auth):
         if t.get("task_code") == task_code:
             return t

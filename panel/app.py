@@ -686,6 +686,13 @@ TASK_ENABLE_KEY = {
     # 也没有 schedule.compensation_enabled 字段），面板据此把它渲染成「一次性」pill
     # 而不是开关。白名单仍必须登记它，否则「跑一次」会报任务标识不正确。
     "compensation": "",
+    # 成长任务点亮（2026-10-19 新增，一次性任务）。
+    #
+    # 与 compensation 同理：没有排程开关，空串让面板渲染成「一次性」pill。
+    # **必须与 internal/panel/config.go 的 taskEnableKey 同步**——Go 侧登记了、
+    # 这里漏了，原生模式（桌面/安卓）点「跑一次」就会吃「任务标识不正确」，
+    # 而 HTTP 模式下同样的操作是正常的。2026-10-19 用户实测撞上。
+    "runner": "",
 }
 
 
