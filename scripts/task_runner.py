@@ -454,15 +454,33 @@ def _fetch_playbook_cases():
 
 
 def _fetch_lighthouse(auth):
-    """市场关键词过滤轻量云专家 -> [(ex_id, meta)]。"""
-    out = []
+    """市场关键词过滤轻量云专家 -> [(ex_id, meta)]。
+
+    2026-10-19 实测：旧实现用 ["lighthouse","轻量","light","yun"] 做子串匹配，
+    "lighthouse" 命中了 agent_name 为 `little-lighthouse` 的「小灯塔」（育儿类
+    专家），把真正的「腾讯轻量云专家」挤到后面；ids_for 取前 N 个，于是上报到
+    错误对象——report 照样 200 code=0，但 progress 恒 0/1。
+
+    现在改为「已知 id 优先」：LIGHTHOUSE_IDS 里的 ex_2cvvUZQhDyeJ 实测可直接点亮
+    （0/1 → completed）。关键词搜索只作为「市场里出现了新 id」的补充，且只认
+    精确的「轻量云 / lighthouse-yun」这类标识，不再用宽泛的 "light"/"lighthouse"
+    子串。
+    """
+    out = list(LIGHTHOUSE_IDS)
+    known = {i for i, _ in out}
     for kw in LIGHTHOUSE_KEYWORDS:
-        for eid, meta in _fetch_market_experts(auth, keyword=kw):
+        try:
+            found = _fetch_market_experts(auth, keyword=kw)
+        except Exception:
+            continue
+        for eid, meta in found:
+            if eid in known:
+                continue
             blob = (eid + meta.get("name", "") + meta.get("agent_name", "")).lower()
-            if any(k in blob for k in ["lighthouse", "轻量", "light", "yun"]):
+            # 必须同时带「轻量云」语义，排除小灯塔这类只沾 "lighthouse" 的专家。
+            if "轻量云" in blob or "lightweight-cloud" in blob or "lighthouse-yun" in blob:
+                known.add(eid)
                 out.append((eid, meta))
-    if not out:
-        out = LIGHTHOUSE_IDS
     return out
 
 
@@ -521,9 +539,18 @@ def ids_for(kind, auth, need, offset=0, spec_kws=None):
     if kind == "skin":
         return _dedup_slice(_fetch_pe_theme(auth), offset, need)
     if kind == "expert_task":
-        # 动态专家任务：用 task_desc 抽出的关键词去市场搜真实 ex_ id
+        # 动态专家任务：用关键词去市场搜真实 ex_ id
         #（2026-10-19 实测：伪造 id 会 report 200 但 progress 恒 0，服务端校验真实 id）
-        kws = spec_kws if spec_kws else None
+        #
+        # spec_kws 可能来自两处，键名不同：MAPPING 里静态写的是 `"kw": "拼豆"`（字符串），
+        # build_dynamic_spec 生成的是 `"kws": ["拼豆"]`（列表）。调用方传的是
+        # spec.get("kws")，静态条目因此一直是 None —— 关键词没生效，取到市场第一页的
+        # 无关专家（合婚师），report 200 但 progress 恒 0（2026-10-19 实测）。
+        # 这里统一成列表，两种写法都认。
+        if isinstance(spec_kws, str):
+            kws = [spec_kws] if spec_kws else None
+        else:
+            kws = spec_kws or None
         return _dedup_slice(_fetch_market_experts(auth, keyword=kws), offset, need)
     if kind in ("chat", "glmchat", "automation", "cat"):
         return [("", {}) for _ in range(need)]
@@ -852,12 +879,18 @@ def _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=False):
     return 1
 
 
-def _claim_via_web(auth, code, uid8, stats, gap):
-    """web 域领奖（fork ClaimReward 同款头：Origin/Referer/x-client-platform: web）。"""
-    st, r = tc.do_post(auth, WEB_BASE,
-                       f"/activity/growth/tasks/{code}/claim", None,
-                       headers=_web_claim_headers(auth))
-    return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
+def _claim_via_web(auth, code):
+    """web 域领奖（fork ClaimReward 同款头：Origin/Referer/x-client-platform: web）。
+
+    返回 (status, resp)，与 tc.do_post 同形——调用方 claim_one 要按 status 判断
+    是否降级到 chat 域。**不要在这里直接返回 _claim_parse 的结果**：那个函数返回
+    的是 1/2/0 的结算码，拿去 `st, r = ...` 解包会抛
+    `cannot unpack non-iterable int object`（2026-10-19 实测：每个账号处理到
+    最后一个任务时崩掉，日志停在 claim 成功之后）。
+    """
+    return tc.do_post(auth, WEB_BASE,
+                      f"/activity/growth/tasks/{code}/claim", None,
+                      headers=_web_claim_headers(auth))
 
 
 def claim_one(auth, code, uid8, stats, gap):
@@ -867,7 +900,7 @@ def claim_one(auth, code, uid8, stats, gap):
     仅靠 Cookie + x-client-platform: web + Origin/Referer 就是 200。因此 web 域提为主路径，
     chat 域降级为备选（少数任务 chat 域才认）。幂等语义不变：already_claimed 不算失败。
     """
-    st, r = _claim_via_web(auth, code, uid8, stats, gap)
+    st, r = _claim_via_web(auth, code)
     if st == 200 and isinstance(r, dict) and r.get("code") == 0:
         return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
     # web 域未果再试 chat 域（保留旧行为兜底）
@@ -963,7 +996,7 @@ def process_task(auth, code, t, opts, stats):
         return
 
     if not opts.yes:
-        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws"))
+        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws") or spec.get("kw"))
         shown = [i for i, _ in ids][:6]
         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮 need={need} "
               f"id源={spec['src']} ids={shown}，dry-run 跳过")
@@ -1052,7 +1085,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                 time.sleep(opts.gap)
         time.sleep(2.0)  # 服务端归账可能异步
     else:
-        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws"))
+        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws") or spec.get("kw"))
         if not ids:
             print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
             stats["fail"] += 1
