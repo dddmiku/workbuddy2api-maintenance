@@ -53,7 +53,7 @@ sudo install -o 10001 -g 10001 -m 600 config.example.json config/config.json
 # 2. 拉镜像
 docker pull ghcr.io/dddmiku/workbuddy2api-maintenance:latest
 
-# 3. 启动（见下方注意事项）
+# 3. 启动
 docker compose up -d
 ```
 
