@@ -1,0 +1,25 @@
+# ═══ 更新日志 ═══
+# 2026-10-19：新增。把源码构建从 docker-compose.yml 拆出来，作为可选覆盖层。
+#
+# 为什么拆：docker-compose.yml 里 build: 与 image: 并存时，`docker compose up -d`
+# 会先构建再启动——即使用户已经 docker pull 过预构建镜像。多一次构建是次要的，
+# 主要问题是构建产物的 tag（workbuddy2api-unified:local）与镜像仓库里的不是同一个，
+# 面板「当前版本」可能显示成 dev，用户无法判断跑的是哪个版本。
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 构建参数从环境变量读，与主 compose 的镜像名保持一致的命名习惯：
+#   export VERSION="$(cat VERSION)"
+#   export COMMIT="$(git rev-parse HEAD)"
+#   export BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+services:
+  wb2api:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILT_AT: ${BUILT_AT:-unknown}
+    # 源码构建用本地 tag，避免与 ghcr 上的镜像混淆——两者内容可能不同。
+    image: workbuddy2api-unified:${VERSION:-local}

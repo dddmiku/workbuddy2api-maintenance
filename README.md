@@ -57,17 +57,9 @@ docker pull ghcr.io/dddmiku/workbuddy2api-maintenance:latest
 docker compose up -d
 ```
 
-> **注意：仓库里的 `docker-compose.yml` 用的是 `build:` 而不是 `image:`。**
-> 直接 `docker compose up -d` 会**重新构建**镜像，而不是用你刚拉下来的那个。
-> 要用预构建镜像，把 compose 里的 `build:` 段替换成：
->
-> ```yaml
-> services:
->   wb2api:
->     image: ghcr.io/dddmiku/workbuddy2api-maintenance:latest
-> ```
->
-> 保留其余内容（端口、卷、`security_opt`、`cap_drop`）不变。
+`docker-compose.yml` 默认就是 `image:`，`docker compose up -d` 直接用拉下来的镜像，不会触发构建。固定版本把 `WB2API_TAG` 写进 `.env`，例如 `WB2API_TAG=v3.14.2`。
+
+**镜像版支持热更新。** `docker-entrypoint.sh` 先看 `data/updates/current` 指针，存在就用热更新落地的二进制，否则回落到镜像内的 `/app/wb2api`。热更新产物在 `data/` 卷里，容器重建后仍然生效。镜像与运行包是两条独立路径：热更新只换网关二进制、内嵌面板、辅助程序和脚本，不换基础镜像；Python/Bash 依赖或 `docker-entrypoint.sh` 有改动时必须重新 `docker pull`。
 
 镜像由 `.github/workflows/docker-image.yml` 构建，触发条件：每天 UTC 04:00（北京 12:00）、每次打 `v*` tag、手动触发。架构为 amd64 + arm64。
 
@@ -85,9 +77,10 @@ sudo install -o 10001 -g 10001 -m 600 config.example.json config/config.json
 export VERSION="$(cat VERSION)"
 export COMMIT="$(git rev-parse HEAD)"
 export BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-docker compose build
-docker compose up -d
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
+
+源码构建走覆盖层 `docker-compose.build.yml`：它加上 `build:` 段，并把镜像 tag 换成 `workbuddy2api-unified:<VERSION>`，与 ghcr 上的镜像区分开。单独 `docker compose up -d` 不读这个文件，仍然只拉镜像。
 
 已有站点升级请按 [迁移与回滚](docs/panel.md#从旧两容器部署迁移) 保留原配置与数据。
 
