@@ -121,7 +121,35 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 	// 上游认就给答案、不认就回它自己的错误——那比我用一个可疑的标记提前拒绝更诚实，
 	// 也不会把本来能读图的组合拦掉。真正需要防的只是「回落丢图」，那条闸门仍在
 	// （见 chatStreamLegacy 的 freshInputHasImages）。
-	if RemoteEnabled() && !requestHasImages(prepared) {
+	// ═══ 上下文压不进 Remote 上限时直接走 llm_utils_chat（2026-10-19 实测）═══
+	//
+	// 生产事故（09:26）：Claude Code 切到 trae:deepseek-v4.1-flash 后连吃 502。
+	// 日志证据：
+	//
+	//	[trae] 模型 deepseek-v4.1-flash 默认 1M 档，执行档 solo_work_remote → solo_agent_remote
+	//	[trae] Remote 收流已建立 session=… message=…     ← 建会话成功
+	//	WARN: Trae upstream returned no data events（已收 0 字节）  ← 事件流空结束
+	//
+	// 逐层拆开那个 2,429,895 字节的 remote create body：query 1,101,077 字符，
+	// content 1,100,958 字符，两者内容重叠。再拆 query 的段落，只有 **2 段**，
+	// 且都是 system：
+	//
+	//	[System] You are Trae Code …        934,956 字符
+	//	[System] x-anthropic-billing-header: …  52,051 字符
+	//
+	// 即 Claude Code 的上下文几乎全是 system 提示。而 boundedRemoteQuery 的裁剪
+	// 循环只在「非 system 消息 > 1 条」时才删（它按对话轮次成对丢弃），全 system
+	// 的请求 nonSystem==0，循环第一次判断就 return，一个字符都没裁掉。
+	// 987K 字符的 query 远超 remoteQueryMaxChars=460_000，上游按既有实测口径
+	// （>500K 静默断流）直接空结束，于是 502。
+	//
+	// 同一个 body 走 llm_utils_chat 是通的：实测 1,105,264 字节 / 204,033
+	// prompt_tokens 返回 200（27.4s）。该端点的输入上限就是模型窗口 1M，
+	// 没有 Remote 那种扁平化 query 的字符上限。
+	//
+	// 所以判据是「压不进 Remote 的 query 上限」而不是「大不大」：能压就仍走
+	// Remote（它有 1M max 档与网页端会话能力），压不进才换端点。
+	if RemoteEnabled() && !requestHasImages(prepared) && !remoteQueryUnbounded(prepared) {
 		if stream, err := ChatStreamRemote(ctx, a, prepared, clientIP); err == nil {
 			return stream, http.StatusOK, nil, nil
 		} else {
@@ -129,6 +157,41 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		}
 	}
 	return chatStreamLegacy(ctx, a, prepared, clientIP)
+}
+
+// remoteQueryUnbounded 报告这个请求的扁平化 query 是否**压不进** Remote 的上限。
+//
+// 只有一种情况压不进：裁剪后仍超限。boundedRemoteQuery 按对话轮次成对丢弃
+// 非 system 消息，当请求里几乎没有非 system 消息时（典型是 Claude Code 把
+// 整个环境说明塞进 system），它无物可删，只能原样返回。
+//
+// 这里复用与出站完全相同的三步（prepareRemoteMessages → compactRemoteHistory
+// → boundedRemoteQuery），所以判据不会与真正发出去的 body 漂移。
+//
+// 代价：每次 Remote 请求多算一次扁平化（对 1MB 量级是毫秒级字符串操作），
+// 换来的是把「必然 502」提前变成一个可用的端点选择。
+func remoteQueryUnbounded(prepared []byte) bool {
+	if len(prepared) == 0 {
+		return false
+	}
+	var src map[string]any
+	if err := json.Unmarshal(prepared, &src); err != nil {
+		return false
+	}
+	rawMessages, _ := src["messages"].([]any)
+	if len(rawMessages) == 0 {
+		return false
+	}
+	messages := make([]map[string]any, 0, len(rawMessages))
+	for _, raw := range rawMessages {
+		if m, ok := raw.(map[string]any); ok {
+			messages = append(messages, m)
+		}
+	}
+	prepared2, _ := prepareRemoteMessages(messages, src)
+	compacted := compactRemoteHistory(prepared2, remoteHistoryMaxMessages, remoteHistoryMaxChars)
+	bounded, _ := boundedRemoteQuery(compacted, remoteQueryMaxChars)
+	return flattenQueryChars(bounded) > remoteQueryMaxChars
 }
 
 // freshInputHasImages 报告「本轮新输入」里是否带图片。
