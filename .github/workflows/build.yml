@@ -126,7 +126,12 @@ jobs:
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags '-s -w' -o "$stage/$output" "./cmd/$helper"
             done
             cp login.sh credit.sh signin.sh trial.sh fission.sh "$stage/"
-            cp scripts/global_region.py scripts/task_common.py scripts/task_runner.py scripts/school_open_day_2026.py scripts/growth_center.py "$stage/scripts/"
+            # 脚本清单必须与 scripts/runtime_bundle.py 的 FILES 逐项对齐。
+            # 2026-10-19 实测：这里漏了 compensation_claim.py，CI 在
+            # `Build fixed runtime contents` 步骤报 missing regular runtime file。
+            cp scripts/global_region.py scripts/task_common.py scripts/task_runner.py \
+               scripts/school_open_day_2026.py scripts/growth_center.py \
+               scripts/compensation_claim.py "$stage/scripts/"
             sed -i 's/\r$//' "$stage/"*.sh "$stage/scripts/"*.py
             python3 scripts/runtime_bundle.py --stage "$stage" --version "$version" --arch "$arch" --archive "dist/wb2api-runtime-linux-$arch.tar.gz"
           done
