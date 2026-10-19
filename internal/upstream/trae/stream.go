@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,6 +156,14 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 		} else {
 			log.Printf("WARN: [trae] Remote 主路径失败，回落 llm_utils_chat：%v", err)
 		}
+	} else if RemoteEnabled() {
+		// 大上下文走 legacy 是常态，但要能一眼看出「为什么没走 Remote」——
+		// 否则排查 TTFB 时只能看到 legacy 的扣费日志，误以为是回落失败。
+		reason := "带图"
+		if !requestHasImages(prepared) {
+			reason = "query 压不进 " + strconv.Itoa(remoteQueryMaxChars) + " 字符上限"
+		}
+		log.Printf("INFO: [trae] 跳过 Remote（%s），走 llm_utils_chat", reason)
 	}
 	return chatStreamLegacy(ctx, a, prepared, clientIP)
 }
@@ -170,6 +179,25 @@ func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP str
 //
 // 代价：每次 Remote 请求多算一次扁平化（对 1MB 量级是毫秒级字符串操作），
 // 换来的是把「必然 502」提前变成一个可用的端点选择。
+//
+// ═══ 2026-10-19 补充：这条判据会让大上下文全部走 legacy，而 legacy 冷启动很慢 ═══
+//
+// 实测（Claude Code 会话，53 万 token）：
+//
+//	冷前缀（hit=0）      TTFB 123.8s
+//	热缓存（hit≈99%）    TTFB  18.5s
+//	热缓存 + 2000 思考   TTFB  53.1s
+//
+// 直接打上游做对照，确认**不是**网关的问题，也不是缓存键的问题：
+//
+//	prompt_cache_key 传与不传完全一样（冷调用都 93.6s，热调用都 16s）
+//	tools 定义 20 个与 0 个完全一样（冷 24.6s vs 25.1s）
+//	两个上游主机 api5-normal / trae-api-cn 完全一样（冷 24.6s vs 27.6s）
+//	尾部 52K 字符每轮全变，命中量不变（只取决于稳定前缀长度）
+//
+// 所以冷启动是上游的固有成本，网关能做的只有「尽量让它别冷」。
+// 但 Remote 的上限是 query 的 46 万**字符**，而 Claude Code 的 system 单独
+// 就有 98.7 万字符——压不进去，只能走 legacy。这条路径没有更快的选择。
 func remoteQueryUnbounded(prepared []byte) bool {
 	if len(prepared) == 0 {
 		return false
@@ -308,6 +336,42 @@ func messageHasImageBlock(message map[string]any) bool {
 // 语义与反转前完全一致（含 3004 → Remote 的反向回落），原样保留——它现在是
 // 双向冗余的另一半。上游非 2xx 时返回 (nil, status, body, nil) 让上层按既有
 // 错误分类处理。
+//
+// dumpPrefixFingerprint 在 WB2API_DUMP_PREFIX=1 时按消息段落打前缀指纹。
+//
+// 排查「上一轮命中 99%、这一轮只命中 2.7%」这类问题时，唯一可靠的办法是
+// 对比两轮实际出站内容的逐段哈希——凭日志里的 hit 数字只能看出「断了」，
+// 看不出「断在哪一条」。每段输出 md5 前 8 位 + 长度 + 角色 + 开头 40 字符，
+// 两轮日志一 diff 就知道是哪段变了。
+//
+// 默认关闭：53 万 token 的请求有几百段，每轮都打会刷屏。
+func dumpPrefixFingerprint(body []byte) {
+	if strings.TrimSpace(os.Getenv("WB2API_DUMP_PREFIX")) != "1" {
+		return
+	}
+	var src map[string]any
+	if err := json.Unmarshal(body, &src); err != nil {
+		return
+	}
+	rawMessages, _ := src["messages"].([]any)
+	log.Printf("[prefix] msgs=%d", len(rawMessages))
+	for i, raw := range rawMessages {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		text := messageText(m["content"])
+		sum := md5.Sum([]byte(text))
+		head := text
+		if len(head) > 40 {
+			head = head[:40]
+		}
+		head = strings.ReplaceAll(head, "\n", " ")
+		log.Printf("[prefix] %3d role=%-9s len=%7d md5=%x head=%q",
+			i, role, len(text), sum[:4], head)
+	}
+}
 func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
 	requestID := newRequestID()
 	// 用实时目录把客户端模型名解析成 config_name（含显示名匹配，如
@@ -328,6 +392,7 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	dumpPrefixFingerprint(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GatewayBaseVar+ChatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, nil, err
