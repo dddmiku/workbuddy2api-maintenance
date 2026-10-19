@@ -1,0 +1,113 @@
+# Docker 镜像发布：定时多架构打包推 ghcr.io + amd64 离线 tar.gz artifact。
+# 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
+#
+# 文件名是 docker-image.yml 而不是 build.yml：本仓库的 build.yml 是「Runtime build」
+# （构建 Release 用的运行包，不推镜像）。两者职责不同，共用 build.yml 会互相覆盖。
+# 2026-10-19 合并：本流水线原先只存在于本地旧分支，从未推到远端，
+# 于是用户 `docker pull ghcr.io/...:latest` 拿到的一直是 9 月的镜像。
+name: Docker image
+
+on:
+  schedule:
+    # 每天北京时间 12:00 = UTC 04:00
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+  push:
+    tags: ['v*'] # 打 tag 也触发发布
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 是版本推导的前提——`git describe --tags` 需要 tag 历史，
+          # 默认的浅克隆（depth=1）拿不到 tag，会退化成纯 SHA。
+          fetch-depth: 0
+
+      - name: Create config.json for build
+        run: cp config.example.json config.json
+
+      # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr 镜像名必须全小写：github.repository 含大写（Sliverkiss/...），需转小写
+      - name: Compute image name (lowercase)
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # 版本元数据必须显式传入，否则 Dockerfile 里 `ARG VERSION=dev` 的默认值
+      # 生效——镜像里的二进制 version.Version 就是 "dev"，面板「当前版本」显示
+      # dev、构建时间为空，自更新还会把它当成开发态。
+      # 2026-10-19 用户实测：`docker pull ghcr.io/.../latest` 拿到的就是 dev。
+      #
+      # 来源优先级：tag 名（push tags 时最准）> 仓库根 VERSION 文件（定时/手动
+      # 触发时用）> "dev"。VERSION 文件是源码里的发行目标，定时构建读它是
+      # 「当前代码对应的版本」，比留空更接近事实。
+      - name: Resolve version metadata
+        id: meta
+        run: |
+          # 本仓库没有 VERSION 文件，版本只能从 git 推导：
+          #   1) 打 tag 时用 tag 名（最准）
+          #   2) 否则用最近 tag + 提交距离（v3.14.2-12-gabc1234 这种）
+          #   3) 仓库没有任何 tag 时用短 SHA
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="$(git describe --tags --always --dirty 2>/dev/null || echo '')"
+            # 没有 v 前缀的（纯短 SHA）补成 v0.0.0-<sha> 形态，便于前端识别
+            [[ "$VER" != v* ]] && VER="v0.0.0-${VER}"
+          fi
+          [[ -z "$VER" ]] && VER="dev"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $VER"
+
+      - name: Build & push multi-arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILT_AT=${{ steps.meta.outputs.built_at }}
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 额外导出 amd64 离线 tar.gz：NAS 拉不到 ghcr 时用 artifact 部署。
+      # 这里同样要传 build-args——否则离线包里的二进制版本也是 dev，与线上镜像不一致。
+      - name: Export offline tarball (amd64)
+        run: |
+          docker buildx build --platform linux/amd64 --file Dockerfile \
+            --build-arg VERSION=${{ steps.meta.outputs.version }} \
+            --build-arg COMMIT=${{ github.sha }} \
+            --build-arg BUILT_AT=${{ steps.meta.outputs.built_at }} \
+            --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
+          gzip -f wb2api-amd64.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-amd64
+          path: wb2api-amd64.tar.gz
+          if-no-files-found: error

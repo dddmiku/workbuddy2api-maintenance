@@ -55,6 +55,9 @@ COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
 COPY scripts/growth_center.py /app/scripts/growth_center.py
 COPY scripts/runtime_bundle.py /app/scripts/runtime_bundle.py
+# compensation_claim.py 是「补偿积分领取」任务的实现（一次性任务，面板手动触发）。
+# 2026-10-19 发现它一直没被 COPY 进镜像——容器里点该任务会报脚本不存在。
+COPY scripts/compensation_claim.py /app/scripts/compensation_claim.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
