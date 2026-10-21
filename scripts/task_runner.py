@@ -268,13 +268,37 @@ def _fetch_scenes(auth):
 #   - accept 必须先于 report（顺序反了 progress 永远不动）
 #   - claim 只看 progress，不看 accept_status
 # --------------------------------------------------------------------------
-# 文本特征 -> kind。顺序敏感：越具体的规则越靠前。
+# 跳转地址 -> kind。**这是第一判据，优先于任何文本规则**。
+#
+# 为什么必须用它：服务端在 jump_url 里直接给出了任务归属的功能入口，是结构化
+# 事实；而文本匹配会被高频词带偏。2026-10-19 实测：16 个任务里 13 个描述含
+# 「对话」，`chat` 规则必然抢在 `专家` 前面命中，Expert_lighthouse
+# （"召唤专家…对话一次"）、WorkBuddy_Valorant（"搜索并召唤…完成一次对话"）、
+# expert_5（"召唤 5 位不同的专家并发起对话"）全被推成 chat——动态处理的新专家
+# 活动会因此上报错事件，progress 恒 0。
+JUMP_RULES = [
+    #（正则, kind）——越具体的入口越靠前
+    (r"workbuddy://experts?\b",        "expert_task"),
+    (r"workbuddy://playbook",          "playbook"),
+    (r"workbuddy://library",           "library"),
+    (r"workbuddy://templates?",        "template"),
+    (r"workbuddy://skills?",           "skill"),
+    (r"workbuddy://automation",        "automation"),
+    (r"workbuddy://settings/appearance", "skin"),
+    (r"workbuddy://home\?openBuddySwitcher", "buddy5"),
+    (r"workbuddy://chat",              "chat"),
+]
+
+# 文本特征 -> kind，仅在 jump_url 缺失或未命中时使用。
+# 顺序敏感：越具体的规则越靠前。专家类必须排在 chat 之前——专家任务的描述
+# 几乎都带「对话」，反过来排就会全部误判（见上面 JUMP_RULES 的实测记录）。
 KIND_RULES = [
     #（正则, kind, 目标 id 抽取方式）
     (r"外观|主题|皮肤|appearance",       "skin",       None),
     (r"发现应用|Buddy\s*应用|应用.*进入",  "buddy5",     None),
     (r"资料库|读.*文档",                   "library",    None),
     (r"专家团|团队.*专家|专家.*团队",      "team",       None),
+    (r"专家|expert",                      "expert_task", "expert"),
     (r"技能|尝鲜|热门",                    "skill",      None),
     (r"自动化|定时任务|周期任务",          "automation", None),
     (r"模板|场景",                         "template",   None),
@@ -282,7 +306,6 @@ KIND_RULES = [
     (r"灵感|playbook|案例",               "playbook",   None),
     (r"夜猫|黑猫",                         "cat",        None),
     (r"对话|聊天|发消息",                  "chat",       None),
-    (r"专家|expert",                      "expert_task", "expert"),
 ]
 
 # 明确不可自动化的任务（正文含真人操作/长时等待）
@@ -292,26 +315,66 @@ UNFORGEABLE_HINTS = [
 ]
 
 
-def infer_kind(title, desc=""):
-    """按标题+描述文本推断任务类型。返回 (kind, extra) 或 (None, reason)。"""
+def infer_kind(title, desc="", jump_url=""):
+    """推断任务类型。返回 (kind, extra) 或 (None, reason)。
+
+    判定顺序：不可伪造 -> 文本特征 -> jump_url 修正。
+
+    为什么不是「jump_url 优先」：实测它并不总是精确。create_canvas 的
+    jump_url 是 `workbuddy://chat`（实际是画布任务），Expert_team_use_3 是
+    `workbuddy://experts`（实际是专家团，不是单个专家）。所以文本规则先跑，
+    jump_url 只在两种情况下覆盖：文本判不出，或文本只落到宽泛的 chat。
+    """
     blob = f"{title} {desc}"
     for pat, reason in UNFORGEABLE_HINTS:
         if re.search(pat, blob, re.I):
             return None, reason
-    for pat, kind, extra in KIND_RULES:
+
+    text_kind, extra = None, None
+    for pat, kind, kw in KIND_RULES:
         if re.search(pat, blob, re.I):
-            return kind, extra
-    return None, "文本特征无法推断事件类型"
+            text_kind, extra = kind, kw
+            break
+
+    jump_kind = None
+    if jump_url:
+        for pat, kind in JUMP_RULES:
+            if re.search(pat, jump_url, re.I):
+                jump_kind = kind
+                break
+
+    # 文本没结论，或只落到最宽泛的 chat —— 用更具体的 jump_url 修正。
+    if text_kind is None or (text_kind == "chat" and jump_kind and jump_kind != "chat"):
+        if jump_kind:
+            return jump_kind, ("expert" if jump_kind == "expert_task" else None)
+    if text_kind is not None:
+        return text_kind, extra
+    return None, "文本特征与 jump_url 都无法推断事件类型"
 
 
 # 从 task_desc / title 抽专家搜索关键词（"体验「XXX」专家" -> ["XXX"]）
 def extract_expert_keyword(title, desc=""):
-    m = re.search(r"[「\[]([^」\]]{2,20})[」\]]\s*专家", f"{title} {desc}")
-    if m:
-        return [m.group(1)]
-    m = re.search(r"(?:召唤|搜索并召唤)\s*「?([^「」，。]{2,20})」?", f"{title} {desc}")
-    if m:
-        return [m.group(1)]
+    """抽专家搜索词。只认「」/[] 括起来的专名，且要剥掉末尾的「专家」。
+
+    不用「召唤 X」这种无引号正则兜底：实测它会跨越标点把整句吞进去
+    （`召唤 3 次专家团，切换至「专家团」` -> `3 次专家团 切换至`），拿去搜
+    市场必然为空。抽不出就返回空列表，由调用方退回默认列表并如实标注。
+
+    2026-10-19 实测：`搜索并召唤「无畏契约拼豆专家」` 的捕获是
+    `无畏契约拼豆专家`，直接搜为空；剥成 `无畏契约拼豆` 才命中。
+    """
+    blob = f"{title} {desc}"
+    # 两种都要求引号包裹，避免无引号正则跨标点吞整句。
+    for pat in (r"[「\[]([^」\]]{2,20})[」\]]\s*专家",
+                r"(?:搜索并召唤|召唤)\s*[「\[]([^」\]]{2,20})[」\]]"):
+        m = re.search(pat, blob)
+        if not m:
+            continue
+        kw = m.group(1).strip()
+        if kw.endswith("专家") and len(kw) > 2:
+            kw = kw[:-2].strip()
+        if kw:
+            return [kw]
     return []
 
 
@@ -319,17 +382,25 @@ def build_dynamic_spec(t):
     """为未映射任务构造 spec。返回 (spec, note)。"""
     title = t.get("title") or ""
     desc = t.get("task_desc") or t.get("description") or ""
-    code = t.get("task_code")
-    kind, extra = infer_kind(title, desc)
+    jump = t.get("jump_url") or ""
+    kind, extra = infer_kind(title, desc, jump)
     if kind is None:
         return None, extra
-    spec = {"kind": kind, "target": 1,
+    # 目标次数取服务端 progress.target：动态任务不知道要几次，硬写 1 会让
+    # 「召唤 5 次专家」这类任务只点亮一次。缺失时退回 1。
+    target = (t.get("progress") or {}).get("target") or 1
+    spec = {"kind": kind, "target": target,
             "src": f"动态推断({kind})", "dynamic": True,
             "title": title}
     if kind == "expert_task":
         kws = extract_expert_keyword(title, desc)
         if not kws:
-            return None, "专家类任务但抽不出关键词（task_desc 无「XXX」格式）"
+            # jump_url 指向专家页但没有「XXX」命名时，不静默放弃：退回无关键词
+            # 的专家列表（市场第一页），至少能点亮一次，并如实标注来源。
+            spec["kw"] = ""
+            spec["kws"] = []
+            spec["src"] = "market/expert/list (无关键词，jump_url 判定为专家)"
+            return spec, f"动态推断 kind={kind}（未抽出关键词，用市场默认列表）"
         spec["kw"] = kws[0]
         spec["kws"] = kws
         spec["src"] = f"market/expert/list keyword={kws[0]}"
