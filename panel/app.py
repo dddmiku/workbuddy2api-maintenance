@@ -1257,6 +1257,11 @@ def build_state(force_credit=False):
             "total": pool.get("total"),
             "healthy": pool.get("healthy"),
             "cooling": pool.get("cooling"),
+            # credits_exhausted 之前漏在这里：前端 renderMetrics 读的是
+            # p.creditsExhausted，而网关 /status 给的是 credits_exhausted，
+            # 没映射过来时该值恒为 undefined → 「余额不足」的号在总览里
+            # 一直显示 0（2026-10-22 排查统计缺失时发现）。
+            "creditsExhausted": pool.get("credits_exhausted"),
             "disabled": pool.get("disabled"),
             "inFlightFull": pool.get("in_flight_full"),
             "realmTotals": pool.get("realm_totals"),

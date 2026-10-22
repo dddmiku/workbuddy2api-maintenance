@@ -1122,7 +1122,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 		// global 号没有签到体系：跳过签到调用（写操作，会触发风控），但下面的余额查询照做。
 		// trae 号在更上面已整条 continue（端点族不同，签到与余额都不适用）。
 		if isWorkBuddy && a.Realm() != auth.RealmGlobal {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+			if err := s.dailyCheckinWithRetry(ctx, a, st.UID); err != nil {
 				if upstream.IsAlreadyCheckin(err) {
 					// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
 					// 出现一整段 400 报文、被误读成签到失败。
@@ -1180,6 +1180,54 @@ func joinDetail(existing, add string) string {
 		return add
 	}
 	return existing + "; " + add
+}
+
+// checkinRetryDelays 签到失败后的重试间隔。
+//
+// 2026-10-22 实测：09:00 那次签到 a2689910 / eac2597c / fbede7cd 三个号报
+// `http 500 code=10001 签到失败，请稍后重试`，12:07 手动重跑同样三个号全部成功。
+// 上游这是**瞬时故障**，不是账号问题——原实现一次失败就记 fail，用户看到
+// 「3 成功 3 失败」以为号坏了，实际只是没重试。
+//
+// 间隔取 3s / 8s：签到是轻量写请求，不需要长退避；总耗时上限 ~11s，
+// 37 个号里少数几个失败也不会把整轮拖到超时。
+var checkinRetryDelays = []time.Duration{3 * time.Second, 8 * time.Second}
+
+// dailyCheckinWithRetry 签到，失败按 checkinRetryDelays 重试。
+//
+// 只重试**可恢复**错误：
+//   - 已签到（IsAlreadyCheckin）：直接返回，重试没有意义且会多打一次上游；
+//   - 上下文取消：立刻返回，不重试（用户在面板点了停止）；
+//   - 其余（含上游 5xx、网络抖动）：重试。
+//
+// 鉴权类错误（401/403）也走重试：token 刚刷新过仍然 401 说明是上游瞬时拒绝，
+// 重试一次的代价远小于误判账号失效。
+func (s *Scheduler) dailyCheckinWithRetry(ctx context.Context, a *auth.Auth, uid string) error {
+	err := s.cfg.Upstream.DailyCheckin(a)
+	if err == nil || upstream.IsAlreadyCheckin(err) {
+		return err
+	}
+	for i, delay := range checkinRetryDelays {
+		if ctx.Err() != nil {
+			return err
+		}
+		log.Printf("签到 %s 失败（第 %d 次），%s 后重试：%v",
+			logfmt.UID8(uid), i+1, delay, err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		if retryErr := s.cfg.Upstream.DailyCheckin(a); retryErr == nil {
+			log.Printf("签到 %s 重试成功（第 %d 次重试）", logfmt.UID8(uid), i+1)
+			return nil
+		} else if upstream.IsAlreadyCheckin(retryErr) {
+			return retryErr
+		} else {
+			err = retryErr
+		}
+	}
+	return err
 }
 
 // ── 余额刷新（独立任务，2026-10-14）────────────────────────────────────────

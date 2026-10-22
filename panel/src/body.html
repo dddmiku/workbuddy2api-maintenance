@@ -113,6 +113,9 @@
       <div class="notes" id="notes"></div>
       <section class="view" data-view="overview">
         <div class="metrics" id="metrics"></div>
+        <!-- 冷却台账：按「未冷却 / 冷却中 / 余额不足 / 已停用」各给一个数。
+             总览卡片只说 healthy/total，看不出剩下的到底是熔断还是停用。 -->
+        <div class="coolsum" id="coolSummary"></div>
         <div class="vhead sec">
           <h1>账号池与积分</h1>
           <div class="d">运行时状态</div>

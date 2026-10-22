@@ -731,6 +731,47 @@ function renderMetrics(){
     metric('任务', taskList().length ? String(taskList().length) : '—', '个任务',
       runs ? (runs + ' 个执行中') : '全部空闲', runs ? 'w' : '', null, IC.clock)
   ].join('');
+
+  renderCoolSummary(a, p);
+}
+
+// renderCoolSummary 冷却台账：把「有多少号在冷却、多少没有」单独列一行。
+//
+// 为什么单独列：总览卡片里的「账号池」只说 `healthy / total`，用户看不出
+// 「剩下的到底是熔断、余额不足，还是被停用」。2026-10-22 用户要求
+// 「账号有冷却和没有被冷却的加个统计」，于是按四种互斥状态各给一个数：
+//
+//	可用       — 没冷却、没停用、没余额不足
+//	冷却中     — 账号级熔断/软冷却（上游限流这个号）
+//	余额不足   — CoolHard，只影响付费模型，免费模型照常可用
+//	已停用     — 网关停用
+//
+// 口径与 pool/state.go 的 countsDetailedForRealm 一致：total = 可用 + 冷却 + 停用，
+// 余额不足是「可用」的子集，所以单独标注而不是从可用里扣。
+function renderCoolSummary(accounts, p){
+  var el = $('#coolSummary');
+  if (!el) return;
+  var total = Number(p.total) || 0;
+  if (!total){
+    el.innerHTML = '';
+    return;
+  }
+  var cooling = Number(p.cooling) || 0;
+  var disabled = Number(p.disabled) || 0;
+  var exhausted = Number(p.creditsExhausted) || 0;
+  var healthy = Number(p.healthy) || 0;
+  // 未冷却 = 可用 - 余额不足（余额不足不算冷却，但要单独说明）
+  var noCool = Math.max(0, healthy - exhausted);
+  var items = [
+    { k:'ok',   label:'未冷却',   n:noCool,   hint:'正常参与选号' },
+    { k:'w',    label:'冷却中',   n:cooling,  hint:'上游限流或熔断，到期自动恢复' },
+    { k:'a',    label:'余额不足', n:exhausted, hint:'仅影响付费模型，免费模型可用' },
+    { k:'',     label:'已停用',   n:disabled, hint:'网关停用，需手动启用' }
+  ];
+  el.innerHTML = '<div class="coolsum">' + items.map(function(it){
+    return '<span class="cs ' + it.k + '" title="' + esc(it.hint) + '">' +
+      '<b>' + it.n + '</b> ' + esc(it.label) + '</span>';
+  }).join('') + '</div>';
 }
 
 function renderNotes(){

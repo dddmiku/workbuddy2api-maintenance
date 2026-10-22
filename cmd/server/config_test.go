@@ -338,14 +338,14 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 		t.Errorf("travel/activity enabled defaults want true/true, got %v/%v",
 			c.Schedule.TravelEnabled, c.Schedule.ActivityEnabled)
 	}
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want [9,21]", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 1 || c.Schedule.TravelHours[0] != 15 {
+		t.Errorf("travel_hours=%v want [15]", c.Schedule.TravelHours)
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 13 {
+		t.Errorf("school_hours=%v want [13]", c.Schedule.SchoolHours)
 	}
 	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
@@ -376,14 +376,14 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 		t.Errorf("checkin_hours=%v", c.Schedule.CheckinHours)
 	}
 	// 新 hours 缺省 → 回落默认（非空）。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21]", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 1 || c.Schedule.TravelHours[0] != 15 {
+		t.Errorf("travel_hours=%v want default [15]", c.Schedule.TravelHours)
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
 	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 13 {
+		t.Errorf("school_hours=%v want default [13]", c.Schedule.SchoolHours)
 	}
 	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
@@ -432,8 +432,8 @@ func TestScheduleTravelActivityExplicitDisable(t *testing.T) {
 		t.Errorf("checkin/keepalive should stay enabled: %+v", c.Schedule)
 	}
 	// hours 仍回落默认。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21] even when disabled", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 1 || c.Schedule.TravelHours[0] != 15 {
+		t.Errorf("travel_hours=%v want default [15] even when disabled", c.Schedule.TravelHours)
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10] even when disabled", c.Schedule.ActivityHours)
@@ -471,6 +471,7 @@ func TestScheduleTravelActivityExplicitHours(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 显式配置的小时必须原样保留——这里断言的是 [9,21]，不是默认值。
 	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
 		t.Errorf("travel_hours=%v want [9 21]", c.Schedule.TravelHours)
 	}
@@ -519,8 +520,8 @@ func TestScheduleEmptyHoursFallsBackToDefault(t *testing.T) {
 			if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
 				t.Errorf("keepalive_hours=%v want default [22]", c.Schedule.KeepaliveHours)
 			}
-			if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-				t.Errorf("travel_hours=%v want default [9 21]", c.Schedule.TravelHours)
+			if len(c.Schedule.TravelHours) != 1 || c.Schedule.TravelHours[0] != 15 {
+				t.Errorf("travel_hours=%v want default [15]", c.Schedule.TravelHours)
 			}
 			if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 				t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)

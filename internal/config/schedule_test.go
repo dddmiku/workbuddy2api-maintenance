@@ -21,8 +21,8 @@ func TestDefaultScheduleActivityCount(t *testing.T) {
 	if len(s.ActivityHours) != 1 || s.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", s.ActivityHours)
 	}
-	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", s.SchoolHours)
+	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 13 {
+		t.Errorf("school_hours=%v want [13]", s.SchoolHours)
 	}
 	if len(s.CatHours) != 1 || s.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want [1]", s.CatHours)
@@ -72,14 +72,14 @@ func TestNormalizeScheduleEmptyHoursFallback(t *testing.T) {
 	if len(s.KeepaliveHours) != 1 || s.KeepaliveHours[0] != 22 {
 		t.Errorf("keepalive_hours=%v want [22]", s.KeepaliveHours)
 	}
-	if len(s.TravelHours) != 2 || s.TravelHours[0] != 9 || s.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want [9 21]", s.TravelHours)
+	if len(s.TravelHours) != 1 || s.TravelHours[0] != 15 {
+		t.Errorf("travel_hours=%v want [15]", s.TravelHours)
 	}
 	if len(s.ActivityHours) != 1 || s.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", s.ActivityHours)
 	}
-	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", s.SchoolHours)
+	if len(s.SchoolHours) != 1 || s.SchoolHours[0] != 13 {
+		t.Errorf("school_hours=%v want [13]", s.SchoolHours)
 	}
 	if len(s.CatHours) != 1 || s.CatHours[0] != 1 {
 		t.Errorf("cat_hours=%v want [1]", s.CatHours)
@@ -120,8 +120,8 @@ func TestNormalizeScheduleInvalidHour(t *testing.T) {
 // 2026-10-11：Trae 与 WorkBuddy 拆成两个站点两套排程（用户要求）。
 func TestTraeCheckScheduleDefaults(t *testing.T) {
 	d := DefaultSchedule()
-	if len(d.TraeCheckHours) != 1 || d.TraeCheckHours[0] != 10 {
-		t.Fatalf("默认 trae_check_hours 应为 [10]，实际 %v", d.TraeCheckHours)
+	if len(d.TraeCheckHours) != 1 || d.TraeCheckHours[0] != 11 {
+		t.Fatalf("默认 trae_check_hours 应为 [11]，实际 %v", d.TraeCheckHours)
 	}
 	if !d.TraeCheckEnabled {
 		t.Fatal("默认 trae_check_enabled 应为 true")
@@ -130,8 +130,8 @@ func TestTraeCheckScheduleDefaults(t *testing.T) {
 	if err := s.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.TraeCheckHours) != 1 || s.TraeCheckHours[0] != 10 {
-		t.Fatalf("归一化后应为 [10]，实际 %v", s.TraeCheckHours)
+	if len(s.TraeCheckHours) != 1 || s.TraeCheckHours[0] != 11 {
+		t.Fatalf("归一化后应为 [11]，实际 %v", s.TraeCheckHours)
 	}
 	bad := Schedule{TraeCheckHours: []int{99}}
 	err := bad.Normalize()

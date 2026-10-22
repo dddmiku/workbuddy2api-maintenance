@@ -739,3 +739,80 @@ func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckinRetriesTransientFailure 上游 5xx 瞬时故障 → 重试后成功。
+//
+// 2026-10-22 实测：09:00 那次签到 a2689910 / eac2597c / fbede7cd 三个号报
+// `http 500 code=10001 签到失败，请稍后重试`，12:07 手动重跑同样三个号全成功。
+// 原实现一次失败就记 fail，用户看到「3 成功 3 失败」以为号坏了。
+func TestCheckinRetriesTransientFailure(t *testing.T) {
+	// 把重试间隔压到毫秒级，否则每个用例要真等 11 秒。
+	prev := checkinRetryDelays
+	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { checkinRetryDelays = prev })
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+			// 前两次 500，第三次成功——模拟上游瞬时故障
+			if calls.Add(1) < 3 {
+				w.WriteHeader(500)
+				w.Write([]byte(`{"code":10001,"msg":"签到失败，请稍后重试"}`))
+				return
+			}
+			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	out, _ := s.CheckinAll()
+	if out[0].Status != CheckinOK {
+		t.Errorf("status=%q want ok（重试后应成功），detail=%q", out[0].Status, out[0].Detail)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("签到调用次数=%d want 3（首调 + 2 次重试）", got)
+	}
+}
+
+// TestCheckinAlreadyDoesNotRetry 「今天已签到」是幂等成功，不该重试。
+func TestCheckinAlreadyDoesNotRetry(t *testing.T) {
+	prev := checkinRetryDelays
+	checkinRetryDelays = []time.Duration{time.Millisecond}
+	t.Cleanup(func() { checkinRetryDelays = prev })
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+			calls.Add(1)
+			w.WriteHeader(400)
+			w.Write([]byte(`{"code":10002,"msg":"今日已签到"}`))
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	out, _ := s.CheckinAll()
+	if out[0].Status != CheckinAlready {
+		t.Errorf("status=%q want already，detail=%q", out[0].Status, out[0].Detail)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("签到调用次数=%d want 1（已签到不该重试）", got)
+	}
+}

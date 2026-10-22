@@ -141,3 +141,17 @@
 .metric .bar{height:4px;background:var(--sunken);margin-top:11px;overflow:hidden;border-radius:3px}
 .metric .bar i{display:block;height:100%;background:var(--ok);transition:width .3s var(--ease)}
 .metric .bar i.w{background:var(--warn)} .metric .bar i.e{background:var(--err)}
+
+/* ══ 冷却台账（概览，2026-10-22）═════════════════════════════════════
+   总览卡片只说 healthy/total，看不出剩下的到底是熔断、余额不足还是停用。
+   这里按四种互斥状态各给一个数，与 pool/state.go 的分桶口径一致。 */
+.coolsum{display:flex;flex-wrap:wrap;gap:8px;margin:-8px 0 18px}
+.coolsum:empty{display:none}
+.coolsum .cs{display:inline-flex;align-items:baseline;gap:5px;
+  background:var(--surface);border:1px solid var(--line);border-radius:999px;
+  padding:5px 12px;font-size:12.5px;color:var(--ink-2)}
+.coolsum .cs b{font:600 14px/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
+.coolsum .cs.ok b{color:var(--ok)}
+.coolsum .cs.w{border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.coolsum .cs.w b{color:var(--warn)}
+.coolsum .cs.a b{color:var(--ink-2)}

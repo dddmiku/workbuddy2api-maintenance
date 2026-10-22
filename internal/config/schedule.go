@@ -18,11 +18,11 @@ type Schedule struct {
 	CheckinHours []int `json:"checkin_hours"` // [9,21]（WorkBuddy 两域）
 	// TraeCheckHours 是 Trae 站点的独立签到排程。Trae 与 WorkBuddy 不是同一个
 	// 站点（api.trae.cn vs codebuddy.cn），签到必须分开排程、分开开关。
-	TraeCheckHours []int `json:"trae_check_hours"` // [10]
-	TravelHours    []int `json:"travel_hours"`     // [9,21]
+	TraeCheckHours []int `json:"trae_check_hours"` // [11]
+	TravelHours    []int `json:"travel_hours"`     // [15]
 	ActivityHours  []int `json:"activity_hours"`   // [10]
 	KeepaliveHours []int `json:"keepalive_hours"`  // [22]
-	SchoolHours    []int `json:"school_hours"`     // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
+	SchoolHours    []int `json:"school_hours"`     // [13] 开学季任务（迁移自 school/cat 两条系统 crontab）
 	CatHours       []int `json:"cat_hours"`        // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
 	// GrowthHours 是**成长中心**的排程（2026-10-14 新增，合并原 redeem/lottery/makeup）。
 	//
@@ -33,7 +33,7 @@ type Schedule struct {
 	// 合并后一次跑完全部七段，顺序由代码保证（88lin 的 run_growth 同款）。
 	//
 	// 只服务 CN：国际版（global）不参与任何成长中心调用。
-	GrowthHours []int `json:"growth_hours"` // [9,21]
+	GrowthHours []int `json:"growth_hours"` // [12]
 	// BalanceHours 是**余额刷新**的独立排程（2026-10-14 新增）。
 	//
 	// 为什么必须独立：积分余额与快过期分桶原本只在签到任务里刷新（checkinAll 调
@@ -44,7 +44,7 @@ type Schedule struct {
 	//
 	// 余额查询是**纯读**接口（不写上游状态、不消耗账号），单独跑不引入风控风险，
 	// 所以把它从签到里解耦出来，各自可开关。
-	BalanceHours []int `json:"balance_hours"` // [9,21]
+	BalanceHours []int `json:"balance_hours"` // [14]
 	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
 	// 显式禁用开关（缺省 true）。
 	//
@@ -80,17 +80,34 @@ type Schedule struct {
 // 开关「缺省 true」靠这里实现：调用方先取 DefaultSchedule 再用 json.Unmarshal 覆盖，
 // 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 // ActivityReportCount 默认 5：领猫前置需 5 次对话，5 连发刷满 chat_5。
+//
+// **小时必须错开**（2026-10-22 用户反馈「定时重复的任务挤在一起」）。
+// 旧默认 checkin/travel/growth/balance 全排在 [9,21]，四个任务同一分钟启动：
+// 签到要打签到接口、成长中心要打任务接口、余额刷新要打资源接口，同一账号在
+// 同一秒被三四个请求打中，既触发上游风控，日志也搅在一起看不出谁失败。
+//
+// 现在的分配原则：每个整点最多一个「重」任务，间隔 ≥1 小时。
+//   09:00  签到（WorkBuddy）       —— 早上第一件事，决定当天能否用
+//   10:00  活跃上报                —— 签到后 1 小时，避免与签到抢同一账号
+//   11:00  Trae 签到               —— Trae 是独立站点，与 CN 无账号冲突
+//   12:00  成长中心                —— 任务类，依赖签到后的余额
+//   13:00  开学季任务
+//   14:00  余额刷新                —— 纯读，放在重任务之后
+//   15:00  猫猫旅行
+//   21:00  签到（WorkBuddy）       —— 晚间补签
+//   22:00  token 保活              —— 睡前刷新，覆盖次日
+//   01:00  夜猫子任务              —— 夜猫窗口 23-08 内
 func DefaultSchedule() Schedule {
 	return Schedule{
 		CheckinHours:        []int{9, 21},
-		TraeCheckHours:      []int{10},
-		TravelHours:         []int{9, 21},
+		TraeCheckHours:      []int{11},
+		TravelHours:         []int{15},
 		ActivityHours:       []int{10},
 		KeepaliveHours:      []int{22},
-		SchoolHours:         []int{12},
+		SchoolHours:         []int{13},
 		CatHours:            []int{1},
-		GrowthHours:         []int{9, 21},
-		BalanceHours:        []int{9, 21},
+		GrowthHours:         []int{12},
+		BalanceHours:        []int{14},
 		CheckinEnabled:      true,
 		TraeCheckEnabled:    true,
 		TravelEnabled:       true,
@@ -113,32 +130,37 @@ func DefaultSchedule() Schedule {
 // 注意这是「显式配 0 = 旧行为」的兼容语义，与 scheduler.New 的 <=0 → 1 归一一致；
 // 「缺省 = 5」由 DefaultSchedule 在 Unmarshal 前置入，是另一条路径，两者不合并。
 func (s *Schedule) Normalize() error {
+	// 回落值统一取 DefaultSchedule，**不再在这里抄一份字面量**。
+	// 2026-10-22 踩到：DefaultSchedule 里把 travel 从 [9,21] 改成 [15] 后，
+	// 这里还留着旧值 [9,21]，于是「显式配了空数组」的配置会悄悄回落到旧排程，
+	// 而测试同时断言两处、立刻红——两处漂移是这类改动的固定失败模式。
+	def := DefaultSchedule()
 	if len(s.CheckinHours) == 0 {
-		s.CheckinHours = []int{9, 21}
+		s.CheckinHours = def.CheckinHours
 	}
 	if len(s.TraeCheckHours) == 0 {
-		s.TraeCheckHours = []int{10}
+		s.TraeCheckHours = def.TraeCheckHours
 	}
 	if len(s.TravelHours) == 0 {
-		s.TravelHours = []int{9, 21}
+		s.TravelHours = def.TravelHours
 	}
 	if len(s.ActivityHours) == 0 {
-		s.ActivityHours = []int{10}
+		s.ActivityHours = def.ActivityHours
 	}
 	if len(s.KeepaliveHours) == 0 {
-		s.KeepaliveHours = []int{22}
+		s.KeepaliveHours = def.KeepaliveHours
 	}
 	if len(s.SchoolHours) == 0 {
-		s.SchoolHours = []int{12}
+		s.SchoolHours = def.SchoolHours
 	}
 	if len(s.CatHours) == 0 {
-		s.CatHours = []int{1}
+		s.CatHours = def.CatHours
 	}
 	if len(s.GrowthHours) == 0 {
-		s.GrowthHours = []int{9, 21}
+		s.GrowthHours = def.GrowthHours
 	}
 	if len(s.BalanceHours) == 0 {
-		s.BalanceHours = []int{9, 21}
+		s.BalanceHours = def.BalanceHours
 	}
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
