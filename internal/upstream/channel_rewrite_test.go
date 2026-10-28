@@ -5,7 +5,6 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -55,8 +54,9 @@ func TestAttributionSentenceUppercased(t *testing.T) {
 	if bytes.Contains(out, []byte(sentence)) {
 		t.Fatalf("归属句原样存留: %s", out)
 	}
-	if !bytes.Contains(out, []byte(strings.ToUpper(sentence))) {
-		t.Fatalf("未按预期大写化: %s", out)
+	// 2026-10-29 生产 dump 实测：大写化无效（上游大小写不敏感），必须改措辞。
+	if !bytes.Contains(out, []byte("You are a coding assistant, an official CLI for Claude")) {
+		t.Fatalf("未按预期替换成中性措辞: %s", out)
 	}
 }
 
@@ -113,5 +113,27 @@ func TestRewriteKeepsJSONValid(t *testing.T) {
 	}
 	if obj["stream"] != true || obj["max_tokens"] != float64(9) || obj["model"] != "m" {
 		t.Fatalf("非目标字段被改动: %v", obj)
+	}
+}
+
+// 2026-10-29 生产 dump 实测：Claude Code 2.1.312 发来的归属句**本身就是大写 +
+// 词间插零宽**（"Y\u200bOU A\u200bRE C\u200bLAUDE ..."）。按小写字面量匹配永远
+// 命不中，改写因此从未生效——三档重试全被拒。这里用真实形态做回归。
+func TestUppercaseZeroWidthAttributionIsRewritten(t *testing.T) {
+	// 逐字符还原客户端真实字节：大写 + 每个词首后插 U+200B
+	raw := "Y\u200bOU A\u200bRE C\u200bLAUDE C\u200bODE, A\u200bNTHROPIC'S\u200b " +
+		"O\u200bFFICIAL C\u200bLI F\u200bOR C\u200bLAUDE."
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"` +
+		raw + `"}]},{"role":"user","content":"hi"}]}`)
+
+	out, changed := NeutralizeBillingHeaders(body)
+	if !changed {
+		t.Fatal("大写+零宽的归属句必须被改写（否则上游仍 11128）")
+	}
+	if !bytes.Contains(out, []byte("coding assistant")) {
+		t.Fatalf("未替换成中性措辞: %s", out)
+	}
+	if bytes.Contains(out, []byte("LAUDE")) {
+		t.Fatalf("原大写句仍存留: %s", out)
 	}
 }

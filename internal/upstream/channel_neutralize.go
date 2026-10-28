@@ -170,11 +170,34 @@ var channelTokenRewrites = []struct {
 
 // channelAttributionSentences 归属声明句：上游对整句做模糊匹配，只能整句改写。
 //
-// 实测（2026-10-29）：「改措辞」与「去掉 Claude」都通过，说明匹配单元是整句
-// 而非单个词。这里统一转大写——保持可读、语义不变，字面量已不同。
-var channelAttributionSentences = []string{
-	"You are Claude Code, Anthropic's official CLI for Claude",
-	"Codex CLI is an open source project led by OpenAI",
+// 2026-10-29 用**生产 dump 真实请求**回放的实测矩阵（每次只改一项）：
+//
+//	原样                          → 11128
+//	**大写化**                    → 11128  ← 上游大小写不敏感，转大写骗不过
+//	插零宽断词                    → 11128
+//	改措辞 You are a coding assistant, an official CLI for Claude.  → 200
+//	去掉 Claude Code              → 200
+//	改成中文                      → 200
+//	加中性前缀                    → 200
+//	只留前半句 / 只留后半句       → 200
+//
+// 结论：必须**改掉字母本身**。这里选「替换成中性措辞」——保持语义可读
+// （模型仍知道自己在做 CLI 助手），但字面量与官方不同。
+//
+// 注意：早期版本用 strings.ToUpper 改写，在简化请求上测通过、在真实请求上
+// 仍被拒——那是「大写化」这一条路本身无效，不是实现写错了。
+var channelAttributionRewrites = []struct {
+	trigger string
+	replace string
+}{
+	{
+		"You are Claude Code, Anthropic's official CLI for Claude",
+		"You are a coding assistant, an official CLI for Claude",
+	},
+	{
+		"Codex CLI is an open source project led by OpenAI",
+		"A CLI coding tool is an open source project.",
+	},
 }
 
 
@@ -298,27 +321,30 @@ func breakFirstLineTokens(head string, changed *bool) string {
 			touched = true
 		}
 	}
-	// 归属句（"You are Claude Code, ..."）不能只删一个字符——上游对整句做模糊匹配。
-	// 实测「改措辞」「去掉 Claude」「挪到第二行」都能过；这里取最小改动：
-	// 把该句整体转成大写，保持可读但字面量与官方的不同。
+	// 归属句整句替换。必须改掉字母——大写化与断词都已被实测否决（见
+	// channelAttributionRewrites 上的矩阵）。
 	//
-	// 幂等：只在句子**尚未被大写**时才改写。已全大写的句子上再跑一次不会变化，
-	// 于是多档重试不会累积改动（与 removeZeroWidth 的幂等语义一致）。
-	for _, token := range channelAttributionSentences {
-		index := indexFrom(strings.ToLower(rewritten), strings.ToLower(token), 0)
-		if index < 0 {
-			continue
+	// ═══ 为什么必须忽略大小写和零宽 ═══
+	//
+	// Claude Code 2.1.312 发来的原文本身就是**大写 + 词间插零宽**：
+	//   "Y​OU A​RE C​LAUDE C​ODE, A​NTHROPIC'S​ ..."
+	// 直接按小写字面量 `You are Claude Code, ...` 匹配永远命中不了，
+	// 改写因此从未生效（2026-10-29 生产 dump 实测：三档重试全被拒）。
+	// 归一化后的 plain 已经剥掉零宽，这里再按小写比一次。
+	lowered := strings.ToLower(rewritten)
+	for _, rw := range channelAttributionRewrites {
+		trigger := strings.ToLower(rw.trigger)
+		for {
+			index := indexFrom(lowered, trigger, 0)
+			if index < 0 {
+				break
+			}
+			// 两串同步替换：rewritten 保留原大小写风格之外的措辞，lowered 只用于
+			// 后续定位。length 可能不同，所以每次都用同一段区间一起改。
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(trigger):]
+			lowered = lowered[:index] + strings.ToLower(rw.replace) + lowered[index+len(trigger):]
+			touched = true
 		}
-		end := index + len(token)
-		if end > len(rewritten) {
-			end = len(rewritten)
-		}
-		upper := strings.ToUpper(rewritten[index:end])
-		if upper == rewritten[index:end] {
-			continue // 已是大写形态，不再改动（幂等）
-		}
-		rewritten = rewritten[:index] + upper + rewritten[end:]
-		touched = true
 	}
 	// 未命中任何触发串：**原样返回 head**，不要落回归一化结果。
 	// 零宽剥离只用于匹配——首行里客户端自带的零宽字符对模型无语义价值，但

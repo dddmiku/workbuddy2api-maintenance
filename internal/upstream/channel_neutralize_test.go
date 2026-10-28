@@ -29,13 +29,13 @@ func TestNeutralizeChannelTriggerBreaksSentence(t *testing.T) {
 	}
 	// 2026-10-29：断词（插零宽）对上游已失效，改为整句大写化。
 	// 断言「触发句不再以原样出现」已在上一条覆盖，这里只确认句被改写。
-	if !bytes.Contains(out, []byte(strings.ToUpper(channelTriggerSentence))) {
+	if !bytes.Contains(out, []byte(attributionReplacementFor(channelTriggerSentence))) {
 		t.Fatalf("触发句未被改写: %s", out)
 	}
 	// 比较解码后的结构：
 	// 中性化会经 json.Marshal 重排键序，字节序差异不算内容差异。
 	// 2026-10-29：改写形态是大写化，还原时把大写句换回原文再比。
-	restored := bytes.ReplaceAll(out, []byte(strings.ToUpper(channelTriggerSentence)), []byte(channelTriggerSentence))
+	restored := bytes.ReplaceAll(out, []byte(attributionReplacementFor(channelTriggerSentence)), []byte(channelTriggerSentence))
 	var want, got any
 	if err := json.Unmarshal(body, &want); err != nil {
 		t.Fatalf("unmarshal want: %v", err)
@@ -113,7 +113,7 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 			t.Fatalf("attempt %d still carries the raw trigger sentence: %s", index+1, sent)
 		}
 	}
-	if !bytes.Contains(bodies[0], []byte(strings.ToUpper(channelTriggerSentence))) {
+	if !bytes.Contains(bodies[0], []byte(attributionReplacementFor(channelTriggerSentence))) {
 		t.Fatalf("pre-neutralised first attempt carries no rewrite: %s", bodies[0])
 	}
 }
@@ -262,4 +262,15 @@ func TestTriggerTablesHoldCleanStrings(t *testing.T) {
 	if _, changed := NeutralizeBillingHeaders([]byte(`{"messages":[{"role":"system","content":"` + clean + `"}]}`)); !changed {
 		t.Fatal("pre-neutralisation must fire on the clean client text")
 	}
+}
+
+// attributionReplacementFor 返回某条归属句的中性替换形态（测试用）。
+// 2026-10-29 起中性化改为整句替换措辞——大写化与断词都已被实测否决。
+func attributionReplacementFor(sentence string) string {
+	for _, rw := range channelAttributionRewrites {
+		if rw.trigger == sentence {
+			return rw.replace
+		}
+	}
+	return sentence
 }
