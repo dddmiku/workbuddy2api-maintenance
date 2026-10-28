@@ -85,11 +85,16 @@
 （`channel verification` / 「渠道校验」）时也判渠道拒绝。11140 的同 msg 是账号级封禁，
 按 code 严格区分，不混入。
 
-## 结论三：断词（零宽空格）是有效解法
+## 结论三：断词（零宽空格）曾有效，**2026-10-29 起已失效**
 
-对上述全部触发点，在命中 token 的每个单词首字母后插入零宽空格（U+200B）即通过：
+> **2026-10-29 勘误（重要）**：本节原结论「插零宽空格即通过」已被上游推翻。
+> 上游改成模糊匹配后，插零宽、插普通空格都被照拒；只有**改动字母本身**才能通过。
+> 现状见下方「结论四」，本节的矩阵保留作为历史记录。
 
-| 场景 | 原文 | 断词后 |
+2026-10-17 时点，对上述全部触发点，在命中 token 的每个单词首字母后插入零宽空格
+（U+200B）即可通过：
+
+| 场景 | 原文 | 断词后（2026-10-17） |
 |---|---|---|
 | 首行 billing 头 | ❌ | ✅ |
 | 首行 Claude Code 归属句 | ❌ | ✅ |
@@ -97,13 +102,40 @@
 
 零宽字符不可见，模型读到的文字不变，客户端解析不受影响。
 
+## 结论四（2026-10-29）：必须改动字母
+
+Claude Code 经网关走 cn/global 全部 11128。同一账号、同一时刻的实测矩阵
+（每次只改一个变量）：
+
+| 处理方式 | 结果 |
+|---|---|
+| `x-anthropic-billing-header` 原样 | ❌ 11128 |
+| 插零宽 `x-a-nthropic-b-illing-h-eader` | ❌ 11128 |
+| 插普通空格 `x - anthropic - billing - header` | ❌ 11128 |
+| **去掉 `x-` 前缀** → `anthropic-billing-header` | ✅ 200 |
+| 换成中文「计费头：」 | ✅ 200 |
+| 归属句改措辞 `You are a coding assistant, ...` | ✅ 200 |
+| 归属句去掉 `Claude` | ✅ 200 |
+| 归属句挪到 system 第二行 | ✅ 200 |
+
+**结论**：上游按**带前缀的完整字面量**做模糊匹配，插字符（零宽或空格）不再生效，
+改动任意字母即可绕开。网关因此改为：
+
+- 计费头：删掉 `x-` 前缀（改动面最小，只删 2 字节，语义仍可读）；
+- 归属句：整句大写化（`strings.ToUpper`，实测改措辞即通过，大写保持一致可读）。
+
+零误伤契约不变：**未命中触发串时，首行一个字节都不许动**——零宽剥离只用于匹配，
+不得落回输出（2026-10-29 修过一次这个回归）。
+
 ## 实现要点
 
-- `channelFirstLineTriggerTokens`：首行触发 token 表；
+- `channelFirstLineTriggerTokens`：首行触发 token 表（用于**匹配**，含客户端自带的零宽形态）；
+- `channelTokenRewrites` / `channelAttributionSentences`：命中后的**改写**规则；
 - `neutralizeSystemFirstLine`：只处理 system 首行（含单行 system 与 part 数组），
   未命中首行的请求**一个字节都不变**；
-- `NeutralizeBillingHeaders`：发送前预中和首行（省掉「先被拒再重试」的往返）；
-- `NeutralizeChannelTriggerAt` 第 0 档也先跑首行处理，再按需升级到通用归属句/全文；
+- `NeutralizeBillingHeaders`：发送前预改写首行（省掉「先被拒再重试」的往返）；
+- `NeutralizeChannelTriggerAt` 第 0 档也先跑首行改写，再按需升级到通用归属句/全文
+  （第 1/2 档仍是插零宽，作为上游改版后的兜底）；
 - global 域 `ensureConsoleSystem` 补首条 system；CN 域不动（实测不要求）。
 
 ## 复现方式
