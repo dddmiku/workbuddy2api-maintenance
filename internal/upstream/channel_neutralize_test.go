@@ -27,12 +27,15 @@ func TestNeutralizeChannelTriggerBreaksSentence(t *testing.T) {
 	if bytes.Contains(out, []byte(channelTriggerSentence)) {
 		t.Fatalf("trigger sentence still intact: %s", out)
 	}
-	if !bytes.Contains(out, []byte(wafBreakMarker)) {
-		t.Fatalf("no break marker inserted: %s", out)
+	// 2026-10-29：断词（插零宽）对上游已失效，改为整句大写化。
+	// 断言「触发句不再以原样出现」已在上一条覆盖，这里只确认句被改写。
+	if !bytes.Contains(out, []byte(strings.ToUpper(channelTriggerSentence))) {
+		t.Fatalf("触发句未被改写: %s", out)
 	}
-	// 去掉零宽标记后必须逐字还原（不删不改任何字符）。比较解码后的结构：
+	// 比较解码后的结构：
 	// 中性化会经 json.Marshal 重排键序，字节序差异不算内容差异。
-	restored := bytes.ReplaceAll(out, []byte(wafBreakMarker), nil)
+	// 2026-10-29：改写形态是大写化，还原时把大写句换回原文再比。
+	restored := bytes.ReplaceAll(out, []byte(strings.ToUpper(channelTriggerSentence)), []byte(channelTriggerSentence))
 	var want, got any
 	if err := json.Unmarshal(body, &want); err != nil {
 		t.Fatalf("unmarshal want: %v", err)
@@ -110,8 +113,8 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 			t.Fatalf("attempt %d still carries the raw trigger sentence: %s", index+1, sent)
 		}
 	}
-	if !bytes.Contains(bodies[0], []byte(wafBreakMarker)) {
-		t.Fatalf("pre-neutralised first attempt carries no break marker: %s", bodies[0])
+	if !bytes.Contains(bodies[0], []byte(strings.ToUpper(channelTriggerSentence))) {
+		t.Fatalf("pre-neutralised first attempt carries no rewrite: %s", bodies[0])
 	}
 }
 
@@ -141,8 +144,9 @@ func TestChatStreamChannelRejectionEscalatesForUnknownClients(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("attempts=%d want 2 (one escalated retry)", attempts)
 	}
-	if !bytes.Contains(bodies[1], []byte(wafBreakMarker)) {
-		t.Fatalf("retry carries no break marker: %s", bodies[1])
+	if !bytes.Contains(bodies[1], []byte(wafBreakMarker)) &&
+		bytes.Contains(bodies[1], []byte("You are Foobar, a coding assistant for Baz.")) {
+		t.Fatalf("retry neither broke nor rewrote the attribution sentence: %s", bodies[1])
 	}
 }
 
@@ -181,8 +185,9 @@ func TestChannelTriggerCoversClaudeCodeBillingHeader(t *testing.T) {
 	if bytes.Contains(first, []byte(header)) {
 		t.Fatalf("billing header survived level 0: %s", first)
 	}
-	if !bytes.Contains(first, []byte(wafBreakMarker)) {
-		t.Fatalf("no break marker inserted: %s", first)
+	// 2026-10-29：断词已失效，改为删掉 "x-" 前缀。
+	if !bytes.Contains(first, []byte("anthropic-billing-header")) {
+		t.Fatalf("计费头未被改写: %s", first)
 	}
 	// 其他 anthropic 头不触发（实测通过），断词器不得误伤它们。
 	for _, safe := range []string{"x-anthropic-version: 2023-06-01", "x-stainless-lang: js"} {
@@ -207,8 +212,9 @@ func TestNeutralizeBillingHeadersPreemptsTheRetry(t *testing.T) {
 	if bytes.Contains(out, []byte(header)) {
 		t.Fatalf("billing header survived: %s", out)
 	}
-	if !bytes.Contains(out, []byte(wafBreakMarker)) {
-		t.Fatalf("no break marker inserted: %s", out)
+	// 2026-10-29：断词已失效，改为删掉 "x-" 前缀。
+	if !bytes.Contains(out, []byte("anthropic-billing-header")) {
+		t.Fatalf("计费头未被改写: %s", out)
 	}
 	// 其他内容与结构必须原样保留
 	var obj map[string]any

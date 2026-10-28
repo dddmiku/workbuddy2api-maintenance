@@ -55,8 +55,10 @@ func TestNeutralizeChannelTriggerCoversClaudeCode(t *testing.T) {
 			if changed != tc.want {
 				t.Fatalf("changed=%v want=%v out=%s", changed, tc.want, out)
 			}
-			if changed && !strings.Contains(string(out), "\u200b") {
-				t.Fatal("no word break was inserted")
+			// 2026-10-29\uff1a\u65ad\u8bcd\uff08\u63d2\u96f6\u5bbd\uff09\u5bf9\u4e0a\u6e38\u5df2\u5931\u6548\uff0c\u4e2d\u6027\u5316\u6539\u4e3a\u5927\u5199\u5316\u5f52\u5c5e\u53e5 /
+			// \u5220\u8ba1\u8d39\u5934\u7684 "x-" \u524d\u7f00\u3002\u65ad\u8a00\u300c\u6539\u52a8\u540e\u4e0d\u518d\u542b\u539f\u6837\u89e6\u53d1\u4e32\u300d\u3002
+			if changed && strings.Contains(string(out), tc.body) {
+				t.Fatal("\u89e6\u53d1\u4e32\u539f\u6837\u5b58\u7559")
 			}
 		})
 	}

@@ -132,6 +132,10 @@ const (
 //   - 同句前面加 20 字节中性前缀、或挪到第二行 → 通过；
 //   - 首行内每个单词首字母后插零宽空格 → 通过（本函数采用的做法）。
 //
+// 2026-10-29 实测：**断词已失效**。上游改成模糊匹配，插零宽空格、插普通空格
+// 都照样被拒（A/B/C 三组对照：原样拒、零宽插词拒、空格插词拒）。真正有效的
+// 手段是改动字母本身——去掉 `x-` 前缀后同一句立即 200。
+//
 // 为什么单列成表而不复用 channelTriggerSentences：这两个 token 的判定与
 // 「整句归属声明」无关（"x-anthropic-billing-header" 单独一行也照样被拒），
 // 触发条件是「在首行」而非「句子内容像归属声明」，误判边界不同。
@@ -142,6 +146,37 @@ var channelFirstLineTriggerTokens = []string{
 	"You are Claude Code, Anthropic's official CLI for Claude",
 	"Codex CLI is an open source project led by OpenAI",
 }
+
+// channelTokenRewrites 断词失效后的替代方案：**改写字母**而不是插零宽。
+//
+// 2026-10-29 实测矩阵（cn 域，同一账号，每次只改一个变量）：
+//
+//	x-anthropic-billing-header 原样              → 11128
+//	插零宽 x-a-nthropic-b-illing-h-eader       → 11128（断词已失效）
+//	插普通空格 x - anthropic - billing - header → 11128
+//	去掉 x- 前缀 → anthropic-billing-header      → 200
+//	连字符也去掉 → -anthropic-billing-header     → 200
+//	换成中文「计费头：」                         → 200
+//
+// 结论：上游匹配的是**带前缀的完整字面量**，改动任意字母即可绕开。
+// 选「去掉 x- 前缀」而不是换成中文：改动最小（删 2 字节）、语义仍可读
+// （模型看得出这是计费头）、且不引入非 ASCII 字符。
+var channelTokenRewrites = []struct {
+	trigger string
+	replace string
+}{
+	{"x-anthropic-billing-header", "anthropic-billing-header"},
+}
+
+// channelAttributionSentences 归属声明句：上游对整句做模糊匹配，只能整句改写。
+//
+// 实测（2026-10-29）：「改措辞」与「去掉 Claude」都通过，说明匹配单元是整句
+// 而非单个词。这里统一转大写——保持可读、语义不变，字面量已不同。
+var channelAttributionSentences = []string{
+	"You are Claude Code, Anthropic's official CLI for Claude",
+	"Codex CLI is an open source project led by OpenAI",
+}
+
 
 // neutralizeSystemFirstLine 断开 system 消息**首行**里的渠道触发 token。
 //
@@ -230,7 +265,8 @@ func splitFirstLine(text string) (head, rest string) {
 // 客户端的其它零宽字符会被顺带清掉；那些字符对模型无语义价值，清掉反而更接近
 // 官方客户端的正常形态。未命中时首行一个字节都不动（见下方 return）。
 func breakFirstLineTokens(head string, changed *bool) string {
-	// 归一化：剥掉全部零宽类字符。
+	// 归一化：剥掉全部零宽类字符，用于**匹配**（客户端自己就在词间插了零宽，
+	// 直接按字面量 Contains 永远命不中）。
 	visible := make([]byte, 0, len(head))
 	for i := 0; i < len(head); {
 		size, isZW := zeroWidthAt(head, i)
@@ -246,41 +282,52 @@ func breakFirstLineTokens(head string, changed *bool) string {
 	}
 	plain := string(visible)
 
-	// 在归一化文本上定位 token，一次性算出断词点。
-	insertAt := map[int]struct{}{}
-	for _, token := range channelFirstLineTriggerTokens {
-		start := 0
+	// 改写：删掉触发串里会被上游匹配的片段（见 channelTokenRewrites 的实测矩阵）。
+	//
+	// 2026-10-29 起不再插零宽空格：上游已改成模糊匹配，断词（零宽或普通空格）
+	// 照样被拒。改写字母后同一句立即 200，且改动面最小（只删 "x-" 两个字节）。
+	rewritten := plain
+	touched := false
+	for _, rw := range channelTokenRewrites {
 		for {
-			index := indexFrom(plain, token, start)
+			index := indexFrom(rewritten, rw.trigger, 0)
 			if index < 0 {
 				break
 			}
-			for _, pos := range wordBreakPoints(plain, index, index+len(token)) {
-				insertAt[pos] = struct{}{}
-			}
-			start = index + len(token)
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(rw.trigger):]
+			touched = true
 		}
 	}
-	// 未命中：原样返回，**不要**把归一化结果落回去。
-	// 首行里的零宽字符可能是同一轮其它断词器（句子档 / 归属档 / 全量档）刚插入的，
-	// 在这里清掉等于把它们的成果抹平（2026-10-17 实测：会把指纹句的断词擦干净，
-	// 于是「已中和」的请求又带着连续触发串打上游）。
-	if len(insertAt) == 0 {
-		return head
+	// 归属句（"You are Claude Code, ..."）不能只删一个字符——上游对整句做模糊匹配。
+	// 实测「改措辞」「去掉 Claude」「挪到第二行」都能过；这里取最小改动：
+	// 把该句整体转成大写，保持可读但字面量与官方的不同。
+	//
+	// 幂等：只在句子**尚未被大写**时才改写。已全大写的句子上再跑一次不会变化，
+	// 于是多档重试不会累积改动（与 removeZeroWidth 的幂等语义一致）。
+	for _, token := range channelAttributionSentences {
+		index := indexFrom(strings.ToLower(rewritten), strings.ToLower(token), 0)
+		if index < 0 {
+			continue
+		}
+		end := index + len(token)
+		if end > len(rewritten) {
+			end = len(rewritten)
+		}
+		upper := strings.ToUpper(rewritten[index:end])
+		if upper == rewritten[index:end] {
+			continue // 已是大写形态，不再改动（幂等）
+		}
+		rewritten = rewritten[:index] + upper + rewritten[end:]
+		touched = true
 	}
-	points := make([]int, 0, len(insertAt))
-	for pos := range insertAt {
-		points = append(points, pos)
-	}
-	// 在归一化文本上算断点、插入，得到「规范形态」。再与原文逐字节比对：
-	// 相同即无需改动（幂等），也必须报 false —— 调用方用 changed 决定要不要
-	// 改写 body 重发，报错会白花一趟往返。
-	out, _ := insertBreaks(plain, points)
-	if out == head {
+	// 未命中任何触发串：**原样返回 head**，不要落回归一化结果。
+	// 零宽剥离只用于匹配——首行里客户端自带的零宽字符对模型无语义价值，但
+	// 「没触发就一个字节都不动」是零误伤的契约（2026-10-17 起就有测试守着）。
+	if !touched || rewritten == head {
 		return head
 	}
 	*changed = true
-	return out
+	return rewritten
 }
 
 // zeroWidthAt 报告 head[i] 处是否是一个零宽/格式类字符，并返回其字节长度。
