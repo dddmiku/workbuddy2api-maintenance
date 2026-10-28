@@ -87,13 +87,44 @@ type exchangeRequest struct {
 	UserID       string `json:"UserID"`
 }
 
+// flexString 兼容上游把同一个字段写成字符串或数字。
+//
+// 2026-10-28 实测：ExchangeToken 的 Result.RefreshExpireAt 返回**数字**
+// （1807365600661，毫秒），而结构体声明成 string，于是 json.Unmarshal 直接报
+// `cannot unmarshal number into Go struct field .Result.RefreshExpireAt of type string`，
+// 整个响应解析失败——6 个 Trae 号的 token 保活连续两周每天全失败，账号过期
+// 1.6~2.7 天，面板显示「凭证已过期 / 查询失败」。上游同一个字段在不同版本/端点
+// 上字符串与数字都出现过，所以这里两种都收，统一转成字符串。
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == "" {
+		*f = ""
+		return nil
+	}
+	// 字符串形态：去掉引号与可能的转义
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var out string
+		if err := json.Unmarshal(b, &out); err != nil {
+			return err
+		}
+		*f = flexString(out)
+		return nil
+	}
+	// 数字形态：原样保留字面量，交给 parseExpire 解析
+	*f = flexString(s)
+	return nil
+}
+
 // exchangeResponse ExchangeToken 的响应（Result 包 Token/RefreshToken/UserInfo）。
 type exchangeResponse struct {
 	Result struct {
-		Token           string          `json:"Token"`
-		RefreshToken    string          `json:"RefreshToken"`
-		TokenExpireAt   string          `json:"TokenExpireAt"`
-		RefreshExpireAt string          `json:"RefreshExpireAt"`
+		Token        string `json:"Token"`
+		RefreshToken string `json:"RefreshToken"`
+		// TokenExpireAt / RefreshExpireAt 都可能是字符串或数字，见 flexString。
+		TokenExpireAt   flexString      `json:"TokenExpireAt"`
+		RefreshExpireAt flexString      `json:"RefreshExpireAt"`
 		UserInfo        json.RawMessage `json:"UserInfo"`
 	} `json:"Result"`
 }
@@ -583,7 +614,7 @@ func Refresh(a *auth.Auth) (accessToken, refreshToken string, expiresAt int64, e
 	if newRefresh == "" {
 		newRefresh = rt
 	}
-	return out.Result.Token, newRefresh, parseExpire(out.Result.TokenExpireAt), nil
+	return out.Result.Token, newRefresh, parseExpire(string(out.Result.TokenExpireAt)), nil
 }
 
 // parseExpire 把 TokenExpireAt（秒/毫秒时间戳字符串）归一成 Unix 秒；无法解析返回 0。
