@@ -1206,7 +1206,7 @@ function renderAccounts(){
       ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
       : '';
     // 账号行第二行：优先显示手机号（Trae 账号由 GetUserInfo 写入 account.mobile，
-    // 形如 157******41）。没有手机号时回落到 uid——WorkBuddy 账号本来就没有。
+    // 形如 138******00）。没有手机号时回落到 uid——WorkBuddy 账号本来就没有。
     //
     // 为什么换掉 uid：Trae 的 uid 是一串内部数字（411685466945619），运维看不出
     // 哪个号是哪个；手机号（哪怕掩码）能直接对上人。

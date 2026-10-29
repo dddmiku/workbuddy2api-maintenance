@@ -266,7 +266,7 @@ func (s *Server) writeTraeAuthFile(creds map[string]any, uid string, expiresAt i
 		"nickname": firstNonEmpty(jsonString(creds["nickname"]), uidPrefix(uid)),
 	}
 	// 补手机号：Trae 的 uid 是一串内部数字（如 411685466945619），运维看不出
-	// 哪个号是哪个。GetUserInfo 会返回掩码手机号（157******41）与真实昵称，
+	// 哪个号是哪个。GetUserInfo 会返回掩码手机号（138******00）与真实昵称，
 	// 这是唯一能把账号和「人」对上的标识。
 	//
 	// 失败不阻断加号：手机号只是展示用，拿不到就留空，前端回落到 uid。

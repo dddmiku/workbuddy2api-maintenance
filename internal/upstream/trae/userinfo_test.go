@@ -15,12 +15,12 @@ import (
 
 // TestGetUserInfoParsesMaskedMobile GetUserInfo 的真实响应形态（2026-10-29 生产实测）。
 //
-// 手机号在 NonPlainTextMobile 里，已是掩码形态（157******41）——上游不下发明文，
+// 手机号在 NonPlainTextMobile 里，已是掩码形态（138******00）——上游不下发明文，
 // 这是 passport 侧的隐私策略。面板只需要「能区分账号」，掩码足够。
 func TestGetUserInfoParsesMaskedMobile(t *testing.T) {
 	const body = `{"ResponseMetadata":{"Action":"","OID":null,"Region":""},
  "Result":{"AIRegion":"CN","Gender":0,"LastLoginTime":"2026-10-29T12:44:57+08:00",
- "LastLoginType":"sms","NonPlainTextEmail":"","NonPlainTextMobile":"157******41",
+ "LastLoginType":"sms","NonPlainTextEmail":"","NonPlainTextMobile":"138******00",
  "Region":"CN","RegisterTime":"2026-10-11T13:48:38.121+08:00",
  "ScreenName":"用户6126656924","TenantID":"7o2d894p7dr0o4","UserID":"411685466945619"}}`
 
@@ -53,7 +53,7 @@ func TestGetUserInfoParsesMaskedMobile(t *testing.T) {
 	if gotUID != "411685466945619" {
 		t.Fatalf("x-uid=%q", gotUID)
 	}
-	if info.Mobile != "157******41" {
+	if info.Mobile != "138******00" {
 		t.Fatalf("Mobile=%q", info.Mobile)
 	}
 	if info.ScreenName != "用户6126656924" {

@@ -58,7 +58,7 @@ type AuthSummary struct {
 	ExpiresAt    int64  `json:"expiresAt"`
 	Disabled     bool   `json:"disabled"`
 	Parsable     bool   `json:"parsable"`
-	// Mobile 是掩码手机号（Trae 账号才有，形如 157******41）。
+	// Mobile 是掩码手机号（Trae 账号才有，形如 138******00）。
 	//
 	// 落盘位置：账号文件的 account.mobile。由添加账号时的 GetUserInfo 写入，
 	// 面板只读不查——每次刷新都打 6 次上游接口会把页面拖慢 1-2 秒，

@@ -1322,7 +1322,7 @@ func TestListAuthFilesFallsBackToFilenameWhenCorrupt(t *testing.T) {
 func TestAuthSummaryBothDocumentShapes(t *testing.T) {
 	h := newHarness(t)
 	authDir := h.server.opts.AuthDir
-	nested := `{"account":{"uid":"nested01","nickname":"昵称A","enterpriseId":"ent-1","mobile":"157******41"},` +
+	nested := `{"account":{"uid":"nested01","nickname":"昵称A","enterpriseId":"ent-1","mobile":"138******00"},` +
 		`"auth":{"accessToken":"t","expiresAt":1800000000,"domain":"codebuddy.cn","realm":"cn"}}`
 	flat := `{"uid":"flat0001","accessToken":"t","realm":"global","domain":"workbuddy.ai","expiresAt":"1800000001"}`
 	if err := os.WriteFile(filepath.Join(authDir, "workbuddy-nested01.json"), []byte(nested), 0600); err != nil {
@@ -1342,7 +1342,7 @@ func TestAuthSummaryBothDocumentShapes(t *testing.T) {
 	}
 	// 手机号来自 account.mobile（Trae 加号时由 GetUserInfo 写入，掩码形态）。
 	// 前端拿它替换 uid 显示，让运维能对上「这是谁的号」。
-	if a.Mobile != "157******41" {
+	if a.Mobile != "138******00" {
 		t.Fatalf("mobile 未读出：%+v", a)
 	}
 	b := byUID["flat0001"]

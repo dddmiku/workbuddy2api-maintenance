@@ -31,7 +31,7 @@ const GetUserInfoPath = "/cloudide/api/v3/trae/GetUserInfo"
 type UserInfo struct {
 	UserID      string // 上游 UserID（与账号文件里的 uid 一致）
 	ScreenName  string // 昵称，形如「用户6126656924」
-	Mobile      string // 掩码手机号，形如 157******41（上游字段 NonPlainTextMobile）
+	Mobile      string // 掩码手机号，形如 138******00（上游字段 NonPlainTextMobile）
 	Email       string // 掩码邮箱，可能为空
 	RegisterTime string
 	LastLoginType string
@@ -39,7 +39,7 @@ type UserInfo struct {
 
 // GetUserInfo 取账号资料。ctx 为 nil 时用 Background。
 //
-// 上游把手机号放在 NonPlainTextMobile（已掩码，形如 157******41），
+// 上游把手机号放在 NonPlainTextMobile（已掩码，形如 138******00），
 // 明文手机号不会下发——这是 passport 侧的隐私策略，不是权限不足。
 func GetUserInfo(ctx context.Context, a *auth.Auth) (UserInfo, error) {
 	if a == nil {
