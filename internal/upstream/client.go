@@ -1514,6 +1514,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 						observeChatRetry(ctx, raw)
 						continue retry
 					}
+					// 三档都改不动 = 正文里没有可改写的归属句（预改写已在发送前把
+					// 已知触发串处理掉，或客户端压根没有归属句）。此时**不能直接
+					// 返回**——上游的拒绝可能与该账号的风控画像相关，换号仍有机会
+					// （见 handler.go 的 softRotate 注释：同一请求不同 uid 结果不同）。
+					// 这里直接返回会让换号逻辑完全失效，生产表现就是「换号 0 次」。
+					log.Printf("INFO: [上游] 渠道拒绝 — 无可改写内容，交由换号处理 uid=%s 路径=%s",
+						logfmt.UID8(a.UID), path)
 				}
 				// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 				if attempt < pathCount-1 && chatFallbackHTTPStatus(resp.StatusCode) {

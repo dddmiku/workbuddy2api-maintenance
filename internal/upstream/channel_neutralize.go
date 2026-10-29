@@ -101,8 +101,15 @@ func NeutralizeChannelTriggerAt(body []byte, level int) ([]byte, bool) {
 	}
 	changed := false
 	obj = neutralizeChannelJSONValue(obj, &changed)
-	// 第 0 档即处理 system 首行：这是实测的确定性触发点，代价最小（只断一行）。
-	changed = neutralizeSystemFirstLine(obj, &changed) || changed
+	// 第 0 档处理 system 首行：实测的确定性触发点，代价最小（只改一行）。
+	//
+	// 只在 level==0 时做首行档：第 1/2 档是**升级**，此时首行早已被第 0 档（或
+	// 发送前的 NeutralizeBillingHeaders）改写过，再跑一遍不会有新改动，
+	// 反而让调用方拿到 changed=false 而放弃重试（2026-10-29 生产实测：
+	// 预改写已生效、首行无触发串，升级档因此全部空转，请求直接返回 11128）。
+	if level <= channelLevelFingerprint {
+		changed = neutralizeSystemFirstLine(obj, &changed) || changed
+	}
 	switch {
 	case level >= channelLevelAll:
 		changed = neutralizeMessageText(obj, channelTextModeAll) || changed
@@ -434,38 +441,190 @@ func neutralizeMessageText(obj any, mode int) bool {
 	return changed
 }
 
-// breakAllWords 在每个单词首字母后插入零宽标记（正文全量档）。
+// breakAllWords 正文全量档：**改写字母**，不再插零宽。
+//
+// 2026-10-29 实测：上游改成模糊匹配后，插零宽空格（wafBreakMarker）已经无效——
+// 生产日志的直接证据是「已中和渠道触发词（第 2 级）」之后仍然 11128。
+// 第 0 档改成了改写字母，但升级档漏改，于是没命中第 0 档的请求升到第 2 档、
+// 插一堆零宽，照样被拒。
+//
+// 现在的做法：先按已知触发串改写（与第 0 档同一张表），再兜底——对每个命中
+// 「自称客户端」特征的句子删掉产品名。两档共用同一实现，差别只在兜底的句域：
+// 第 1 档逐句判定归属特征，第 2 档（all=true）对全部正文都过一遍。
 func breakAllWords(text string, changed *bool) string {
-	points := wordBreakPoints(text, 0, len(text))
-	if len(points) == 0 {
-		return text
-	}
-	out, inserted := insertBreaks(text, points)
-	if !inserted {
-		return text
-	}
-	*changed = true
-	return out
+	return rewriteAttributionText(text, changed, true)
 }
 
-// breakAttributionSentences 断开「自称客户端」的句子：句内出现产品名或官方归属措辞即命中。
+// breakAttributionSentences 归属句档：只改写「自称客户端」的句子。
 func breakAttributionSentences(text string, changed *bool) string {
-	points := []int{}
-	for _, span := range sentenceSpans(text) {
-		if !isChannelAttribution(text[span[0]:span[1]]) {
+	return rewriteAttributionText(text, changed, false)
+}
+
+// rewriteAttributionText 按已知触发串改写字母（零宽断词已失效，见 breakAllWords 注释）。
+//
+// 两档都做兜底改写：已知表只覆盖两个客户端，未列出的客户端仍会自称，必须有
+// 一条不依赖字面量的路径。all 只控制兜底的句域范围——
+// false（第 1 档）逐句判定归属特征，true（第 2 档）对全部正文都试一遍。
+func rewriteAttributionText(text string, changed *bool, all bool) string {
+	rewritten, touched := rewriteKnownTriggers(text)
+	// 逐句兜底：句子含「官方归属措辞 + 产品名」但没被已知表覆盖时，删掉产品名。
+	// 不插字符、不改句子结构，模型读到的仍是「自称是某 CLI 助手」的语义。
+	var builder strings.Builder
+	builder.Grow(len(rewritten))
+	last := 0
+	for _, span := range sentenceSpans(rewritten) {
+		segment := rewritten[span[0]:span[1]]
+		if !all && !isChannelAttribution(segment) {
 			continue
 		}
-		points = append(points, wordBreakPoints(text, span[0], span[1])...)
+		if replaced, ok := stripClientName(segment); ok {
+			builder.WriteString(rewritten[last:span[0]])
+			builder.WriteString(replaced)
+			last = span[1]
+			touched = true
+		}
 	}
-	if len(points) == 0 {
-		return text
+	if last > 0 {
+		builder.WriteString(rewritten[last:])
+		rewritten = builder.String()
 	}
-	out, inserted := insertBreaks(text, points)
-	if !inserted {
+	// 幂等判据：内容没变就不报改动。
+	//
+	// 这一步必需——stripZeroWidth 只用于匹配，若正文里本来就没有触发串，
+	// 上面的 touched 可能因为「剥零宽后重编码」而误报 true（例如客户端自带
+	// 零宽字符、但没有触发串）。调用方拿 changed 决定要不要重发，
+	// 误报会导致无意义的重试（2026-10-29 生产实测的「第 2 级中和后仍被拒」
+	// 有一部分就是这类空转）。
+	if !touched || rewritten == text {
 		return text
 	}
 	*changed = true
-	return out
+	return rewritten
+}
+
+// rewriteKnownTriggers 按 channelTokenRewrites / channelAttributionRewrites 改写字母。
+// 与第 0 档的 breakFirstLineTokens 用同一张表、同一套「归一化后忽略大小写匹配」，
+// 但作用于任意文本而非仅首行。
+func rewriteKnownTriggers(text string) (string, bool) {
+	visible := stripZeroWidth(text)
+	if visible == "" {
+		return text, false
+	}
+	rewritten := visible
+	touched := false
+	for _, rw := range channelTokenRewrites {
+		for {
+			index := indexFrom(rewritten, rw.trigger, 0)
+			if index < 0 {
+				break
+			}
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(rw.trigger):]
+			touched = true
+		}
+	}
+	lowered := strings.ToLower(rewritten)
+	for _, rw := range channelAttributionRewrites {
+		trigger := strings.ToLower(rw.trigger)
+		for {
+			index := indexFrom(lowered, trigger, 0)
+			if index < 0 {
+				break
+			}
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(trigger):]
+			lowered = lowered[:index] + strings.ToLower(rw.replace) + lowered[index+len(trigger):]
+			touched = true
+		}
+	}
+	if !touched {
+		return text, false
+	}
+	return rewritten, true
+}
+
+// zeroWidthMarkers 除 U+200B 之外的同类零宽/格式字符（U+200C/200D/2060/FEFF）。
+// 用常量拼接而不是字面量：U+FEFF 直接写进源码会被编译器当成 BOM 拒绝。
+var zeroWidthMarkers = []string{
+	"\u200c", "\u200d", "\u2060", string(rune(0xFEFF)),
+}
+
+// stripZeroWidth 剥掉零宽类字符（仅用于匹配，见 breakFirstLineTokens 的同名逻辑）。
+func stripZeroWidth(text string) string {
+	if !strings.Contains(text, wafBreakMarker) {
+		// 快速路径：绝大多数文本没有零宽字符，避免逐字节重建。
+		for _, marker := range zeroWidthMarkers {
+			if strings.Contains(text, marker) {
+				goto rebuild
+			}
+		}
+		return text
+	}
+rebuild:
+	visible := make([]byte, 0, len(text))
+	for i := 0; i < len(text); {
+		size, isZW := zeroWidthAt(text, i)
+		if isZW {
+			i += size
+			continue
+		}
+		visible = append(visible, text[i])
+		i++
+	}
+	return string(visible)
+}
+
+// stripClientName 删掉句中的产品名（兜底改写，用于未列入词表的客户端）。
+//
+// 只删产品名本身，不动「official CLI for ...」这类归属措辞之外的正文：
+// 实测「去掉 Claude Code」「只留后半句」都能通过，删产品名是最小改动面。
+//
+// 两条规则，按优先级：
+//  1. 命中 channelClientNames 里的已知产品名 → 删掉它；
+//  2. 未命中时按通用句式「You are <名字>, ...」删掉名字段——
+//     未列入词表的客户端（"You are Foobar, the official CLI for Baz."）走这条。
+func stripClientName(segment string) (string, bool) {
+	lowered := strings.ToLower(segment)
+	for _, name := range channelClientNames {
+		index := indexFrom(lowered, name, 0)
+		if index < 0 {
+			continue
+		}
+		// 去掉产品名及其后的空白，保留句子其余部分。
+		rest := segment[index+len(name):]
+		rest = strings.TrimLeft(rest, " \t")
+		head := segment[:index]
+		if strings.TrimSpace(head) == "" && strings.TrimSpace(rest) == "" {
+			continue
+		}
+		return head + rest, true
+	}
+	return stripSelfIntroduction(segment)
+}
+
+// stripSelfIntroduction 处理「You are <名字>, <归属措辞>」这种通用自称句式。
+//
+// 这是不依赖字面量的最后一条路径：只要句子是「You are X, ... official CLI/IDE/...」，
+// 就把 X 换成中性词。产品名未列入 channelClientNames 时靠它救回来
+// （2026-10-29 生产日志：未知客户端的第 1 级重试仍被拒，因为旧实现只查已知表）。
+func stripSelfIntroduction(segment string) (string, bool) {
+	const prefix = "you are "
+	lowered := strings.ToLower(segment)
+	index := indexFrom(lowered, prefix, 0)
+	if index < 0 {
+		return segment, false
+	}
+	start := index + len(prefix)
+	// 名字段到第一个逗号为止；没有逗号就不是这个句式。
+	rest := segment[start:]
+	comma := strings.IndexByte(rest, ',')
+	if comma <= 0 {
+		return segment, false
+	}
+	name := strings.TrimSpace(rest[:comma])
+	if name == "" || len(name) > 40 {
+		return segment, false
+	}
+	// 只换名字段，保留「, <归属措辞>」的其余部分。
+	return segment[:start] + "a coding assistant" + rest[comma:], true
 }
 
 // sentenceSpans 按句末标点与换行切句，返回半开区间的字节偏移。

@@ -119,23 +119,28 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 }
 
 // TestChatStreamChannelRejectionEscalatesForUnknownClients 未列入词表的客户端也要救回来：
-// 第一次原样被拒 → 按档位升级断词重发（通用归属句/正文全量）。
+// 第一次原样被拒 → 按档位升级重发（改写归属句）。
+//
+// 2026-10-29：判定依据从「含零宽字符」改为「触发句被改写」——上游已能识别断词，
+// 升级档也必须改字母，插零宽不再能通过。
 func TestChatStreamChannelRejectionEscalatesForUnknownClients(t *testing.T) {
 	attempts := 0
 	bodies := [][]byte{}
+	const trigger = "You are Foobar, a coding assistant for Baz."
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
 			raw, _ := io.ReadAll(r.Body)
 			bodies = append(bodies, raw)
-			if bytes.Contains(raw, []byte(wafBreakMarker)) {
-				return jsonResp(200, `{"choices":[{"index":0,"delta":{"content":"ok"}}]}`), nil
+			// 上游行为：触发句原样出现就拒；被改写则通过。
+			if bytes.Contains(raw, []byte(trigger)) {
+				return jsonResp(400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`), nil
 			}
-			return jsonResp(400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`), nil
+			return jsonResp(200, `{"choices":[{"index":0,"delta":{"content":"ok"}}]}`), nil
 		})},
 		ChatBaseCN: "https://chat.example",
 	}
-	body := []byte(`{"model":"m","messages":[{"role":"system","content":"You are Foobar, a coding assistant for Baz."},{"role":"user","content":"hi"}]}`)
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":"` + trigger + `"},{"role":"user","content":"hi"}]}`)
 	rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at"}, body, "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("status=%d err=%v", status, err)
@@ -144,9 +149,11 @@ func TestChatStreamChannelRejectionEscalatesForUnknownClients(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("attempts=%d want 2 (one escalated retry)", attempts)
 	}
-	if !bytes.Contains(bodies[1], []byte(wafBreakMarker)) &&
-		bytes.Contains(bodies[1], []byte("You are Foobar, a coding assistant for Baz.")) {
-		t.Fatalf("retry neither broke nor rewrote the attribution sentence: %s", bodies[1])
+	if bytes.Contains(bodies[1], []byte(trigger)) {
+		t.Fatalf("retry still carries the attribution sentence: %s", bodies[1])
+	}
+	if bytes.Contains(bodies[1], []byte(wafBreakMarker)) {
+		t.Fatalf("retry fell back to zero-width breaks (upstream detects them now): %s", bodies[1])
 	}
 }
 

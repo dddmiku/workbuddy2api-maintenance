@@ -71,11 +71,19 @@ func TestNeutralizeChannelTriggerEscalationLevels(t *testing.T) {
 		t.Fatal("level 0 cannot know an unlisted client")
 	}
 	out, changed := NeutralizeChannelTriggerAt([]byte(unknownClient), channelLevelAttribution)
-	if !changed || !strings.Contains(string(out), "\u200b") {
+	if !changed {
 		t.Fatal("attribution sentence was not neutralized at level 1")
 	}
-	if strings.Contains(string(out), "Always answer briefly.\u00a0") {
-		t.Fatal("unrelated sentence should stay intact")
+	// 2026-10-29\uff1a\u65ad\u8bcd\uff08\u63d2\u96f6\u5bbd\uff09\u5df2\u88ab\u4e0a\u6e38\u8bc6\u522b\uff0c\u5347\u7ea7\u6863\u4e5f\u5fc5\u987b\u6539\u5199\u5b57\u6bcd\u3002
+	// \u65ad\u8a00\u300c\u89e6\u53d1\u4e32\u6d88\u5931\u300d\u4e14\u300c\u6ca1\u6709\u9000\u56de\u63d2\u96f6\u5bbd\u300d\u3002
+	if strings.Contains(string(out), "You are Foobar, the official CLI for Baz") {
+		t.Fatalf("attribution sentence survived level 1: %s", out)
+	}
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 1 must rewrite letters, not insert zero-width: %s", out)
+	}
+	if strings.Contains(string(out), "Always answer briefly.") == false {
+		t.Fatalf("unrelated sentence must stay intact: %s", out)
 	}
 	plain := `{"model":"m","messages":[{"role":"user","content":"write a function that reverses a list"}]}`
 	if _, changed := NeutralizeChannelTriggerAt([]byte(plain), channelLevelAttribution); changed {
@@ -83,8 +91,11 @@ func TestNeutralizeChannelTriggerEscalationLevels(t *testing.T) {
 	}
 	structured := `{"model":"m","tool_choice":"auto","tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"mode":{"enum":["fast","safe"]}}}}}],"messages":[{"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"Read","arguments":"{\"mode\":\"fast\"}"}}]},{"role":"tool","tool_call_id":"call_abc","content":"done"}]}`
 	out, changed = NeutralizeChannelTriggerAt([]byte(structured), channelLevelAll)
-	if !changed {
-		t.Fatal("level 2 must always break some message text")
+	// 2026-10-29\uff1a\u7b2c 2 \u6863\u4ece\u300c\u5168\u91cf\u63d2\u96f6\u5bbd\u300d\u6539\u4e3a\u300c\u6539\u5199\u5b57\u6bcd\u300d\u3002\u4e0a\u9762\u8fd9\u4efd body \u6ca1\u6709\u4efb\u4f55
+	// \u81ea\u79f0\u5ba2\u6237\u7aef\u7684\u53e5\u5b50\uff0c\u6240\u4ee5\u4e0d\u518d\u6709\u53ef\u6539\u5199\u7684\u5185\u5bb9\u2014\u2014**\u4e0d\u52a8\u5c31\u662f\u6b63\u786e\u884c\u4e3a**\uff08\u96f6\u8bef\u4f24\uff09\u3002
+	// \u771f\u6b63\u8981\u5b88\u7684\u662f\uff1a\u7ed3\u6784\u6027\u5b57\u7b26\u4e32\u4e00\u4e2a\u5b57\u8282\u90fd\u4e0d\u80fd\u53d8\u3002
+	if changed {
+		t.Fatalf("level 2 must not touch a body with no attribution text: %s", out)
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(out, &parsed); err != nil {
@@ -101,7 +112,19 @@ func TestNeutralizeChannelTriggerEscalationLevels(t *testing.T) {
 	if call["function"].(map[string]any)["arguments"] != `{"mode":"fast"}` {
 		t.Fatalf("tool arguments were rewritten: %v", call["function"])
 	}
-	if !strings.Contains(parsed["messages"].([]any)[1].(map[string]any)["content"].(string), "\u200b") {
-		t.Fatal("message content was not broken at level 2")
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 2 must not fall back to zero-width breaks: %s", out)
+	}
+	// \u6709\u5f52\u5c5e\u53e5\u65f6\u7b2c 2 \u6863\u5fc5\u987b\u6539\u5199\uff0c\u4e14\u4e0d\u63d2\u96f6\u5bbd\u3002
+	withAttr := `{"model":"m","messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz."},{"role":"user","content":"hi"}]}`
+	out, changed = NeutralizeChannelTriggerAt([]byte(withAttr), channelLevelAll)
+	if !changed {
+		t.Fatal("level 2 must rewrite an attribution sentence")
+	}
+	if strings.Contains(string(out), "You are Foobar, the official CLI for Baz") {
+		t.Fatalf("attribution sentence survived level 2: %s", out)
+	}
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 2 must rewrite letters, not insert zero-width: %s", out)
 	}
 }

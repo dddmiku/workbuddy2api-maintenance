@@ -23,22 +23,27 @@ func TestChatAttemptObserverTracksInternalRetries(t *testing.T) {
 	t.Cleanup(func() { auth.SetGlobalEnabled(previousGlobal) })
 	const final = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
 	cases := []struct {
-		name, realm, input, rejected string
-		status                       int
-		paths                        []string
+		name, realm, input, rejected, system string
+		status                               int
+		paths                                []string
 	}{
 		{
 			name: "global-path", realm: "global", input: "audit",
+			system:   "Codex CLI is an open source project led by OpenAI",
 			rejected: `{"code":404,"msg":"not found","usage":{"prompt_tokens":7,"completion_tokens":2,"credit":0.5}}`,
 			status:   http.StatusNotFound, paths: []string{chatCompletionsPath, globalChatConsolePath},
 		},
 		{
 			name: "channel", realm: "cn", input: "audit",
+			// 未列入词表的客户端自称：第 0 档（只认已知字面量）改不动，
+			// 第 1 档的兜底改写（stripSelfIntroduction）能改——正好触发一次升级重试。
+			system:   "You are Foobar, the official CLI for Baz.",
 			rejected: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","usage":{"prompt_tokens":7,"completion_tokens":2,"credit":0.5}}`,
 			status:   http.StatusBadRequest, paths: []string{chatCompletionsPath, chatCompletionsPath},
 		},
 		{
 			name: "waf", realm: "cn", input: "<script>fixture</script>",
+			system:   "Codex CLI is an open source project led by OpenAI",
 			rejected: `<html><head><title>WAF Block Page</title></head><body>request blocked by WAF</body></html>`,
 			status:   http.StatusForbidden, paths: []string{chatCompletionsPath, chatCompletionsPath},
 		},
@@ -69,7 +74,12 @@ func TestChatAttemptObserverTracksInternalRetries(t *testing.T) {
 				discarded = append(discarded, append([]byte(nil), body...))
 				order = append(order, "retry")
 			})
-			body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"Codex CLI is an open source project led by OpenAI"},{"role":"user","content":"` + tc.input + `"}]}`
+			// channel 用例的 body 必须含一条「第 0 档改不动、升级档能改」的归属句，
+			// 否则预改写（NeutralizeBillingHeaders）已在发送前处理掉已知触发串，
+			// 三档全部返回 changed=false，重试根本不会发生。
+			// 2026-10-29：断词改为改写字母后，这条要求变得必须——旧的
+			// 「Codex CLI is an open source project led by OpenAI」已被预改写覆盖。
+			body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"` + tc.system + `"},{"role":"user","content":"` + tc.input + `"}]}`
 			account := &auth.Auth{UID: "attempt-fixture", AccessToken: "synthetic-only", Domain: "www.codebuddy.cn"}
 			if tc.realm == "global" {
 				account.Domain = "www.workbuddy.ai"

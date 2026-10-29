@@ -534,7 +534,11 @@ func TestUsageOutcomeInternalSamePathRetries(t *testing.T) {
 						if kind == "waf" {
 							input = "<script>fixture</script>"
 						}
-						body := fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,"messages":[{"role":"system","content":"Codex CLI is an open source project led by OpenAI"},{"role":"user","content":%q}]}`, stream, input)
+						// system 用「未列入词表的客户端自称」：第 0 档（已知字面量）
+						// 改不动，第 1 档的兜底改写能改 → 触发一次同路径重试。
+						// 2026-10-29：断词改改写字母后，原先的 Codex 句已被发送前的
+						// 预改写覆盖，三档全部无改动，重试不再发生。
+						body := fmt.Sprintf(`{"model":"cn:deepseek-v4.1-flash","stream":%t,"messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz."},{"role":"user","content":%q}]}`, stream, input)
 						h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 						want := usage.Totals{Requests: 1, FailedRequests: 1, UnreportedRequests: 1, PromptTokens: 200, CompletionTokens: 3, TotalTokens: 203, Credit: 0.75}
 						if finalSuccess {
@@ -572,7 +576,9 @@ func TestUsageOutcomeInternalRetryThenTransportFailure(t *testing.T) {
 		}
 		return nil, errors.New("fixture retry transport failure")
 	})
-	body := `{"model":"cn:deepseek-v4.1-flash","stream":true,"messages":[{"role":"system","content":"Codex CLI is an open source project led by OpenAI"},{"role":"user","content":"audit"}]}`
+	// system 用未列入词表的客户端自称：第 0 档改不动、第 1 档能改，
+	// 从而真的发生一次同路径重试（第二次触发 transport 失败）。
+	body := `{"model":"cn:deepseek-v4.1-flash","stream":true,"messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz."},{"role":"user","content":"audit"}]}`
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 	want := usage.Totals{Requests: 1, FailedRequests: 1, UnreportedRequests: 1, PromptTokens: 100, CompletionTokens: 2, TotalTokens: 102, Credit: 0.5}
 	if got := ledger.Snapshot().Totals; calls != 2 || got != want {

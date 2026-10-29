@@ -30,9 +30,10 @@ func TestChannelRejectionIsExplicitAndDoesNotRotate(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"upstream_channel_rejected"`) {
 		t.Fatalf("channel rejection lost: %d %s", recorder.Code, recorder.Body)
 	}
-	// 2.4.4 起被渠道拒绝会按档位断词重发（这里正文无客户端归属句，一档升到「正文全量」），
-	// 但上限固定、且始终不轮换账号：上游一直拒绝时仍是同号两次尝试，然后如实返回渠道拒绝。
-	if strings.Contains(recorder.Body.String(), "content_blocked") || strings.Contains(recorder.Body.String(), "违规词") || requests != 2 {
+	// 2026-10-29：断词（插零宽）已被上游识别，升级档改为「改写字母」。
+	// 这份正文里没有任何客户端归属句，因此没有可改写的内容——**只发一次是对的**，
+	// 无谓的重发既浪费往返又掩盖真实原因。关键断言不变：不轮换账号、如实返回渠道拒绝。
+	if strings.Contains(recorder.Body.String(), "content_blocked") || strings.Contains(recorder.Body.String(), "违规词") || requests != 1 {
 		t.Fatalf("wrong diagnosis or rotation: requests=%d body=%s", requests, recorder.Body)
 	}
 	for _, uid := range []string{"u1", "u2"} {
