@@ -1322,7 +1322,7 @@ func TestListAuthFilesFallsBackToFilenameWhenCorrupt(t *testing.T) {
 func TestAuthSummaryBothDocumentShapes(t *testing.T) {
 	h := newHarness(t)
 	authDir := h.server.opts.AuthDir
-	nested := `{"account":{"uid":"nested01","nickname":"昵称A","enterpriseId":"ent-1"},` +
+	nested := `{"account":{"uid":"nested01","nickname":"昵称A","enterpriseId":"ent-1","mobile":"157******41"},` +
 		`"auth":{"accessToken":"t","expiresAt":1800000000,"domain":"codebuddy.cn","realm":"cn"}}`
 	flat := `{"uid":"flat0001","accessToken":"t","realm":"global","domain":"workbuddy.ai","expiresAt":"1800000001"}`
 	if err := os.WriteFile(filepath.Join(authDir, "workbuddy-nested01.json"), []byte(nested), 0600); err != nil {
@@ -1340,9 +1340,18 @@ func TestAuthSummaryBothDocumentShapes(t *testing.T) {
 		a.Domain != "codebuddy.cn" || a.ExpiresAt != 1800000000 || !a.Parsable {
 		t.Fatalf("嵌套形摘要不对：%+v", a)
 	}
+	// 手机号来自 account.mobile（Trae 加号时由 GetUserInfo 写入，掩码形态）。
+	// 前端拿它替换 uid 显示，让运维能对上「这是谁的号」。
+	if a.Mobile != "157******41" {
+		t.Fatalf("mobile 未读出：%+v", a)
+	}
 	b := byUID["flat0001"]
 	if b.Nickname != "flat0001" || b.Realm != "global" || b.ExpiresAt != 1800000001 || !b.Parsable {
 		t.Fatalf("扁平形摘要不对（nickname 应回落到 uid）：%+v", b)
+	}
+	// 没有 mobile 字段时留空串——前端据此回落到 uid 显示。
+	if b.Mobile != "" {
+		t.Fatalf("无 mobile 时应留空：%+v", b)
 	}
 	// realm 缺失时留空串，由前端兜底成 cn——硬填会让「未标注域」与「明确 cn」无法区分。
 	if err := os.WriteFile(filepath.Join(authDir, "workbuddy-norealm.json"), []byte(`{"uid":"norealm1"}`), 0600); err != nil {

@@ -20,11 +20,15 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream/trae"
 )
 
 // loginStart 生成扫码登录链接。
@@ -256,21 +260,38 @@ func (s *Server) writeAuthFile(pollResult map[string]any) (map[string]any, error
 // 文件名用 trae- 前缀区分域（网关按内容里的 realm 判定，前缀只是运维可读性），
 // 但**必须仍匹配网关的 AuthFileGlob**（workbuddy*.json）才会被扫描到。
 func (s *Server) writeTraeAuthFile(creds map[string]any, uid string, expiresAt int64) (map[string]any, error) {
+	accessToken := jsonString(creds["access_token"])
+	account := map[string]any{
+		"uid":      uid,
+		"nickname": firstNonEmpty(jsonString(creds["nickname"]), uidPrefix(uid)),
+	}
+	// 补手机号：Trae 的 uid 是一串内部数字（如 411685466945619），运维看不出
+	// 哪个号是哪个。GetUserInfo 会返回掩码手机号（157******41）与真实昵称，
+	// 这是唯一能把账号和「人」对上的标识。
+	//
+	// 失败不阻断加号：手机号只是展示用，拿不到就留空，前端回落到 uid。
+	// 上游偶发超时/接口变更都不该让「加号」这个主流程失败。
+	if info, err := s.fetchTraeUserInfo(accessToken, uid); err == nil {
+		if info.Mobile != "" {
+			account["mobile"] = info.Mobile
+		}
+		if name := strings.TrimSpace(info.ScreenName); name != "" {
+			account["nickname"] = name
+		}
+	} else {
+		log.Printf("WARN: [面板] 取 Trae 账号资料失败（不影响加号）uid=%s: %v", uid, err)
+	}
 	doc := map[string]any{
-		"account": map[string]any{
-			"uid":      uid,
-			"nickname": firstNonEmpty(jsonString(creds["nickname"]), uidPrefix(uid)),
-		},
+		"account": account,
 		"auth": map[string]any{
-			"accessToken":  jsonString(creds["access_token"]),
+			"accessToken":  accessToken,
 			"refreshToken": jsonString(creds["refresh_token"]),
 			"expiresAt":    expiresAt,
 			"domain":       firstNonEmpty(jsonString(creds["host"]), "api.trae.cn"),
 			"realm":        "trae",
 		},
 	}
-	auth := doc["auth"].(map[string]any)
-	if jsonString(auth["accessToken"]) == "" {
+	if accessToken == "" {
 		return nil, formatError("授权结果里没有 access_token")
 	}
 	finalPath := filepath.Join(s.opts.AuthDir, "workbuddy-trae-"+uid+".json")
@@ -279,9 +300,24 @@ func (s *Server) writeTraeAuthFile(creds map[string]any, uid string, expiresAt i
 	}
 	return map[string]any{
 		"uid": uid, "nickname": jsonString(doc["account"].(map[string]any)["nickname"]),
-		"realm": "trae", "expiresAt": expiresAt,
+		"mobile": jsonString(account["mobile"]),
+		"realm":  "trae", "expiresAt": expiresAt,
 		"expiresInDays": round1(float64(maxInt64(0, expiresAt-s.now().Unix())) / 86400.0),
 	}, nil
+}
+
+// fetchTraeUserInfo 用刚拿到的 accessToken 查账号资料（掩码手机号 + 昵称）。
+//
+// 单独包一层是为了让调用点能简单地「失败就跳过」：这个调用不是加号的关键路径。
+func (s *Server) fetchTraeUserInfo(accessToken, uid string) (trae.UserInfo, error) {
+	if accessToken == "" {
+		return trae.UserInfo{}, formatError("缺少 accessToken")
+	}
+	return trae.GetUserInfo(context.Background(), &auth.Auth{
+		UID:         uid,
+		AccessToken: accessToken,
+		Domain:      "api.trae.cn",
+	})
 }
 
 // writeAuthDocument 原子写一个 auth 文件：先落临时文件、改属主权限，再 rename。

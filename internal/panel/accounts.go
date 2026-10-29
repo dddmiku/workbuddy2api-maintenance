@@ -58,6 +58,12 @@ type AuthSummary struct {
 	ExpiresAt    int64  `json:"expiresAt"`
 	Disabled     bool   `json:"disabled"`
 	Parsable     bool   `json:"parsable"`
+	// Mobile 是掩码手机号（Trae 账号才有，形如 157******41）。
+	//
+	// 落盘位置：账号文件的 account.mobile。由添加账号时的 GetUserInfo 写入，
+	// 面板只读不查——每次刷新都打 6 次上游接口会把页面拖慢 1-2 秒，
+	// 而手机号几乎不变。
+	Mobile string `json:"mobile,omitempty"`
 }
 
 // AccountStore 管理 auths 目录。
@@ -144,6 +150,9 @@ func Summary(entry AuthEntry) AuthSummary {
 		out.Nickname = entry.UID
 	}
 	out.EnterpriseID = firstString(acct, "enterpriseId")
+	// 手机号：Trae 账号由 GetUserInfo 写入 account.mobile（掩码形态）。
+	// 旧账号没有这个字段，留空由前端回落到 uid 显示。
+	out.Mobile = firstString(acct, "mobile")
 	out.Domain = firstString(auth, "domain")
 	// realm 缺失时留空串（不是 "cn"）：面板用 realmOf() 兜底成 cn，
 	// 在这里硬填会让「未标注域」与「明确 cn」无法区分。
