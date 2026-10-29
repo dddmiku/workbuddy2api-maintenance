@@ -137,3 +137,61 @@ func TestUppercaseZeroWidthAttributionIsRewritten(t *testing.T) {
 		t.Fatalf("原大写句仍存留: %s", out)
 	}
 }
+
+// 2026-10-29（另一台设备生产实测补充）：DeepSeek Harness 的归属句与
+// 带 @ 的包名标识同样命中 11128。两条都必须能改写。
+func TestHarnessAndAtTokensAreRewritten(t *testing.T) {
+	cases := []struct {
+		name, body, mustVanish, mustAppear string
+	}{
+		{
+			name:       "harness 归属句",
+			body:       `{"model":"m","messages":[{"role":"system","content":"You are DeepSeek Harness, an official coding agent."},{"role":"user","content":"hi"}]}`,
+			mustVanish: "You are DeepSeek Harness",
+			mustAppear: "You are a coding assistant",
+		},
+		{
+			name:       "@anthropic-ai 首行",
+			body:       `{"model":"m","messages":[{"role":"system","content":"Use @anthropic-ai/sdk here."},{"role":"user","content":"hi"}]}`,
+			mustVanish: "@anthropic-ai",
+			mustAppear: "anthropic-ai",
+		},
+		{
+			// 关键用例：@ 包名出现在 system 正文中段（skill 清单、工具描述），
+			// 不在首行。只走首行档会完全漏掉，必须走全文路径。
+			name:       "@anthropic-ai 非首行",
+			body:       `{"model":"m","messages":[{"role":"system","content":"line one\n\nskills: @anthropic-ai, @deepseek-ai"},{"role":"user","content":"hi"}]}`,
+			mustVanish: "@anthropic-ai",
+			mustAppear: "anthropic-ai",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, changed := NeutralizeBillingHeaders([]byte(tc.body))
+			if !changed {
+				t.Fatalf("未发生改写: %s", tc.body)
+			}
+			if bytes.Contains(out, []byte(tc.mustVanish)) {
+				t.Fatalf("触发串仍在: %s", out)
+			}
+			if !bytes.Contains(out, []byte(tc.mustAppear)) {
+				t.Fatalf("未替换成预期形态: %s", out)
+			}
+			if bytes.Contains(out, []byte(wafBreakMarker)) {
+				t.Fatalf("退回插零宽（上游已识别）: %s", out)
+			}
+		})
+	}
+}
+
+// 零误伤：正文里没有这些串时，一个字节都不许动。
+func TestAnywhereTokensLeaveCleanBodyUntouched(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":"A normal system prompt with no triggers."},{"role":"user","content":"hi"}]}`)
+	out, changed := NeutralizeBillingHeaders(body)
+	if changed {
+		t.Fatalf("无触发串却被改动: %s", out)
+	}
+	if !bytes.Equal(out, body) {
+		t.Fatalf("无触发串时 body 必须逐字节不变")
+	}
+}

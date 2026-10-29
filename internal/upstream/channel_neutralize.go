@@ -205,6 +205,17 @@ var channelAttributionRewrites = []struct {
 		"Codex CLI is an open source project led by OpenAI",
 		"A CLI coding tool is an open source project.",
 	},
+	// 2026-10-29（另一台设备上的生产实测）：DeepSeek Harness 的客户端归属句
+	// 同样命中 11128。它出现在系统提示里声明自己是官方 harness，
+	// 改写后（换成中性说法）通过。
+	{
+		"You are DeepSeek Harness",
+		"You are a coding assistant",
+	},
+	// 带 @ 的产品标识（skill 清单里的 `@anthropic-ai`、`@deepseek-ai` 这类包名写法）。
+	// 上游把它们当渠道特征匹配；去掉 @ 前缀后不再命中，语义仍是「某个包」。
+	{"@anthropic-ai", "anthropic-ai"},
+	{"@deepseek-ai", "deepseek-ai"},
 }
 
 
@@ -840,6 +851,11 @@ var preNeutralizeTriggers = []string{
 	// 以下两条来自第 0 档已实测指纹（channelTriggerSentences）。
 	"Codex CLI is an open source project led by OpenAI",
 	"You are Claude Code, Anthropic's official CLI for Claude",
+	// 2026-10-29：DeepSeek Harness 的归属句与带 @ 的包名标识同样命中 11128。
+	// 提前改写省掉「先被拒一次再重试」的往返（与上面三条同理）。
+	"You are DeepSeek Harness",
+	"@anthropic-ai",
+	"@deepseek-ai",
 }
 
 // NeutralizeBillingHeaders 发送前断开 system 首行的已知渠道触发串；没命中时原样返回 false。
@@ -867,7 +883,19 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	changed := false
-	if !neutralizeSystemFirstLine(obj, &changed) {
+	// 首行档：计费头、归属句这类「上游只看 system 第一行」的串。
+	if neutralizeSystemFirstLine(obj, &changed) {
+		changed = true
+	}
+	// 全文档：与位置无关的串（包名写法 @anthropic-ai 之类）。
+	//
+	// 为什么要单独一条路径：@ 开头的包名出现在 system 正文中段（skill 清单、
+	// 工具描述），不在首行——只走首行档会完全漏掉。这类串本身不含「渠道归属」
+	// 语义，改动它们对模型无影响，因此可以全文处理而不违反零误伤契约。
+	if neutralizeAnywhereTokens(obj, &changed) {
+		changed = true
+	}
+	if !changed {
 		return body, false
 	}
 	out, err := json.Marshal(obj)
@@ -875,6 +903,79 @@ func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return out, true
+}
+
+// anywhereTokens 与位置无关、可全文改写的串（不限于 system 首行）。
+//
+// 入选标准：出现在任何位置都会被上游当渠道特征匹配，且改写后语义不变。
+// 与 preNeutralizeTriggers 的区别：后者是「已知在首行必被拒」的串，
+// 这里的是「在哪都可能被拒」的串。
+var anywhereTokens = []struct{ trigger, replace string }{
+	// 包名写法：@anthropic-ai/sdk、@deepseek-ai/core 这类。去掉 @ 前缀即可，
+	// 仍是可读的包名（anthropic-ai/sdk），模型不受影响。
+	{"@anthropic-ai", "anthropic-ai"},
+	{"@deepseek-ai", "deepseek-ai"},
+}
+
+// neutralizeAnywhereTokens 对消息正文做与位置无关的串改写。
+//
+// 只动命中的字面量，其余字节原样保留（与首行档同一契约）。
+func neutralizeAnywhereTokens(obj any, changed *bool) bool {
+	root, ok := obj.(map[string]any)
+	if !ok {
+		return false
+	}
+	touched := false
+	apply := func(text string) string {
+		if text == "" {
+			return text
+		}
+		out := text
+		for _, rw := range anywhereTokens {
+			for {
+				index := indexFrom(out, rw.trigger, 0)
+				if index < 0 {
+					break
+				}
+				out = out[:index] + rw.replace + out[index+len(rw.trigger):]
+				touched = true
+			}
+		}
+		return out
+	}
+	visit := func(message map[string]any) {
+		if content, ok := message["content"].(string); ok {
+			message["content"] = apply(content)
+			return
+		}
+		if parts, ok := message["content"].([]any); ok {
+			for _, raw := range parts {
+				part, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				for _, key := range []string{"text", "thinking", "input_text"} {
+					if text, ok := part[key].(string); ok {
+						part[key] = apply(text)
+					}
+				}
+			}
+		}
+	}
+	if messages, ok := root["messages"].([]any); ok {
+		for _, raw := range messages {
+			if message, ok := raw.(map[string]any); ok {
+				visit(message)
+			}
+		}
+	}
+	if text, ok := root["system"].(string); ok {
+		root["system"] = apply(text)
+	}
+	if touched {
+		*changed = true
+	}
+	return touched
 }
 
 // containsAnyTrigger 报告 body 里是否**可能**含有任一触发串（字节级，区分大小写）。
@@ -892,6 +993,13 @@ func containsAnyTrigger(body []byte) bool {
 	}
 	for _, token := range channelFirstLineTriggerTokens {
 		if bytes.Contains(body, []byte(token)) {
+			return true
+		}
+	}
+	// 预改写表里的串也要检查：它们同样需要进入完整路径才能被改写。
+	// 漏掉这一步的表现是「发送前预改写从不触发」，请求照旧先撞一次 11128。
+	for _, trigger := range preNeutralizeTriggers {
+		if bytes.Contains(body, []byte(trigger)) {
 			return true
 		}
 	}
