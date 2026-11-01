@@ -94,17 +94,12 @@ func (p *Pool) pickByUIDForModelRealm(uid, model, realm string, d *Decision) *au
 		return nil
 	}
 	d.stage("healthy", 1)
-	// 快过期积分优先：付费模型上，若别的号有快过期积分而本号没有，粘性必须让路。
-	// 否则粘性命中会绕开 pick() 里的硬过滤（2026-11-01 现场：8913 次决策全是
-	// sticky_hit，快过期积分一次都没被优先消耗）。
-	if p.expiringDeferred(e, model) {
-		if d != nil {
-			d.stage("healthy", 1)
-			d.exclude("expiring_deferred")
-			d.ReasonCode, d.SelectionMethod = "expiring_deferred", "sticky"
-		}
-		return nil
-	}
+	// 粘性命中**不**做快过期让路（2026-11-01 用户决策）。
+	//
+	// 快过期优先只在**新建会话**时生效：没有粘性绑定的请求走 pick()，那里有
+	// 硬过滤；已绑定会话保持原号，避免同一对话在多个号之间跳。
+	// 用户明确选择「会话连续性 > 中途切号省积分」——切号会让上游看到同一对话
+	// 的上下文在多个账号间迁移，既影响缓存命中，也可能被风控关联。
 	if p.inFlightFull(e) {
 		d.unavailableSticky("in_flight_full")
 		return nil
