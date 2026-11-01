@@ -403,6 +403,37 @@ func (p *Pool) pickWeightedWithDecision(cands []weighted, d *Decision) *entry {
 	return cands[len(cands)-1].e
 }
 
+// expiringDeferred 报告「这个账号应当为快过期积分让路」。
+//
+// 语义（与 pick() 里的硬过滤同一口径，2026-11-01 抽出供粘性路径复用）：
+// 付费模型上，只要**池里存在别的号**有快过期积分、而本号没有，本号就不该被选中
+// ——积分到期即作废，花掉的每一分都是省下的真金白银。
+//
+// 为什么粘性路径必须调它：粘性命中发生在 pick() 之前（handler 先试
+// PickByUIDForModelRealm，未命中才回落普通选号），而硬过滤写在 pick() 里。
+// 2026-11-01 现场：8913 次决策全是 sticky_hit，快过期积分一次都没被优先消耗。
+//
+// 三个安全边界（任一不成立即返回 false，保持原有行为）：
+//   - 非付费模型：免费模型不扣积分，压流量到快过期号上无收益；
+//   - 本号自己就有快过期积分：无差别，不必让路；
+//   - 池里没有别的号带快过期积分：让路只会选不到号，宁可继续用本号。
+//
+// 调用方需持有 p.mu（读 byUID / entries 与 pick 一致）。
+func (p *Pool) expiringDeferred(e *entry, model string) bool {
+	if e == nil || e.creditsExpiring > 0 {
+		return false
+	}
+	if !p.modelIsPaid(e.a.Realm(), model) {
+		return false
+	}
+	for _, other := range p.byUID {
+		if other != e && other.creditsExpiring > 0 && other.unavailableReason(time.Now(), model) == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // weightEpsilon 等权重判定的浮点容差：权重公式微调（如 EMA 引入）后权重不再
 // 位级相等，精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
 const weightEpsilon = 1e-9

@@ -94,6 +94,17 @@ func (p *Pool) pickByUIDForModelRealm(uid, model, realm string, d *Decision) *au
 		return nil
 	}
 	d.stage("healthy", 1)
+	// 快过期积分优先：付费模型上，若别的号有快过期积分而本号没有，粘性必须让路。
+	// 否则粘性命中会绕开 pick() 里的硬过滤（2026-11-01 现场：8913 次决策全是
+	// sticky_hit，快过期积分一次都没被优先消耗）。
+	if p.expiringDeferred(e, model) {
+		if d != nil {
+			d.stage("healthy", 1)
+			d.exclude("expiring_deferred")
+			d.ReasonCode, d.SelectionMethod = "expiring_deferred", "sticky"
+		}
+		return nil
+	}
 	if p.inFlightFull(e) {
 		d.unavailableSticky("in_flight_full")
 		return nil
