@@ -24,7 +24,7 @@ func TestChatStreamAlwaysRequestsMeasuredUsage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := testClient(func(r *http.Request) (*http.Response, error) {
 				var sent map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+				if err := json.Unmarshal(readReqBody(r), &sent); err != nil {
 					t.Fatal(err)
 				}
 				options, _ := sent["stream_options"].(map[string]any)

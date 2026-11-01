@@ -24,7 +24,7 @@ func responsesToolMediaRequest(t *testing.T, input []any, imageBudget int) (map[
 		ChatBaseCN: "https://tool-media.invalid",
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			calls++
-			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			if err := json.Unmarshal(readReqBody(r), &captured); err != nil {
 				t.Errorf("decode outbound body: %v", err)
 			}
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil

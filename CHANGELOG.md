@@ -1,5 +1,15 @@
 # 版本变更
 
+## v3.15.0 — 2026-10-31
+
+按官方客户端 V5.9.3 抓包复刻 chat 出站请求，修 cn 域账号被判「异常行为」（11140）。
+
+修两处结构性错误：CN chat 上游从 `copilot.tencent.com` 改为官方实发的 `www.workbuddy.cn`；`X-Domain` 改为 chat 目标站点域，不再透传登录域 `www.codebuddy.cn`。
+
+修请求 ID 形态：`X-Conversation-Request-ID` 等改为 UUIDv7，官方前 48 位是毫秒时间戳，此前纯随机填充解码是 2001~8000 年乱值。
+
+补齐 `baggage`、`X-Agent-Runtime`、请求体 gzip；`Accept` 改 `application/json`；chat 停发 `Accept-Language` / `X-No-Enterprise-Id` / `X-Gateway-Request-ID`；UA 升 5.9.3。
+
 ## v3.14.6 — 2026-10-29
 
 补两条命中 11128 的触发形态：DeepSeek Harness 的客户端归属句，以及 `@anthropic-ai` / `@deepseek-ai` 这类包名写法。

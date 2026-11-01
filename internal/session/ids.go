@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ScopeKey namespaces client-controlled identities with the authenticated key ID
@@ -59,17 +60,46 @@ func ResolveConversationID(body []byte) string {
 	return strOrEmpty(obj["conversationId"])
 }
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
+// NewMessageID 生成消息级 ID：32 位 hex，**UUIDv7 形态**（前 48 位是毫秒时间戳，
+// 版本位 = 7，变体位 = RFC 4122）。
+//
+// 为什么必须是 v7 而不是纯随机（2026-10-31 抓包实证）：
+// 官方桌面端 X-Request-ID / X-Conversation-Message-ID / X-Conversation-Request-ID
+// / acp-connection-id 全部是 UUIDv7 去横线形态——把官方抓包（_wb_capture2 的
+// 005747_0101、_wb_capture_new 的 033/039）的 ID 前 48 位按毫秒时间戳解码，
+// 得到的时刻与抓包时刻逐秒吻合（01a145a5e4b6 → 2026-10-16T16:57:42.326Z）。
+// 网关此前用 crypto/rand 纯随机填充，解码后是 2001~8000 年间的乱值——这是
+// 「ID 形态不像官方客户端」的硬指纹：一个声称 WorkBuddy/5.9.3 的客户端，
+// 不可能发出时间戳乱跳的请求 ID。
+//
+// 保持向后兼容：仍是 32 位小写 hex、仍满足 validTraceID / uuidFormatted /
+// acpConnectionID 的全部前置条件（它们只校验长度与字符集）。
 func NewMessageID() string {
-	b := make([]byte, 16)
-	if _, err := cryptorand.Read(b); err == nil {
-		return hex.EncodeToString(b)
+	return newUUIDv7()
+}
+
+// newUUIDv7 生成 RFC 9562 UUIDv7 的 32 位小写 hex 形态（去横线）。
+// 布局：48 位 unix 毫秒 | 4 位版本(=7) | 12 位 rand_a | 2 位变体(=0b10) | 62 位 rand_b。
+func newUUIDv7() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		// 熵源故障的极端兜底：仍保证 32 hex、仍带正确时间戳与版本位。
+		// #nosec G404 -- crypto/rand 已先行；这里仅为理论上失败时的兜底，
+		// 生成的是对客户端可见的聚合 ID，不做安全凭据。
+		for i := 6; i < 16; i++ {
+			b[i] = byte(rand.Uint64())
+		}
 	}
-	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
-	// #nosec G404 -- crypto/rand 已在上一行先行；这里是它理论上失败时的兜底，仅用于生成对客户端可见的 ID，不做安全凭据
-	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
+	b[6] = (b[6] & 0x0F) | 0x70 // 版本 7
+	b[8] = (b[8] & 0x3F) | 0x80 // 变体 RFC 4122
+	return hex.EncodeToString(b[:])
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法

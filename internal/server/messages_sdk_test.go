@@ -33,7 +33,7 @@ func TestMessagesOfficialSDKContract(t *testing.T) {
 	releaseTools := func() { release.Do(func() { close(permit) }) }
 	defer releaseTools()
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body := readReqBody(r)
 		if err != nil {
 			t.Error(err)
 			return

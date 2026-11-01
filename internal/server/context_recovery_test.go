@@ -64,10 +64,7 @@ func TestContextLimitPreservesHistoryAndSignalsRecovery(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					var calls atomic.Int32
 					remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						data, err := io.ReadAll(r.Body)
-						if err != nil {
-							t.Errorf("read request: %v", err)
-						}
+						data := readReqBody(r)
 						if calls.Add(1) == 1 {
 							if !strings.Contains(string(data), "keep-earliest-canary") || !strings.Contains(string(data), "keep-latest-canary") {
 								t.Error("initial request lost context")

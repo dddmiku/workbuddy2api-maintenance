@@ -5,7 +5,6 @@ package upstream
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -129,11 +128,7 @@ func TestChatStreamWireBodyPreservesBusinessContent(t *testing.T) {
 		t.Run(fmt.Sprintf("legacy_sanitize=%t", legacySanitize), func(t *testing.T) {
 			wire := make(chan []byte, 1)
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
+				body := readReqBody(r)
 				wire <- body
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte("data: [DONE]\n\n"))

@@ -91,7 +91,7 @@ func globalEffortChatSrv(t *testing.T, modelsBody string, capture func([]byte)) 
 			w.WriteHeader(200)
 			_, _ = io.WriteString(w, modelsBody)
 		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
-			body, _ := io.ReadAll(r.Body)
+			body := readReqBody(r)
 			if capture != nil {
 				capture(body)
 			}

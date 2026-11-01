@@ -139,7 +139,7 @@ func TestActNoteReachesNativeChatPath(t *testing.T) {
 	// 生产由 main.go 经 ActNoteFor 解析后注入；测试里直接构造 Handler，需显式设置。
 	h.cfg.PromptActNote = ActNoteFor("")
 	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		raw, _ := io.ReadAll(req.Body)
+		raw := readReqBody(req)
 		captured = raw
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -178,7 +178,7 @@ func TestActNoteSkippedOnNativeChatWithoutTools(t *testing.T) {
 	h, _ := postreleaseUsageHandler(t, postreleaseUsageContent+postreleaseFinish("stop")+"data: [DONE]\n\n")
 	h.cfg.PromptActNote = ActNoteFor("")
 	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		raw, _ := io.ReadAll(req.Body)
+		raw := readReqBody(req)
 		captured = raw
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -203,7 +203,7 @@ func TestActNoteNotInjectedTwiceOnResponsesPath(t *testing.T) {
 	h, _ := postreleaseUsageHandler(t, postreleaseUsageContent+postreleaseFinish("stop")+"data: [DONE]\n\n")
 	h.cfg.PromptActNote = ActNoteFor("")
 	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		raw, _ := io.ReadAll(req.Body)
+		raw := readReqBody(req)
 		captured = raw
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -233,7 +233,7 @@ func TestActNoteNotInjectedTwiceOnResponsesPath(t *testing.T) {
 func TestActNoteSurvivesCustomPromptMode(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			outbound = raw
 			return &http.Response{
 				StatusCode: 200,

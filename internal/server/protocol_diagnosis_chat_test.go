@@ -275,7 +275,7 @@ func TestProtocolDiagnosisChatBuiltinDeclarationsDoNotLeakUpstream(t *testing.T)
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return http.StatusOK, sseOK, true })
 	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Body != nil {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			_ = json.Unmarshal(raw, &sent)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil
@@ -334,7 +334,7 @@ func TestProtocolDiagnosisChatLongNamesRoundTrip(t *testing.T) {
 		var sent map[string]any
 		up := newFakeUpstream(t, func(string) (int, string, bool) { return http.StatusOK, sseOK, true })
 		up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			_ = json.Unmarshal(raw, &sent)
 			tools := sent["tools"].([]any)
 			alias := tools[0].(map[string]any)["function"].(map[string]any)["name"].(string)

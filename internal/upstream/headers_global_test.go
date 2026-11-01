@@ -10,14 +10,14 @@ import (
 
 // globalUAString global realm 默认出站 UA。
 //
-// 2026-10-17 双端抓包实测（5.8.4）：
+// 2026-10-29 双端抓包实测（V5.9.3）：
 //
-//	global → `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
-//	CN     → `WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0`
+//	global → `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0`
+//	CN     → `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`
 //
 // 第二段按 realm 分流：国际版用**全小写连字符** `workbuddy-ai`，国内版沿用
 // `WorkBuddy`。此前两 realm 同形（2026-09-17 对 5.5.2 抓包的结论）已被实测推翻。
-const globalUAString = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
+const globalUAString = "WorkBuddy/" + defaultClientVersion + " workbuddy-ai/" + defaultClientVersion + " CLI/" + defaultCliVersion
 
 // TestChatHeadersGlobalRealm global 账号的 chat 请求头对齐 intl 三件套：
 //  1. UA 用官方国际版实测形态 `WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`；
@@ -35,8 +35,9 @@ func TestChatHeadersGlobalRealm(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != globalUAString {
 		t.Errorf("global UA = %q want %q", got, globalUAString)
 	}
-	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
-		t.Errorf("global X-No-Enterprise-Id = %q want %q", got, "1")
+	// 2026-10-31 按官方抓包修正：官方 global chat 不发 X-No-Enterprise-Id。
+	if got := req.Header.Get("X-No-Enterprise-Id"); got != "" {
+		t.Errorf("global X-No-Enterprise-Id = %q want empty（官方 global chat 不发）", got)
 	}
 	if got := req.Header.Get("X-Domain"); got != "www.workbuddy.ai" {
 		t.Errorf("global X-Domain = %q want %q", got, "www.workbuddy.ai")
@@ -47,9 +48,12 @@ func TestChatHeadersGlobalRealm(t *testing.T) {
 	}
 }
 
-// TestChatHeadersCNRealm CN 账号头零回归：UA 用 `WorkBuddy` 平台段、不注入
-// global 专属的 X-No-Enterprise-Id / X-Domain: www.workbuddy.ai；EnterpriseID 非空
-// 走原有 X-Enterprise-Id 分支，Domain 空走原有 X-No-Department-Info 分支。
+// TestChatHeadersCNRealm CN 账号头：UA 用 `WorkBuddy` 平台段、不注入 global 专属的
+// X-No-Enterprise-Id；EnterpriseID 非空走 X-Enterprise-Id 分支。
+//
+// 2026-10-31 按官方抓包修正断言：CN 桌面端 chat 请求**不发** X-No-Enterprise-Id，
+// 且 X-Domain 恒为 www.workbuddy.cn（chat 上游域，不是登录域）。原断言
+// 「X-Domain 空 → X-No-Department-Info」是网关自造形态，官方从不产生。
 func TestChatHeadersCNRealm(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "c1", EnterpriseID: "e1"} // CN 企业账号 + 无 domain
 	req := mustRequest(t)
@@ -66,13 +70,13 @@ func TestChatHeadersCNRealm(t *testing.T) {
 		t.Errorf("CN X-Enterprise-Id = %q want e1", got)
 	}
 	if got := req.Header.Get("X-No-Enterprise-Id"); got != "" {
-		t.Errorf("CN X-No-Enterprise-Id = %q want empty (enterprise set)", got)
+		t.Errorf("CN X-No-Enterprise-Id = %q want empty (官方 CN chat 不发该头)", got)
 	}
-	if got := req.Header.Get("X-Domain"); got != "" {
-		t.Errorf("CN X-Domain = %q want empty (domain empty → X-No-Department-Info)", got)
+	if got := req.Header.Get("X-Domain"); got != "www.workbuddy.cn" {
+		t.Errorf("CN X-Domain = %q want www.workbuddy.cn (chat 上游域，非登录域)", got)
 	}
-	if got := req.Header.Get("X-No-Department-Info"); got != "1" {
-		t.Errorf("CN X-No-Department-Info = %q want 1 (zero regression)", got)
+	if got := req.Header.Get("X-No-Department-Info"); got != "" {
+		t.Errorf("CN X-No-Department-Info = %q want empty (X-Domain supersedes)", got)
 	}
 }
 
@@ -86,8 +90,9 @@ func TestChatHeadersGlobalStrongOverride(t *testing.T) {
 	c := &Client{}
 	c.ChatHeaders(req, a, "", ChatMeta{})
 
-	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
-		t.Errorf("global(virtual enterprise) X-No-Enterprise-Id = %q want 1", got)
+	// 官方 global chat 不发 X-No-Enterprise-Id（2026-10-31 抓包实证）。
+	if got := req.Header.Get("X-No-Enterprise-Id"); got != "" {
+		t.Errorf("global(virtual enterprise) X-No-Enterprise-Id = %q want empty", got)
 	}
 	if got := req.Header.Get("X-Enterprise-Id"); got != "" {
 		t.Errorf("global(virtual enterprise) X-Enterprise-Id = %q want empty", got)
@@ -113,22 +118,25 @@ func TestChatHeadersGlobalWithConfiguredDomain(t *testing.T) {
 	}
 }
 
-// TestChatHeadersCNNoEnterpriseZeroRegression CN 无企业/无 domain 的老形态账号：
-// X-No-Enterprise-Id=1 + X-No-Department-Info=1（各自缺省），不注入 global 的 X-Domain。
+// TestChatHeadersCNNoEnterpriseZeroRegression CN 无企业账号：X-Domain 仍归一为
+// www.workbuddy.cn（chat 上游域），不发 X-No-Enterprise-Id（官方 CN chat 无此头）。
+//
+// 2026-10-31 按官方抓包修正：原断言「X-No-Enterprise-Id=1 + X-No-Department-Info=1 +
+// 无 X-Domain」是网关自造形态，官方 CN 桌面端从不这样发。
 func TestChatHeadersCNNoEnterpriseZeroRegression(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "c2"}
 	req := mustRequest(t)
 	c := &Client{}
 	c.ChatHeaders(req, a, "", ChatMeta{})
 
-	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
-		t.Errorf("CN(no enterprise) X-No-Enterprise-Id = %q want 1", got)
+	if got := req.Header.Get("X-No-Enterprise-Id"); got != "" {
+		t.Errorf("CN(no enterprise) X-No-Enterprise-Id = %q want empty (官方 CN chat 不发)", got)
 	}
-	if got := req.Header.Get("X-No-Department-Info"); got != "1" {
-		t.Errorf("CN(no domain) X-No-Department-Info = %q want 1", got)
+	if got := req.Header.Get("X-Domain"); got != "www.workbuddy.cn" {
+		t.Errorf("CN(no enterprise) X-Domain = %q want www.workbuddy.cn", got)
 	}
-	if got := req.Header.Get("X-Domain"); got != "" {
-		t.Errorf("CN(no enterprise) X-Domain = %q want empty", got)
+	if got := req.Header.Get("X-No-Department-Info"); got != "" {
+		t.Errorf("CN(no enterprise) X-No-Department-Info = %q want empty", got)
 	}
 }
 
@@ -144,7 +152,7 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	}
 	// version 覆盖仍生效：平台段跟随 clientVersion。
 	c2 := &Client{ClientVersion: "6.0.0"}
-	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 workbuddy-ai/6.0.0 CLI/2.161.0" {
+	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 workbuddy-ai/6.0.0 CLI/"+defaultCliVersion {
 		t.Errorf("defaultWorkBuddyUAFor(global, v6) = %q", got)
 	}
 }

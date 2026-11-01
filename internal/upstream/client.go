@@ -1013,8 +1013,15 @@ func New() *Client {
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: false,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
+		// CN 域 chat 上游：官方桌面端实发 https://www.workbuddy.cn/v2/chat/completions
+		// （_wb_capture2 的 005747_0101 / 005755_0150，V5.9.3 的 _wb_capture_new
+		// 20261029-103217.049-033 同址）。此前用 copilot.tencent.com 是早期从
+		// 插件链路推断的，官方 chat 路径从不走那个域——见 chatBase 注释。
+		ChatBaseCN: "https://www.workbuddy.cn",
+		// Billing 域保持不变：签到/成长等短 RPC 在 codebuddy.cn 上工作正常
+		// （2026-10-14 实测 copilot.tencent.com 与 www.codebuddy.cn 对这类路径
+		// 都返回 200），改它没有收益却会动到已验证的签到链路。
+		BillingBaseCN: "https://www.codebuddy.cn",
 	}
 }
 
@@ -1385,6 +1392,19 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, 0, nil, err
 			}
 			c.ChatHeaders(req, a, clientIP, meta)
+			// 请求体 gzip：官方桌面端**每次都压缩** chat 请求体
+			// （_wb_capture2 四份 + _wb_capture_new 两份，Content-Encoding: gzip，
+			// 6/6 一致；195KB 正文压到 73KB）。网关此前发明文，是与官方最直观的
+			// 一处形态差异。放在 ChatHeaders 之后：头组先按官方基线设好，
+			// 这里只追加传输编码。
+			if gz, gerr := gzipBody(prepared); gerr == nil {
+				req.Body = io.NopCloser(bytes.NewReader(gz))
+				req.ContentLength = int64(len(gz))
+				req.Header.Set("Content-Encoding", "gzip")
+				req.GetBody = func() (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(gz)), nil
+				}
+			}
 			dumpOutboundHeaders(req.Header, a.UID)
 			// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 			// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。

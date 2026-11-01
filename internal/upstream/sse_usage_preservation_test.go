@@ -27,10 +27,7 @@ func TestSuccessfulHistoryPreservesSplitUsage(t *testing.T) {
 			requests := make(chan []byte, 16)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer r.Body.Close()
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Errorf("read upstream request: %v", err)
-				}
+				body := readReqBody(r)
 				requests <- body
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = io.WriteString(w, raw)

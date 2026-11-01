@@ -52,7 +52,7 @@ func TestChatUsageVisibilityDoesNotChangeAccounting(t *testing.T) {
 				})
 				var actual map[string]any
 				up := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-					raw, _ := io.ReadAll(r.Body)
+					raw := readReqBody(r)
 					if err := json.Unmarshal(raw, &actual); err != nil {
 						t.Error(err)
 					}

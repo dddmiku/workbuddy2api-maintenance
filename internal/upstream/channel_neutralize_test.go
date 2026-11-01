@@ -83,7 +83,7 @@ func TestChatStreamRetriesChannelRejection(t *testing.T) {
 	var bodies [][]byte
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			bodies = append(bodies, raw)
 			if len(bodies) == 1 {
 				return jsonResp(400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`), nil
@@ -130,7 +130,7 @@ func TestChatStreamChannelRejectionEscalatesForUnknownClients(t *testing.T) {
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			bodies = append(bodies, raw)
 			// 上游行为：触发句原样出现就拒；被改写则通过。
 			if bytes.Contains(raw, []byte(trigger)) {

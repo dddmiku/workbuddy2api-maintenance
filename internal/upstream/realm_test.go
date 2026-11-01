@@ -42,7 +42,7 @@ func TestGlobalChatUsesV2PathAndBase(t *testing.T) {
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotOrigin = r.Header.Get("Origin")
-		raw, _ := io.ReadAll(r.Body)
+		raw := readReqBody(r)
 		var req map[string]any
 		_ = json.Unmarshal(raw, &req)
 		gotModel, _ = req["model"].(string)
@@ -196,7 +196,7 @@ func TestCNChatPathUnchanged(t *testing.T) {
 	var gotPath, gotMsgsJSON string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		gotPath = r.URL.Path
-		raw, _ := io.ReadAll(r.Body)
+		raw := readReqBody(r)
 		gotMsgsJSON = string(raw)
 		return &http.Response{
 			StatusCode: 200,
@@ -270,9 +270,9 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 			// Origin（见 stripBrowserHeaders），改按 X-Domain 区分：
 			// global → www.workbuddy.ai，CN → 账号自带的域。
 			if r.Header.Get("X-Domain") == "www.workbuddy.ai" {
-				globalBody, _ = io.ReadAll(r.Body)
+				globalBody = readReqBody(r)
 			} else {
-				cnBody, _ = io.ReadAll(r.Body)
+				cnBody = readReqBody(r)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)

@@ -3,6 +3,8 @@
 package upstream
 
 import (
+	"bytes"
+	"compress/gzip"
 	"log"
 	"os"
 	"sort"
@@ -60,4 +62,27 @@ func logfmtUID(uid string) string {
 		return uid
 	}
 	return uid[:8]
+}
+
+// gzipBody 把请求体压成 gzip（官方桌面端 chat 请求体恒为 gzip）。
+//
+// 为什么需要它（2026-10-31 双版本抓包实证）：官方 chat 请求 6/6 携带
+// `Content-Encoding: gzip`，195KB 正文压成 73KB；网关此前发明文 JSON。
+// 一个声称 WorkBuddy/5.9.3 的客户端却从不压缩请求体，是与官方最直观的
+// 形态差异之一。
+//
+// 失败时返回错误，调用方保持明文发送（不因压缩失败打断业务）。
+func gzipBody(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

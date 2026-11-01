@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,7 +20,7 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method=%s want POST", r.Method)
 		}
-		raw, _ := io.ReadAll(r.Body)
+		raw := readReqBody(r)
 		var arr []map[string]any
 		if err := json.Unmarshal(raw, &arr); err != nil {
 			t.Fatalf("body must be a JSON array: %v (body=%s)", err, raw)

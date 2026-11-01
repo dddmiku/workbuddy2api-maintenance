@@ -24,8 +24,10 @@ func messagesFixture(t *testing.T, reply string) (*Handler, *map[string]any, *in
 	trace := ""
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		trace = r.Header.Get("X-Gateway-Request-ID")
-		if err := json.NewDecoder(r.Body).Decode(&outbound); err != nil {
+		// 2026-10-31：chat 出站不再发 X-Gateway-Request-ID（官方客户端没有这个头，
+		// 见 stripBrowserHeaders），trace 改由官方同形的 X-Conversation-Request-ID 取。
+		trace = r.Header.Get("X-Conversation-Request-ID")
+		if err := json.Unmarshal(readReqBody(r), &outbound); err != nil {
 			t.Error(err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -50,8 +52,15 @@ func TestMessagesTextAndUsage(t *testing.T) {
 			if w.Code != 200 || *calls != 1 {
 				t.Fatalf("%d %d %s", w.Code, *calls, w.Body.String())
 			}
-			if (*out)["model"] != "fixture" || *trace == "" || *trace != w.Header().Get("X-Request-ID") || *trace == "forged" {
+			if (*out)["model"] != "fixture" || *trace == "" || *trace == "forged" {
 				t.Fatalf("routing/trace mismatch: %v %s", (*out)["model"], *trace)
+			}
+			// 响应头 X-Request-ID 是网关自造的 req_xxx（request_id.go），与出站
+			// X-Conversation-Request-ID 不同源，不再断言两者相等（2026-10-31：
+			// chat 出站已按官方形态移除 X-Gateway-Request-ID，出站 trace 改由
+			// X-Conversation-Request-ID 承载）。
+			if got := w.Header().Get("X-Request-ID"); got == "" || got == "forged" {
+				t.Fatalf("response X-Request-ID must be gateway-generated, got %q", got)
 			}
 			if !strings.Contains(w.Body.String(), `"input_tokens":40`) || !strings.Contains(w.Body.String(), `"cache_read_input_tokens":60`) || !strings.Contains(w.Body.String(), `"output_tokens":7`) {
 				t.Fatalf("usage must split cached input without double counting: %s", w.Body.String())

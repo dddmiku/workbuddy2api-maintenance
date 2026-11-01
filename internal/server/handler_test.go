@@ -2062,7 +2062,7 @@ func TestContentBlockedPreservesPromptWithoutRetry(t *testing.T) {
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			bodies = append(bodies, raw)
 			// 首次（body 含原始 system）返回 400 内容拦截；后续返回 200。
 			if len(bodies) == 1 {
@@ -2110,7 +2110,7 @@ func TestContentBlockedDoesNotRewriteAnotherSession(t *testing.T) {
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			body, _ := io.ReadAll(r.Body)
+			body := readReqBody(r)
 			bodies = append(bodies, body)
 			status, contentType, result := 200, "text/event-stream", sseOK
 			if len(bodies) == 1 {
@@ -2319,7 +2319,7 @@ func TestCustomModePreservesUserText(t *testing.T) {
 	var sentBody []byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			sentBody = raw
 			return &http.Response{
 				StatusCode: 200,
@@ -2498,7 +2498,7 @@ func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
 	var sentBody []byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			sentBody = raw
 			return &http.Response{
 				StatusCode: 200,
@@ -2558,7 +2558,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	var sentBodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			sentBodies = append(sentBodies, raw)
 			// 全部返回 200：本测试只论「custom 请求在降级期内的出站体」，不涉及重试。
 			return &http.Response{

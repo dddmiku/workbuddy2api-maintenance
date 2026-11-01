@@ -85,7 +85,7 @@ func TestChatStreamMaxCompletionTokensReachesUpstreamBudget(t *testing.T) {
 		t.Run(fields, func(t *testing.T) {
 			client := testClient(func(request *http.Request) (*http.Response, error) {
 				var sent map[string]json.RawMessage
-				if err := json.NewDecoder(request.Body).Decode(&sent); err != nil {
+				if err := json.Unmarshal(readReqBody(request), &sent); err != nil {
 					t.Fatal(err)
 				}
 				// This fixture only accepts WorkBuddy's actual output-budget field.

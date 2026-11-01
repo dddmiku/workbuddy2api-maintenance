@@ -109,7 +109,7 @@ func TestBusinessToolOutputSurvivesHTTPAndUpstreamNormalization(t *testing.T) {
 			calls := 0
 			client := &upstream.Client{ChatBaseCN: "https://business-json.invalid", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
-				decoder := json.NewDecoder(r.Body)
+				decoder := json.NewDecoder(bytes.NewReader(readReqBody(r)))
 				decoder.UseNumber()
 				if err := decoder.Decode(&captured); err != nil {
 					t.Fatal(err)

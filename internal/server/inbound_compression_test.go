@@ -43,9 +43,13 @@ func compressedHandler(t *testing.T, limit int64, calls *atomic.Int32) *Handler 
 	t.Helper()
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		data, _ := io.ReadAll(r.Body)
-		if r.Header.Get("Content-Encoding") != "" {
-			t.Error("inbound compression leaked to the uncompressed upstream request")
+		data := readReqBody(r)
+		// 出站 Content-Encoding 由网关自己决定（2026-10-31 起按官方客户端形态
+		// 恒为 gzip），与入站是否压缩无关。这里要防的是**入站压缩算法泄漏**
+		// （入站 zstd 时出站不能是 zstd）：readReqBody 已按 gzip 解压成功，
+		// 说明出站就是 gzip；若泄漏成 zstd 会解压失败、canary 断言不成立。
+		if ce := r.Header.Get("Content-Encoding"); ce != "" && ce != "gzip" {
+			t.Errorf("inbound compression algorithm leaked to upstream: Content-Encoding=%q", ce)
 		}
 		if !bytes.Contains(data, []byte("compression-canary")) {
 			t.Error("decompressed request data was lost")

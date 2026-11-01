@@ -37,9 +37,14 @@ func TestCredentialIntegrityConcurrentRefreshAndReaders(t *testing.T) {
 			return credentialIntegrityResponse(string(raw)), nil
 		}
 		if domain := r.Header.Get("X-Domain"); domain != "" {
-			want := "domain-" + strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer access-") + ".example"
-			if domain != want {
-				t.Errorf("mixed credential generations: domain=%q want=%q", domain, want)
+			// chat 路径的 X-Domain 是**请求目标域**（官方客户端恒发 chat 上游域），
+			// 不承载凭据代际，因此不参与本一致性断言；只有 billing/refresh 这类
+			// 把账号登录域原样透传的路径才校验代际。见 chatDomainFor 注释。
+			if !strings.HasSuffix(r.URL.Path, "chat/completions") {
+				want := "domain-" + strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer access-") + ".example"
+				if domain != want {
+					t.Errorf("mixed credential generations: domain=%q want=%q", domain, want)
+				}
 			}
 		}
 		if strings.HasSuffix(r.URL.Path, "chat/completions") {
@@ -67,17 +72,25 @@ func TestCredentialIntegrityConcurrentRefreshAndReaders(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 1000; i++ {
-			for _, fill := range []func(*http.Request){
-				func(r *http.Request) { c.ChatHeaders(r, a, "", ChatMeta{}) },
-				func(r *http.Request) { c.BillingHeaders(r, a) },
-				func(r *http.Request) { c.RefreshHeaders(r, a) },
+			for _, tc := range []struct {
+				name        string
+				fill        func(*http.Request)
+				domainByCred bool // true = X-Domain 透传账号登录域，需校验代际
+			}{
+				{"chat", func(r *http.Request) { c.ChatHeaders(r, a, "", ChatMeta{}) }, false},
+				{"billing", func(r *http.Request) { c.BillingHeaders(r, a) }, true},
+				{"refresh", func(r *http.Request) { c.RefreshHeaders(r, a) }, true},
 			} {
 				req, _ := http.NewRequest("POST", "https://headers.example", nil)
-				fill(req)
-				if domain := req.Header.Get("X-Domain"); domain != "" {
-					want := "domain-" + strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer access-") + ".example"
-					if domain != want {
-						t.Errorf("request headers mixed credential generations: %q != %q", domain, want)
+				tc.fill(req)
+				// chat 的 X-Domain 是请求目标域（官方客户端恒发 chat 上游域），
+				// 不承载凭据代际；只有 billing/refresh 透传账号登录域，需校验代际。
+				if tc.domainByCred {
+					if domain := req.Header.Get("X-Domain"); domain != "" {
+						want := "domain-" + strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer access-") + ".example"
+						if domain != want {
+							t.Errorf("%s headers mixed credential generations: %q != %q", tc.name, domain, want)
+						}
 					}
 				}
 			}

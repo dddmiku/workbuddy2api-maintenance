@@ -27,7 +27,7 @@ func TestChatUpstreamWAFBlockPageIsTerminal(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			auths = append(auths, r.Header.Get("Authorization"))
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			bodies = append(bodies, string(raw))
 			return &http.Response{
 				StatusCode: http.StatusForbidden,

@@ -27,9 +27,14 @@ const (
 	// 2026-10-17 双端再次抓包，官方已升级：
 	//   国内 WorkBuddy  5.8.3 → UA `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`
 	//   国际 WorkBuddyAI 5.8.4 → UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
+	//
+	// 2026-10-29 再抓（V5.9.3，_wb_capture_new 033/039）：
+	//   国内 `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`
+	//   国际 `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0`
+	// 版本段过旧本身就是指纹：上游按 UA 解析客户端版本，5.8.x 已是上一个版本。
 	// 注意国际版第二段是**小写连字符** `workbuddy-ai`（与首段 `WorkBuddy` 不同大小写），
 	// 见 defaultWorkBuddyUAFor。
-	defaultClientVersion = "5.8.4"
+	defaultClientVersion = "5.9.3"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
 	// （cli/package.json publishConfig.customPackage.version）。
 	//
@@ -38,7 +43,7 @@ const (
 	// 该值同时是 X-IDE-Version 之外唯一随包升级而变动的版本段。
 	//
 	// 2026-10-17 再次抓包：随 5.8.x 升级到 2.161.0（双端一致）。
-	defaultCliVersion = "2.161.0"
+	defaultCliVersion = "2.165.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -217,11 +222,19 @@ func isChatPath(path string) bool {
 // 不带 Origin/Referer（浏览器语义）、不带网关自有派生头（X-Machine-ID /
 // X-Session-ID）。2026-10-17 生产 dump 实测网关把这两类混在一起发，正是
 // global 域持续被 11128 拒绝的可疑点之一。
+//
+// 2026-10-31 逐字段比对（官方 _wb_capture2 / _wb_capture_new vs 生产 dump）后追加：
+//   - Accept-Language：官方 chat 请求**不发**（浏览器语义，SDK 不带）；
+//   - X-Gateway-Request-ID：网关自有头，官方没有。它进上游等于自报「这是转发来的」。
+//
+// 保留 X-Device-Token（官方必发，见 injectDeviceToken）。
 func stripBrowserHeaders(req *http.Request) {
 	req.Header.Del("Origin")
 	req.Header.Del("Referer")
 	req.Header.Del("X-Machine-ID")
 	req.Header.Del("X-Session-ID")
+	req.Header.Del("Accept-Language")
+	req.Header.Del("X-Gateway-Request-ID")
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -232,23 +245,73 @@ func acceptLanguageFor(a *auth.Auth) string {
 	return "zh-CN"
 }
 
+// chatDomainFor 返回 chat 出站应携带的 X-Domain。
+//
+// 语义（2026-10-31 双版本抓包实证）：X-Domain 是**请求目标站点域**，与 chat 请求
+// 的 URL Host 一致，而不是账号 SSO 登录域。官方桌面端：
+//
+//	CN     chat → https://www.workbuddy.cn/v2/chat/completions，X-Domain: www.workbuddy.cn
+//	global chat → https://www.workbuddy.ai/v2/chat/completions，X-Domain: www.workbuddy.ai
+//
+// 账号 auth 文件里的 domain 是登录入口（CN 为 www.codebuddy.cn），不能直接当
+// X-Domain 用。这里按 realm 归一：
+//   - global → www.workbuddy.ai（固定，见 injectGlobalChatHeaders）
+//   - cn     → 账号域已是 workbuddy.cn 系则原样用，否则**无条件**归一为
+//     www.workbuddy.cn（官方客户端不看账号有没有登录域，一律发这个值）
+//
+// 恒返回非空：官方 CN chat 请求 100% 带 X-Domain，缺了就是自造形态。
+func chatDomainFor(a *auth.Auth) string {
+	if a == nil {
+		return "www.workbuddy.cn"
+	}
+	if a.IsGlobal() {
+		return "www.workbuddy.ai"
+	}
+	// CN：保留私有部署可能写入的 workbuddy.cn 原值，其余一律归一。
+	if host := hostOfDomain(a.Domain); host != "" && strings.HasSuffix(host, "workbuddy.cn") {
+		return host
+	}
+	return "www.workbuddy.cn"
+}
+
+// hostOfDomain 从 domain 取值里剥掉协议与路径，返回纯主机名（小写）。
+// auth 文件里的 domain 形态不统一：`www.codebuddy.cn`、`https://api.trae.com.cn`、
+// 空串都出现过。非域名形态（如 trae 的 URL）返回空串，调用方据此回落。
+func hostOfDomain(domain string) string {
+	d := strings.TrimSpace(strings.ToLower(domain))
+	if d == "" {
+		return ""
+	}
+	if i := strings.Index(d, "://"); i >= 0 {
+		d = d[i+3:]
+	}
+	if i := strings.IndexByte(d, '/'); i >= 0 {
+		d = d[:i]
+	}
+	// 只有含点的才算主机名；纯 token 一律视为无效。
+	if !strings.Contains(d, ".") {
+		return ""
+	}
+	return d
+}
+
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
 // billing 域未走 CommonHeaders，单独注入保证全出站覆盖。
 func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 	req.Header.Set("X-CodeBuddy-Request", "1")
 }
 
-// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
-// （ANALYSIS-global-chat-solutions.md）：
-//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
-//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
+// injectGlobalChatHeaders global 账号的 chat 专属声明头：
+//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与请求 URL Host 一致）
 //
-// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
+// 2026-10-31 按官方抓包修正：**不再发 X-No-Enterprise-Id**。官方 V5.9.3 的
+// global chat 请求（_wb_capture_new 039）里没有这个头——它是网关早期从
+// 「个人账号无企业 ID，显式声明」的推测加上的，官方从不发。多发一个官方没有
+// 的头与少发同样属于指纹差异（见 outbound_fidelity_test.go 的基线断言）。
 func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || !a.IsGlobal() {
 		return
 	}
-	req.Header.Set("X-No-Enterprise-Id", "1")
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
@@ -279,7 +342,12 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 见 stripBrowserHeaders 注释。
 	stripBrowserHeaders(req)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	//
+	// 2026-10-31 修正：官方 chat 请求的 Accept **恒为 `application/json`**，
+	// 从不发 `text/event-stream`（_wb_capture2 四份 + _wb_capture_new 两份，
+	// 6/6 一致）。SSE 由上游按请求体 stream=true 决定，与 Accept 无关。
+	// 此前网关发 `application/json, text/event-stream` 是官方没有的形态。
+	req.Header.Set("Accept", "application/json")
 	if a.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	} else {
@@ -291,21 +359,25 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		req.Header.Set("X-No-User-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
-	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
-	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
-	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
+	// 企业与域头按 realm 分发。
+	//
+	// 2026-10-31 逐字段比对官方抓包后修正：CN 桌面端 chat 请求**不发**
+	// X-No-Enterprise-Id（该头只在 global 客户端出现，见 injectGlobalChatHeaders）。
+	// 此前 CN 分支在无企业 ID 时发它，凭空多出一个官方 CN 客户端没有的头。
+	// 企业账号仍发真实 X-Enterprise-Id（私有部署/企业版场景，官方同形）。
 	if a != nil && !a.IsGlobal() {
 		if a.EnterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		} else {
-			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if a.Domain != "" {
-			req.Header.Set("X-Domain", a.Domain)
-		} else {
-			req.Header.Set("X-No-Department-Info", "1")
-		}
+		// X-Domain 必须发 chat 上游域，**不是**账号登录域。
+		//
+		// 官方抓包实证（_wb_capture2 的 005747_0101 / 005755_0150，V5.9.3 的
+		// _wb_capture_new 033）：CN 桌面端 chat 请求的 X-Domain 恒为
+		// `www.workbuddy.cn`，与请求 URL 的 Host 完全一致。而 auth 文件里的
+		// domain 是**登录域** `www.codebuddy.cn`（SSO 入口），把它当 X-Domain 发出去
+		// 就是「用 codebuddy.cn 的域声明访问 workbuddy.cn 的 chat 接口」——一个官方
+		// 客户端绝不会产生的组合。
+		req.Header.Set("X-Domain", chatDomainFor(a))
 	} else {
 		c.injectGlobalChatHeaders(req, a)
 	}
@@ -320,7 +392,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectSDKFingerprintHeaders(req)
 	// ACP/隐私声明头（X-Private-Data / acp-connection-id）：2026-10-17 双域抓包确认
 	// 官方 chat 请求 100% 携带、网关此前缺失的头。见 injectACPHeaders 注释。
-	c.injectACPHeaders(req, meta)
+	c.injectACPHeaders(req, a, meta)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
 	c.injectClientIP(req, clientIP)
@@ -396,6 +468,18 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-ParentSpanId", parentSpan)
 	req.Header.Set("traceparent", "00-"+b3Trace+"-"+spanID+"-01")
 	req.Header.Set("b3", b3Trace+"-"+spanID+"-1-"+parentSpan)
+	// baggage：W3C 传播头，官方客户端每次 chat 必发（2026-10-29 V5.9.3 抓包
+	// _wb_capture_new 033/039，两 realm 同形）：
+	//
+	//	baggage: buddyId=,buddyName=,codebuddy.session_id=<UUID>,
+	//	         codebuddy.conversation_request_id=<convReqID>
+	//
+	// buddyId / buddyName 在个人账号下恒为空（企业账号才有值，网关无该信息，
+	// 与官方个人账号同形）；session_id 用 X-Conversation-ID 的值（官方此处
+	// 与 X-Conversation-ID 一致，见 033 的 1a9795d6-… 两处同值）；
+	// conversation_request_id 用聚合主键，与 X-Conversation-Request-ID 同值。
+	req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conversationID+
+		",codebuddy.conversation_request_id="+convReqID)
 }
 
 // uuidFormatted 把 32 hex 渲染成官方 X-Conversation-ID 的带横线 UUID 形态
@@ -505,35 +589,47 @@ func (c *Client) injectAttribution(req *http.Request) {
 }
 
 // injectAgentIntentHeaders 注入官方 CLI 在每次模型请求上固定携带的意图/角色头：
-//   - X-Agent-Intent: craft      当前交互模式（default 模式，超时/自动档同值）
-//   - X-Agent-Type:   main       顶层会话 agent（subagent 为 "subagent"，团队为 "team"）
+//   - X-Agent-Intent:  craft      当前交互模式（default 模式，超时/自动档同值）
+//   - X-Agent-Type:    main       顶层会话 agent（subagent 为 "subagent"，团队为 "team"）
+//   - X-Agent-Runtime: local-agent 运行时形态（2026-10-29 V5.9.3 抓包新增）
 //
-// 取值来自 2026-09-17 国际版客户端抓包原文（CLI host 实发 /v2/chat/completions）。
-// 缺这两个头时上游后台按未知来源归类，且与官方客户端指纹不一致，故默认补齐。
+// 取值来自国际版客户端抓包原文（2026-09-17 CLI host 实发 /v2/chat/completions），
+// X-Agent-Runtime 来自 2026-10-29 V5.9.3 双域抓包（_wb_capture_new 033/039，
+// 两 realm 同为 `local-agent`）。缺这些头时上游后台按未知来源归类，且与官方
+// 客户端指纹不一致，故默认补齐。
 func (c *Client) injectAgentIntentHeaders(req *http.Request) {
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("X-Agent-Runtime", "local-agent")
 }
 
 // injectACPHeaders 注入官方客户端 chat 请求固定携带的 ACP/隐私声明头：
 //
-//	X-Private-Data: true
-//	acp-connection-id: <UUID>
+//	X-Private-Data:    CN=false / global=true
+//	acp-connection-id: <UUIDv7>
+//
+// X-Private-Data 按域取值（2026-10-29 V5.9.3 抓包 _wb_capture_new 033/039）：
+// CN 桌面端发 `false`、global 发 `true`；5.8.x 时代两域都是 `true`（_wb_capture2
+// 的 005747_0101 / 005742_0068）。以最新版为准按 realm 分流。
 //
 // 2026-10-17 双域抓包（_wb_capture2，global 005742_0068 / CN 005747_0101）确认
-// 这两个头在两域 chat 请求里 100% 存在、且是缺了会被 11128 渠道校验拦下的头组
-// 之一（对照实验：裸头 11128 "request illegal"，补齐官方头组后同一请求返回
-// "first message is not system prompt"——校验是分层的，头组不过关根本到不了
-// body 校验）。acp-connection-id 是 ACP 协议的连接标识，官方每进程一个 UUID；
-// 网关按 gateway request 派生稳定值（同一请求的全部尝试/换号共用一个连接 ID，
-// 与官方「一次会话连接一个 ID」的语义对齐），不引入跨请求随机性。
+// 这组头是缺了会被 11128 渠道校验拦下的头组之一（对照实验：裸头 11128
+// "request illegal"，补齐官方头组后同一请求返回 "first message is not system
+// prompt"——校验是分层的，头组不过关根本到不了 body 校验）。acp-connection-id
+// 是 ACP 协议的连接标识，官方每进程一个 UUIDv7；网关按 gateway request 派生
+// 稳定值（同一请求的全部尝试/换号共用一个连接 ID，与官方「一次会话连接一个 ID」
+// 的语义对齐），不引入跨请求随机性。
 //
 // acp-connection-id 的取值：优先入站透传（客户端自己带 ACP 连接标识时原样转发），
 // 缺省用 X-Gateway-Request-ID（ChatHeaders 已设；每次客户端请求唯一、
-// 同请求内全部重试共享），形态为 32 hex——官方是带横线 UUID，两者同为
-// RFC 4122 形态的合法标识符（hex 无横线也是 UUID 的标准文本形式）。
-func (c *Client) injectACPHeaders(req *http.Request, meta ChatMeta) {
-	req.Header.Set("X-Private-Data", "true")
+// 同请求内全部重试共享），形态为 32 hex——官方是带横线 UUIDv7，acpConnectionID
+// 负责重排成官方形态。
+func (c *Client) injectACPHeaders(req *http.Request, a *auth.Auth, meta ChatMeta) {
+	if a != nil && a.IsGlobal() {
+		req.Header.Set("X-Private-Data", "true")
+	} else {
+		req.Header.Set("X-Private-Data", "false")
+	}
 	// x-codebuddy-request: 1 —— 官方 chat 请求固定携带的 CodeBuddy 通道标记。
 	// 2026-10-17 双域抓包（global 005742_0068 / CN 005747_0101）与成功对照实验
 	// （run_full_official.py：9/13 个号 200）均携带；网关此前从未发送过。缺它时

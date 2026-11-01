@@ -79,10 +79,7 @@ func TestContextTooLongPreservesHistory(t *testing.T) {
 							requests := make(chan []byte, 16)
 							srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 								defer r.Body.Close()
-								body, err := io.ReadAll(r.Body)
-								if err != nil {
-									t.Errorf("read upstream request: %v", err)
-								}
+								body := readReqBody(r)
 								attempts.Add(1)
 								requests <- body
 								w.WriteHeader(http.StatusBadRequest)

@@ -41,10 +41,7 @@ type budgetUpstream struct {
 
 func (u *budgetUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		u.t.Errorf("read upstream request: %v", err)
-	}
+	raw := readReqBody(r)
 	var request struct {
 		MaxTokens *json.Number `json:"max_tokens"`
 		Messages  []any        `json:"messages"`

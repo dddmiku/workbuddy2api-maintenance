@@ -100,11 +100,11 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
 		}
 	}
-	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.8.4，且四头齐全。
+	// X-IDE-Version 缺省（client_version 空）= 内置默认 defaultClientVersion，且四头齐全。
 	c2 := &Client{ClientName: "WorkBuddy"}
 	h2 := chatHeadersReq(t, c2, a, "")
-	if got := h2.Get("X-IDE-Version"); got != "5.8.4" {
-		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.8.4")
+	if got := h2.Get("X-IDE-Version"); got != defaultClientVersion {
+		t.Errorf("X-IDE-Version = %q want %q (default)", got, defaultClientVersion)
 	}
 	// 显式 ClientName="SaaS" 时 X-IDE-Version 不设（还原旧行为：只有 X-Product=SaaS）。
 	c3 := &Client{ClientName: "SaaS"}
@@ -124,7 +124,7 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 		"X-Product":       "SaaS",
 		"X-IDE-Name":      "WorkBuddy",
 		"X-IDE-Type":      "WorkBuddy",
-		"X-IDE-Version":   "5.8.4",
+		"X-IDE-Version":   defaultClientVersion,
 		"X-Agent-Purpose": "conversation",
 		"X-Agent-Intent":  "craft",
 		"X-Agent-Type":    "main",
@@ -146,11 +146,12 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 			t.Errorf("%s = %q want %q (sdk fingerprint)", hdr, got, want)
 		}
 	}
-	// ACP/隐私声明头（2026-10-17 双域抓包：官方 chat 请求 100% 携带）：
-	// X-Private-Data 恒 true；x-codebuddy-request 恒 1；acp-connection-id 为
-	// 官方 8-4-4-4-12 UUID 形态（零值 meta 下也必须发）。
-	if got := h.Get("X-Private-Data"); got != "true" {
-		t.Errorf("X-Private-Data = %q want %q (official always sends)", got, "true")
+	// ACP/隐私声明头（官方 chat 请求 100% 携带）：
+	// X-Private-Data 按 realm 取值——CN=false / global=true（2026-10-29 V5.9.3
+	// 抓包 _wb_capture_new 033/039；5.8.x 时代两域都是 true）。本用例是 CN 账号。
+	// x-codebuddy-request 恒 1；acp-connection-id 为官方 8-4-4-4-12 UUID 形态。
+	if got := h.Get("X-Private-Data"); got != "false" {
+		t.Errorf("X-Private-Data = %q want %q (CN 域官方取值)", got, "false")
 	}
 	if got := h.Get("x-codebuddy-request"); got != "1" {
 		t.Errorf("x-codebuddy-request = %q want %q (official channel marker)", got, "1")
@@ -245,9 +246,9 @@ func TestACPConnectionIDPassthrough(t *testing.T) {
 	if got := h.Get("acp-connection-id"); got != "3f2b1c4d-5e6f-7081-92a3-b4c5d6e7f809" {
 		t.Errorf("acp-connection-id = %q want same value in UUID form", got)
 	}
-	// X-Private-Data 与 GatewayRequestID 无关，恒为 true。
-	if got := h.Get("X-Private-Data"); got != "true" {
-		t.Errorf("X-Private-Data = %q want true", got)
+	// X-Private-Data 与 GatewayRequestID 无关，按 realm 取值（本用例 CN 账号 = false）。
+	if got := h.Get("X-Private-Data"); got != "false" {
+		t.Errorf("X-Private-Data = %q want false (CN 域)", got)
 	}
 	// x-codebuddy-request：官方 chat 请求固定携带的通道标记。
 	if got := h.Get("x-codebuddy-request"); got != "1" {

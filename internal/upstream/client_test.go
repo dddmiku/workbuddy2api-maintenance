@@ -313,7 +313,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUID = r.Header.Get("X-User-Id")
 		gotProduct = r.Header.Get("X-Product")
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readReqBody(r)
 		return &http.Response{
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -349,7 +349,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
 		default:
-			outbound, _ = io.ReadAll(r.Body)
+			outbound = readReqBody(r)
 			return &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -541,7 +541,7 @@ func TestUserResourceAggregation(t *testing.T) {
 		if r.Method != http.MethodPost {
 			return nil, errors.New("want POST")
 		}
-		body, _ := io.ReadAll(r.Body)
+		body := readReqBody(r)
 		if !bytes.Contains(body, []byte(`"ProductCode":"p_tcaca"`)) {
 			return nil, errors.New("missing ProductCode: " + string(body))
 		}

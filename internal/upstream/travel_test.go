@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"testing"
 
@@ -69,7 +68,7 @@ func TestTravelDepartSendsLocationID(t *testing.T) {
 		if err := travelPath(r, "/activity/growth/buddy/travel/depart"); err != nil {
 			return nil, err
 		}
-		got, _ = io.ReadAll(r.Body)
+		got = readReqBody(r)
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{}}`), nil
 	})
 	if err := c.TravelDepart(&auth.Auth{AccessToken: "at", UID: "u1"}, 4); err != nil {
@@ -93,7 +92,7 @@ func TestTravelClaimReturnsReward(t *testing.T) {
 		if err := travelPath(r, "/activity/growth/buddy/travel/claim"); err != nil {
 			return nil, err
 		}
-		got, _ = io.ReadAll(r.Body)
+		got = readReqBody(r)
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{"reward_credit":9}}`), nil
 	})
 	reward, err := c.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
@@ -150,7 +149,7 @@ func TestBuddyAgreementIdempotent(t *testing.T) {
 		if err := travelPath(r, "/activity/growth/buddy/agreement"); err != nil {
 			return nil, err
 		}
-		got, _ = io.ReadAll(r.Body)
+		got = readReqBody(r)
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{"agreed":true}}`), nil
 	})
 	if err := c.BuddyAgreement(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
@@ -170,7 +169,7 @@ func TestBuddyFirstPath(t *testing.T) {
 		if err := travelPath(r, "/activity/growth/buddy/first"); err != nil {
 			return nil, err
 		}
-		got, _ = io.ReadAll(r.Body)
+		got = readReqBody(r)
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{"buddy":{"id":1}}}`), nil
 	})
 	if err := c.BuddyFirst(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {

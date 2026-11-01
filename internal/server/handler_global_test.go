@@ -34,7 +34,7 @@ func newRealmFake(t *testing.T) *realmFake {
 			defer cf.mu.Unlock()
 			cf.authz = r.Header.Get("Authorization")
 			cf.path = r.URL.Path
-			raw, _ := io.ReadAll(r.Body)
+			raw := readReqBody(r)
 			var req map[string]any
 			_ = json.Unmarshal(raw, &req)
 			cf.model, _ = req["model"].(string)
