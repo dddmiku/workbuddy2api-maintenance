@@ -17,7 +17,19 @@ func crossDeviceError() error { return errNotSameDevice }
 // symbolic link 之类的假象；试一次真操作则是同一个事实来源，不可能判错。
 //
 // 目录名以 .probe 开头，试完即删，不留残留。
-func secondVolumeDir(t interface{ TempDir() string }) string {
+//
+// 为什么必须注册 t.Cleanup（2026-11-01 修）：这个目录建在 t.TempDir() **之外**
+// 的卷上，Go 的自动清理管不到它。此前只在找不到第二个卷时才删，找到就直接
+// 返回、交给调用方——而调用方（exdev_test.go）从没删过它，于是每跑一次测试
+// 就在 D:\ 根目录留一个 wb2api-crossdev-<随机数>/auths-trash/ 目录，且里面
+// 还有测试用的 auth 文件。实测积了 28 个（2026-10-18 ~ 10-31）。
+//
+// 用 t.Cleanup 而不是让调用方删：清理责任归创建方，调用方不可能忘；
+// 且测试中途 Fatal 时 Cleanup 仍会执行（defer 在 Fatal 时不会）。
+func secondVolumeDir(t interface {
+	TempDir() string
+	Cleanup(func())
+}) string {
 	base := t.TempDir()
 	probeSrc := base + `\.crossdev-probe`
 	if err := os.WriteFile(probeSrc, []byte("probe"), 0600); err != nil {
@@ -47,6 +59,9 @@ func secondVolumeDir(t interface{ TempDir() string }) string {
 			continue
 		}
 		if isCrossDevice(renameErr) {
+			// 交给调用方使用，但清理责任留在本函数：调用方不可能忘，也不会
+			// 因为测试中途 Fatal 而漏删。
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
 			return dir
 		}
 		// 别的错（权限、只读盘）——不是可用的第二个卷。

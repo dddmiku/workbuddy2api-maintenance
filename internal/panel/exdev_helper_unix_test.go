@@ -17,7 +17,10 @@ func crossDeviceError() error { return syscall.EXDEV }
 //
 // 遍历常见挂载点：容器里 /tmp 与 / 常是不同 overlay，/dev/shm 通常是 tmpfs。
 // 判据是 st_dev 真的不同——只按路径猜会在「/tmp 与 / 同一个卷」的机器上假通过。
-func secondVolumeDir(t interface{ TempDir() string }) string {
+func secondVolumeDir(t interface {
+	TempDir() string
+	Cleanup(func())
+}) string {
 	base := t.TempDir()
 	baseDev, err := deviceOf(base)
 	if err != nil {
@@ -36,6 +39,10 @@ func secondVolumeDir(t interface{ TempDir() string }) string {
 		if mkErr != nil {
 			continue
 		}
+		// 清理责任留在创建方（2026-11-01 修）：这个目录建在 t.TempDir() 之外的
+		// 挂载点上，Go 的自动清理管不到它，此前直接返回、调用方从没删过。
+		// t.Cleanup 让调用方不可能忘，且测试中途 Fatal 时仍会执行。
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
 		return dir
 	}
 	return ""
