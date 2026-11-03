@@ -62,7 +62,7 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go �
     machineId/sessionId 由 uid+盐 md5 稳定派生，勿每次随机）；library 走 web 域 web 指纹。
   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
 """
-import sys, os, json, time, argparse, urllib.request, re
+import sys, os, json, time, argparse, urllib.request, urllib.parse, re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc
@@ -353,8 +353,62 @@ def infer_kind(title, desc="", jump_url=""):
 
 
 # 从 task_desc / title 抽专家搜索关键词（"体验「XXX」专家" -> ["XXX"]）
+def extract_jump_expert_id(jump_url):
+    """从 jump_url 的 deeplink 里取服务端指定的 expertId。
+
+    2026-11-04 实测（用户报障：两个专家任务恒 0/1）——这是**权威判据**，不是
+    关键词搜索的补充：
+
+        expert_use_maidehao  task_desc「搜索并召唤「中国电商运营专家」」
+          jump_url  ...deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0
+          关键词搜「中国电商运营专家」第一条是 ex_7DAbhXJOhxSj（国内电商经营诊断师）
+          而任务指定的 ex_GDl31WahyIH0 是「卖得好」——两者是不同专家。
+        上报错的 id 照样 200 code=0，但服务端按 expertId 记账，progress 恒 0/1。
+
+    实测：改用 jump_url 里的 id 上报，一次就 0/1 -> 1/1 completed。
+    关键词搜索只能拿到「市场里最像的」，而 service 的判据是「指定的那一个」，
+    name 相似度永远替代不了它。
+
+    deeplink 是 URL 编码过的（`workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_xxx`），
+    也可能未编码；两种都处理。取不到返回空串。
+    """
+    if not jump_url:
+        return ""
+    # 先解码一次：%3F/%3D 都还原，再按普通 query 取参数。
+    decoded = urllib.parse.unquote(jump_url)
+    m = re.search(r"[?&]expertId=([A-Za-z0-9_\-]+)", decoded)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def extract_expert_display_name(title, desc=""):
+    """取任务里给出的专家**展示名**（原样，不剥「专家」后缀）。
+
+    与 extract_expert_keyword 的区别：那个是拿去**搜索**的（要剥后缀才命中），
+    这个是写进上报事件 `name`/`expertTitle` 的展示字段（要原样，和任务描述一致）。
+
+    `体验「中国电商运营专家」` -> `中国电商运营专家`
+    `体验「抖音策略师」`       -> `抖音策略师`
+    抽不出返回空串。
+    """
+    blob = f"{title} {desc}"
+    # 优先取紧跟「专家」二字的引号内容，其次取任意引号内容。
+    for pat in (r"[「\[]([^」\]]{2,20})[」\]]\s*专家",
+                r"[「\[]([^」\]]{2,20})[」\]]"):
+        m = re.search(pat, blob)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                return name
+    return ""
+
+
 def extract_expert_keyword(title, desc=""):
     """抽专家搜索词。只认「」/[] 括起来的专名，且要剥掉末尾的「专家」。
+
+    仅在 jump_url 没有 expertId 时使用（见 extract_jump_expert_id：服务端
+    指定 id 才是权威判据，名字搜索只是拿不到 id 时的次优来源）。
 
     不用「召唤 X」这种无引号正则兜底：实测它会跨越标点把整句吞进去
     （`召唤 3 次专家团，切换至「专家团」` -> `3 次专家团 切换至`），拿去搜
@@ -393,10 +447,24 @@ def build_dynamic_spec(t):
             "src": f"动态推断({kind})", "dynamic": True,
             "title": title}
     if kind == "expert_task":
+        # 权威判据优先：jump_url 里的 expertId 是服务端**指定的那一个专家**。
+        # 关键词搜索只能拿到「市场里最像的」，两者经常不是同一个对象
+        # （2026-11-04 实测：任务指定「卖得好」ex_GDl31WahyIH0，关键词搜到的
+        #  第一条却是「国内电商经营诊断师」ex_7DAbhXJOhxSj，上报 200 但恒 0/1）。
+        jump_id = extract_jump_expert_id(jump)
+        if jump_id:
+            spec["jump_expert_id"] = jump_id
+            spec["kws"] = []
+            # 事件里的 name/expertTitle 用任务标题给出的官方称法（「体验「抖音策略师」」
+            # -> 抖音策略师）。服务端按 id 记账，name 只是展示字段；不编造市场里查到的
+            # 另一个名字（那会和任务描述对不上），也不留空。
+            spec["jump_expert_name"] = extract_expert_display_name(title, desc) or title
+            spec["src"] = f"jump_url expertId={jump_id}"
+            return spec, f"动态推断 kind={kind}（jump_url 指定 expertId）"
         kws = extract_expert_keyword(title, desc)
         if not kws:
-            # jump_url 指向专家页但没有「XXX」命名时，不静默放弃：退回无关键词
-            # 的专家列表（市场第一页），至少能点亮一次，并如实标注来源。
+            # 既没有 jump_url expertId，也没有「XXX」命名时，不静默放弃：
+            # 退回无关键词的专家列表（市场第一页），至少能点亮一次，并如实标注。
             spec["kw"] = ""
             spec["kws"] = []
             spec["src"] = "market/expert/list (无关键词，jump_url 判定为专家)"
@@ -588,7 +656,7 @@ def _dedup_slice(src, offset, need):
     return final[offset:offset + need]
 
 
-def ids_for(kind, auth, need, offset=0, spec_kws=None):
+def ids_for(kind, auth, need, offset=0, spec_kws=None, jump_expert_id="", spec_meta=None):
     """返回需要上报的对象 id 列表 [(obj_id, meta)]（按源顺序，偏移 cur 避免复用）。"""
     if need <= 0:
         return []
@@ -610,8 +678,22 @@ def ids_for(kind, auth, need, offset=0, spec_kws=None):
     if kind == "skin":
         return _dedup_slice(_fetch_pe_theme(auth), offset, need)
     if kind == "expert_task":
-        # 动态专家任务：用关键词去市场搜真实 ex_ id
-        #（2026-10-19 实测：伪造 id 会 report 200 但 progress 恒 0，服务端校验真实 id）
+        # 动态专家任务的对象 id 来源，按权威度排序：
+        #
+        # 1) jump_url 里的 expertId（服务端指定）——**唯一能保证点亮的方式**。
+        #    2026-11-04 实测：expert_use_maidehao 指定 ex_GDl31WahyIH0（卖得好），
+        #    关键词搜「中国电商运营专家」第一条却是 ex_7DAbhXJOhxSj（国内电商经营
+        #    诊断师）；上报后者 200 code=0 但 progress 恒 0/1，改前者一次即 completed。
+        #    名字相似 ≠ 服务端记账的对象，所以只要 jump_url 给了 id 就绝不搜索。
+        # 2) 关键词搜索（拿不到 jump_url id 时的次优来源）。
+        #
+        # 2026-10-19 实测：伪造 id 会 report 200 但 progress 恒 0，服务端校验真实 id。
+        if jump_expert_id:
+            meta = dict(spec_meta or {})
+            # need 份相同 id：任务若要求「用同一个专家 N 次」，每次上报都被 build_event
+            # 分配独立的 conversationId/requestId，是 N 个不同事件；只返 1 份会让
+            # N>1 的任务永远补不满。实测任务都是 target=1，这里只是不留下结构缺陷。
+            return [(jump_expert_id, meta) for _ in range(need)]
         #
         # spec_kws 可能来自两处，键名不同：MAPPING 里静态写的是 `"kw": "拼豆"`（字符串），
         # build_dynamic_spec 生成的是 `"kws": ["拼豆"]`（列表）。调用方传的是
@@ -1067,7 +1149,12 @@ def process_task(auth, code, t, opts, stats):
         return
 
     if not opts.yes:
-        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws") or spec.get("kw"))
+        ids = ids_for(spec["kind"], auth, need, offset=cur,
+                      spec_kws=spec.get("kws") or spec.get("kw"),
+                      jump_expert_id=spec.get("jump_expert_id") or "",
+                      spec_meta={"name": spec.get("jump_expert_name") or "",
+                                 "category": "", "expertType": "agent",
+                                 "version": ""})
         shown = [i for i, _ in ids][:6]
         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮 need={need} "
               f"id源={spec['src']} ids={shown}，dry-run 跳过")
@@ -1122,7 +1209,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                   f"deskchain conv={conv}")
             if i < need - 1:
                 time.sleep(opts.gap)
-        time.sleep(2.0)  # 服务端归账可能异步
+        # 归账异步：不再在这里固定 sleep，交给下方轮询回读（settle_secs 内每 2 秒查一次）。
     elif spec["kind"] == "buddy5":
         # 五连「进入 Buddy 应用」事件（fork DesktopBuddyAppSequence，两账号实测点亮）；
         # 上报失败（非 200 / code!=0）降级为单发 buddyapp_enter_click（旧形状兜底）。
@@ -1144,7 +1231,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                       f"buddy5 id={buddy_id}")
             if i < need - 1:
                 time.sleep(opts.gap)
-        time.sleep(2.0)  # 服务端归账可能异步
+        # 归账异步：不再在这里固定 sleep，交给下方轮询回读（settle_secs 内每 2 秒查一次）。
     elif spec["kind"] == "library":
         # web 域 web_element_click（fork ReportWebEvent），base 为 www.workbuddy.cn
         for i in range(need):
@@ -1154,9 +1241,14 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
                   f"web_element_click")
             if i < need - 1:
                 time.sleep(opts.gap)
-        time.sleep(2.0)  # 服务端归账可能异步
+        # 归账异步：不再在这里固定 sleep，交给下方轮询回读（settle_secs 内每 2 秒查一次）。
     else:
-        ids = ids_for(spec["kind"], auth, need, offset=cur, spec_kws=spec.get("kws") or spec.get("kw"))
+        ids = ids_for(spec["kind"], auth, need, offset=cur,
+                      spec_kws=spec.get("kws") or spec.get("kw"),
+                      jump_expert_id=spec.get("jump_expert_id") or "",
+                      spec_meta={"name": spec.get("jump_expert_name") or "",
+                                 "category": "", "expertType": "agent",
+                                 "version": ""})
         if not ids:
             print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
             stats["fail"] += 1
@@ -1170,19 +1262,42 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
             print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} id={obj_id}")
             if i < len(ids) - 1:
                 time.sleep(opts.gap)
-        time.sleep(2.0)  # 服务端归账可能异步
+        # 归账异步：不再在这里固定 sleep，交给下方轮询回读（settle_secs 内每 2 秒查一次）。
 
-    # 回读确认
-    t2 = tc.task_status(auth, code)
-    prog2 = (t2.get("progress") or {}) if t2 else {}
-    cur2 = prog2.get("current", 0)
-    ast2 = t2.get("accept_status") if t2 else "?"
-    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', tgt)} accept_status={ast2}")
-    if ast2 != "claimed" and cur2 >= prog2.get("target", tgt):
+    # 回读确认：服务端归账是**异步**的，固定等一次不够。
+    #
+    # 2026-11-04 实测（用户报障：专家任务一直 0/1 点不亮）：
+    #   report 200 code=0  →  2 秒后回读  →  仍是 0/1，accept_status=accepted
+    # accepted 表示"已受理、待结算"，不是失败。此前只回读一次就判「未达 target」，
+    # 于是每一次跑都白报一遍、任务永远点不亮。
+    #
+    # 改为轮询：每 2 秒回读一次，最多等 settle_secs（默认 30 秒）。命中即 claim；
+    # 超时仍未归账才如实标 WARN——那时才是真的没成功，而不是"还没轮到"。
+    # 与记忆里的「异步结算不能用固定 sleep 判成败」是同一条教训。
+    settle_deadline = time.time() + max(0.0, opts.settle_secs)
+    cur2, tgt2, ast2 = 0, tgt, "?"
+    polls = 0
+    while True:
+        polls += 1
+        t2 = tc.task_status(auth, code)
+        prog2 = (t2.get("progress") or {}) if t2 else {}
+        cur2 = prog2.get("current", 0)
+        tgt2 = prog2.get("target", tgt)
+        ast2 = t2.get("accept_status") if t2 else "?"
+        print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{tgt2} "
+              f"accept_status={ast2} (poll {polls})")
+        if ast2 == "claimed" or cur2 >= tgt2:
+            break
+        if time.time() >= settle_deadline:
+            break
+        time.sleep(2.0)
+
+    if ast2 != "claimed" and cur2 >= tgt2:
         claim_one(auth, code, uid8, stats, opts.gap)
     elif ast2 != "claimed":
-        # 未点亮：如实标注，不强行刷
-        print(f"[task_runner] {uid8} {code}: report 未达 target（{cur2}/{prog2.get('target', tgt)}），WARN 待下次")
+        # 轮询到超时仍未归账：如实标注（这才是真的没成功）。
+        print(f"[task_runner] {uid8} {code}: report 未达 target（{cur2}/{tgt2}）"
+              f" 轮询 {polls} 次仍未归账，WARN 待下次")
 
 
 # --------------------------------------------------------------------------
@@ -1290,6 +1405,11 @@ def main():
     ap.add_argument("--only-claim", action="store_true",
                     help="只领奖不点亮（已完成任务直接 claim，已领幂等）")
     ap.add_argument("--gap", type=float, default=1.0, help="动作间隔秒数（默认 1.0）")
+    # 归账等待上限：report 成功后服务端异步结算，accept_status=accepted 表示
+    # "已受理待结算"。2026-11-04 前只等固定 2 秒就判失败，专家类任务因此
+    # 永远停在 0/1 点不亮。这里改为轮询，默认最多等 30 秒。
+    ap.add_argument("--settle-secs", type=float, default=30.0,
+                    help="report 后等待服务端归账的上限秒数（每 2 秒轮询一次，默认 30）")
     ap.add_argument("--discover", action="store_true",
                     help="只读探测：列出服务端当前全部任务及动态推断结果，不做任何写操作")
     a = ap.parse_args()

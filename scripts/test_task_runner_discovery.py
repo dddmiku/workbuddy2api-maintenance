@@ -122,5 +122,86 @@ class ExpertKeywordTests(unittest.TestCase):
                                                    "召唤 5 位不同的专家并发起对话。"), [])
 
 
+class JumpExpertIdTests(unittest.TestCase):
+    """2026-11-04 回归：专家任务的对象 id 必须取 jump_url 指定的那个。
+
+    实测（用户报障「两个任务一直 0/1」）：task_desc 说「搜索并召唤「中国电商运营
+    专家」」，关键词搜到的第一条是 ex_7DAbhXJOhxSj（国内电商经营诊断师），而服务端
+    在 jump_url 里指定的 ex_GDl31WahyIH0 是「卖得好」——两个不同专家。上报错的那个
+    照样 200 code=0，但 progress 恒 0/1；改成 jump_url 的 id 后一次就 completed。
+    """
+
+    # 真实服务端返回（2026-11-04 实测）
+    MAIDEHAO = ("https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2F"
+                "experts%3FexpertId%3Dex_GDl31WahyIH0&buddy_type=workbuddy")
+    DOUYINYIN = ("https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2F"
+                 "experts%3FexpertId%3Dex_FbY5nlWTqDod&buddy_type=workbuddy")
+
+    def test_parses_url_encoded_deeplink(self):
+        self.assertEqual(tr.extract_jump_expert_id(self.MAIDEHAO), "ex_GDl31WahyIH0")
+        self.assertEqual(tr.extract_jump_expert_id(self.DOUYINYIN), "ex_FbY5nlWTqDod")
+
+    def test_parses_plain_deeplink(self):
+        # 未编码形态（本地/桌面端 jump_url）也要认
+        self.assertEqual(
+            tr.extract_jump_expert_id("workbuddy://experts?expertId=ex_abc123XYZ"),
+            "ex_abc123XYZ")
+
+    def test_returns_empty_when_absent(self):
+        self.assertEqual(tr.extract_jump_expert_id("workbuddy://expert"), "")
+        self.assertEqual(tr.extract_jump_expert_id("workbuddy://chat"), "")
+        self.assertEqual(tr.extract_jump_expert_id(""), "")
+
+    def test_spec_prefers_jump_id_over_keyword(self):
+        # 有关键词也要让路：服务端指定的 id 才是记账对象。
+        spec, note = spec_for("体验「中国电商运营专家」",
+                              "在专家页搜索并召唤「中国电商运营专家」，完成一次对话。",
+                              self.MAIDEHAO)
+        self.assertEqual(spec["kind"], "expert_task")
+        self.assertEqual(spec["jump_expert_id"], "ex_GDl31WahyIH0")
+        self.assertEqual(spec["kws"], [], "有 jump id 时不再走关键词搜索")
+        self.assertIn("jump_url", note)
+
+    def test_ids_for_uses_jump_id_without_network(self):
+        # 有 jump id 时 ids_for 不能发起任何网络请求（不发市场查询）。
+        class Boom(Exception):
+            pass
+
+        orig = tr._fetch_market_experts
+
+        def boom(*a, **k):
+            raise Boom("不应搜索市场")
+
+        tr._fetch_market_experts = boom
+        try:
+            got = tr.ids_for("expert_task", {}, 1, offset=0, spec_kws=None,
+                             jump_expert_id="ex_GDl31WahyIH0",
+                             spec_meta={"name": "中国电商运营专家"})
+        finally:
+            tr._fetch_market_experts = orig
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "ex_GDl31WahyIH0")
+        self.assertEqual(got[0][1]["name"], "中国电商运营专家")
+
+    def test_ids_for_fills_target_count(self):
+        # target>1 时同一 id 要返 need 份（每次 build_event 生成独立会话 id）
+        got = tr.ids_for("expert_task", {}, 3, offset=0, spec_kws=None,
+                         jump_expert_id="ex_GDl31WahyIH0", spec_meta={"name": "X"})
+        self.assertEqual([i for i, _ in got], ["ex_GDl31WahyIH0"] * 3)
+
+
+class ExpertDisplayNameTests(unittest.TestCase):
+    def test_keeps_expert_suffix(self):
+        # 展示名要原样（写进事件的 name/expertTitle），与搜索词不同。
+        self.assertEqual(
+            tr.extract_expert_display_name("体验「中国电商运营专家」",
+                                           "在专家页搜索并召唤「中国电商运营专家」，完成一次对话。"),
+            "中国电商运营专家")
+        self.assertEqual(tr.extract_expert_display_name("体验「抖音策略师」", ""), "抖音策略师")
+
+    def test_empty_when_no_brackets(self):
+        self.assertEqual(tr.extract_expert_display_name("召唤 5 次专家", ""), "")
+
+
 if __name__ == "__main__":
     unittest.main()
