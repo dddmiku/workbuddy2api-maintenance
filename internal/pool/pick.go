@@ -403,14 +403,52 @@ func (p *Pool) pickWeightedWithDecision(cands []weighted, d *Decision) *entry {
 	return cands[len(cands)-1].e
 }
 
-// expiringDeferred 已废弃（2026-11-01 用户决策）。
+// expiringDeferred 报告「这个账号应当为快过期积分让路」。
 //
-// 原本用于「粘性命中也让路给快过期积分」，但用户明确选择：快过期优先只在
-// **新建会话**时生效，已绑定会话保持原号（会话连续性优先于中途切号省积分）。
-// 新建会话的优先逻辑在 pick() 的硬过滤里，那里会把候选集缩到「有快过期积分」
-// 的子集，再由 weightOf 的 expiringWeight 项按占比排序。
+// 语义（与 pick() 里的硬过滤同一口径）：付费模型上，只要**池里存在别的号**有
+// 快过期积分、而本号没有，本号就不该被选中——积分到期即作废，花掉的每一分都是
+// 省下的真金白银。
 //
-// 保留此注释说明为何粘性路径不调用它，避免以后有人以为是漏了。
+// 为什么粘性路径也必须调它（2026-11-04 用户决策，第二次改回）：
+// 粘性命中发生在 pick() 之前（handler 先试 PickByUIDForModelRealm，未命中才回落
+// 普通选号），而硬过滤写在 pick() 里。生产实测 9862 次决策里 9822 次是 sticky_hit，
+// 全池 5 个带快过期积分的号一分没动，流量全压在无快过期积分的那一个号上
+// （已消耗 2000+ 积分）。「只在新建会话时优先」在粘性主导的负载下等于该特性不存在。
+//
+// 代价与取舍：让路会让同一对话切换账号，下一跳起重新绑定到新号（handler 在
+// acct==nil 时 unbindSticky，选到新号后 Bind）。切换只发生一次，之后稳定——
+// 相比「快过期积分整批作废」，用户明确选择前者。
+//
+// 三个安全边界（任一不成立即返回 false，保持原有粘性行为）：
+//   - 非付费模型：免费模型不扣积分，压流量到快过期号上无收益；
+//   - 本号自己就有快过期积分：无差别，不必让路；
+//   - 池里没有别的号带快过期积分：让路只会选不到号，宁可继续用本号。
+//
+// 调用方需持有 p.mu（读 byUID 与 pick 一致）。
+func (p *Pool) expiringDeferred(e *entry, model string) bool {
+	if e == nil || e.creditsExpiring > 0 {
+		return false
+	}
+	if !p.modelIsPaid(e.a.Realm(), model) {
+		return false
+	}
+	now := time.Now()
+	for _, other := range p.byUID {
+		if other == e || other.creditsExpiring <= 0 {
+			continue
+		}
+		// 只对**此刻真能服务这个模型**的号让路：让给一个正在冷却/禁用的号
+		// 等于白切一次号，还白白弄丢会话粘性。
+		if other.unavailableReason(now, model) != "" {
+			continue
+		}
+		if p.inFlightFull(other) {
+			continue
+		}
+		return true
+	}
+	return false
+}
 
 // weightEpsilon 等权重判定的浮点容差：权重公式微调（如 EMA 引入）后权重不再
 // 位级相等，精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
