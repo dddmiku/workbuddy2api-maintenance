@@ -85,6 +85,40 @@ func TestAdminSocketPermissionAndConflict(t *testing.T) {
 	}
 }
 
+// TestListenUnixToleratesStalePathRemovedByPeer 陈旧 socket 在探测与删除之间被
+// 对方删掉时，bind 仍须成功。
+//
+// 现场（CI 2026-11-04，阻塞了 v3.15.4 发版）：热更新时旧实例收尾会自己删掉
+// admin.sock，新实例的 ListenUnix 在 dial 探测失败（说明是陈旧 inode）之后去
+// os.Remove，此时文件已不在，旧的 `return nil, err` 把整个 WaitUnix 判成硬失败：
+//
+//	wait: remove /tmp/.../admin.sock: no such file or directory
+//
+// 路径不存在时 net.Listen 本来就能成功——删除只是清理陈旧 inode，不是前置条件。
+func TestListenUnixToleratesStalePathRemovedByPeer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix socket deployment check")
+	}
+	path := filepath.Join(t.TempDir(), "admin.sock")
+	// 直接构造「路径消失」这一态：不建 socket，bind 必须成功。
+	listener, err := ListenUnix(path)
+	if err != nil {
+		t.Fatalf("bind on a nonexistent path must succeed, got: %v", err)
+	}
+	defer listener.Close()
+
+	// 再覆盖「文件存在但已陈旧、随即被删」的窗口：模拟对端在探测后抢先删除。
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	listener.Close()
+	again, err := ListenUnix(path)
+	if err != nil {
+		t.Fatalf("rebind after peer removal must succeed, got: %v", err)
+	}
+	again.Close()
+}
+
 // TestWaitUnixTakesOverAfterRelease 热更新兼容路径：旧实例（不会传管理 socket FD）
 // 收尾释放路径后，新实例要能重新 bind 并继续提供管理接口。
 func TestWaitUnixTakesOverAfterRelease(t *testing.T) {

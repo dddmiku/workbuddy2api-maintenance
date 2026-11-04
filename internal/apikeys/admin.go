@@ -248,7 +248,14 @@ func ListenUnix(path string) (net.Listener, error) {
 			_ = conn.Close()
 			return nil, ErrSocketBusy
 		}
-		if err := os.Remove(path); err != nil {
+		// 陈旧 socket 先删再 bind。ENOENT 必须忽略：探测（dial 失败）与删除之间，
+		// 持有它的旧实例可能正好收尾自己删掉了这个文件——热更新期间这是常态，
+		// 不是错误。此前直接 return err，导致 WaitUnix 把一个「已经腾空」的路径
+		// 判成硬失败（CI 实测：wait: remove .../admin.sock: no such file or directory，
+		// TestWaitUnixTakesOverAfterRelease 0.30s 即失败）。
+		// 路径不存在时，下面的 net.Listen 本来就能成功——删除只是清理陈旧 inode，
+		// 不是前置条件。
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
