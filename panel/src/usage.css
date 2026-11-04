@@ -36,7 +36,7 @@
 .usage-table th:nth-child(4){width:11%}   /* 缓存命中 */
 .usage-table th:nth-child(5){width:11%}   /* 输出 tokens */
 .usage-table th:nth-child(6){width:11%}   /* 合计 tokens */
-.usage-table th:nth-child(7){width:9%}    /* 已用积分 */
+.usage-table th:nth-child(7){width:9%}    /* 积分数值 */
 .usage-table th:nth-child(8){width:10%}   /* 最近使用 */
 .usage-table th:nth-child(9){width:7%}    /* 模型拆分 */
 /* 数字不换行：固定列宽下长数字若折行会让行高参差。 */
