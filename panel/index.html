@@ -713,6 +713,21 @@ pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
 .usage-tile .v{font:600 22px/1.35 var(--mono);margin-top:6px;letter-spacing:-.02em}
 .usage-tile .s{font-size:12px;color:var(--ink-3)}
 .usage-table td.num,.usage-table th.r{text-align:right}
+/* 列宽固定：默认 table-layout:auto 会让「输入 tokens」这类长数字列被内容撑到很宽，
+ * 把密钥列挤窄、整表左右拉扯（2026-11-04 用户反馈「这个间隔太远了」）。
+ * 用固定布局 + 百分比列宽把九个列的比例定下来，数字列等宽，密钥列吃掉剩余空间。 */
+.usage-table{table-layout:fixed}
+.usage-table th:nth-child(1){width:22%}   /* 密钥 */
+.usage-table th:nth-child(2){width:8%}    /* 请求 */
+.usage-table th:nth-child(3){width:11%}   /* 输入 tokens */
+.usage-table th:nth-child(4){width:11%}   /* 缓存命中 */
+.usage-table th:nth-child(5){width:11%}   /* 输出 tokens */
+.usage-table th:nth-child(6){width:11%}   /* 合计 tokens */
+.usage-table th:nth-child(7){width:9%}    /* 已用积分 */
+.usage-table th:nth-child(8){width:10%}   /* 最近使用 */
+.usage-table th:nth-child(9){width:7%}    /* 模型拆分 */
+/* 数字不换行：固定列宽下长数字若折行会让行高参差。 */
+.usage-table td.num{white-space:nowrap}
 .usage-key{display:flex;flex-direction:column;gap:2px;min-width:0}
 .usage-key b{font-weight:600}
 .usage-key code{font-size:11px;color:var(--ink-3)}
