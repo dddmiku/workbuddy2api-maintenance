@@ -1,5 +1,13 @@
 # 版本变更
 
+## v3.15.5 — 2026-11-04
+
+修渠道校验 11128：system 消息里的 `workspace root` 是触发词，此前三档中和都覆盖不到。
+
+DSH 客户端一次请求被拒后换 3 个账号重试 9 次全部失败。用生产 dump 单变量回放定位到：system 里出现该短语即被拒，与位置无关（挪到 user 消息则通过），大小写不敏感。改为 `workspace base` 后同一请求 400 → 200。
+
+顺带修 `stripClientName` 的子串误伤：`"zed "` 命中 `authorized` 中间的 `zed `，把 `already authorized and` 切成 `already authoriand`——畸形英文本身是更强的异常特征。
+
 ## v3.15.4 — 2026-11-04
 
 快过期积分优先重新覆盖已绑定会话：粘性命中时若别的号有快过期积分而本号没有，就让路重选。
