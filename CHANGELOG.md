@@ -2,11 +2,11 @@
 
 ## v3.15.5 — 2026-11-04
 
-修渠道校验 11128：system 消息里的 `workspace root` 是触发词，此前三档中和都覆盖不到。
+修 system 消息含 `workspace root` 时被上游判非官方客户端（11128）。
 
-DSH 客户端一次请求被拒后换 3 个账号重试 9 次全部失败。用生产 dump 单变量回放定位到：system 里出现该短语即被拒，与位置无关（挪到 user 消息则通过），大小写不敏感。改为 `workspace base` 后同一请求 400 → 200。
+DSH 客户端 19:00 连续 9 次重试、换 3 个账号全部被拒。单变量回放定位到触发点：该短语出现在 system 任意行都触发，加前缀无效，挪到 user 消息则通过。原净化只处理 system 首行，覆盖不到。改为 `workspace base` 后同一请求 400 变 200。
 
-顺带修 `stripClientName` 的子串误伤：`"zed "` 命中 `authorized` 中间的 `zed `，把 `already authorized and` 切成 `already authoriand`——畸形英文本身是更强的异常特征。
+顺带修客户端名子串误伤：`zed` 命中 `authorized` 把单词切坏，反成更强的异常特征。
 
 ## v3.15.4 — 2026-11-04
 
