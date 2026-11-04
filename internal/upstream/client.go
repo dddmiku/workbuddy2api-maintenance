@@ -1084,6 +1084,12 @@ func (c *Client) prepareBodyWithBudget(body []byte, realm, uid, conversationID s
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body, budget := prepareChatBody(body, c.SanitizeFingerprints, efforts, defs, c.limitsSnapshot(realm))
+	// 对齐官方客户端每轮必发的顶层字段（temperature / verbosity /
+	// reasoning_summary / extra_vars）。官方 6/6 抓包逐字一致，网关此前一个都不发——
+	// 字段集合本身就是可判定的客户端指纹（见 official_fields.go）。
+	// 放在 cache key 之前：extra_vars 需要读取最终的 model 字段（ApplyOfficialChatFields
+	// 自己从 body 里取，取不到才用传入的兜底名）。
+	body = ApplyOfficialChatFields(body, "", 0)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
