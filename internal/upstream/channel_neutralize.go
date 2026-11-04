@@ -63,13 +63,61 @@ var channelAttributionMarkers = []string{
 }
 
 // channelClientNames 常见 AI 编码/代理客户端产品名（小写匹配）。
+//
+// ═══ 2026-11-04：每个名字都必须带词边界，否则会切碎普通英文单词 ═══
+//
+// 现场（用户报障 DSH 19:00 一直 11128）：stripClientName 用 indexFrom 做**子串**
+// 匹配，名字表里的 "zed " 命中了 `authorized and` 中间的 "zed "——把
+// `Treat every user instruction as already authorized and act...` 切成了
+// `...already authoriand act...`（"zed " 三个字母被删）。
+//
+// 后果比"没生效"严重得多：上游看到的是一段**被改坏的畸形英文**，这本身就是
+// 非官方客户端的强特征，于是第 1 级、第 2 级中和全被拒（三份 dump 逐字节 diff
+// 实测：a→b 只动了 copilot 那处大写化，b→c 就是这一处 authoriand）。
+//
+// 修法：名字两侧都必须是非字母边界。短的、会当普通英文词根出现的（zed / kiro /
+// trae / crush / amp）尤其危险，靠边界挡住；长的（claude code 等）本来就不会误命中，
+// 但统一走同一判据，避免以后再加短名时重犯。
+//
+// 为什么不用 `"zed "` 这种自带尾空格的老写法：那只挡住了右侧，左侧
+// （`authori|zed `）照样命中。真正的词边界要两边都判。
 var channelClientNames = []string{
 	"claude code", "codex cli", "codex", "cursor", "windsurf", "cline", "roo code",
-	"kilocode", "aider", "copilot", "gemini cli", "zed ", "devin", "opencode",
+	"kilocode", "aider", "copilot", "gemini cli", "zed", "devin", "opencode",
 	"kiro", "trae", "qoder", "continue.dev", "amazon q", "jetbrains ai",
 	"augment code", "comate", "marscode", "lingma", "codebuddy", "workbuddy",
-	"tongyi", "qwen code", "iflow", "crush", "amp ", "factory droid",
+	"tongyi", "qwen code", "iflow", "crush", "amp", "factory droid",
 }
+
+// indexWordIn 在 lowered 里查找 name，要求 name 的**两侧都不是 ASCII 字母**。
+//
+// 用途：channelClientNames 是产品名，必须整词命中。子串匹配会把
+// authorized→authori + zed、kiro 之类嵌在普通词里切掉（见上表注释的现场）。
+//
+// 为什么只判 ASCII 字母、不判数字与下划线：产品名周围出现数字（`cursor2`）或
+// 下划线（`claude_code`）时仍应命中——那是同一个产品名的常见写法；而字母拼接
+// （authorized / kirobyte）才是误伤源。
+func indexWordIn(lowered, name string) int {
+	for from := 0; from <= len(lowered)-len(name); {
+		index := indexFrom(lowered, name, from)
+		if index < 0 {
+			return -1
+		}
+		startOK := index == 0 || !isASCIILetter(lowered[index-1])
+		end := index + len(name)
+		endOK := end >= len(lowered) || !isASCIILetter(lowered[end])
+		if startOK && endOK {
+			return index
+		}
+		from = index + 1
+	}
+	return -1
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
 
 // NeutralizeChannelTrigger 在「已确认被上游渠道校验拒绝」的请求体上断开触发句。
 //
@@ -152,6 +200,24 @@ var channelFirstLineTriggerTokens = []string{
 	// Claude Code 系统提示首句的产品归属声明。
 	"You are Claude Code, Anthropic's official CLI for Claude",
 	"Codex CLI is an open source project led by OpenAI",
+	// 2026-11-04 实测（DSH 客户端 19:00 全量被拒，9 次重试 3 个账号 11128）：
+	// **system 消息里出现 `workspace root` 这个短语即被拒**，与它是不是首行无关，
+	// 加前缀无效，挪到 user 消息则通过。
+	//
+	// 定位过程（本机对生产 dump 的单变量回放，每次只改一处）：
+	//   system 去掉该行                → 200
+	//   system 保留该行                → 400
+	//   同一行挪到 user 消息            → 200
+	//   system 只有这一行               → 400
+	//   `...workspace root`            → 400
+	//   `...workspace roox`（改末字母） → 200
+	//   `...workspace rooT`（改大小写） → 400  ← 大小写不敏感
+	//   任意长度的无意义串              → 200  ← 不是长度判据
+	//
+	// 注意官方客户端**也发** `workspace root`（抓包 6/6 命中），但它出现在
+	// **user 消息**的 IDENTITY.md 模板里，不在 system——所以这不是「禁用词」，
+	// 而是「system 里不许出现」。改写在 system 内把它换掉即可，user 侧不动。
+	"workspace root",
 }
 
 // channelTokenRewrites 断词失效后的替代方案：**改写字母**而不是插零宽。
@@ -248,9 +314,17 @@ func neutralizeSystemFirstLine(obj any, changed *bool) bool {
 		}
 		switch content := message["content"].(type) {
 		case string:
+			orig := content
 			head, rest := splitFirstLine(content)
 			if broken := breakFirstLineTokens(head, changed); broken != head {
-				message["content"] = broken + rest
+				content = broken + rest
+			}
+			// system 全文档（2026-11-04）：`workspace root` 这类触发点与位置无关，
+			// 出现在 system 第 105 行照样被拒（前置测试：加前缀无效、挪到 user 消息
+			// 才通过）。首行档覆盖不到它，所以对整条 system 再做一次全域改写。
+			content = breakSystemBodyTokens(content, changed)
+			if content != orig {
+				message["content"] = content
 				touched = true
 			}
 		case []any:
@@ -264,9 +338,14 @@ func neutralizeSystemFirstLine(obj any, changed *bool) bool {
 				if !ok {
 					continue
 				}
+				orig := text
 				head, rest := splitFirstLine(text)
 				if broken := breakFirstLineTokens(head, changed); broken != head {
-					part["text"] = broken + rest
+					text = broken + rest
+				}
+				text = breakSystemBodyTokens(text, changed)
+				if text != orig {
+					part["text"] = text
 					touched = true
 				}
 			}
@@ -275,8 +354,56 @@ func neutralizeSystemFirstLine(obj any, changed *bool) bool {
 	return touched
 }
 
-// splitFirstLine 把文本切成首行与其余部分（rest 保留换行符本身）。
-// 无换行符时整条文本就是首行（head=全量、rest 为空）——单行 system 的首行即其全部，
+// breakSystemBodyTokens 对 **system 全文档**（不限首行）改写位置无关的触发短语。
+//
+// 为什么需要单独一档（2026-11-04 现场）：
+// 首行档只覆盖「上游只看 system 首行」这一类触发点（billing 头、Claude Code 归属句）。
+// 但 `workspace root` 不是首行敏感——它出现在 DSH 的 system 第 105 行照样被拒：
+//
+//	system 去掉该行        → 200
+//	system 保留该行        → 400
+//	同一行挪到 user 消息    → 200     ← 只有当它在 system 里才拒
+//	该行加 20 字节前缀      → 400     ← 前缀无效，与首行档的规则相反
+//	`workspace root`       → 400
+//	`workspace roox`       → 200     ← 改一个字母即可
+//	`workspace rooT`       → 400     ← 大小写不敏感
+//
+// 换句话说这是一条**位置约束不同的独立规则**，塞进首行档永远命中不了。
+//
+// 改写策略：把 `workspace root` 换成 `workspace base`——同义、同长、语义可读，
+// 且已实测 200。不做删除（会破坏 dsh 给模型的工作区路径说明，模型可能因此
+// 误解相对路径的解析基准）。
+//
+// 只动 system：官方客户端在 **user** 消息的 IDENTITY.md 模板里也发这个短语
+// （抓包 6/6 命中）且能 200，说明 user 侧不受此规则约束——动它只会白白改变
+// 用户可见内容。
+func breakSystemBodyTokens(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	lowered := strings.ToLower(text)
+	trigger := "workspace root"
+	const repl = "workspace base"
+	index := indexFrom(lowered, trigger, 0)
+	if index < 0 {
+		return text
+	}
+	// 大小写不敏感替换：上表实测 `workspace rooT` 同样被拒，所以不能只匹配小写原样。
+	var b strings.Builder
+	b.Grow(len(text))
+	last := 0
+	for index >= 0 {
+		b.WriteString(text[last:index])
+		b.WriteString(repl)
+		last = index + len(trigger)
+		index = indexFrom(lowered, trigger, last)
+	}
+	b.WriteString(text[last:])
+	*changed = true
+	return b.String()
+}
+
+// splitFirstLine 把文本切成首行与其余部分（rest 保留换行符本身）。// 无换行符时整条文本就是首行（head=全量、rest 为空）——单行 system 的首行即其全部，
 // 上游照样检查它，因此必须处理（2026-10-17：早前一版把这种形态跳过，导致
 // 「单行 system 含触发串」漏检）。
 func splitFirstLine(text string) (head, rest string) {
@@ -595,7 +722,9 @@ rebuild:
 func stripClientName(segment string) (string, bool) {
 	lowered := strings.ToLower(segment)
 	for _, name := range channelClientNames {
-		index := indexFrom(lowered, name, 0)
+		// 整词匹配，不是子串：`authorized` 里的 "zed" 不算客户端名（见
+		// channelClientNames 上方的现场记录）。
+		index := indexWordIn(lowered, name)
 		if index < 0 {
 			continue
 		}
