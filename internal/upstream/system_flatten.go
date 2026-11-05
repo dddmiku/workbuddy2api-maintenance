@@ -179,7 +179,9 @@ func messageText(content any) string {
 	case string:
 		return v
 	case map[string]any:
-		// 单个 part 对象（非数组）：部分客户端这么发，取它的 text。
+		// 单个 part 对象（非数组）。网关入口的 messages 校验会先拒掉这种形态
+		// （content must be a string, content-part array, or null），所以正常
+		// 请求走不到这里；保留是为了让本函数对任意 messages 输入都不 panic。
 		if text, ok := v["text"].(string); ok {
 			return text
 		}
