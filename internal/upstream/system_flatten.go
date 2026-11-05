@@ -130,6 +130,10 @@ func FlattenSystemIntoUser(body []byte) []byte {
 	if merged != "" {
 		prefix = flattenSystemMarker + "\n" + merged + "\n\n" + flattenUserMarker + "\n"
 	}
+	// attached 记录系统指令是否**真的**挂到了第一条 user 上。
+	// 挂不上（content 是数字/布尔等无法前置的形态）时，改为在它前面插入一条
+	// 独立的 user 消息承载指令——绝不带着「system 已删、指令没落地」的结果出去。
+	attached := prefix == ""
 	for i, raw := range rawMsgs {
 		msg, ok := raw.(map[string]any)
 		if !ok {
@@ -147,9 +151,17 @@ func FlattenSystemIntoUser(body []byte) []byte {
 			if changed {
 				msg = cloneMessage(msg)
 				msg["content"] = mergedContent
+				attached = true
+			} else {
+				// 承载不了就另起一条，保持顺序：新 user 在原 user 之前。
+				out = append(out, map[string]any{"role": "user", "content": prefix})
+				attached = true
 			}
 		}
 		out = append(out, msg)
+	}
+	if !attached {
+		return body
 	}
 	obj["messages"] = out
 
@@ -166,6 +178,11 @@ func messageText(content any) string {
 	switch v := content.(type) {
 	case string:
 		return v
+	case map[string]any:
+		// 单个 part 对象（非数组）：部分客户端这么发，取它的 text。
+		if text, ok := v["text"].(string); ok {
+			return text
+		}
 	case []any:
 		parts := make([]string, 0, len(v))
 		for _, raw := range v {
@@ -187,6 +204,10 @@ func messageText(content any) string {
 // 返回 (新 content, 是否改动)。
 func prependToContent(content any, prefix string) (any, bool) {
 	switch v := content.(type) {
+	case nil:
+		// content:null 是合法的 chat 消息形态（实测网关自身接受）。
+		// 直接写成 prefix：指令落地，且原本就没有正文可丢。
+		return prefix, true
 	case string:
 		return prefix + v, true
 	case []any:

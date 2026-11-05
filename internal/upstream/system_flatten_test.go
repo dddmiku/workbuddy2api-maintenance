@@ -149,6 +149,62 @@ func TestFlattenIdempotent(t *testing.T) {
 	}
 }
 
+// TestFlattenNullFirstUserContentKeepsInstructions content:null 的首条 user 要能承载系统指令。
+//
+// 回归：初版 prependToContent 对 null 返回 changed=false，而重建逻辑已经先删掉了
+// system——指令静默消失（实测 200 但模型完全没看到 system）。这里守「要么挂上、
+// 要么整体不改」。
+func TestFlattenNullFirstUserContentKeepsInstructions(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[` +
+		`{"role":"system","content":"YOU_ARE_A_PIRATE"},` +
+		`{"role":"user","content":null},` +
+		`{"role":"user","content":"hi"}]}`)
+	out := FlattenSystemIntoUser(body)
+	obj := flattenDecode(t, out)
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("消息数 = %d want 3", len(msgs))
+	}
+	head, ok := msgs[1].(map[string]any)["content"].(string)
+	if !ok || !strings.Contains(head, "YOU_ARE_A_PIRATE") {
+		t.Fatalf("null user 未承载系统指令: %#v", msgs[1])
+	}
+	if sys := msgs[0].(map[string]any)["content"].(string); strings.Contains(sys, "YOU_ARE_A_PIRATE") {
+		t.Error("system 里仍有客户端内容")
+	}
+	if tail := msgs[2].(map[string]any)["content"].(string); tail != "hi" {
+		t.Errorf("后续 user 被改: %q", tail)
+	}
+}
+
+// TestFlattenUnsupportedFirstUserContentStillKeepsInstructions 首条 user 的 content 是
+// 数字这类无法前置的形态时，另起一条 user 承载系统指令——指令绝不能丢。
+//
+// 回归：初版实现删掉 system 后 prependToContent 返回 false，指令静默消失
+// （实测 200 但模型完全没看到 system）。
+func TestFlattenUnsupportedFirstUserContentStillKeepsInstructions(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[` +
+		`{"role":"system","content":"MUST_NOT_VANISH"},` +
+		`{"role":"user","content":123}]}`)
+	out := FlattenSystemIntoUser(body)
+	obj := flattenDecode(t, out)
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("消息数 = %d want 3（官方 system + 指令 user + 原 user）", len(msgs))
+	}
+	head := msgs[1].(map[string]any)
+	if head["role"] != "user" || !strings.Contains(head["content"].(string), "MUST_NOT_VANISH") {
+		t.Fatalf("指令未落到独立 user: %#v", head)
+	}
+	orig := msgs[2].(map[string]any)
+	if v, ok := orig["content"].(float64); !ok || v != 123 {
+		t.Errorf("原 user content 被改: %#v", orig["content"])
+	}
+	if sys := msgs[0].(map[string]any)["content"].(string); strings.Contains(sys, "MUST_NOT_VANISH") {
+		t.Error("system 里仍有客户端内容")
+	}
+}
+
 // TestFlattenNoSystemUntouched 没有 system 时一个字节都不动。
 func TestFlattenNoSystemUntouched(t *testing.T) {
 	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
