@@ -26,6 +26,12 @@ import (
 var outbound []byte
 
 // firstSystem 取首条 system 消息的文本（decodeChat 复用 responses_test.go 里的同名助手）。
+// firstSystem 返回出站请求里 system 的内容。
+//
+// 2026-11-06 起出站 system 恒为官方固定句——客户端的 system 内容被
+// FlattenSystemIntoUser 搬进了第一条 user（结构性规避上游渠道校验 11128，
+// 见 internal/upstream/system_flatten.go）。因此运行约定不再出现在 system 里，
+// 断言「约定送达模型」要改用 allOutboundText。
 func firstSystem(t *testing.T, obj map[string]any) string {
 	t.Helper()
 	msgs, _ := obj["messages"].([]any)
@@ -40,6 +46,37 @@ func firstSystem(t *testing.T, obj map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// allOutboundText 把出站 messages 的全部文本拼起来（system + user + part 数组）。
+//
+// 用途：扁平化之后「客户端 system 内容 + 运行约定」都落在 user 里，判断某段文本
+// 是否送达模型必须扫全部消息，而不能只看 system 角色。
+func allOutboundText(t *testing.T, obj map[string]any) string {
+	t.Helper()
+	var b strings.Builder
+	msgs, _ := obj["messages"].([]any)
+	for _, item := range msgs {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch c := msg["content"].(type) {
+		case string:
+			b.WriteString(c)
+			b.WriteString("\n")
+		case []any:
+			for _, raw := range c {
+				if part, ok := raw.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok {
+						b.WriteString(text)
+						b.WriteString("\n")
+					}
+				}
+			}
+		}
+	}
+	return b.String()
 }
 
 func TestApplyActNoteAppendsToSystemWhenToolsPresent(t *testing.T) {
@@ -159,12 +196,15 @@ func TestActNoteReachesNativeChatPath(t *testing.T) {
 	if err := json.Unmarshal(captured, &obj); err != nil {
 		t.Fatalf("captured body is not JSON: %v", err)
 	}
-	system := firstSystem(t, obj)
-	if !strings.HasPrefix(system, "You are Codex.") {
-		t.Fatalf("原 system 被改写: %q", system)
+	// 扁平化后客户端 system 内容与运行约定都落在 user，断言改为扫全部消息。
+	// 「原 system 必须原样保留在 system 角色里」这条已不成立——那正是被上游
+	// 渠道校验（11128）拦下的形态，见 internal/upstream/system_flatten.go。
+	all := allOutboundText(t, obj)
+	if !strings.Contains(all, "You are Codex.") {
+		t.Fatalf("客户端 system 内容丢失: %q", all)
 	}
-	if !strings.Contains(system, prompt.ActNote) {
-		t.Fatalf("原生 Chat 路径未注入运行约定: %q", system)
+	if !strings.Contains(all, prompt.ActNote) {
+		t.Fatalf("原生 Chat 路径未注入运行约定: %q", all)
 	}
 	// 工具声明与用户消息必须原样保留。
 	if tools, _ := obj["tools"].([]any); len(tools) != 1 {
@@ -264,14 +304,17 @@ func TestActNoteSurvivesCustomPromptMode(t *testing.T) {
 		t.Fatal("请求未到达上游")
 	}
 	obj := decodeChat(t, outbound)
-	system := firstSystem(t, obj)
-	if !strings.Contains(system, "You are the gateway prompt.") {
-		t.Fatalf("custom 提示词未生效: %q", system)
+	// 2026-11-06：出站 system 恒为官方固定句（客户端 system 内容被扁平化进 user，
+	// 见 internal/upstream/system_flatten.go）。custom 提示词与运行约定随之落到 user，
+	// 断言改扫全部消息；「客户端 system 被替换」这条语义不变。
+	all := allOutboundText(t, obj)
+	if !strings.Contains(all, "You are the gateway prompt.") {
+		t.Fatalf("custom 提示词未生效: %q", all)
 	}
-	if !strings.Contains(system, prompt.ActNote) {
-		t.Fatalf("运行约定在 custom 模式下丢失（被 prompt.Rewrite 删掉）: %q", system)
+	if !strings.Contains(all, prompt.ActNote) {
+		t.Fatalf("运行约定在 custom 模式下丢失（被 prompt.Rewrite 删掉）: %q", all)
 	}
-	if strings.Contains(system, "client system") {
-		t.Fatalf("custom 模式应替换客户端 system: %q", system)
+	if strings.Contains(all, "client system") {
+		t.Fatalf("custom 模式应替换客户端 system: %q", all)
 	}
 }

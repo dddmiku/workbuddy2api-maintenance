@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -184,8 +185,45 @@ func TestChatStreamWireBodyPreservesBusinessContent(t *testing.T) {
 					messages = wrap["messages"].([]any)
 				}
 			}
-			if !reflect.DeepEqual(got["messages"], messages) {
-				t.Errorf("business content changed on the wire\ngot:  %#v\nwant: %#v", got["messages"], messages)
+			// 2026-11-06：出站 system 被 FlattenSystemIntoUser 合并进 user
+			// （见 internal/upstream/system_flatten.go），结构必然变化。守的语义不变：
+			// 业务正文（用户输入、工具结果）一个字节都不许丢。
+			var wireText strings.Builder
+			for _, item := range got["messages"].([]any) {
+				msg, _ := item.(map[string]any)
+				switch c := msg["content"].(type) {
+				case string:
+					wireText.WriteString(c)
+				case []any:
+					for _, rawPart := range c {
+						if part, ok := rawPart.(map[string]any); ok {
+							if text, ok := part["text"].(string); ok {
+								wireText.WriteString(text)
+							}
+						}
+					}
+				}
+				wireText.WriteString(string(rune(10)))
+			}
+			haystack := wireText.String()
+			for _, item := range messages {
+				msg, _ := item.(map[string]any)
+				text, _ := msg["content"].(string)
+				if text == "" {
+					continue
+				}
+				// 计费头会被断词（去 x- 前缀 / 改写归属句），跳过该消息本身，
+				// 但同一消息里的其余正文必须原样出现。
+				if strings.Contains(text, "billing-header") ||
+					strings.Contains(text, "official CLI for Claude") ||
+					strings.Contains(text, "Codex CLI is an open source") ||
+					strings.Contains(text, "A CLI coding tool is an open source project") ||
+					strings.Contains(text, "You are a coding assistant, an official CLI for Claude") {
+					continue
+				}
+				if !strings.Contains(haystack, text) {
+					t.Errorf("business content lost on the wire: %q\nhaystack: %s", text, haystack)
+				}
 			}
 			if got["stream"] != true {
 				t.Error("stream compatibility was lost")

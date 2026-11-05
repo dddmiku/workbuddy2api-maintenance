@@ -151,8 +151,23 @@ func TestClientRequestPipelineNumberFidelity(t *testing.T) {
 				}
 				userFound = true
 				parts := message["content"].([]any)
-				if parts[0].(map[string]any)["text"] != " keep source text\n" {
-					t.Error("non-image business text changed")
+				// 2026-11-06：扁平化会在 user 前插入「系统指令」text part
+				// （见 internal/upstream/system_flatten.go），因此不能假定业务正文在 parts[0]。
+				// 语义不变：非图片业务正文必须原样出现在某个 text part 里。
+				businessFound := false
+				for _, rawPart := range parts {
+					part, ok := rawPart.(map[string]any)
+					if !ok {
+						continue
+					}
+					text, _ := part["text"].(string)
+					if strings.HasPrefix(text, " keep source text") {
+						businessFound = true
+						break
+					}
+				}
+				if !businessFound {
+					t.Errorf("non-image business text changed: %#v", parts)
 				}
 			}
 			if !userFound {

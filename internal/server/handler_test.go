@@ -2373,27 +2373,38 @@ func TestCustomModePreservesUserText(t *testing.T) {
 		t.Fatalf("out body not json: %v %s", err, out)
 	}
 	msgs := obj["messages"].([]any)
+	// 2026-11-06：出站 system 恒为官方固定句——客户端/自定义 system 内容被
+	// FlattenSystemIntoUser 搬进第一条 user，以规避上游渠道校验 11128
+	// （见 internal/upstream/system_flatten.go）。因此这里断言：
+	//   1) 恰好一条 system，且内容是官方固定句；
+	//   2) 自定义提示词与用户正文都完整保留在 user 里，未被额外改写。
+	official := "You are a helpful assistant. You are an expert in programming."
 	var systemCount int
+	var allUser string
 	for _, m := range msgs {
 		mm := m.(map[string]any)
-		if mm["role"] == "system" {
+		switch mm["role"] {
+		case "system":
 			systemCount++
-			if mm["content"] != customSys {
-				t.Errorf("system content=%v want %q", mm["content"], customSys)
+			if mm["content"] != official {
+				t.Errorf("system content=%v want 官方固定句 %q", mm["content"], official)
 			}
-		}
-		// user 正文只允许「触发句断词」这一种改动：去掉零宽字符后必须与原文逐字相同。
-		if mm["role"] == "user" {
-			stripped, _ := mm["content"].(string)
-			stripped = strings.ReplaceAll(stripped, "\u200b", "")
-			const want = "You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)"
-			if stripped != want {
-				t.Errorf("custom mode changed user content beyond trigger breaking: got %q want %q", stripped, want)
+		case "user":
+			if text, ok := mm["content"].(string); ok {
+				allUser += text
 			}
 		}
 	}
 	if systemCount != 1 {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
+	}
+	if !strings.Contains(allUser, customSys) {
+		t.Errorf("custom 提示词未保留在 user: %q", allUser)
+	}
+	// 用户正文去掉零宽后必须仍逐字出现在 user 里（未被额外改写）。
+	const wantText = "You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)"
+	if !strings.Contains(strings.ReplaceAll(allUser, "\u200b", ""), wantText) {
+		t.Errorf("custom mode changed user content beyond trigger breaking: got %q want contain %q", allUser, wantText)
 	}
 }
 
@@ -2537,18 +2548,31 @@ func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
 	if len(msgs) < 2 {
 		t.Fatalf("expected >=2 messages (system kept + user kept), got %d: %s", len(msgs), out)
 	}
+	// 2026-11-06：出站 system 恒为官方固定句，客户端 system 内容被扁平化进
+	// 第一条 user（见 internal/upstream/system_flatten.go）。透传语义因此改为
+	// 「客户端 system 文本逐字保留在 user 里」，而不是「system 角色原样」。
+	official := "You are a helpful assistant. You are an expert in programming."
 	sysCount := 0
+	var allUser string
 	for _, m := range msgs {
 		mm, _ := m.(map[string]any)
-		if mm["role"] == "system" {
+		switch mm["role"] {
+		case "system":
 			sysCount++
-			if mm["content"] != sys {
-				t.Errorf("system content=%v want %q (no rewrite in default mode)", mm["content"], sys)
+			if mm["content"] != official {
+				t.Errorf("system content=%v want 官方固定句 %q", mm["content"], official)
+			}
+		case "user":
+			if text, ok := mm["content"].(string); ok {
+				allUser += text
 			}
 		}
 	}
 	if sysCount != 1 {
-		t.Errorf("system count=%d want 1 (passthrough keeps client system exactly once)", sysCount)
+		t.Errorf("system count=%d want 1", sysCount)
+	}
+	if !strings.Contains(allUser, sys) {
+		t.Errorf("客户端 system 文本未逐字保留在 user: got %q want contain %q", allUser, sys)
 	}
 }
 

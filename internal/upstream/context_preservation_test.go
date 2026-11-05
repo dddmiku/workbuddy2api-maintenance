@@ -10,7 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -50,6 +50,92 @@ func contextHistoryMessages(t *testing.T, body []byte) []map[string]any {
 		t.Fatalf("invalid request body: %v", err)
 	}
 	return request.Messages
+}
+
+// historyFingerprint 把 messages 拍平成「角色 + 内容」序列，用于断言历史未被丢弃。
+//
+// 为什么不用条数比较：2026-11-06 起出站 system 被 FlattenSystemIntoUser 合并
+// （客户端 system 内容并入第一条 user，system 只留官方固定句），消息条数会变，
+// 但每一条用户/助手消息的内容与顺序都必须原样保留。这里比对的是「内容清单」
+// 而不是「条数」，守的仍然「历史不许丢」这条语义。
+func historyFingerprint(msgs []map[string]any) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		role, _ := m["role"].(string)
+		switch c := m["content"].(type) {
+		case string:
+			out = append(out, role+"|"+c)
+		case []any:
+			for _, raw := range c {
+				if part, ok := raw.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok {
+						out = append(out, role+"|"+text)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// contentPreserved 报告 want 里每条消息的**正文**是否都还出现在 got 里。
+//
+// 2026-11-06：出站 system 被 FlattenSystemIntoUser 合并进第一条 user
+// （见 internal/upstream/system_flatten.go），条数与 role 序列必然变化。
+// 守的语义不变——**历史正文一律不许丢**——所以这里检查「每条原文内容都是
+// got 全部文本的子串」，而不是 DeepEqual 整条消息。
+func contentPreserved(want, got []map[string]any) bool {
+	var all strings.Builder
+	for _, m := range got {
+		switch c := m["content"].(type) {
+		case string:
+			all.WriteString(c)
+			all.WriteString("\n")
+		case []any:
+			for _, raw := range c {
+				if part, ok := raw.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok {
+						all.WriteString(text)
+						all.WriteString("\n")
+					}
+				}
+			}
+		}
+		// 工具结果/调用也要算进「历史正文」，否则丢一条 tool 结果查不出来。
+		if calls, ok := m["tool_calls"].([]any); ok {
+			for _, rc := range calls {
+				if call, ok := rc.(map[string]any); ok {
+					all.WriteString(fmt.Sprintf("%v", call))
+				}
+			}
+		}
+		if id, ok := m["tool_call_id"].(string); ok {
+			all.WriteString(id)
+		}
+	}
+	haystack := all.String()
+	for _, m := range want {
+		switch c := m["content"].(type) {
+		case string:
+			if c == "" {
+				continue // assistant 的 content 常为空串，无可比对正文
+			}
+			if !strings.Contains(haystack, c) {
+				return false
+			}
+		case []any:
+			for _, raw := range c {
+				if part, ok := raw.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok && text != "" {
+						if !strings.Contains(haystack, text) {
+							return false
+						}
+					}
+				}
+			}
+		}
+	}
+	return true
 }
 
 func TestContextTooLongPreservesHistory(t *testing.T) {
@@ -117,8 +203,13 @@ func TestContextTooLongPreservesHistory(t *testing.T) {
 							}
 							for len(requests) > 0 {
 								gotMessages := contextHistoryMessages(t, <-requests)
-								if !reflect.DeepEqual(gotMessages, wantMessages) {
-									t.Errorf("upstream history changed: got %d messages, want all %d original messages", len(gotMessages), len(wantMessages))
+								// 2026-11-06：system 会被 FlattenSystemIntoUser 合并进 user
+								// （见 internal/upstream/system_flatten.go），条数与 role 序列
+								// 必然变化。守的语义不变——**历史一律不许丢**，所以比对
+								// 内容清单而非 DeepEqual 整条消息。
+								if !contentPreserved(wantMessages, gotMessages) {
+									t.Errorf("upstream history lost content: got %d messages, want all %d original messages preserved",
+										len(gotMessages), len(wantMessages))
 								}
 							}
 						})

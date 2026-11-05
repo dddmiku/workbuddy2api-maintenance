@@ -1084,21 +1084,33 @@ func (c *Client) prepareBodyWithBudget(body []byte, realm, uid, conversationID s
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body, budget := prepareChatBody(body, c.SanitizeFingerprints, efforts, defs, c.limitsSnapshot(realm))
-	// 对齐官方客户端每轮必发的顶层字段（temperature / verbosity /
-	// reasoning_summary / extra_vars）。官方 6/6 抓包逐字一致，网关此前一个都不发——
-	// 字段集合本身就是可判定的客户端指纹（见 official_fields.go）。
-	// 放在 cache key 之前：extra_vars 需要读取最终的 model 字段（ApplyOfficialChatFields
-	// 自己从 body 里取，取不到才用传入的兜底名）。
-	body = ApplyOfficialChatFields(body, "", 0)
-	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
-	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	body = InjectPromptCacheKey(body, uid, conversationID)
-	// 计费头提前断词：这类串对模型没有语义价值，却会被上游当渠道特征拒掉，而且几乎每个
-	// 请求都带着它。提前处理省掉「先被拒一次再重试」的往返（实测 76/79 的请求都白撞一次）。
+	// 计费头/归属句预中和：必须在扁平化**之前**。
+	//
+	// neutralizeSystemFirstLine 只处理 role=system 的消息；一旦 FlattenSystemIntoUser
+	// 把 system 内容搬进 user，这里就再也命中不了——实测该顺序下触发句会原样进 user
+	// （TestChatStreamRetriesChannelRejection 抓到）。先中和再搬家，两个保护才叠加生效。
 	if neutralized, changed := NeutralizeBillingHeaders(body); changed {
 		log.Printf("INFO: [上游] 计费头已预先中和 uid=%s", logfmt.UID8(uid))
 		body = neutralized
 	}
+	// 把客户端的 system 内容扁平化进 user，system 只留官方句。
+	//
+	// 上游的渠道校验（11128 unapproved channel）扫描 system 消息内容，而触发串是
+	// 开放集合——每换一个客户端就可能冒出新的句子（2026-11-04 修了 workspace root，
+	// 11-06 又出现别的）。维护黑名单必然追不上，所以改成结构性规避：
+	// 客户端内容一律搬到 user（同一内容放 user 实测 100% 通过），system 留官方句。
+	//
+	// 放在 prepareChatBody 之后：那里已做过 role 归一化（developer→system 等），
+	// 这里拿到的是最终角色形态。放在 ApplyOfficialChatFields 之前：后者按 model
+	// 补 extra_vars，与 messages 结构无关。
+	body = FlattenSystemIntoUser(body)
+	// 对齐官方客户端每轮必发的顶层字段（temperature / verbosity /
+	// reasoning_summary / extra_vars）。官方 6/6 抓包逐字一致，网关此前一个都不发——
+	// 字段集合本身就是可判定的客户端指纹（见 official_fields.go）。
+	body = ApplyOfficialChatFields(body, "", 0)
+	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
+	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
+	body = InjectPromptCacheKey(body, uid, conversationID)
 	// 出站图片预算（最后一环）：前面所有改写都可能让体积膨胀，这里统一按字节收口。
 	// 放在 prompt_cache_key 之后：裁剪只动图片 part，缓存键不受影响。
 	body = ShrinkOutboundImages(body, c.OutboundImageBudgetBytes)

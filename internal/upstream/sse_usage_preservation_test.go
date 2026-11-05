@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -43,8 +42,11 @@ func TestSuccessfulHistoryPreservesSplitUsage(t *testing.T) {
 			if got := len(requests); got != 1 {
 				t.Fatalf("successful request made %d attempts; want one", got)
 			}
-			if got, want := contextHistoryMessages(t, <-requests), contextHistoryMessages(t, body); !reflect.DeepEqual(got, want) {
-				t.Fatal("successful request lost or changed original history")
+			// 2026-11-06：出站 system 被 FlattenSystemIntoUser 合并进 user
+			// （见 internal/upstream/system_flatten.go），条数/role 序列必然变化。
+			// 语义不变——历史正文一条都不许丢——故比对内容而非 DeepEqual。
+			if got, want := contextHistoryMessages(t, <-requests), contextHistoryMessages(t, body); !contentPreserved(want, got) {
+				t.Fatal("successful request lost original history content")
 			}
 			var usage map[string]any
 			if mode == "aggregate" {
