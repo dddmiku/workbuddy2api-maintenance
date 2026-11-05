@@ -127,6 +127,41 @@ Claude Code 经网关走 cn/global 全部 11128。同一账号、同一时刻的
 零误伤契约不变：**未命中触发串时，首行一个字节都不许动**——零宽剥离只用于匹配，
 不得落回输出（2026-10-29 修过一次这个回归）。
 
+## 结论五（2026-11-06）：校验范围从「system 首行」扩到「整条 system」
+
+同一账号同时刻、单变量回放（cn 域）：
+
+| 场景 | 结果 |
+|---|---|
+| `system` = dsh 的 18086 字符 / 146 行内容 | ❌ 400 / 11128 |
+| 同一份内容并入 `user`，`system` 换官方句 | ✅ 200 |
+| 无 system，内容只在 user | ✅ 200 |
+| `system` 首行官方句 + 后面放触发句 | ✅ 200（首行之后不扫） |
+| `system` 首行就是触发句 | ❌ 11128 |
+| 官方句放第一条 system，触发句放**第二条** system | ❌ 11128 |
+
+最后一行是 2026-10-17 结论「第二行 PASS」的**失效证据**：校验已扩到整条 system，
+「挪到第二行」这条规避路径不再成立。同时说明触发串是**开放集合**——修了
+`workspace root` 之后又出现新的句子，维护黑名单永远追不上。
+
+### 落地做法：结构性规避（v3.15.8）
+
+`internal/upstream/system_flatten.go` 的 `FlattenSystemIntoUser`：
+
+```text
+[system A, system B, user X, assistant Y, ...]
+→ [system 官方句, user (【系统指令】+A+B+【用户消息】+X), assistant Y, ...]
+```
+
+system/developer 内容按序合并、前置到第一条 user，system 只留官方句。指令文本
+一字不丢（模型语义不变），但不再进入 system 的扫描范围。**调用顺序**：
+`NeutralizeBillingHeaders` 必须在扁平化之前——它只处理 role=system，搬家后
+就再也命中不了。
+
+搬家时必须校验「真的挂上了」：`content:null` 或数字形态的首条 user 承载不了
+前缀，初版实现会先删 system 再挂失败 → **指令静默消失，请求仍返回 200**。
+现在的做法是 null 直接写 prefix、其它形态另插一条 user，并保留 `attached` 兜底。
+
 ## 实现要点
 
 - `channelFirstLineTriggerTokens`：首行触发 token 表（用于**匹配**，含客户端自带的零宽形态）；
