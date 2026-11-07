@@ -2596,6 +2596,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.CooldownSoftRateForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
+		//
+		// 11134「模型提供方暂时不可用」是例外（2026-11-07 生产实测）：它虽然回的是
+		// HTTP 500，但语义是模型后端瞬时不可用，与账号无关——五分钟内五个不同账号
+		// 各中 3–4 次、到期后立刻全 200、文案自己写着 "switch to another model"。
+		// 判成账号故障的后果是把一整片健康号摘出池子 30 分钟。处置与 14003 Model
+		// busy 对齐：只记观测时间，不喂熔断。
+		if upstream.IsTransientProviderUnavailable(http.StatusInternalServerError, body) {
+			h.cfg.Pool.NoteTransientError(uid)
+			log.Printf("INFO: [服务] 上游 11134 模型提供方暂时不可用，不熔断账号 uid=%s 模型=%s",
+				logfmt.UID8(uid), model)
+			return
+		}
 		h.cfg.Pool.NoteError(uid)
 	case upstream.ErrContextTooLong:
 		// 上下文超限：请求体问题非账号问题，不罚账号（无冷却/熔断/NoteError）。

@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -365,6 +366,14 @@ func upstreamErrorCode(body string) int {
 		if json.Unmarshal(raw, &n) == nil {
 			return n, true
 		}
+		// 上游偶尔把 code 发成字符串（"code":"11134"）。数字形态是常态，
+		// 但字符串形态在 11128/11134 的观测里都出现过，不能当成「没有 code」。
+		var str string
+		if json.Unmarshal(raw, &str) == nil {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(str)); err == nil {
+				return parsed, true
+			}
+		}
 		return 0, false
 	}
 	if raw, ok := envelope["code"]; ok {
@@ -547,6 +556,55 @@ func IsTransientModelBusy(status int, body string) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(body), transientBusyMarker)
+}
+
+// providerUnavailableCode 模型提供方暂时不可用的业务 code（11134，HTTP 500）。
+const providerUnavailableCode = 11134
+
+// providerUnavailableMarker 11134 答复的确定性文案片段。
+//
+// ═══ 为什么 11134 不能喂账号熔断（2026-11-07 生产实测） ═══
+//
+// 上游返回：
+//
+//	500 {"code":11134,"msg":"the model provider is temporarily unavailable,
+//	     please retry later or switch to another model"}
+//
+// 状态码是 500，Classify 走 status >= 5xx 兜底判成 ErrServer，applyErrorPolicy
+// 于是调 NoteError —— 连续 3 次就把**账号**熔断 30 分钟。
+//
+// 但实测证据全部指向「模型后端问题，与账号无关」：
+//   - 15:05–15:22 五分钟内，五个完全不同的账号（b0eedd14 / daa92d37 / eac2597c /
+//     fbede7cd / a2689910）各中 3–4 次，共享上游故障的典型分布；
+//   - 这些号积分 5298~6348、disabled=false、成功率 EMA 0.66–0.73，本身健康；
+//   - fus 到期后 b0eedd14 立刻连续 7 个请求全 200（TTFB 2.1–3.9s）；
+//   - 文案自己写着 "switch to another model"。
+//
+// 对照 14003「Model busy」：语义等价（都是模型侧瞬时不可用），早已因同一理由
+// 被排除在账号惩罚之外（见 IsTransientModelBusy 的长注释）。11134 只是漏了豁免，
+// 因为它的状态码落在通用 5xx 分支，没进入那套判定。
+//
+// 还有一个不对称佐证：传输层错误（context canceled / timeout awaiting response
+// headers）明确「只换号、不喂熔断计数」（见 handler.go 的 terr 分支），而上游
+// **正常返回**的 500 反而被判成账号故障——判据错位。
+const providerUnavailableMarker = "model provider is temporarily unavailable"
+
+// IsTransientProviderUnavailable 报告 body 是否是 11134「模型提供方暂时不可用」。
+//
+// 只认 **5xx** + code 精确为 11134 + 窄短语命中：宽泛匹配 "temporarily unavailable"
+// 会把其他业务的忙等文案（以及本网关自己的 503 文案）卷进来，与 IsModelBlocked
+// 的宁缺毋滥同口径。状态码放宽到整个 5xx 是因为调用方本就是 ErrServer 分支
+// （必然 ≥500），实测只见过 500，但 502/503 包裹同一 code 时语义不变。
+func IsTransientProviderUnavailable(status int, body string) bool {
+	if status < 500 || status >= 600 || body == "" {
+		return false
+	}
+	// 轻量预检：既无 code 也无 marker 时直接短路（大多数 5xx 零分配返回）。
+	if !strings.Contains(body, "11134") ||
+		!strings.Contains(strings.ToLower(body), providerUnavailableMarker) {
+		return false
+	}
+	return upstreamErrorCode(body) == providerUnavailableCode
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
