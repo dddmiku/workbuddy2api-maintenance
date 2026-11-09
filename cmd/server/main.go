@@ -406,6 +406,7 @@ func main() {
 		MaxRotate:             cfg.Pool.MaxRotate,
 		MaxSoftRotations:      cfg.Pool.MaxSoftRotations,
 		RotateOnClientError:   cfg.Pool.RotateOnClientError != nil && *cfg.Pool.RotateOnClientError,
+		FreezeOnAccountFault:  cfg.Pool.FreezeOnAccountFault != nil && *cfg.Pool.FreezeOnAccountFault,
 		SlotWait:              &cfg.PoolSlotWaitDur,
 		ReasoningLoopGuard:    &cfg.Features.ReasoningLoopGuard,
 		ReasoningLoopStopOnly: cfg.Features.ReasoningLoopStopOnly,

@@ -130,6 +130,14 @@ type Config struct {
 	// RotateOnClientError 未知 4xx 是否也换号再试（默认 false，保持既有契约：
 	// 未知 4xx 通常由请求本身决定，换号会掩盖真实错误、放大无效请求）。
 	RotateOnClientError bool
+	// FreezeOnAccountFault 收到 11140（账号级授权封禁）时**不换号**，直接把上游原文
+	// 原样回给调用方（默认 false = 保持既有轮转行为）。
+	//
+	// 为什么要这个开关（用户 2026-11-09 提出）：11140 意味着「这个号在上游被判异常」，
+	// 换号虽然能救活当次请求，但会把事故现场冲掉——运维看不到是哪个号、什么形态、
+	// 上游原文长什么样。冻结后死一个号还能抓包对比、针对性修；代价是当次请求失败。
+	// 只拦 11140 本身：14017（trial not activated）仍按模型级避让继续轮转。
+	FreezeOnAccountFault bool
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
@@ -2164,6 +2172,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						logfmt.UID8(acct.UID), st.keyName, chatShapeSummary(body, stats, hasStats))
 				}
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_invalid_request", "upstream rejected request params: "+detail)
+				st.status = http.StatusBadRequest
+				return
+			}
+			// 11140 冻结档（pool.freeze_on_account_fault）：账号级授权封禁是**该号**的
+			// 上游画像问题，换号能救活当次请求，但会把事故现场冲掉——不知道是哪个号、
+			// 什么形态、上游原文多长。冻结后原样透传上游 body，留着抓包对照。
+			//
+			// 只认 11140 本身：14017（trial not activated）是配置缺失、补完 register 就
+			// 自愈，继续轮转更有价值。也不碰 11128——那是渠道校验，换号本来就是正解。
+			if h.cfg.FreezeOnAccountFault && upstream.IsAccountFaultCode(string(respBody)) {
+				uidLog := logfmt.UID8(acct.UID)
+				log.Printf("WARN: [服务] 上游 11140 账号级封禁 — 已按配置冻结换号 uid=%s 模型=%s status=%d；上游原文透传给调用方",
+					uidLog, bareModel, status)
+				// 仍然记账：这个号确实坏了，不该被后续请求反复选中。
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				releaseHeld()
+				// error-passthrough：code/msg/requestId 原样交给调用方，便于抓包比对。
+				writeOpenAIError(w, http.StatusBadRequest, "upstream_account_fault", string(respBody))
 				st.status = http.StatusBadRequest
 				return
 			}

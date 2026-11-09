@@ -230,6 +230,10 @@ type Config struct {
 		// RotateOnClientError 未知 4xx 是否也换号再试（默认 false）。开启后，
 		// 换号成本只是一个多出来的上游请求；关掉可避免用轮转掩盖真实请求错误。
 		RotateOnClientError *bool `json:"rotate_on_client_error"`
+		// FreezeOnAccountFault 收到 11140（账号级授权封禁）时不换号，直接把上游原文
+		// 回给调用方（默认 false = 保持既有轮转）。开启后当次请求会失败，换来的是
+		// 完整的事故现场：哪个号、什么形态、上游原文都在响应里，便于抓包对照修复。
+		FreezeOnAccountFault *bool `json:"freeze_on_account_fault"`
 		// SlotWait 「健康账号全被在途名额占满」时，单个请求等待名额释放的上限
 		// （如 "10s"，默认 10s）。这类账号可用、只是并发名额暂时用尽，名额会在
 		// 既有请求结束时释放，等等就能正常服务。显式 "0s" = 不等待，立即回 503。

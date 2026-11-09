@@ -434,6 +434,25 @@ var accountFaultCodes = map[int]bool{
 	14017: true, // trial not activated
 }
 
+// IsAccountFaultCode 报告 body 的业务 code 是否**恰好**是 11140（账号级授权封禁）。
+//
+// 与 isAccountFault 的区别：后者还要排除限流文案、且在无 code 时退回关键词匹配；
+// 这里只回答「上游是不是用 11140 拒了这次请求」，供「冻结换号」这类要求判据极窄的
+// 场景使用。14017 不算——那是配置缺失、补完可自愈，不该冻结。
+//
+// 11140 也承载模型级限流（"The model provider is rate-limiting requests."），那种
+// 必须保持 soft_rate 语义、不能当账号故障，因此这里复用同一条排除规则。
+func IsAccountFaultCode(body string) bool {
+	if body == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	if softRateRule.hit(body, lower) {
+		return false
+	}
+	return upstreamErrorCode(body) == 11140
+}
+
 // isAccountFault 报告该响应是否为**账号级**故障（决定是否计进停号阈值）。
 //
 // 判定顺序：
