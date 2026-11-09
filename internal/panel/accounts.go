@@ -160,6 +160,20 @@ func Summary(entry AuthEntry) AuthSummary {
 	if out.Realm == "" {
 		out.Realm = firstString(raw, "realm")
 	}
+	// Trae 的展示名优先用手机号（2026-11-09 用户要求）。
+	//
+	// 为什么：Trae 上游给的 nickname 是「用户6126656924」这种自动生成串，加上
+	// uid 是 15 位内部数字，两者都看不出这是哪个号。掩码手机号（157****3894）
+	// 是唯一能直接对上「人」的标识，所以它该当主标题，而不是塞在第二行。
+	//
+	// 只对 Trae 域生效：WorkBuddy 账号的 nickname 是用户真实设置的（如
+	// "rmo43oa5wx"），不该被手机号顶掉。没有 mobile 时保持原有回退链不变。
+	//
+	// 位置很关键：必须在 Realm 赋值**之后**——放在前面时 out.Realm 还是空串，
+	// 判断永远不成立（这个顺序错误被 TestTraeSummaryPrefersMobile 抓到）。
+	if out.Realm == "trae" && out.Mobile != "" {
+		out.Nickname = out.Mobile
+	}
 	out.ExpiresAt = toInt64Lenient(auth["expiresAt"])
 	return out
 }

@@ -385,15 +385,26 @@ func printPretty(accounts []accountResult, totalRemain, totalUsed, totalSize int
 //
 // 面板的「有效期」视图按固定档位聚合（1/3/7/30 天 + 不会过期），档位口径与
 // WorkBuddy 侧一致——两域在面板上呈现同一个概念，不该各写一套。
+//
+// ═══ 只统计「还剩多少」，绝不用 Limit 兜底（2026-11-09 生产 bug）═══
+//
+// 原实现是 `amount = pack.Limit; if pack.Remaining > 0 { amount = pack.Remaining }`。
+// 当某个包 **已经用完**（Remaining == 0）时，amount 会退回成 Limit（包的总额度），
+// 于是「已经消耗掉的额度」被算成「即将过期的余额」。
+//
+// 实测（uid=20818427）：remain=2670，但各档位合计 6800 = size，前端按 7 天窗口
+// 取 within_1d+within_3d+within_7d 得 5000 —— 比账号余额本身还大，界面自相矛盾。
+//
+// 正确口径：档位里只能放**当前还剩余**的额度，且合计不得超过 remain。
+// 没有 Remaining 字段的包（上游没下发）无法判断还剩多少，归入 Unlimited 会让
+// 「有效期」视图虚高，因此直接跳过——宁可少显示，不可显示错的数。
 func traeExpiryView(credits trae.Credits) expiryView {
 	var out expiryView
 	now := time.Now().Unix()
 	for _, pack := range credits.Packs {
-		amount := int64(pack.Limit)
-		if pack.Remaining > 0 {
-			amount = int64(pack.Remaining)
-		}
+		amount := int64(pack.Remaining)
 		if amount <= 0 {
+			// 用完的包不产生任何到期压力；缺字段的包无法判断剩余，同样跳过。
 			continue
 		}
 		if pack.EndTime <= 0 {

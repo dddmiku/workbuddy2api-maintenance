@@ -1114,6 +1114,11 @@ function renderAccounts(){
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
     var expiring = expiringSoon(c, 7);
+    // 兜底：即将过期的量不可能超过当前余额（它是 remain 的子集）。上游各字段若
+    // 不同步（例如逐包 remaining 合计与汇总 remain 口径不一致），宁可整行不显示，
+    // 也不能让界面出现「余额 2,670，其中 5,000 即将过期」这种自相矛盾的数。
+    // 2026-11-09 实测踩过：Trae 侧逐包金额用了包总额做兜底，档位合计达 size。
+    if (typeof c.remain === 'number' && expiring > c.remain) expiring = 0;
     var expiringLine = (expiring > 0 && typeof c.remain === 'number')
       ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
         num(expiring) + ' 即将过期</span>'

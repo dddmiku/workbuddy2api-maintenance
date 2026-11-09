@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -160,5 +161,21 @@ func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler) 
 		return nil, err
 	}
 	log.Printf("[panel] 使用 Go 版面板引擎（无需 Python）")
+	// Trae 账号手机号回填（2026-11-09）。
+	//
+	// 手机号只在「添加账号」那一刻写入，加号早于该功能的账号 account.mobile 恒为空，
+	// 面板只能显示上游自动生成的「用户6126656924」。这里在启动后异步补一次，
+	// 只处理缺 mobile 的 Trae 账号；失败不影响启动（尽力而为）。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		n, problems := server.BackfillTraeProfiles(ctx)
+		if n > 0 {
+			log.Printf("[panel] Trae 账号手机号回填完成：更新 %d 个", n)
+		}
+		for _, p := range problems {
+			log.Printf("WARN: [panel] Trae 手机号回填：%s", p)
+		}
+	}()
 	return server, nil
 }

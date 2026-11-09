@@ -2677,6 +2677,8 @@ function renderAccounts(){
     // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
     // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
     var expiring = expiringSoon(c, 7);
+    // 兜底：即将过期的量不可能超过当前余额（见 app.js 同处注释）。
+    if (typeof c.remain === 'number' && expiring > c.remain) expiring = 0;
     var expiringLine = (expiring > 0 && typeof c.remain === 'number')
       ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
         num(expiring) + ' 即将过期</span>'
