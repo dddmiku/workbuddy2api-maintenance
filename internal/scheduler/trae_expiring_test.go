@@ -186,3 +186,45 @@ func TestTraeCheckinZeroWindowDisablesBucketing(t *testing.T) {
 		t.Fatalf("窗口为 0 时不该分桶，got %d", st.CreditsExpiring)
 	}
 }
+
+// 今天已签也必须刷新余额与快过期分桶（2026-11-09 实测 bug）。
+//
+// 余额查询原先写在 traeCheckOne 之后，于是「今天已签」「9074 退避中」两条
+// continue 路径永远走不到它——一天里余额只在签到那一刻更新一次。
+// 线上表现：签到日志「跳过 6」，6 个号的 credits_expiring 仍是 0。
+func TestTraeCheckinRefreshesCreditsEvenWhenAlreadyCheckedIn(t *testing.T) {
+	now := time.Now()
+	traeCreditsStub(t, now.Add(72*time.Hour).Unix(), now.Add(60*24*time.Hour).Unix())
+
+	p := pool.New("")
+	p.Add(newTraeAuthForTest(t, "trae-uid-0004"))
+	s := New(Config{
+		Pool:               p,
+		ExpiringSoonWindow: 7 * 24 * time.Hour,
+		TraeCheckHours:     []int{11},
+		CheckinDisabled:    true,
+	})
+
+	// 先把该号标记成「今天已签」，强制走 continue 分支。
+	s.markTraeCheckedInT(t, "trae-uid-0004", now)
+
+	if _, err := s.traeCheckAll(t.Context()); err != nil {
+		t.Fatalf("traeCheckAll: %v", err)
+	}
+
+	st, _ := p.Status("trae-uid-0004")
+	if st.Credits <= 0 {
+		t.Fatalf("Credits = %d —— 已签的号也要刷新余额（纯读接口与签到状态无关）", st.Credits)
+	}
+	if st.CreditsExpiring != 400 {
+		t.Fatalf("CreditsExpiring = %d want 400 —— 已签路径把余额刷新整个跳过了", st.CreditsExpiring)
+	}
+}
+
+// markTraeCheckedInT 把账号标记为「今天已签」（走生产同一个状态写入路径）。
+func (s *Scheduler) markTraeCheckedInT(t *testing.T, uid string, now time.Time) {
+	t.Helper()
+	s.traeCheckin.update(uid, func(st *traeCheckinState) {
+		st.CheckedInAt = now.Unix()
+	})
+}

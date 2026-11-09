@@ -678,6 +678,29 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 			out = append(out, oc)
 			continue
 		}
+		// 余额查询放在**所有跳过分支之前**（2026-11-09 修正）。
+		//
+		// 它是纯读接口，与「这个号今天签没签到」完全无关。原先写在 traeCheckOne
+		// 之后，于是「今天已签」和「9074 退避中」两条路径各自 continue，永远走不到
+		// 这里——结果是一天里余额与快过期信息只在签到那一刻更新一次，之后手动触发
+		// 或重试都刷不到。实测：签到显示「跳过 6」时，6 个号的 credits_expiring
+		// 仍是 0，新写的快过期优先完全不生效。
+		//
+		// 快过期积分必须一起写（用户要求「按 cn 一样，优先使用过期积分」）：选号侧
+		// 的硬过滤（pick 的 paid_expiring_preferred）与粘性让路（expiringDeferred）
+		// 全部只读 entry.creditsExpiring，为 0 时整套机制对该域完全失效。
+		//
+		// 窗口取 s.cfg.ExpiringSoonWindow，与 WorkBuddy 侧同一个配置项
+		// （pool.expiring_soon），保证两域的「快过期」口径逐字一致。
+		if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
+			remain := int64(credits.Remaining)
+			expiring := trae.ExpiringWithin(credits, s.cfg.ExpiringSoonWindow, time.Now())
+			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, expiring)
+			oc.Credits = &remain
+		} else {
+			log.Printf("查余额 %s（trae）：%v", logfmt.UID8(st.UID), cerr)
+		}
 		// 今天已经确认签过：不再打上游。这一层缓存原先没有，导致每天定时点之后的
 		// 每一次手动触发（以及 2026-10-15 新加的自动重试循环）都会重打 status+claim。
 		// 判据是「日期」而非 TTL，跨天自动失效。
@@ -698,26 +721,6 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 		s.traeCheckOne(ctx, st, a, &oc, &okN, &alreadyN, &failN)
 		// 单账号失败不阻断遍历：其它账号的签到不该被一个坏号拖累。
 		// （traeCheckOne 内部已把失败写进 oc，这里只保证继续往下走。）
-		// 顺手读余额（纯读接口，与签到是两件事）。
-		//
-		// 快过期积分必须一起写进来（2026-11-09 用户要求「按 cn 一样，优先使用
-		// 过期积分」）：选号侧的硬过滤（pick 的 paid_expiring_preferred）与
-		// 粘性让路（expiringDeferred）全部只读 entry.creditsExpiring，为 0 时
-		// 整套机制对该域完全失效。此前这里只调 SetCredits，Trae 账号的快过期
-		// 额度从未同步进池子——实测某个号 74% 的余额会在 7 天内作废，选号时
-		// 权重却与「积分永不过期」的号一模一样。
-		//
-		// 窗口取 s.cfg.ExpiringSoonWindow，与 WorkBuddy 侧同一个配置项
-		// （pool.expiring_soon），保证两域的「快过期」口径逐字一致。
-		if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
-			remain := int64(credits.Remaining)
-			expiring := trae.ExpiringWithin(credits, s.cfg.ExpiringSoonWindow, time.Now())
-			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, expiring)
-			oc.Credits = &remain
-		} else {
-			log.Printf("查余额 %s（trae）：%v", logfmt.UID8(st.UID), cerr)
-		}
 		out = append(out, oc)
 	}
 	log.Printf("trae 签到完成：共 %d，成功 %d，已签 %d，失败 %d，跳过 %d",
