@@ -699,10 +699,21 @@ func (s *Scheduler) traeCheckAll(ctx context.Context) ([]CheckinOutcome, error) 
 		// 单账号失败不阻断遍历：其它账号的签到不该被一个坏号拖累。
 		// （traeCheckOne 内部已把失败写进 oc，这里只保证继续往下走。）
 		// 顺手读余额（纯读接口，与签到是两件事）。
+		//
+		// 快过期积分必须一起写进来（2026-11-09 用户要求「按 cn 一样，优先使用
+		// 过期积分」）：选号侧的硬过滤（pick 的 paid_expiring_preferred）与
+		// 粘性让路（expiringDeferred）全部只读 entry.creditsExpiring，为 0 时
+		// 整套机制对该域完全失效。此前这里只调 SetCredits，Trae 账号的快过期
+		// 额度从未同步进池子——实测某个号 74% 的余额会在 7 天内作废，选号时
+		// 权重却与「积分永不过期」的号一模一样。
+		//
+		// 窗口取 s.cfg.ExpiringSoonWindow，与 WorkBuddy 侧同一个配置项
+		// （pool.expiring_soon），保证两域的「快过期」口径逐字一致。
 		if credits, cerr := trae.FetchCredits(ctx, a); cerr == nil {
 			remain := int64(credits.Remaining)
+			expiring := trae.ExpiringWithin(credits, s.cfg.ExpiringSoonWindow, time.Now())
 			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-			s.cfg.Pool.SetCredits(st.UID, remain)
+			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, expiring)
 			oc.Credits = &remain
 		} else {
 			log.Printf("查余额 %s（trae）：%v", logfmt.UID8(st.UID), cerr)

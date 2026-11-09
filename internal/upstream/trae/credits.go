@@ -471,3 +471,34 @@ func RawEntUsage(ctx context.Context, a *auth.Auth) (map[string]any, error) {
 	return postTraeAPI(ctx, a, entUsagePath,
 		map[string]any{"require_usage": true, "req_source": 1}, 0)
 }
+
+// ExpiringWithin 返回在 window 内到期、且当前仍有剩余的额度合计。
+//
+// 这是「快过期积分优先消耗」在 Trae 域的数据源，对应 WorkBuddy 侧的
+// CreditBuckets.Expiring（见 upstream.ResourceUsage）。两域语义必须一致：
+// 都是 remain 的子集、都按 pool.expiring_soon 同一个窗口判定。
+//
+// ═══ 为什么必须与 traeExpiryView 共用「只算剩余量」的口径 ═══
+//
+// 2026-11-09 修过一次生产 bug：面板档位曾把已用完的包按总额度计入，导致
+// 「余额 2,670，其中 5,000 即将过期」。同一个错误如果出现在这里，后果更重——
+// 选号会为了并不存在的「快过期积分」把流量硬压到这些号上，等于为了假的紧迫度
+// 牺牲真实的分层策略。所以两处都只认 pack.Remaining。
+//
+// window<=0 时返回 0（与 WorkBuddy 侧 soon<=0 时不分桶一致）。
+func ExpiringWithin(credits Credits, window time.Duration, now time.Time) int64 {
+	if window <= 0 {
+		return 0
+	}
+	deadline := now.Add(window)
+	var total int64
+	for _, pack := range credits.Packs {
+		if pack.Remaining <= 0 || pack.EndTime <= 0 {
+			continue
+		}
+		if !time.Unix(pack.EndTime, 0).After(deadline) {
+			total += int64(pack.Remaining)
+		}
+	}
+	return total
+}
