@@ -381,12 +381,39 @@ func FetchCredits(ctx context.Context, a *auth.Auth) (Credits, error) {
 }
 
 // parseCreditPack 解析一个积分包（层级较深，逐层容错）。
+//
+// ═══ 剩余额度的真实字段（2026-11-09 实测）═══
+//
+// 上游**没有** remaining_amount / available_amount 这两个顶层字段（原实现读的就是
+// 它们，所以 Remaining 恒为 0）。实际结构是：
+//
+//	{
+//	  "display_desc": "老用户福利",
+//	  "entitlement_base_info": {
+//	    "end_time": 1794480993,
+//	    "product_extra": {"package_extra": {"package_name": "...",
+//	                                        "quota": {"credits_limit": 4000}}}
+//	  },
+//	  "usage": {"credits_amount": 4000}      ← 该包**已用**多少；空 {} 表示未用
+//	}
+//
+// 所以剩余 = quota.credits_limit − usage.credits_amount。
+//
+// 「usage 为空对象」是**未使用**（不是缺字段），按已用 0 处理；这一点与
+// 「整个 usage 键都不存在」不同——后者才是上游格式变更，此时 Remaining 保持 0
+// 并由上层决定是否跳过（见 cmd/credit 的 traeExpiryView）。
 func parseCreditPack(pack map[string]any) CreditPack {
 	out := CreditPack{}
 	base, _ := pack["entitlement_base_info"].(map[string]any)
 	if base != nil {
 		if v, ok := asFloat(base["end_time"]); ok && v > 0 {
 			out.EndTime = int64(v)
+		}
+		// end_time 为 0 时回落顶层 expire_time（部分包只在顶层给）。
+		if out.EndTime == 0 {
+			if v, ok := asFloat(pack["expire_time"]); ok && v > 0 {
+				out.EndTime = int64(v)
+			}
 		}
 		if extra, ok := base["product_extra"].(map[string]any); ok {
 			if pe, ok := extra["package_extra"].(map[string]any); ok {
@@ -401,10 +428,27 @@ func parseCreditPack(pack map[string]any) CreditPack {
 			}
 		}
 	}
-	if v, ok := asFloat(pack["remaining_amount"]); ok {
-		out.Remaining = v
-	} else if v, ok := asFloat(pack["available_amount"]); ok {
-		out.Remaining = v
+	// 剩余 = 额度 − 已用。usage 为空对象 = 未使用（已用 0）。
+	var used float64
+	usedKnown := false
+	if usage, ok := pack["usage"].(map[string]any); ok {
+		usedKnown = true // usage 键存在即可（空对象代表 0）
+		if v, ok := asFloat(usage["credits_amount"]); ok {
+			used = v
+		}
+	}
+	switch {
+	case out.Limit > 0 && usedKnown:
+		out.Remaining = out.Limit - used
+	case out.Limit > 0:
+		// 没有 usage 键：不知道用了多少，不猜。
+		out.Remaining = 0
+	default:
+		// 连额度都没给：保持 0，由上层跳过。
+		out.Remaining = 0
+	}
+	if out.Remaining < 0 {
+		out.Remaining = 0
 	}
 	if out.Name == "" {
 		out.Name, _ = pack["display_desc"].(string)
