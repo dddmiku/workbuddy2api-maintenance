@@ -40,7 +40,10 @@ type Config struct {
 	// TraeCheckHours 是 Trae 域签到的独立排程。Trae 与 WorkBuddy 是**两个不同的
 	// 站点**（不同端点、不同风控），签到必须分开：混在一个任务里无法单独开关，
 	// 面板也会把 trae 归到 WorkBuddy 的「签到」下。
-	TraeCheckHours []int // 默认 [10]
+	//
+	// 默认 [0]（实际 00:05 触发，见 traeFireMinute）：必须晚于 CST 日切，
+	// 否则会踩到 traeCheckedInToday 的跨天边界。
+	TraeCheckHours []int // 默认 [0]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
@@ -186,7 +189,7 @@ func New(cfg Config) *Scheduler {
 		cfg.CheckinHours = []int{9, 21}
 	}
 	if len(cfg.TraeCheckHours) == 0 {
-		cfg.TraeCheckHours = []int{10}
+		cfg.TraeCheckHours = []int{0}
 	}
 	if len(cfg.TravelHours) == 0 {
 		cfg.TravelHours = []int{9, 21}
@@ -347,6 +350,35 @@ func nextFire(now time.Time, hours []int) time.Time {
 	return earliest
 }
 
+// traeFireMinute Trae 签到在整点之后的第几分钟触发。
+//
+// 为什么不是 00:00：Trae 的「今天已签」缓存按 **CST 业务日** 判（见
+// traeCheckedInToday / traeCheckinLocation）。00:00 整点恰好是日切边界，
+// 那一刻跑会踩两个坑：
+//   - 排程 timer 可能早醒几毫秒，落在前一天的日期上，签完记的还是昨天，
+//     于是当天再跑一次（重复打上游）；
+//   - 日志时间戳与业务日容易在跨秒时错位，排查时看不出到底是哪一天的。
+// 00:05 留出余量，且晚于 9074 重试循环的启动窗口，顺序稳定。
+const traeFireMinute = 5
+
+// nextTraeFire 返回 Trae 签到的下一个触发时刻（整点 + traeFireMinute 分钟）。
+//
+// 与 nextFire 分开而不是给后者加参数：nextFire 是**九类任务共用**的整点语义，
+// 改它的签名会让所有任务都被迫接受「非整点」，而只有 Trae 需要错开日切边界。
+func nextTraeFire(now time.Time, hours []int) time.Time {
+	var earliest time.Time
+	for _, h := range hours {
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, traeFireMinute, 0, 0, now.Location())
+		if !t.After(now) {
+			t = t.Add(24 * time.Hour)
+		}
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest
+}
+
 // taskKind 调度任务类型。
 type taskKind int
 
@@ -381,6 +413,24 @@ const (
 	taskCompensation
 )
 
+// lastTraeFire 返回今天**已经过去**的最近一个 Trae 排程时刻；今天一个都还没到则返回零值。
+//
+// 与 nextTraeFire 配对：后者算「下一次」，本函数算「今天的签到点到了没」。
+// 重试循环用它做闸门，避免在排程点之前抢跑（见 traeRetryCycle）。
+func lastTraeFire(now time.Time, hours []int) time.Time {
+	var latest time.Time
+	for _, h := range hours {
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, traeFireMinute, 0, 0, now.Location())
+		if t.After(now) {
+			continue
+		}
+		if latest.IsZero() || t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -403,7 +453,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
 	}
 	if !disabled[taskTraeCheck] {
-		slots = append(slots, slot{nextFire(now, s.cfg.TraeCheckHours), taskTraeCheck})
+		slots = append(slots, slot{nextTraeFire(now, s.cfg.TraeCheckHours), taskTraeCheck})
 	}
 	if !disabled[taskTravel] {
 		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
@@ -941,7 +991,31 @@ func (s *Scheduler) traeRetryLoop(ctx context.Context) {
 // device_generation 三者之一），并特意说明「this loop must not turn into a
 // general claim poller」。
 func (s *Scheduler) traeRetryCycle(ctx context.Context) {
-	now := time.Now()
+	s.traeRetryCycleAt(ctx, time.Now())
+}
+
+// traeRetryCycleAt 是 traeRetryCycle 的时间可注入版本（now 由调用方给定）。
+//
+// 为什么拆出 now 参数：闸门判据「今天的排程点到了没」与墙钟强相关，
+// 直接取 time.Now() 的版本无法写确定性测试——用例只能靠 t.Skip 躲开
+// 时段，等于把最关键的回归（00:00 抢跑）永远测不到。生产入口只传 time.Now()，
+// 行为与拆分前逐字一致。
+func (s *Scheduler) traeRetryCycleAt(ctx context.Context, now time.Time) {
+	// 今天的排程点还没到：重试循环**不要抢跑**。
+	//
+	// ═══ 为什么需要这道闸门（2026-11-14 实测）═══
+	//
+	// 9074 痕迹（device_generation / retry_9074_count）是**跨天保留**的，而
+	// 「今天已签」在 CST 日切时失效。于是每天 00:00:15，重试循环发现这些账号
+	// 「有 9074 痕迹 + 今天还没签」→ 立刻调用 traeCheckAll 把**全部账号**签掉。
+	// 等 11:00 的排程点真正到点时，6 个号已经是「今天已签」，日志只剩
+	// 「跳过 6」——面板上看着每天 11:00 在跑，实际真正签到的是 00:00 的重试循环。
+	//
+	// 闸门语义：当天的排程点跑过之后，重试循环才接管「撞了 9074 没签上的号」。
+	// 这正是它本来的职责（每日一次签到失败后的补签），而不是替代排程做首签。
+	if len(s.cfg.TraeCheckHours) > 0 && lastTraeFire(now, s.cfg.TraeCheckHours).IsZero() {
+		return
+	}
 	var pending []string
 	for _, st := range s.cfg.Pool.List() {
 		state := s.traeState(st.UID)

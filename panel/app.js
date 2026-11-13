@@ -1722,8 +1722,13 @@ function renderTasks(){
 // taskTile 单个任务卡片。
 function taskTile(t){
   var st = taskState(t);
+  // Trae 签到不是整点触发：后端 nextTraeFire 把它排在整点后第 5 分钟（避开
+  // CST 日切边界，见 scheduler.traeFireMinute）。小时标签必须显示真实时刻，
+  // 否则面板写 00:00、实际 00:05 才跑，排查时会误判成任务没触发。
+  // 分钟值由后端下发的 fire_minute 决定，前端不硬编码——两处各写一份必然漂移。
+  var fireMin = (typeof t.fire_minute === 'number') ? t.fire_minute : 0;
   var hours = (t.hours || []).map(function(h){
-    return '<span class="hour">' + pad(h) + ':00</span>'; }).join('');
+    return '<span class="hour">' + pad(h) + ':' + pad(fireMin) + '</span>'; }).join('');
   // 一次性任务（无 hours）没有开关：它的执行与否由上游活动是否过期决定，
   // 不由配置决定。面板隐藏开关（服务端也会拒绝对它的 toggle，见
   // panel.SetTaskEnabled 的空字段保护），只留「跑一次」与「停止」。

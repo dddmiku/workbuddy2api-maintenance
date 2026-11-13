@@ -75,6 +75,9 @@ func TestNextWakeCatSlot(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		CatHours:          []int{1},
+		// Trae 默认 [0]（实际 00:05），会抢在 01:00 之前成为 earliest。
+		// 本用例只测夜猫子独立时点，Trae 必须显式排除。
+		TraeCheckDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 23, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 15, 1, 0, 0, 0, time.Local); !at.Equal(want) {

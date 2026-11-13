@@ -114,14 +114,16 @@ func TestNormalizeScheduleInvalidHour(t *testing.T) {
 	}
 }
 
-// TestTraeCheckScheduleDefaults Trae 签到是独立排程段：默认 [10]、缺省启用、
+// TestTraeCheckScheduleDefaults Trae 签到是独立排程段：默认 [0]、缺省启用、
 // 空值回落、非法小时报错指向 trae_check_enabled。
 //
 // 2026-10-11：Trae 与 WorkBuddy 拆成两个站点两套排程（用户要求）。
+// 2026-11-14：默认从 [11] 改为 [0] —— Trae 的「今天已签」按 CST 业务日失效，
+// 排程必须落在日切之后；实际触发是 00:05（见 scheduler.traeFireMinute）。
 func TestTraeCheckScheduleDefaults(t *testing.T) {
 	d := DefaultSchedule()
-	if len(d.TraeCheckHours) != 1 || d.TraeCheckHours[0] != 11 {
-		t.Fatalf("默认 trae_check_hours 应为 [11]，实际 %v", d.TraeCheckHours)
+	if len(d.TraeCheckHours) != 1 || d.TraeCheckHours[0] != 0 {
+		t.Fatalf("默认 trae_check_hours 应为 [0]，实际 %v", d.TraeCheckHours)
 	}
 	if !d.TraeCheckEnabled {
 		t.Fatal("默认 trae_check_enabled 应为 true")
@@ -130,8 +132,8 @@ func TestTraeCheckScheduleDefaults(t *testing.T) {
 	if err := s.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.TraeCheckHours) != 1 || s.TraeCheckHours[0] != 11 {
-		t.Fatalf("归一化后应为 [11]，实际 %v", s.TraeCheckHours)
+	if len(s.TraeCheckHours) != 1 || s.TraeCheckHours[0] != 0 {
+		t.Fatalf("归一化后应为 [0]，实际 %v", s.TraeCheckHours)
 	}
 	bad := Schedule{TraeCheckHours: []int{99}}
 	err := bad.Normalize()

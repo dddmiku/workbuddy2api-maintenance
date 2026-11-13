@@ -60,10 +60,16 @@ type TaskInfo struct {
 	// 改任务实现时**必须同步改这里**，否则面板会把任务归错组。
 	Realms  []string   `json:"realms"`
 	Hours   []int      `json:"hours"`
-	Enabled bool       `json:"enabled"`
-	NextRun *time.Time `json:"next_run"`
-	LastRun *time.Time `json:"last_run"`
-	Running bool       `json:"running"`
+	// FireMinute 小时段内的触发分钟（0 = 整点）。
+	//
+	// 面板据此渲染真实时刻。目前只有 Trae 签到非 0（见 traeFireMinute）：
+	// 它必须排在 CST 日切之后，不能放在 00:00 整点上。前端不硬编码这个值，
+	// 否则改后端忘了改前端就会出现「面板 00:00 / 实际 00:05」的漂移。
+	FireMinute int        `json:"fire_minute"`
+	Enabled    bool       `json:"enabled"`
+	NextRun    *time.Time `json:"next_run"`
+	LastRun    *time.Time `json:"last_run"`
+	Running    bool       `json:"running"`
 }
 
 // key 内部 taskKind → 对外 TaskKey。返回空串表示未登记的种类（不该出现）。
@@ -251,9 +257,19 @@ func (s *Scheduler) TaskSnapshot() []TaskInfo {
 			Key: string(key), Name: name, Detail: detail,
 			Hours: hours, Enabled: enabled, Realms: realmsOf(key),
 		}
+		if key == TaskKeyTraeCheck {
+			info.FireMinute = traeFireMinute
+		}
 		// 禁用任务没有下个时点（nextWake 同样跳过），置 nil 而不是留一个假的未来时刻。
 		if enabled {
-			if at := nextFire(now, hours); !at.IsZero() {
+			// Trae 走自己的分钟偏移（00:05），其余任务仍是整点——面板显示的
+			// 「下次运行」必须与实际触发同一口径，否则会出现「面板写 00:00、
+			// 实际 00:05 才跑」的假象，排查时会误判成任务没触发。
+			at := nextFire(now, hours)
+			if key == TaskKeyTraeCheck {
+				at = nextTraeFire(now, hours)
+			}
+			if !at.IsZero() {
 				info.NextRun = &at
 			}
 		}

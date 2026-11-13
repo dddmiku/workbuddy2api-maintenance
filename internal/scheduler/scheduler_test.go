@@ -72,6 +72,9 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		CatDisabled:      true,
 		GrowthDisabled:   true,
 		BalanceDisabled:  true,
+		// Trae 默认 [0]（实际 00:05），会抢在 09:00 之前成为 earliest。
+		// 本用例只测「签到+保活同整点」，Trae 必须显式排除。
+		TraeCheckDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {

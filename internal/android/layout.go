@@ -102,7 +102,7 @@ func DefaultConfig() string {
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
-    "trae_check_hours": [10],
+    "trae_check_hours": [0],
     "growth_hours": [9, 21],
     "balance_hours": [9, 21],
     "checkin_enabled": true,

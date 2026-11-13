@@ -112,7 +112,7 @@ func defaultConfig() string {
 			"checkin_hours": []int{9, 21}, "travel_hours": []int{9, 21},
 			"activity_hours": []int{10}, "keepalive_hours": []int{22},
 			"school_hours": []int{12}, "cat_hours": []int{1},
-			"trae_check_hours": []int{10},
+			"trae_check_hours": []int{0},
 			"growth_hours":     []int{9, 21},
 			"balance_hours":    []int{9, 21},
 			"checkin_enabled": true, "travel_enabled": true,

@@ -18,7 +18,13 @@ type Schedule struct {
 	CheckinHours []int `json:"checkin_hours"` // [9,21]（WorkBuddy 两域）
 	// TraeCheckHours 是 Trae 站点的独立签到排程。Trae 与 WorkBuddy 不是同一个
 	// 站点（api.trae.cn vs codebuddy.cn），签到必须分开排程、分开开关。
-	TraeCheckHours []int `json:"trae_check_hours"` // [11]
+	//
+	// 2026-11-14 从 [11] 改为 [0]：Trae 的「今天已签」缓存按 CST 业务日失效，
+	// 实际签到必须发生在日切之后。原 [11] 在一天过半时才跑，而 00:00 的 9074
+	// 重试循环会先跨日把账号签掉，于是 11:00 那轮永远「跳过 N」——面板上看着
+	// 有排程、日志看着在跑，实际每天真正签到的是重试循环顺手做的。
+	// 具体触发分钟见 scheduler.traeFireMinute（00:05，不是 00:00）。
+	TraeCheckHours []int `json:"trae_check_hours"` // [0]（实际 00:05 触发）
 	TravelHours    []int `json:"travel_hours"`     // [15]
 	ActivityHours  []int `json:"activity_hours"`   // [10]
 	KeepaliveHours []int `json:"keepalive_hours"`  // [22]
@@ -89,7 +95,8 @@ type Schedule struct {
 // 现在的分配原则：每个整点最多一个「重」任务，间隔 ≥1 小时。
 //   09:00  签到（WorkBuddy）       —— 早上第一件事，决定当天能否用
 //   10:00  活跃上报                —— 签到后 1 小时，避免与签到抢同一账号
-//   11:00  Trae 签到               —— Trae 是独立站点，与 CN 无账号冲突
+//   00:05  Trae 签到               —— 独立站点；排在 CST 业务日切换后 5 分钟
+//                                    （见 scheduler.traeFireMinute，避开 00:00 边界）
 //   12:00  成长中心                —— 任务类，依赖签到后的余额
 //   13:00  开学季任务
 //   14:00  余额刷新                —— 纯读，放在重任务之后
@@ -100,7 +107,7 @@ type Schedule struct {
 func DefaultSchedule() Schedule {
 	return Schedule{
 		CheckinHours:        []int{9, 21},
-		TraeCheckHours:      []int{11},
+		TraeCheckHours:      []int{0},
 		TravelHours:         []int{15},
 		ActivityHours:       []int{10},
 		KeepaliveHours:      []int{22},

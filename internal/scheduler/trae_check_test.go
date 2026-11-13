@@ -59,8 +59,10 @@ func TestTraeCheckScheduleIndependent(t *testing.T) {
 		GrowthDisabled:    true,
 	})
 	at, kinds := s2.nextWake(time.Date(2026, 9, 11, 6, 0, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 11, 7, 0, 0, 0, time.Local); !at.Equal(want) {
-		t.Errorf("next=%v want %v（WorkBuddy 签到禁用，Trae 签到 07:00 照跑）", at, want)
+	// Trae 的触发时刻是「整点 + traeFireMinute」（避开 CST 日切边界），
+	// 所以 07:00 这档实际在 07:05 跑。
+	if want := time.Date(2026, 9, 11, 7, traeFireMinute, 0, 0, time.Local); !at.Equal(want) {
+		t.Errorf("next=%v want %v（WorkBuddy 签到禁用，Trae 签到 07:05 照跑）", at, want)
 	}
 	if !hasKind(kinds, taskTraeCheck) {
 		t.Errorf("kinds=%v 应含 trae_check", kinds)

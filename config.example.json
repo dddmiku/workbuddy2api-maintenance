@@ -22,7 +22,7 @@
     "school_hours": [12],
     "cat_hours": [1],
     "growth_hours": [9, 21],
-    "trae_check_hours": [10],
+    "trae_check_hours": [0],
     "balance_hours": [9, 21],
     "checkin_enabled": true,
     "travel_enabled": true,
