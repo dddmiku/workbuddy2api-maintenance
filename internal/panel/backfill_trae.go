@@ -1,4 +1,5 @@
 // 2026-11-09：Trae 账号手机号回填。
+// 2026-11-14：回填日志只记完成事件与截短 UID，不输出上游 mobile 的值。
 //
 // ═══ 问题 ═══
 //
@@ -89,7 +90,7 @@ func (s *Server) BackfillTraeProfiles(ctx context.Context) (int, []string) {
 			continue
 		}
 		updated++
-		log.Printf("INFO: [面板] Trae 账号已补手机号 uid=%s mobile=%s", shortUID(entry.UID), info.Mobile)
+		log.Printf("INFO: [面板] Trae 账号已补手机号 uid=%s", shortUID(entry.UID))
 	}
 	return updated, problems
 }

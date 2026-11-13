@@ -146,7 +146,8 @@ func TestTraeRetryCycleHoldsBeforeScheduledFire(t *testing.T) {
 	// 造出「有 9074 痕迹且退避已过期」——这正是每天 00:00 的状态。
 	s.noteTraeBackoff("2081842786229369")
 	s.traeCheckin.update("2081842786229369", func(st *traeCheckinState) {
-		st.RetryUpdatedAt = time.Now().Add(-time.Hour).Unix()
+		// 本例只测排程闸门：保留 9074 痕迹、清掉退避，避免注入时刻与墙钟混用。
+		st.RetryBackoff = 0
 	})
 
 	// 00:04:59：排程点（00:05）还差 1 秒，正是线上 00:00:15 抢跑的时刻。
@@ -170,7 +171,8 @@ func TestTraeRetryCycleRunsAfterScheduledFire(t *testing.T) {
 	s.cfg.TraeCheckHours = []int{0}
 	s.noteTraeBackoff("2081842786229369")
 	s.traeCheckin.update("2081842786229369", func(st *traeCheckinState) {
-		st.RetryUpdatedAt = time.Now().Add(-time.Hour).Unix()
+		// 本例只测排程闸门：保留 9074 痕迹、清掉退避，避免注入时刻与墙钟混用。
+		st.RetryBackoff = 0
 	})
 
 	// 00:05:00 整：闸门刚打开，重试循环应接手补签。

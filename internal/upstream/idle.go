@@ -1,4 +1,6 @@
 // idle.go 聊天 SSE 流中空闲监控：活跃吐数据续命不掐，静默超过阈值才断流（释放租约）。
+// ═══ 更新日志 ═══
+// 2026-11-14：Close 的取消、底流关闭与错误结果共用 Once，避免重复关闭和丢失首次错误。
 package upstream
 
 import (
@@ -18,6 +20,7 @@ type idleMonitoringBody struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	cancel   context.CancelFunc
+	closeErr error
 }
 
 func (b *idleMonitoringBody) Read(p []byte) (int, error) {
@@ -32,9 +35,12 @@ func (b *idleMonitoringBody) Read(p []byte) (int, error) {
 
 // Close 停掉后台 goroutine、取消请求 context、关闭底流，保证无泄漏。
 func (b *idleMonitoringBody) Close() error {
-	b.stopOnce.Do(func() { close(b.stopCh) })
-	b.cancel()
-	return b.rc.Close()
+	b.stopOnce.Do(func() {
+		close(b.stopCh)
+		b.cancel()
+		b.closeErr = b.rc.Close()
+	})
+	return b.closeErr
 }
 
 func (b *idleMonitoringBody) idleFor() time.Duration {

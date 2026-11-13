@@ -1,4 +1,7 @@
 // remote.go — Trae Remote 会话端点（两步协议）的**主路径**实现。
+// ═══ 更新日志 ═══
+// 2026-11-14：关闭转译流时穿透 io.Pipe 关闭原始 HTTP 流，避免取消后仍占上游读取/会话槽位。
+// 2026-11-14：正常收尾与调用方 Close 共用一次上游关闭，保留首次关闭错误。
 //
 // ═══ 架构对齐（2026-10-16 重写）═══
 //
@@ -44,6 +47,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -844,10 +848,11 @@ var logRemoteTrim = func(dropped int) {
 // translateRemoteEvents 把 Remote 事件流改写成 llm_utils_chat 形态的 SSE。
 func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string) io.ReadCloser {
 	pr, pw := io.Pipe()
+	r := &remoteEventReader{PipeReader: pr, upstream: upstream}
 	go func() {
 		var err error
 		defer func() {
-			_ = upstream.Close()
+			_ = r.closeUpstream()
 			_ = pw.CloseWithError(err)
 		}()
 		reader := bufio.NewReaderSize(upstream, 1<<16)
@@ -927,7 +932,27 @@ func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string) io.R
 			}
 		}
 	}()
-	return pr
+	return r
+}
+
+// A PipeReader.Close alone cannot interrupt the converter's upstream.Read.
+type remoteEventReader struct {
+	*io.PipeReader
+	upstream  io.ReadCloser
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *remoteEventReader) Close() error {
+	_ = r.PipeReader.Close()
+	return r.closeUpstream()
+}
+
+func (r *remoteEventReader) closeUpstream() error {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.upstream.Close()
+	})
+	return r.closeErr
 }
 
 // remoteEventConverter 把 Remote 事件转成 llm_utils_chat 形态。

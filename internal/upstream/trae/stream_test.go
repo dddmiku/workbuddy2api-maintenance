@@ -618,16 +618,14 @@ func TestTranslateNativeToolUsageMapping(t *testing.T) {
 	}
 }
 
-// idleBody 模拟「支持读截止、且会长时间静默」的 resp.Body：SetReadDeadline
-// 转给可替换的闭包，测试用它把 15s 的截止短路成 300ms，静默期就能在测试里走完。
-// Read 语义与 net/http 的 resp.Body 一致：截止到期返回包装 os.ErrDeadlineExceeded
-// 的错误（net.Pipe 的 Conn 行为），正好覆盖 run() 的空闲心跳分支。
+// idleBody 包装静默的连接；生产 HTTP 响应体没有 SetReadDeadline，
+// 心跳不能依赖这个接口。测试缩短的是转译器自己的进度计时。
 type idleBody struct {
-	r    io.Reader
-	set  func(time.Time) error
+	r   io.Reader
+	set func(time.Time) error
 }
 
-func (b *idleBody) Read(p []byte) (int, error)        { return b.r.Read(p) }
+func (b *idleBody) Read(p []byte) (int, error) { return b.r.Read(p) }
 func (b *idleBody) Close() error {
 	if c, ok := b.r.(io.Closer); ok {
 		return c.Close()
@@ -636,21 +634,12 @@ func (b *idleBody) Close() error {
 }
 func (b *idleBody) SetReadDeadline(t time.Time) error { return b.set(t) }
 
-// TestTranslateIdleHeartbeat 静默期心跳回归：上游停顿超过读截止时，下游必须
-// 收到 keepalive 注释行并且流不中断——deadline 超时是「该发心跳」而不是错误
-// （2026-10-14 trae 三连 502 的组合缓解之二）。
+// TestTranslateIdleHeartbeat 静默期持续发心跳，但不改变正文与终态。
 func TestTranslateIdleHeartbeat(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()
 	body := &idleBody{r: server, set: server.SetReadDeadline}
-	// 短路截止：run() 每次设 15s，这里改成 300ms——静默 1.2s 足够触发 3 次心跳。
-	body.set = func(t time.Time) error {
-		if !t.IsZero() {
-			t = time.Now().Add(300 * time.Millisecond)
-		}
-		return server.SetReadDeadline(t)
-	}
 
 	go func() {
 		_, _ = client.Write([]byte("event: output\ndata: {\"response\":\"hi\"}\n\n"))
@@ -660,7 +649,7 @@ func TestTranslateIdleHeartbeat(t *testing.T) {
 	}()
 
 	tr := newTranslator("glm-5.3")
-	r := newTranslateReader(body, tr)
+	r := newTranslateReaderWithProgress(body, tr, 300*time.Millisecond, 300*time.Millisecond)
 	defer r.Close()
 	start := time.Now()
 	data, err := io.ReadAll(r)

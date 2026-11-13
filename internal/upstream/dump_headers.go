@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-10-17：初版——按 WB2API_DUMP_HEADERS 环境变量把真实出站头打进日志。
+// 2026-11-14：诊断统一脱敏凭据头与完整 UID，设备头存在检查不区分大小写。
 package upstream
 
 import (
@@ -13,7 +14,7 @@ import (
 )
 
 // dumpOutboundHeaders 在设置 WB2API_DUMP_HEADERS=1 时把本次 chat 出站请求的
-// 全部头写进日志（脱敏 Authorization / X-Device-Token）。
+// 全部头名写进日志，凭据头脱敏、账号标识截短。
 //
 // 为什么需要它：判断「网关出站头组是否与官方客户端同形」只能靠真实抓取。
 // 2026-10-17 排查 global 全部被 11128 拒绝时，仅凭代码阅读无法确定实际发出的
@@ -35,25 +36,44 @@ func dumpOutboundHeaders(headers map[string][]string, uid string) {
 	b.WriteString(logfmtUID(uid))
 	// 设备 token 是否存在 + 客户端持有的全局值长度：定位「token 没发出去」时区分
 	// 「配置没读到」与「注入逻辑没走到」。
-	if _, ok := headers["X-Device-Token"]; ok {
+	hasDevice := false
+	for _, k := range keys {
+		if strings.EqualFold(k, "X-Device-Token") {
+			hasDevice = true
+			break
+		}
+	}
+	if hasDevice {
 		b.WriteString(" [device-token=present]")
 	} else {
 		b.WriteString(" [device-token=MISSING]")
 	}
 	for _, k := range keys {
-		v := strings.Join(headers[k], ",")
-		switch strings.ToLower(k) {
-		case "authorization":
-			v = "Bearer <redacted>"
-		case "x-device-token":
-			v = "<redacted len=" + strconv.Itoa(len(v)) + ">"
-		}
+		v := diagnosticHeaderValue(k, strings.Join(headers[k], ","))
 		b.WriteString(" | ")
 		b.WriteString(k)
 		b.WriteString("=")
 		b.WriteString(v)
 	}
 	log.Print(b.String())
+}
+
+// 诊断共用同一出口，避免日志脱敏但 JSON 落盘仍保留鉴权材料。
+func diagnosticHeaderValue(name, value string) string {
+	name = strings.ToLower(name)
+	compact := strings.NewReplacer("-", "", "_", "").Replace(name)
+	for _, marker := range []string{"authorization", "token", "cookie", "apikey", "secret", "password"} {
+		if strings.Contains(compact, marker) {
+			return "<redacted len=" + strconv.Itoa(len(value)) + ">"
+		}
+	}
+	switch compact {
+	case "xuserid", "xenterpriseid", "xtenantid":
+		return logfmtUID(value)
+	case "xphone", "xmobile", "xphonenumber":
+		return "<redacted>"
+	}
+	return value
 }
 
 // logfmtUID 只保留 UID 前 8 位（与包内其他日志同口径）。

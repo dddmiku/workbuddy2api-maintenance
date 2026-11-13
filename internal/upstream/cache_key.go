@@ -1,14 +1,17 @@
 // ═══ 更新日志 ═══
+// 2026-11-14：区分服务端缓存能力、官方抓包形态及网关生成键的实际隔离/空会话语义。
 // 2026-09-16：缓存键注入保留请求中的数字原值，并保持完整 JSON 文档校验。
 // cache_key.go 注入上游 prompt_cache_key 字段（P0 费用优化）。
 //
-// 逆向实测（buddy-adapter.ts:706-714）：上游服务端支持 prompt_cache_key，
-// 同一段 8k token 前缀：
+// 历史实验（buddy-adapter.ts:706-714）观察到上游支持 prompt_cache_key：
+// 在所测模型、账号和同一段 8k token 前缀条件下：
 //   - 不带 → prompt_cache_hit_tokens=0, credit≈0.34
 //   - 带   → prompt_cache_hit_tokens=7808, credit≈0.02（费用降 ~17×）
 //
 // 网关在此为每个出站 chat 请求注入一个稳定、按账号隔离的 cache key，
 // 让同一客户端对同一账号的连续请求复用上游前缀缓存。
+// 所查 6 份官方抓包未见该字段；服务端支持它，不等于官方客户端通常发送它。
+// 约 17× 的历史费用差异不是当前所有请求的保证；不据样本缺字段删除既有缓存功能。
 package upstream
 
 import (
@@ -30,20 +33,20 @@ import (
 //
 // 安全约束——按账号隔离：
 //   - 生成键格式 `wb2a-<uid8>-<convHex>`
-//   - uid8 是账号 UID 前 8 字符，跨账号绝不相同 → 跨账号缓存键绝不碰撞
-//   - 跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话，故 uid 是硬隔离因子
+//   - uid8 仅为可读标识，不同账号可能同前缀；convHex 的哈希输入包含完整 UID 与会话源
+//   - 自动生成键按账号维度分桶；显式键仍原样保留。缓存键不是授权边界，不能仅据键相同断言泄露
 //
 // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
 // 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
-// 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
+// 两源都空时，同一 UID 得到同一键，空会话源共享该账号的分桶，不会自动生成新会话键。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不二次错误化）。
 func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if len(body) == 0 {
 		return body
 	}
-	// 廉价前置：客户端已带 prompt_cache_key 时无需解码（官方客户端常见）。
-	// 此前无条件解码整个 body 再判断，60 万 token 上下文光解码就要 4–8ms，
-	// 而结果往往只是原样返回。
+	// 兼容调用方可显式带 prompt_cache_key；这不代表所查官方抓包通常携带。
+	// 键名字节仅作前置检查，仍需完整解码确认顶层值；命中显式键后原样返回，
+	// 否则复用已解析对象生成键，避免再次解码。
 	if bytes.Contains(body, []byte(`"prompt_cache_key"`)) {
 		var probe map[string]any
 		if err := jsonutil.Decode(body, &probe); err == nil && probe != nil {
@@ -90,9 +93,9 @@ func injectCacheKeyInto(obj map[string]any, uid, conversationID string, body []b
 
 // buildCacheKey 生成 `wb2a-<uid8>-<convHex>` 格式的稳定 cache key。
 //
-// uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
-// （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希，
-// 保证跨账号绝不碰撞但同一空会话不复用（空会话 = 新会话语义）。
+// uid8 是可读标识；convHex = sha256(uid + "|" + conversationID)[:16] 的 hex 决定分桶。
+// 同 UID、同会话源的键稳定；会话源为空时，同 UID 的所有空会话请求仍得到同一键。
+// 完整 UID 参与哈希，不依赖 uid8 唯一，也不将缓存分桶等同于上游访问授权。
 func buildCacheKey(uid, conversation string) string {
 	uid8 := uid
 	if len(uid8) > 8 {

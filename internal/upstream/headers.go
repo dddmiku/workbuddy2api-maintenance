@@ -1,6 +1,7 @@
 // Package headers 构造三类上游请求头（common / chat / billing / refresh）。
 // 规则来自 docs/api-reference.md §0/§4/§6。
 // 2026-09-16：所有请求头从同一独立凭据快照读取，避免刷新时拼出新旧混合的鉴权头。
+// 2026-11-14：域名后缀按标签边界匹配；ACP 已格式化 UUID 仍校验十六进制内容。
 package upstream
 
 import (
@@ -268,7 +269,7 @@ func chatDomainFor(a *auth.Auth) string {
 		return "www.workbuddy.ai"
 	}
 	// CN：保留私有部署可能写入的 workbuddy.cn 原值，其余一律归一。
-	if host := hostOfDomain(a.Domain); host != "" && strings.HasSuffix(host, "workbuddy.cn") {
+	if host := hostOfDomain(a.Domain); host == "workbuddy.cn" || strings.HasSuffix(host, ".workbuddy.cn") {
 		return host
 	}
 	return "www.workbuddy.cn"
@@ -653,7 +654,9 @@ func acpConnectionID(raw string) string {
 	value := strings.ToLower(strings.TrimSpace(raw))
 	// 已经带横线的合法 UUID 原样保留（入站透传场景）。
 	if len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-' {
-		return value
+		if uuid := uuidFormatted(strings.ReplaceAll(value, "-", "")); uuid != "" {
+			return uuid
+		}
 	}
 	hex32 := value
 	if len(hex32) != 32 {

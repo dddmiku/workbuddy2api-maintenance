@@ -13,6 +13,10 @@
 //   - 上游自造的 finish_reason 归一（对齐网关既有的 validFinishReason 口径）。
 //
 // ═══ 更新日志 ═══
+// 2026-11-14：复用出站连接池；保留 300s 响应头窗口；真实 HTTP/Remote 流独立计时发心跳，关闭时取消阻塞读取。
+// 2026-11-14：legacy 的 3004 回落闸门透传完整注释心跳，角色帧仍扣住，心跳不取消回落资格。
+// 2026-11-14：回落闸门按完整帧判定内容，保留小块读取时的缓冲与原始终止错误。
+// 2026-11-14：Remote 会话 Close 幂等，底流关闭与 stop 只执行一次。
 // 2026-10-11：初版——事件→OpenAI SSE 转译 + 工具累加器 + 终态校验。
 package trae
 
@@ -26,10 +30,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,7 +66,6 @@ const (
 	thinkOpen  = " thinking\n\n"
 	thinkClose = "\n response\n\n"
 )
-
 
 var chunkSeq uint64
 
@@ -445,7 +450,6 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 	return stream, resp.StatusCode, nil, nil
 }
 
-
 // remoteFallbackReader 在 llm_utils_chat 因工具轮次超限被拒时，透明切到 Remote 端点。
 //
 // 为什么在这一层做而不是在 handler：3004 是 trae 域自己的端点限制，与网关的
@@ -467,10 +471,13 @@ type remoteFallbackReader struct {
 	sawContent bool
 	// buffered 尚未交给下游的字节（判定阶段先扣住，见 Read 的说明）。
 	buffered []byte
+	// progress 保存完整注释帧的未读部分；它不携带模型内容、不改变回落资格。
+	progress []byte
 	// released 判定已结束、进入「原样透传」模式。
 	released bool
 	switched bool
 	done     bool
+	readErr  error
 	// hasImages 本轮新输入是否带图。带图时 3004 走「转写后重发」而不是 Remote
 	// （Remote 读不到内联图片，回落等于静默丢图）。
 	hasImages bool
@@ -489,11 +496,23 @@ func newRemoteFallbackReader(ctx context.Context, a *auth.Auth, prepared []byte,
 // 所以这里把「不含实质内容」的字节先扣在 buffered 里，直到出现下列任一情况才放行：
 //   - 读到实质内容 → 连同已扣的一起交出（正常路径，回落不再可能）；
 //   - 读到错误     → 3004 且未交付过内容则回落；否则把扣住的帧交出并报错。
+//   - 读到完整注释 → 直接交出保活，角色帧仍扣住，3004 回落仍可用。
 //
 // 用循环而不是递归：递归会重新进入「buffered 非空就下发」的分支，等于立刻放行，
 // 判定形同虚设（2026-10-15 首版就是这么漏的，被 TestRemoteFallbackSwitchesOn3004 抓住）。
 func (r *remoteFallbackReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
+		if !r.released && len(r.progress) == 0 {
+			r.takeBufferedProgress()
+		}
+		if len(r.progress) > 0 {
+			n := copy(p, r.progress)
+			r.progress = r.progress[n:]
+			return n, nil
+		}
 		// 已切换：之后全部读自 Remote。
 		if r.secondary != nil {
 			n, err := r.secondary.Read(p)
@@ -509,8 +528,8 @@ func (r *remoteFallbackReader) Read(p []byte) (int, error) {
 				r.buffered = r.buffered[n:]
 				return n, nil
 			}
-			if r.done {
-				return 0, io.EOF
+			if r.done || r.readErr != nil {
+				return 0, r.readErr
 			}
 			n, err := r.primary.Read(p)
 			if n > 0 {
@@ -518,25 +537,38 @@ func (r *remoteFallbackReader) Read(p []byte) (int, error) {
 			}
 			if err != nil {
 				r.done = true
+				r.readErr = err
 			}
 			return n, err
 		}
 		if r.done {
-			return 0, io.EOF
+			if len(r.buffered) > 0 {
+				n := copy(p, r.buffered)
+				r.buffered = r.buffered[n:]
+				return n, nil
+			}
+			return 0, r.readErr
 		}
 		// 判定阶段：从 primary 读，不含实质内容的字节先扣住。
-		n, err := r.primary.Read(p)
+		var n int
+		err := r.readErr
+		if err == nil {
+			n, err = r.primary.Read(p)
+			r.readErr = err
+		}
 		if n > 0 {
-			if containsSubstantiveDelta(p[:n]) {
+			r.buffered = append(r.buffered, p[:n]...)
+			// io.Reader 不保证帧边界；只判定已经拼完整的帧，避免把被切开的
+			// role JSON 当作解析失败而提前放行，也避免漏判分片中的正文。
+			end := bytes.LastIndex(r.buffered, []byte("\n\n"))
+			if end >= 0 && containsSubstantiveDelta(r.buffered[:end+2]) {
 				r.sawContent = true
 				r.released = true
 				// 扣住的字节先交出去，本次读到的留给下一次。
-				r.buffered = append(r.buffered, p[:n]...)
 				n = copy(p, r.buffered)
 				r.buffered = r.buffered[n:]
 				return n, nil
 			}
-			r.buffered = append(r.buffered, p[:n]...)
 			continue
 		}
 		if err == nil {
@@ -586,14 +618,31 @@ func (r *remoteFallbackReader) Read(p []byte) (int, error) {
 		}
 		// 不回落：把扣住的开场帧交出去，然后正常报错。
 		r.done = true
-		if len(r.buffered) > 0 {
-			n := copy(p, r.buffered)
-			r.buffered = r.buffered[n:]
-			if n > 0 {
-				return n, nil
+	}
+}
+
+// 提取完整的纯注释帧；即使上游读取或下游缓冲把帧切开，也不能把角色帧一起放行。
+func (r *remoteFallbackReader) takeBufferedProgress() {
+	for start := 0; start < len(r.buffered); {
+		end := bytes.Index(r.buffered[start:], []byte("\n\n"))
+		if end < 0 {
+			return
+		}
+		end += start + 2
+		frame := r.buffered[start:end]
+		comment := frame[0] == ':'
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			if len(line) > 0 && line[0] != ':' {
+				comment = false
+				break
 			}
 		}
-		return 0, err
+		if comment {
+			r.progress = append([]byte(nil), frame...)
+			r.buffered = append(r.buffered[:start], r.buffered[end:]...)
+			return
+		}
+		start = end
 	}
 }
 
@@ -784,7 +833,7 @@ type remoteFirstEventReader struct {
 	timedOut      bool
 	sawFirst      bool
 	readAttempted bool
-	closed        bool
+	closed        atomic.Bool
 	window        []byte
 }
 
@@ -817,7 +866,7 @@ func (r *remoteFirstEventReader) Read(p []byte) (int, error) {
 	if r.timedOut {
 		return 0, fmt.Errorf("trae remote: 首个模型事件超时（%v）", remoteFirstEventTimeout)
 	}
-	if r.closed {
+	if r.closed.Load() {
 		return 0, io.EOF
 	}
 	if r.readAttempted && !r.sawFirst && time.Now().After(r.deadline) {
@@ -841,7 +890,9 @@ func (r *remoteFirstEventReader) Read(p []byte) (int, error) {
 }
 
 func (r *remoteFirstEventReader) Close() error {
-	r.closed = true
+	if r.closed.Swap(true) {
+		return nil
+	}
 	if closer, ok := r.inner.(io.Closer); ok {
 		return closer.Close()
 	}
@@ -851,15 +902,19 @@ func (r *remoteFirstEventReader) Close() error {
 // remoteStreamCloser 在流关闭时顺带结束上游会话。
 type remoteStreamCloser struct {
 	io.ReadCloser
-	auth    *auth.Auth
-	session remoteSession
+	auth      *auth.Auth
+	session   remoteSession
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *remoteStreamCloser) Close() error {
-	err := c.ReadCloser.Close()
-	// 用不带取消的 ctx：客户端断开时 ctx 已取消，但停会话的请求仍要发出去。
-	stopRemoteSession(context.WithoutCancel(context.Background()), c.auth, c.session.id)
-	return err
+	c.closeOnce.Do(func() {
+		c.closeErr = c.ReadCloser.Close()
+		// 客户端取消之后仍需尽力停会话；stop 自身受 10s HTTP 超时约束。
+		stopRemoteSession(context.Background(), c.auth, c.session.id)
+	})
+	return c.closeErr
 }
 
 // RawChatStream 与 ChatStream 相同，但**不做转译**，直接返回上游原始 SSE。
@@ -965,23 +1020,27 @@ func declaredToolNames(tools []any) map[string]bool {
 	return names
 }
 
-// chatTransport 是 SSE 专用 Transport：首字节有超时、流中空闲交给上游事件心跳，
-// 不设总时长（长回答不能因为整体耗时被砍断）。
-//
-// ResponseHeaderTimeout 300s（2026-10-14 从 120s 调大）：实测 trae 上游对大输入
-// （53K token）的处理期会先发 progress_notice 帧再吐正文，头部 26s 内就到；但更大
-// 请求（Claude Code 全量 283K token）的头部可能显著更晚。120s 的头部窗在长上下文
-// 场景没有余量，先放宽到 300s，让「等得起」成为默认（流中空闲不受此参数约束）。
+// 2026-11-14 只读复核：#4166 两次 transport_error 耗时 300.9s、300.8s，
+// 换号后 6.2s 成功，但 requests.jsonl 不记录响应头到达时刻，不能据此认定卡死。
+// 近七天还有 28 条单次尝试成功且 TTFB >120s 的请求，最长 279.8s（433273
+// input tokens；requests.jsonl 快照第 5939 行）。TTFB 是首个 data 帧时间，
+// 不等于等头耗时；分段计时实测确认前，保留原有 300s 余量，避免误杀正常处理。
+// 此超时只覆盖请求写完后的等头阶段，不限制已经建立的长回答。
+// Transport 必须复用；每次新建会让建会话、收流、查账和下一轮请求全都冷连接。
+var sharedChatTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          64,
+	MaxIdleConnsPerHost:   32,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   15 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 300 * time.Second,
+}
+
 func chatTransport() http.RoundTripper {
-	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 300 * time.Second,
-	}
+	return sharedChatTransport
 }
 
 func newRequestID() string {
@@ -1130,8 +1189,10 @@ func toolBlockOpeners() []string {
 // TestVisibleTextHoldsIncompleteToolBlock）。另一种做法是「读不出的块原样保留」
 // （magpie 的选择），但那会把原始协议标签漏给用户，而它自己的 #2414 记录过那条路
 // 的代价（agent 把原始标签当答案收下、调用彻底丢失）。两条路都有代价：
-//   本实现：不泄漏协议标记，代价是读不出的块内容会消失；
-//   magpie：内容不丢，代价是原始标签进正文。
+//
+//	本实现：不泄漏协议标记，代价是读不出的块内容会消失；
+//	magpie：内容不丢，代价是原始标签进正文。
+//
 // 这里选前者，但**把「内容消失」从静默变成可观测**：translator 统计读不出的块数，
 // 收尾时记一行 WARN（见 translator.unparsedBlocks），排障时能看到发生过几次。
 func stripToolCallBlocks(text string) string {
@@ -1920,10 +1981,11 @@ func indexOfAny(haystack string, needles ...string) int {
 // 用 goroutine + io.Pipe 而不是全量缓冲：下游的 chatStatsReader 会边读边统计
 // TTFB 与 usage，必须让字节尽快流出去，否则长回答的 TTFB 会被整段生成时间吃掉。
 type translateReader struct {
-	pr     *io.PipeReader
-	pw     *io.PipeWriter
-	closer io.Closer
-	done   chan struct{}
+	pr        *io.PipeReader
+	pw        *io.PipeWriter
+	closer    io.Closer
+	done      chan struct{}
+	closeOnce sync.Once
 	// closedByCaller 调用方主动 Close（回落切端点时关掉 primary 走这里）。
 	//
 	// 为什么需要：run 在「一帧都没收到」时会把 err 设成 no data events。回落路径
@@ -1934,42 +1996,55 @@ type translateReader struct {
 }
 
 func newTranslateReader(upstream io.ReadCloser, tr *translator) *translateReader {
+	return newTranslateReaderWithProgress(upstream, tr, time.Second, 15*time.Second)
+}
+
+func newTranslateReaderWithProgress(upstream io.ReadCloser, tr *translator, firstBeat, idleBeat time.Duration) *translateReader {
 	pr, pw := io.Pipe()
 	r := &translateReader{pr: pr, pw: pw, closer: upstream, done: make(chan struct{})}
-	go r.run(upstream, tr)
+	go r.run(upstream, tr, firstBeat, idleBeat)
 	return r
 }
 
-func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
+func (r *translateReader) run(upstream io.ReadCloser, tr *translator, firstBeat, idleBeat time.Duration) {
 	defer close(r.done)
 	var err error
+	// A single worker reads lines with bounded handoff; only this goroutine writes
+	// complete downstream frames, so a heartbeat cannot split a JSON/SSE frame.
+	type readResult struct {
+		line string
+		err  error
+	}
+	lines := make(chan readResult)
+	stop := make(chan struct{})
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		reader := bufio.NewReaderSize(upstream, 64*1024)
+		for {
+			line, rerr := reader.ReadString('\n')
+			select {
+			case lines <- readResult{line, rerr}:
+			case <-stop:
+				return
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
 	defer func() {
-		_ = upstream.Close()
+		close(stop)
+		r.closeUpstream()
+		<-readDone
 		_ = r.pw.CloseWithError(err)
 	}()
-	// 空闲心跳：上游长时间不吐帧时（大输入的处理期只有 progress_notice，正文
-	// 要等模型开写），向下游发 SSE 注释行保活，防止中间层（nginx/CDN/客户端
-	// 自身的读超时）在 17-60 秒量级把整条流判死（2026-10-14 trae 502 排查：
-	// 客户端等不到任何字节是三连 502 的共同形态）。注释行按 SSE 规范会被
-	// 客户端忽略，不污染内容流。
-	//
-	// 实现走 SetReadDeadline 轮询而非额外 goroutine：resp.Body 的 Read 阻塞
-	// 在 deadline 上，超时返回 os.ErrDeadlineExceeded——这里把它当「该发心跳
-	// 了」而不是错误，发完续期再读。真断连仍以 EOF/RST 呈现，不会被掩盖。
-	deadlineAware, hasDeadline := upstream.(interface{ SetReadDeadline(time.Time) error })
-	const idleBeat = 15 * time.Second
-	beatDeadline := func() {
-		if hasDeadline {
-			_ = deadlineAware.SetReadDeadline(time.Now().Add(idleBeat))
-		}
-	}
-	beatDeadline()
-	defer func() {
-		if hasDeadline {
-			_ = deadlineAware.SetReadDeadline(time.Time{})
-		}
-	}()
-	reader := bufio.NewReaderSize(upstream, 64*1024)
+	// net/http 响应体和 Remote 的 io.Pipe 都没有 SetReadDeadline。
+	// 独立计时，建立流后 1s 无输出便发注释，此后空闲每 15s 保活；
+	// 注释不产生 role/content/usage，不改变真实内容 TTFB 或回落资格。
+	beat := time.NewTimer(firstBeat)
+	defer beat.Stop()
+	resetBeat := func() { beat.Reset(idleBeat) }
 	var (
 		out         bytes.Buffer
 		eventName   string
@@ -2004,20 +2079,26 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 				return true
 			}
 			out.Reset()
+			resetBeat()
 		}
 		return done
 	}
 	for {
-		line, rerr := reader.ReadString('\n')
-		if rerr != nil && errors.Is(rerr, os.ErrDeadlineExceeded) {
-			// 读截止到期 = 上游空闲超过 idleBeat：向下游补一个心跳注释行，
-			// 然后续期再读。不 break、不置 err——空闲不是流错误（见 run 头部注释）。
+		var line string
+		var rerr error
+		select {
+		case result := <-lines:
+			line, rerr = result.line, result.err
+		case <-beat.C:
 			if _, werr := r.pw.Write([]byte(": relay-keepalive\n\n")); werr != nil {
 				err = werr
 				break
 			}
-			beatDeadline()
+			resetBeat()
 			continue
+		}
+		if err != nil {
+			break
 		}
 		if line != "" {
 			trimmed := strings.TrimRight(line, "\r\n")
@@ -2032,6 +2113,7 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 					err = werr
 					terminal = true
 				}
+				resetBeat()
 			default:
 				field, value, found := strings.Cut(trimmed, ":")
 				if !found {
@@ -2086,9 +2168,14 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator) {
 
 func (r *translateReader) Read(p []byte) (int, error) { return r.pr.Read(p) }
 
+func (r *translateReader) closeUpstream() {
+	r.closeOnce.Do(func() { _ = r.closer.Close() })
+}
+
 func (r *translateReader) Close() error {
 	r.closedByCaller.Store(true)
 	_ = r.pr.Close()
+	r.closeUpstream()
 	<-r.done
 	return nil
 }

@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-11-14：复用已有解码对象计算官方输入文本长度，避免大请求额外解码。
 // 2026-09-26：客户端未声明 max_tokens 时按模型目录补齐输出预算，并把实际预算交给重发逻辑（见 output_budget.go）。
 // 2026-09-25：将正整数 max_completion_tokens 映射到上游 max_tokens，保留显式预算优先级和数字精度。
 // 2026-09-25：出站始终请求实际用量，保留其他流选项；客户端展示偏好不再关闭内部计量。
@@ -51,12 +52,17 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, effort
 // prepareChatBody 是出站 chat 请求体的完整整理管线；limits 为该 realm 的模型目录上限
 // （nil = 未知，不补输出预算）。返回整理后的请求体及其实际携带的输出预算。
 func prepareChatBody(src []byte, legacySanitize bool, efforts map[string][]string, defaultEfforts map[string]string, limits map[string]modelLimits) ([]byte, outputBudget) {
+	out, budget, _ := prepareChatBodyWithInputLength(src, legacySanitize, efforts, defaultEfforts, limits)
+	return out, budget
+}
+
+func prepareChatBodyWithInputLength(src []byte, legacySanitize bool, efforts map[string][]string, defaultEfforts map[string]string, limits map[string]modelLimits) ([]byte, outputBudget, int) {
 	if len(src) == 0 {
-		return src, outputBudget{}
+		return src, outputBudget{}, -1
 	}
 	var obj map[string]any
 	if err := jsonutil.Decode(src, &obj); err != nil || obj == nil {
-		return src, outputBudget{}
+		return src, outputBudget{}, -1
 	}
 	obj["stream"] = true
 	// The gateway needs upstream usage even when a caller opts out of seeing
@@ -101,9 +107,9 @@ func prepareChatBody(src []byte, legacySanitize bool, efforts map[string][]strin
 	warnDeprecatedSanitization(legacySanitize)
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return src, outputBudget{}
+		return src, outputBudget{}, -1
 	}
-	return out, budget
+	return out, budget, officialInputLength(obj)
 }
 
 // normalizeMaxCompletionTokens maps the output-budget alias to WorkBuddy's

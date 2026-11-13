@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-11-14：压制期开流宽限从开始读流计时；纯注释心跳也触发 OnHold，避免 Trae 无内容等待时心跳再被压住。
 // 2026-09-26：压制期回调 StreamOptions.OnHold（同一 goroutine）。
 // 2026-09-26：空工具参数归一为 {}；choice 级 logprobs 透传（缺失补 null）。
 // 2026-09-25：逐段读取并限制 SSE 单行/单事件为 64MiB，防止异常上游持续分配内存；超限返回明确失败。
@@ -1051,6 +1052,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// 保护未启用时不进这个分支，行为与引入前完全一致。
 	var pending []byte
 	released := !state.loopGuardEnabled
+	if !released && onHold != nil {
+		onHold()
+	}
 	holdBackDeadline := time.Now().Add(ReasoningLoopHoldBackTimeout)
 	// 正文压制期的独立时限：从第一帧正文开始计时，比推理侧短得多，避免「没有换行的
 	// 短回答」被闸门压到推理侧的 60 秒上限。holdingContent 记录当前是否正处于正文
@@ -1174,6 +1178,9 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		// SSE 注释行同样要过闸门：压制期间若直接写出，客户端就不是零字节了，
 		// 命中循环时便无法整段重发。
 		if !released {
+			if onHold != nil {
+				onHold()
+			}
 			pending = append(pending, line+"\n\n"...)
 			// 注释行也要受同样的约束：上游只发 keepalive 时既不能让缓冲无限增长，
 			// 也不能让客户端一直看不到任何响应。

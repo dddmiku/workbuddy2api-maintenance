@@ -365,12 +365,14 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 // 这正是排查「同会话后续请求 hit 归零」时唯一缺的信息——没有 prev= 就只能人工
 // 翻上一条请求比对。
 func TestSessionPrefixTrackerColdThenPrev(t *testing.T) {
+	// 使用局部 tracker，避免 -count 多轮复用进程全局缓存导致首轮误判为热会话。
+	tracker := &sessionPrefixTracker{prev: make(map[string]int)}
 	key := "test-cachecol-" + t.Name()
-	if got := sessionPrefixes.last(key); got != 0 {
+	if got := tracker.last(key); got != 0 {
 		t.Fatalf("unseen session must report 0, got %d", got)
 	}
-	sessionPrefixes.record(key, 546167)
-	if got := sessionPrefixes.last(key); got != 546167 {
+	tracker.record(key, 546167)
+	if got := tracker.last(key); got != 546167 {
 		t.Fatalf("last=%d want 546167", got)
 	}
 

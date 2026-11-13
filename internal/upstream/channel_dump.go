@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-10-17：初版——渠道拒绝（11128）时完整落盘出站报文，供事后精确定位。
+// 2026-11-14：凭据头与 URL 鉴权参数不落盘，UID 截短；改名失败清理自身临时文件。
 package upstream
 
 import (
@@ -10,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -50,7 +50,7 @@ func (c *Client) dumpChannelRejection(ctx context.Context, a *auth.Auth, body []
 	record := map[string]any{
 		"at":          time.Now().Format(time.RFC3339Nano),
 		"status":      status,
-		"uid":         uidOf(a),
+		"uid":         logfmtUID(uidOf(a)),
 		"realm":       realmOf(a),
 		"upstream":    urlOf(req),
 		"headers":     headersOf(req),
@@ -74,7 +74,9 @@ func (c *Client) dumpChannelRejection(ctx context.Context, a *auth.Auth, body []
 		_ = os.Remove(tmp.Name())
 		return
 	}
-	_ = os.Rename(tmp.Name(), filepath.Join(dir, name))
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, name)); err != nil {
+		_ = os.Remove(tmp.Name())
+	}
 	_ = ctx // 预留：将来若要在 ctx 里带请求级标签
 }
 
@@ -90,7 +92,7 @@ func headersOf(req *http.Request) map[string]string {
 	sort.Strings(names)
 	out := make(map[string]string, len(names))
 	for _, name := range names {
-		out[name] = strings.Join(req.Header.Values(name), ", ")
+		out[name] = diagnosticHeaderValue(name, strings.Join(req.Header[name], ", "))
 	}
 	return out
 }
@@ -130,7 +132,7 @@ func urlOf(req *http.Request) string {
 	if req == nil || req.URL == nil {
 		return ""
 	}
-	return req.URL.String()
+	url := *req.URL
+	url.User, url.RawQuery, url.Fragment = nil, "", ""
+	return url.String()
 }
-
-var _ = sync.Mutex{} // 预留：将来若需要串行化落盘

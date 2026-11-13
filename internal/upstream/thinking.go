@@ -1,9 +1,15 @@
 // thinking.go DeepSeek 思维链开启：出站请求体注入 thinking:{type:"enabled"} + 默认档位。
+// ═══ 更新日志 ═══
+// 2026-11-14：注明源码条件分支、样本缺字段与网关名称前缀适配的证据边界。
+//
+// 所查 6 份官方抓包未见 thinking，但已读客户端源码有 DeepSeek 条件注入分支
+// （codebuddy-lite-wb.mjs:1016）；这不表示每次官方请求都发 thinking，
+// 也不能据样本缺字段就删除网关已有的思考功能。
 //
 // 根因（issue #43，Hermes 逆向官方客户端 codebuddy.js 已确认）：
-// 官方客户端对 deepseek 系模型标记 thinkingFormat:"deepseek" + requiresReasoningContentOnAssistantMessages，
-// 发请求时「开思考」必须显式带 thinking:{type:"enabled"}，否则上游默认按不思考应答
-// （思维链不返回）。网关 payload 层此前完全不感知该字段，透传请求没有这个开关
+// 已读官方源码按模型能力字段选择 thinkingFormat:"deepseek" 等分支。
+// 既有 DeepSeek 模型验收依赖 thinking:{type:"enabled"} 与 effort 的组合，
+// 这是所测模型与请求的结论，不应推广到全部型号、配置和版本。网关 payload 层此前缺少开关
 // → 上游不给思维链；glm/kimi 走其他 thinkingFormat（qwen 系 enable_thinking 或默认开）所以正常。
 //
 // 打回修复（Hermes #43 验收实测）：
@@ -11,10 +17,10 @@
 //	thinking.type=enabled 单一字段不足——真实上游 deepseek-v4-flash 对「不带 reasoning_effort」的裸请求
 //	仍然按不思考应答（reasoning_content 长度 0），带 reasoning_effort:high 才有思维链。
 //	逆向 codebuddy.js 证实：isThinkingEnabled = !!(reasoning_summary || reasoning_effort || reasoning?.effort)，
-//	case "deepseek" 的 enabled 分支在实际出站里同时保留 reasoning_effort，官方「开思考」= thinking.type:enabled
-//	+ 某档 effort；默认档来自 reasoning.defaultEffort ?? 兜底 "high"（configure thinking 无来源时 warn fallback to 'high'）。
+//	case "deepseek" 的 enabled 条件分支设置 thinking.type 并保留 reasoning_effort，既有适配依赖此组合。
+//	默认档来自 reasoning.defaultEffort ?? 兜底 "high"（configure thinking 无来源时 warn fallback to 'high'）。
 //
-// 行为对齐官方客户端（两路组合）：
+// 网关当前 DeepSeek 适配行为（两路组合，不声称所有官方请求均同形）：
 //   - thinking.type 已显式 enabled / disabled → 客户端显式控制，绝不覆盖；disabled 时照抄 case 行为
 //     删 reasoning_effort（snake/camel 双字段）。enabled 但缺 effort → 补默认档（官方 configure 行为）。
 //   - 无 thinking / thinking.type 空 / 已有 reasoning_effort → 注入 {type:"enabled"} + 补默认档。
@@ -43,7 +49,7 @@ func lookupDefaultEffort(defaultEfforts map[string]string, model string) string 
 
 // isDeepSeekModel 模型名以 deepseek 为前缀（不区分大小写）。
 // 覆盖 deepseek-v4.1-flash / deepseek-v4-pro / deepseek-r1 等变体；
-// 前缀匹配对齐官方 thinkingFormat:"deepseek" 的判定口径，避免漏注。
+// 名称前缀是网关的兼容判定；官方按模型能力字段选择分支，两者不能视为同一判据。
 func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
@@ -112,7 +118,7 @@ func backfillReasoningContent(obj map[string]any) {
 
 // injectThinking 按 DeepSeek 思维链开关规则改写请求体。非 deepseek 零改动。
 //
-// 核心逻辑（对齐官方客户端）：
+// 网关当前适配逻辑（依据既有 DeepSeek 验收与所读条件分支）：
 //   - 「开思考」必须 thinking.type=enabled + 有 effort 档位（Hermes #43 打回证据）。
 //   - 显式 thinking.type 非空 → 客户端显式控制：enabled 缺 effort 时补默认档；
 //     disabled 尊重并删 reasoning_effort（snake/camel 双字段）。

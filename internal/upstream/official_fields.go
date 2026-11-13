@@ -1,4 +1,7 @@
-// official_fields.go 补齐官方客户端每轮必发的 chat 顶层字段。
+// official_fields.go 补齐已观察的官方 chat 请求中调用方未提供的顶层字段。
+// ═══ 更新日志 ═══
+// 2026-11-14：growthEvent 输入长度按官方 UTF-16 文本口径计算，排除平台 system 和图片。
+// 2026-11-14：区分抓包样本与源码条件分支，不将样本缺字段推成全客户端不存在。
 //
 // ═══ 为什么需要（2026-11-04）═══
 //
@@ -7,20 +10,23 @@
 //	model, messages, tools, temperature, max_tokens, stream, stream_options,
 //	reasoning_effort, verbosity, extra_vars, reasoning_summary
 //
-// 而网关出站只有：
+// 补齐前的网关典型出站字段为：
 //
 //	max_tokens, messages, model, prompt_cache_key, reasoning_effort,
 //	store, stream, stream_options, thinking, tools
 //
-// 少了 temperature / verbosity / reasoning_summary / extra_vars 四个，
-// 多了 prompt_cache_key / thinking（官方全客户端 0 处存在这两个字段名）。
+// 相比样本，补齐前少了 temperature / verbosity / reasoning_summary / extra_vars 四个。
+// 所查 6 份抓包未见 prompt_cache_key / thinking，不代表客户端全源码没有这些字段。
+// 已读官方源码存在 DeepSeek 条件注入 thinking 的分支（codebuddy-lite-wb.mjs:1016），
+// 因此不能仅据抓包缺字段就删除这些功能字段。
 //
-// 这不是 11128 的直接触发点（单变量回放实测：删掉多发的三个字段仍被拒，
-// 见 workspace_root_test.go 的排查记录），但字段集合本身就是可判定的客户端指纹——
-// 补齐能让出站形态与官方一致，减少被按「非官方」整体打标的概率。
+// 历史单变量回放中，删掉额外三个字段仍被拒（见 workspace_root_test.go），
+// 不能仅据字段集合认定 11128 根因。补齐缩小样本中观察到的形态差异；
+// 是否改变上游拒绝概率需另行实测。
 //
 // 反向证据（不该擅自删的）：`thinking` 是 DeepSeek 思维链开关，删掉会改变模型行为；
-// `prompt_cache_key` 带来 ~17× 的费用下降。两者都是功能所需，本轮只补不删。
+// `prompt_cache_key` 在历史特定前缀实验中带来约 17× 费用下降，并非当前所有请求的保证。
+// 两者均有既有功能用途，不能仅据样本缺失删除。
 package upstream
 
 import (
@@ -33,26 +39,26 @@ import (
 	"workbuddy2api/internal/jsonutil"
 )
 
-// 官方取值（6/6 抓包一致，见文件头）。
+// 已观察样本的取值（6/6 一致，见文件头），不代表所有模型配置或未来版本。
 const (
-	// officialTemperature 官方恒为 1。客户端不给 temperature 时才补，
+	// officialTemperature 所查样本为 1。客户端不给 temperature 时才补，
 	// 调用方显式指定（含 0）一律尊重——0 是合法且有意义的值。
 	officialTemperature = 1.0
-	// officialVerbosity 官方恒为 "high"。
+	// officialVerbosity 所查样本为 "high"。
 	officialVerbosity = "high"
-	// officialReasoningSummary 官方恒为 "auto"。
+	// officialReasoningSummary 所查样本为 "auto"。
 	officialReasoningSummary = "auto"
 )
 
-// ApplyOfficialChatFields 补齐官方客户端每轮必发、而调用方没给的顶层字段。
+// ApplyOfficialChatFields 按已观察样本补齐调用方未提供的顶层字段。
 //
 // 只在缺字段时补，已有值原样保留（客户端自知想要什么）。
 // body 不可解析时原样返回，与 prepareChatBody 的失败语义一致。
 //
 // modelName 用于 extra_vars.growthEvent 里的 requestModelId / requestModelName，
 // 应与出站 body 的 model 字段一致（调用方传解析后的裸模型名）。
-// inputLength 是官方 growthEvent 里的输入长度估算，0 表示未知（此时不填该键，
-// 而不是谎报 0）。
+// inputLength 是官方 growthEvent 里的输入文本长度（UTF-16 code units）。
+// 负数表示未知；0 是已确认的空文本输入。
 func ApplyOfficialChatFields(body []byte, modelName string, inputLength int) []byte {
 	if len(body) == 0 {
 		return body
@@ -63,7 +69,7 @@ func ApplyOfficialChatFields(body []byte, modelName string, inputLength int) []b
 	}
 	changed := false
 
-	// temperature：官方恒 1。只判「键不存在」，不判值——显式 0 必须保留。
+	// temperature：所查样本为 1。只判「键不存在」，不判值——显式 0 必须保留。
 	if _, ok := obj["temperature"]; !ok {
 		obj["temperature"] = officialTemperature
 		changed = true
@@ -76,7 +82,7 @@ func ApplyOfficialChatFields(body []byte, modelName string, inputLength int) []b
 		obj["reasoning_summary"] = officialReasoningSummary
 		changed = true
 	}
-	// extra_vars：官方每轮必发。形状见 buildGrowthEvent。
+	// extra_vars：所查样本均携带。形状见 buildGrowthEvent，显式值不覆盖。
 	if _, ok := obj["extra_vars"]; !ok {
 		model, _ := obj["model"].(string)
 		if model == "" {
@@ -119,7 +125,7 @@ func buildGrowthEvent(model string, inputLength int) string {
 		"mode":             "craft",
 		"command":          "",
 	}
-	if inputLength > 0 {
+	if inputLength >= 0 {
 		extra["inputLength"] = inputLength
 	}
 	payload := []any{map[string]any{
@@ -132,6 +138,51 @@ func buildGrowthEvent(model string, inputLength int) string {
 		return ""
 	}
 	return string(encoded)
+}
+
+// officialInputLength 对齐官方 TelemetryUtils.getInputLengthFromItem 的文本长度。
+// 必须在 FlattenSystemIntoUser 前取值，平台 system 不是用户输入；图片 URL、
+// base64 和工具调用结构也不属于 text。复用 payload 已解码的对象，不增加解码开销。
+func officialInputLength(obj map[string]any) int {
+	if obj == nil {
+		return -1
+	}
+	messages, ok := obj["messages"].([]any)
+	if !ok {
+		return -1
+	}
+	length := 0
+	addText := func(text string) {
+		for _, r := range text {
+			length++
+			if r > 0xffff {
+				length++
+			}
+		}
+	}
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if role == "system" || role == "developer" {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			addText(content)
+		case []any:
+			for _, rawPart := range content {
+				if part, ok := rawPart.(map[string]any); ok {
+					if text, ok := part["text"].(string); ok {
+						addText(text)
+					}
+				}
+			}
+		}
+	}
+	return length
 }
 
 // displayModelName 把模型 id 转成官方 growthEvent 里的展示名。
