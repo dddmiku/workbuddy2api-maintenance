@@ -13,6 +13,7 @@
 //   - 上游自造的 finish_reason 归一（对齐网关既有的 validFinishReason 口径）。
 //
 // ═══ 更新日志 ═══
+// 2026-11-14：首模型事件先检查整块读取再保留 512 字节尾部；增加请求级可选分段计时。
 // 2026-11-14：复用出站连接池；保留 300s 响应头窗口；真实 HTTP/Remote 流独立计时发心跳，关闭时取消阻塞读取。
 // 2026-11-14：legacy 的 3004 回落闸门透传完整注释心跳，角色帧仍扣住，心跳不取消回落资格。
 // 2026-11-14：回落闸门按完整帧判定内容，保留小块读取时的缓冲与原始终止错误。
@@ -378,6 +379,8 @@ func dumpPrefixFingerprint(body []byte) {
 	}
 }
 func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
+	ctx = withTimingRoute(ctx, "legacy")
+	prepareStart := time.Now()
 	requestID := newRequestID()
 	// 用实时目录把客户端模型名解析成 config_name（含显示名匹配，如
 	// "DeepSeek-V4.1-Flash" → "deepseek-v4.1-flash"）；目录不可用时
@@ -412,7 +415,8 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 	client := &http.Client{Transport: chatTransport()}
-	resp, err := client.Do(req)
+	observeSpan(ctx, "prepare", prepareStart)
+	resp, err := doTimed(ctx, client, req, "header")
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -422,7 +426,7 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 		return nil, resp.StatusCode, raw, nil
 	}
 	stream := translateStreamWithCredit(resp.Body, modelFromPrepared(prepared),
-		preparedTools(prepared), creditForStream(a, requestID))
+		preparedTools(prepared), creditForStream(a, requestID), ctx)
 	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
@@ -780,7 +784,10 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = withTimingRoute(ctx, "remote")
+	prepareStart := time.Now()
 	body, _, _, err := buildRemoteBody(ctx, a, prepared)
+	observeSpan(ctx, "prepare", prepareStart)
 	if err != nil {
 		return nil, err
 	}
@@ -804,11 +811,11 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	return &remoteStreamCloser{
 		ReadCloser: translateStreamWithCredit(
 			translateRemoteEvents(
-				newRemoteFirstEventReader(events),
-				modelFromPrepared(prepared), session.id),
+				newRemoteFirstEventReader(events, ctx),
+				modelFromPrepared(prepared), session.id, ctx),
 			modelFromPrepared(prepared),
 			preparedTools(prepared),
-			remoteCreditSpec(a, session.messageID)),
+			remoteCreditSpec(a, session.messageID), ctx),
 		auth:    a,
 		session: session,
 	}, nil
@@ -828,6 +835,7 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 // SSE 帧可能被 TCP 分片切开（event: 与名字分属两次 Read），判定用跨 Read 的
 // 滚动窗口（最近 512 字节）找 "event: <模型事件名>"，避免帧边界漏判。
 type remoteFirstEventReader struct {
+	timingCtx     context.Context
 	inner         io.Reader
 	deadline      time.Time
 	timedOut      bool
@@ -837,11 +845,15 @@ type remoteFirstEventReader struct {
 	window        []byte
 }
 
-func newRemoteFirstEventReader(inner io.Reader) *remoteFirstEventReader {
-	return &remoteFirstEventReader{
+func newRemoteFirstEventReader(inner io.Reader, contexts ...context.Context) *remoteFirstEventReader {
+	r := &remoteFirstEventReader{
 		inner:    inner,
 		deadline: time.Now().Add(remoteFirstEventTimeout),
 	}
+	if len(contexts) > 0 {
+		r.timingCtx = contexts[0]
+	}
+	return r
 }
 
 // remoteModelEventMarkers 首模型事件的 event 名（Remote 原始事件名）。
@@ -878,12 +890,14 @@ func (r *remoteFirstEventReader) Read(p []byte) (int, error) {
 	if n > 0 && !r.sawFirst {
 		// 滚动窗口：跨分片拼出完整的 event 行再判定。
 		r.window = append(r.window, p[:n]...)
-		if len(r.window) > 512 {
-			r.window = r.window[len(r.window)-512:]
-		}
 		if remoteModelEventPrefix(string(r.window)) {
 			r.sawFirst = true
 			r.window = nil
+			observeFirst(r.timingCtx, "model_event_recognized")
+		} else if len(r.window) > 512 {
+			// Check the whole read before retaining only the boundary suffix.
+			// Large model frames can put their event line more than 512 bytes back.
+			r.window = r.window[len(r.window)-512:]
 		}
 	}
 	return n, err
@@ -979,8 +993,11 @@ func TranslateStreamWithTools(upstream io.ReadCloser, model string, tools []any)
 //
 // credit 为 nil 时不查询（测试、目录缺失、非 trae 路径）。回调在 usage 帧发出前
 // 执行一次，把真实 credits 写进 usage.credit——上游事件流本身不带这个字段。
-func translateStreamWithCredit(upstream io.ReadCloser, model string, tools []any, credit *creditSpec) io.ReadCloser {
+func translateStreamWithCredit(upstream io.ReadCloser, model string, tools []any, credit *creditSpec, contexts ...context.Context) io.ReadCloser {
 	tr := newTranslator(model)
+	if len(contexts) > 0 {
+		tr.timingCtx = contexts[0]
+	}
 	if names := declaredToolNames(tools); len(names) > 0 {
 		tr.allowedTools = names
 	}
@@ -1377,6 +1394,7 @@ func (t *toolAccumulator) absorbTextCalls(calls []textToolCall) []map[string]any
 // ── 转译器 ────────────────────────────────────────────────────────────────
 
 type translator struct {
+	timingCtx context.Context
 	model     string
 	id        string
 	text      *textAccumulator
@@ -1588,6 +1606,14 @@ func (t *translator) absorbTextToolCalls(out *bytes.Buffer) {
 
 // emit 把一条 OpenAI SSE 帧写进输出缓冲。
 func (t *translator) emit(out *bytes.Buffer, delta map[string]any, finish any) {
+	if text, ok := delta["reasoning_content"].(string); ok && text != "" {
+		observeFirst(t.timingCtx, "first_token")
+		observeFirst(t.timingCtx, "first_reasoning")
+	}
+	if text, ok := delta["content"].(string); ok && text != "" {
+		observeFirst(t.timingCtx, "first_token")
+		observeFirst(t.timingCtx, "first_content")
+	}
 	choice := map[string]any{"index": 0, "delta": delta, "finish_reason": finish}
 	frame := map[string]any{
 		"id":      t.id,
@@ -1616,6 +1642,7 @@ func (t *translator) start(out *bytes.Buffer) {
 // handleEvent 处理一个上游事件，把产生的 OpenAI 帧写进 out。
 // 返回 done=true 表示上游已给出终态，停止消费。
 func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (bool, error) {
+	observeRawModel(t.timingCtx, name, data)
 	name = normalizeEventName(name)
 	var obj map[string]any
 	if len(data) > 0 {
@@ -2068,12 +2095,15 @@ func (r *translateReader) run(upstream io.ReadCloser, tr *translator, firstBeat,
 			tr.sawTerminal = true
 			return true
 		}
+		translateStart := time.Now()
 		done, herr := tr.handleEvent(name, []byte(payload), &out)
 		if herr != nil {
 			err = herr
 			return true
 		}
 		if out.Len() > 0 {
+			observeFirst(tr.timingCtx, "first_frame_ready")
+			observeSpan(tr.timingCtx, "translate", translateStart)
 			if _, werr := r.pw.Write(out.Bytes()); werr != nil {
 				err = werr
 				return true

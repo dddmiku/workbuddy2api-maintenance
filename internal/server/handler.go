@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-11-14：Trae 流式请求在目录/建会话/等头期间发保活，观测与写入仍归调用 goroutine。
 // 2026-10-10：同步付费模型表（倍率>0）给号池；global 号仍读余额以补齐 credits_expiring。
 // 2026-09-28：接受 Anthropic 的 `[1m]` 模型后缀（去后缀后按同一模型路由）。
 // 2026-09-28：未知 4xx 换号可选（pool.rotate_on_client_error，默认保持旧契约）。
@@ -334,7 +335,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wire := &traceResponseWriter{ResponseWriter: w, trace: trace}
 	ctx = context.WithValue(ctx, requestTraceKey{}, trace)
 	defer h.finishTrace(trace, wire, ctx)
-	h.mux.ServeHTTP(newBoundedResponseWriter(wire, cancel, downstreamWriteTimeout), r.WithContext(ctx))
+	h.mux.ServeHTTP(newBoundedResponseWriter(wire, cancel, downstreamWriteTimeout, ctx), r.WithContext(ctx))
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -1987,7 +1988,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 与账号无关，换号解决不了问题。
 		regionRepaired := false
 		for {
-			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			if peek.Stream && acct.Realm() == trae.Realm {
+				rc, status, respBody, terr = waitChatWithProgress(chatContext, w, func(ctx context.Context) (io.ReadCloser, int, []byte, error) {
+					return h.cfg.Upstream.ChatStreamContext(ctx, acct, body, clientIP, chatMeta)
+				})
+			} else {
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
+			}
 			if terr != nil || status < 400 || regionRepaired {
 				break
 			}

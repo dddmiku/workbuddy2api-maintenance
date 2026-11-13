@@ -650,6 +650,8 @@ func maxModeFields(custom map[string]any) map[string]any {
 
 // createRemoteSession 建会话（两步协议的第 1 步）。
 func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remoteSession, error) {
+	started := time.Now()
+	defer observeSpan(ctx, "create", started)
 	// 排障开关：WB2API_DUMP_REMOTE_BODY=1 时把建会话体整段打进日志。
 	//
 	// 为什么需要：判断「服务端会话能否复用」只能看真实出站体里 chat_session_id
@@ -667,7 +669,7 @@ func createRemoteSession(ctx context.Context, a *auth.Auth, body []byte) (remote
 			req.Header.Add(k, v)
 		}
 	}
-	resp, err := remoteHTTPClient().Do(req)
+	resp, err := doTimed(ctx, remoteHTTPClient(), req, "create_header")
 	if err != nil {
 		return remoteSession{}, fmt.Errorf("trae remote 建会话：%w", err)
 	}
@@ -805,7 +807,7 @@ func openRemoteEvents(ctx context.Context, a *auth.Auth, session remoteSession) 
 		}
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := remoteHTTPClient().Do(req)
+	resp, err := doTimed(ctx, remoteHTTPClient(), req, "header")
 	if err != nil {
 		return nil, fmt.Errorf("trae remote 收流：%w", err)
 	}
@@ -846,7 +848,11 @@ var logRemoteTrim = func(dropped int) {
 //     （stream.go 的 toolBlockPairs + toolAccumulator 天然支持）。
 
 // translateRemoteEvents 把 Remote 事件流改写成 llm_utils_chat 形态的 SSE。
-func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string) io.ReadCloser {
+func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string, contexts ...context.Context) io.ReadCloser {
+	var ctx context.Context
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	pr, pw := io.Pipe()
 	r := &remoteEventReader{PipeReader: pr, upstream: upstream}
 	go func() {
@@ -875,6 +881,7 @@ func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string) io.R
 				return werr
 			}
 			converted, ok := conv.convert(name, payload)
+			observeRawModel(ctx, name, []byte(payload))
 			if !ok {
 				return nil
 			}

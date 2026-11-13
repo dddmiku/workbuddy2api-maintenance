@@ -15,6 +15,22 @@ type ChatAttemptEvent struct {
 
 type chatAttemptObserverKey struct{}
 
+// DispatchChatObservers marshals synchronous setup callbacks onto the caller's
+// event loop when ChatStreamContext runs in a worker. Writers and accounting
+// state keep their original single-goroutine ownership.
+func DispatchChatObservers(ctx context.Context, dispatch func(func())) context.Context {
+	if ctx == nil || dispatch == nil {
+		return ctx
+	}
+	if observe, ok := ctx.Value(chatAttemptObserverKey{}).(func(ChatAttemptEvent)); ok && observe != nil {
+		ctx = WithChatAttemptObserver(ctx, func(e ChatAttemptEvent) { dispatch(func() { observe(e) }) })
+	}
+	if observe, ok := ctx.Value(chatRetryObserverKey{}).(func([]byte)); ok && observe != nil {
+		ctx = WithChatRetryObserver(ctx, func(body []byte) { copyBody := append([]byte(nil), body...); dispatch(func() { observe(copyBody) }) })
+	}
+	return ctx
+}
+
 func WithChatAttemptObserver(ctx context.Context, observe func(ChatAttemptEvent)) context.Context {
 	if ctx == nil {
 		ctx = context.Background()

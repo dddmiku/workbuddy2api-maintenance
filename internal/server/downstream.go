@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"workbuddy2api/internal/upstream/trae"
 )
 
 const downstreamWriteTimeout = 30 * time.Second
@@ -23,10 +25,15 @@ type boundedResponseWriter struct {
 	timeout    time.Duration
 	cancel     context.CancelCauseFunc
 	err        error
+	timingCtx  context.Context
 }
 
-func newBoundedResponseWriter(inner http.ResponseWriter, cancel context.CancelCauseFunc, timeout time.Duration) *boundedResponseWriter {
-	return &boundedResponseWriter{inner: inner, controller: http.NewResponseController(inner), cancel: cancel, timeout: timeout}
+func newBoundedResponseWriter(inner http.ResponseWriter, cancel context.CancelCauseFunc, timeout time.Duration, contexts ...context.Context) *boundedResponseWriter {
+	w := &boundedResponseWriter{inner: inner, controller: http.NewResponseController(inner), cancel: cancel, timeout: timeout}
+	if len(contexts) > 0 {
+		w.timingCtx = contexts[0]
+	}
+	return w
 }
 
 func (w *boundedResponseWriter) Header() http.Header         { return w.inner.Header() }
@@ -71,7 +78,9 @@ func (w *boundedResponseWriter) Write(p []byte) (int, error) {
 	if err := w.begin(); err != nil {
 		return 0, err
 	}
+	started := time.Now()
 	n, err := w.inner.Write(p)
+	trae.ObserveDownstreamWrite(w.timingCtx, started, n)
 	if err == nil && n != len(p) {
 		err = io.ErrShortWrite
 	}

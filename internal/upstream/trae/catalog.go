@@ -137,14 +137,18 @@ var (
 // 失败时返回上一次成功的快照（若有）并把错误一并返回：展示端点宁可显示稍旧的
 // 真实清单，也不要因为一次网络抖动就变成空列表——空列表会让用户以为模型没了。
 func FetchCatalog(ctx context.Context, a *auth.Auth) ([]CatalogModel, error) {
+	started := time.Now()
+	defer observeSpan(ctx, "catalog", started)
 	key := a.UID
 	catalogMu.Lock()
 	cached, ok := catalogCache[key]
 	catalogMu.Unlock()
 	if ok && time.Since(cached.fetched) < catalogTTL {
+		observeSpan(ctx, "catalog_cache_hit", started)
 		return cached.models, cached.err
 	}
 
+	observeSpan(ctx, "catalog_cache_miss", started)
 	models, err := fetchCatalogUpstream(ctx, a)
 	catalogMu.Lock()
 	if err != nil && ok && len(cached.models) > 0 {
@@ -235,7 +239,7 @@ func fetchCatalogUpstream(ctx context.Context, a *auth.Auth) ([]CatalogModel, er
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := (&http.Client{Transport: chatTransport()}).Do(req)
+	resp, err := doTimed(ctx, &http.Client{Transport: chatTransport()}, req, "catalog_header")
 	if err != nil {
 		return nil, fmt.Errorf("trae catalog: %w", err)
 	}
