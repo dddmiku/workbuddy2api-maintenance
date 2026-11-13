@@ -644,7 +644,11 @@ func TestRenewedSessionRevokedByLogout(t *testing.T) {
 	h := newHarness(t)
 	doc := h.writeCredentials()
 	token := h.token(doc)
-	payload := ReadSession(doc, token)
+	// 必须用 ReadSessionAt + h.clock.Now()，不能用 ReadSession：
+	// 后者读真实 time.Now()，而令牌是用假时钟（2026-10-13）签发的，两个基准
+	// 错位会让「令牌应有效」直接失败——产品代码是对的，错的是测试的时钟。
+	// （与 h.token 注释同一根因，2026-10-13 起就存在，2026-11-14 修。）
+	payload := ReadSessionAt(doc, token, h.clock.Now())
 	if payload == nil {
 		t.Fatal("令牌应有效")
 	}
@@ -673,17 +677,17 @@ func TestRenewedSessionRevokedByLogout(t *testing.T) {
 		t.Fatal("临近过期时必须滑动续期")
 	}
 	// 续期后的令牌与原来的 nonce 相同。
-	if got := ReadSession(doc, renewed); got == nil || got.Nonce != payload.Nonce {
+	if got := ReadSessionAt(doc, renewed, h.clock.Now()); got == nil || got.Nonce != payload.Nonce {
 		t.Fatal("续期必须沿用同一个 nonce（否则登出会留下复活副本）")
 	}
 	// 登出（用续期后的令牌）后，两份都失效。
 	h.do(http.MethodPost, "/api/auth/logout", "{}", map[string]string{
 		"Cookie": CookieName + "=" + renewed, "X-Admin-Request": "1"})
 	reloaded, _ := h.server.creds.Load()
-	if ReadSession(reloaded, token) != nil {
+	if ReadSessionAt(reloaded, token, h.clock.Now()) != nil {
 		t.Fatal("原令牌在登出后必须失效")
 	}
-	if ReadSession(reloaded, renewed) != nil {
+	if ReadSessionAt(reloaded, renewed, h.clock.Now()) != nil {
 		t.Fatal("续期令牌在登出后必须失效")
 	}
 }
