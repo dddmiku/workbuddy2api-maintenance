@@ -179,6 +179,11 @@ var ContentLoopHoldBackTimeout = 8 * time.Second
 type StreamOptions struct {
 	Model              string
 	ReasoningLoopGuard bool
+	// ImmediateProgress delivers the first validated model payload without
+	// waiting for the loop retry holdback window. Detection remains enabled;
+	// after delivery a later loop is reported, never silently retried.
+	// Role, usage, heartbeats and finish-only frames do not count as progress.
+	ImmediateProgress bool
 	// LoopRetryAvailable 告诉 Stream：命中循环且客户端零字节时，调用方**还会**在同一
 	// 账号上重发，因此这次不要向客户端写 error 帧与 [DONE]（避免用户看到半截失败），
 	// 只把错误标成 Retryable 返回。
@@ -623,6 +628,7 @@ func newStreamState(options []StreamOptions) *streamState {
 	if len(options) > 0 {
 		state.loopGuardEnabled = options[0].ReasoningLoopGuard && reasoningLoopModel(options[0].Model)
 		state.loopRetryAvailable = options[0].LoopRetryAvailable
+		state.immediateProgress = options[0].ImmediateProgress
 		state.model = options[0].Model
 	}
 	return state

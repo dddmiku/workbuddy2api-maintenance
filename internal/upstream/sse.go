@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-11-15：支持正常模型进展立即交付，保留逐帧循环检测与交付前重试；命中帧不下发。
 // 2026-11-14：压制期开流宽限从开始读流计时；纯注释心跳也触发 OnHold，避免 Trae 无内容等待时心跳再被压住。
 // 2026-09-26：压制期回调 StreamOptions.OnHold（同一 goroutine）。
 // 2026-09-26：空工具参数归一为 {}；choice 级 logprobs 透传（缺失补 null）。
@@ -356,6 +357,7 @@ type streamState struct {
 	loopGuardEnabled bool
 	// loopRetryAvailable 由 StreamOptions 传入：调用方还会重发时才压制错误帧。
 	loopRetryAvailable bool
+	immediateProgress  bool
 	// model 只用于日志：上游自造 finish_reason 时必须能定位是哪个模型。
 	model string
 }
@@ -406,6 +408,20 @@ func normalizeFinishReason(reason string) (string, bool) {
 func (s *streamState) hasVisibleProgress() bool {
 	for _, choice := range s.choices {
 		if choice.progress > 0 || choice.finishReason != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasModelProgress excludes protocol envelopes and terminal metadata. It does
+// not reset loop detection; it only decides whether held bytes can be delivered.
+func (s *streamState) hasModelProgress() bool {
+	for _, choice := range s.choices {
+		if choice.progress > 0 {
+			return true
+		}
+		if choice.reasoningGuard != nil && choice.reasoningGuard.characters > 0 {
 			return true
 		}
 	}
@@ -1049,6 +1065,8 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	//   - 正文阶段压到出现长行、空行、第三种短行或正文上限为止（正常回答通常一行就放行）；
 	//   - refusal 与工具进展立即放行，它们不是被监控的载荷；
 	//   - 在压制期间命中循环 → 客户端零字节，错误标记 Retryable，由 handler 整段重发。
+	// ImmediateProgress 在首个通过检测的模型载荷到来时放行；此后继续检测，
+	// 命中则明确报错，不能收回已交付内容或无痕重发。Trae 使用此策略避免双层缓冲。
 	// 保护未启用时不进这个分支，行为与引入前完全一致。
 	var pending []byte
 	released := !state.loopGuardEnabled
@@ -1113,7 +1131,7 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		// 先判定这一帧是否命中循环，再决定要不要放行：命中帧本身必须留在压制区里，
 		// 否则客户端会先看到一段重复推理，再收到错误。
 		guardErr := state.observeReasoningLoops(obj)
-		// 命中帧本身必须留在压制区里：先放行再报错，客户端就会看到一段重复文本。
+		// 命中帧本身必须丢弃：先放行再报错，客户端就会看到一段重复文本。
 		// 未命中时按下面几条出口决定要不要继续压住：
 		//   - refusal 与工具进展一出现就放行，它们不是被监控的载荷；
 		//   - 纯推理阶段（还没有正文）继续压住，让推理循环有机会被整段丢弃后重发；
@@ -1131,7 +1149,8 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 				holdingContent = false
 			}
 			keepHolding := !state.hasVisibleProgress() || contentHeld
-			if !keepHolding || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
+			if (state.immediateProgress && state.hasModelProgress()) ||
+				(!state.immediateProgress && !keepHolding) || state.reasoningCharacters() >= reasoningLoopHoldBackChars ||
 				!time.Now().Before(holdBackDeadline) ||
 				(contentHeld && !time.Now().Before(contentDeadline)) {
 				if releaseErr := releasePending(); releaseErr != nil {
@@ -1170,10 +1189,15 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 		if err != nil {
 			return true, &StreamError{Code: "upstream_parse", Message: "upstream frame could not be encoded", Cause: err}
 		}
-		if writeErr := writeRaw(string(raw)); writeErr != nil {
-			return true, errors.Join(guardErr, writeErr)
+		// The frame that triggered the guard is never delivered, including after
+		// earlier progress was released. Observed usage was already retained.
+		if guardErr != nil {
+			return true, guardErr
 		}
-		return guardErr != nil, guardErr
+		if writeErr := writeRaw(string(raw)); writeErr != nil {
+			return true, writeErr
+		}
+		return false, nil
 	}, func(line string) error {
 		// SSE 注释行同样要过闸门：压制期间若直接写出，客户端就不是零字节了，
 		// 命中循环时便无法整段重发。
@@ -1264,7 +1288,13 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 			marshalErr = json.Compact(&compact, streamErr.rawFrame)
 			raw = compact.Bytes()
 		} else {
-			raw, marshalErr = json.Marshal(map[string]any{"error": streamErr.ErrorObject()})
+			failure := map[string]any{"error": streamErr.ErrorObject()}
+			// Dropping the detected loop payload must not drop its observed
+			// usage. Retryable failures already returned without writing above.
+			if IsLoopGuardError(err) && usage != nil {
+				failure["usage"] = usage
+			}
+			raw, marshalErr = json.Marshal(failure)
 		}
 		if marshalErr != nil {
 			return errors.Join(err, marshalErr)

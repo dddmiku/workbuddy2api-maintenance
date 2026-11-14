@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,16 +27,18 @@ import (
 )
 
 type probeCase struct {
-	Name       string `json:"name"`
-	Model      string `json:"model"`
-	InputChars int    `json:"input_chars"`
-	Shape      string `json:"shape"`
-	Task       string `json:"task"`
+	Name           string `json:"name"`
+	Model          string `json:"model"`
+	InputChars     int    `json:"input_chars"`
+	Shape          string `json:"shape"`
+	Task           string `json:"task"`
+	ConversationID string `json:"conversation_id"`
 }
 type input struct {
 	Auth        json.RawMessage `json:"auth_document"`
 	Cases       []probeCase     `json:"cases"`
 	WarmCatalog bool            `json:"warm_catalog"`
+	Legacy      bool            `json:"legacy"`
 }
 type result struct {
 	Name             string             `json:"name"`
@@ -56,6 +59,8 @@ type result struct {
 	ReasoningBytes   int                `json:"reasoning_bytes"`
 	Done             bool               `json:"done"`
 	InputTokens      int                `json:"input_tokens"`
+	CachedTokens     *int               `json:"cached_tokens"`
+	Credit           *float64           `json:"credit"`
 	ErrorClass       string             `json:"error_class,omitempty"`
 	ErrorCode        string             `json:"error_code,omitempty"`
 }
@@ -83,6 +88,10 @@ func main() {
 		fmt.Fprintln(out, `{"error_class":"input_decode"}`)
 		return
 	}
+	if in.Legacy {
+		// Isolated diagnostic process only; never changes deployed routing.
+		_ = os.Setenv("WB2API_TRAE_REMOTE", "0")
+	}
 	a, err := auth.Parse(in.Auth)
 	if err != nil || a == nil || a.Realm() != trae.Realm {
 		fmt.Fprintln(out, `{"error_class":"invalid_auth_snapshot"}`)
@@ -95,7 +104,8 @@ func main() {
 	p.Add(a)
 	p.SetCredits(a.UID, 10000)
 	up := upstream.New()
-	h := server.NewHandler(server.Config{Pool: p, Upstream: up, GlobalEnabled: true})
+	callerKey := rand.Text()
+	h := server.NewHandler(server.Config{Pool: p, Upstream: up, GlobalEnabled: true, APIKey: callerKey})
 	var mu sync.Mutex
 	var events []trae.TimingEvent
 	finished := make(chan struct{}, 1)
@@ -106,11 +116,7 @@ func main() {
 	}))
 	defer local.Close()
 	client := &http.Client{Timeout: 360 * time.Second}
-	uid := a.UID
-	if len(uid) > 8 {
-		uid = uid[:8]
-	}
-	accountHash := sha256.Sum256([]byte(uid))
+	accountHash := sha256.Sum256([]byte(a.UID))
 	encoder := json.NewEncoder(out)
 	for _, c := range in.Cases {
 		if (c.Model != "glm-5.3" && c.Model != "deepseek-v4.1-flash") || c.InputChars < 0 || c.InputChars > 1000000 {
@@ -135,12 +141,13 @@ func main() {
 				prompt = "以下是确定性生成的诊断数据：\n" + data + "\n请分析 x/y/z 数列的生成规律，简要解释推导和程序验证步骤。不要调用外部工具。回答不超过80字。"
 			}
 		}
-		body, _ := json.Marshal(map[string]any{"model": "trae:" + c.Model, "messages": []any{map[string]string{"role": "user", "content": prompt}}, "stream": true, "stream_options": map[string]bool{"include_usage": true}, "max_tokens": 128})
+		body, _ := json.Marshal(map[string]any{"model": "trae:" + c.Model, "messages": []any{map[string]string{"role": "user", "content": prompt}}, "stream": true, "stream_options": map[string]bool{"include_usage": true}, "max_tokens": 128, "conversation_id": c.ConversationID})
 		hash := sha256.Sum256([]byte(prompt))
 		res := result{Name: c.Name, Model: c.Model, InputChars: len(prompt), Shape: c.Shape, Task: c.Task, AccountHash: hex.EncodeToString(accountHash[:6]), InputHash: hex.EncodeToString(hash[:8])}
 		start := time.Now()
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, local.URL+"/v1/chat/completions", strings.NewReader(string(body)))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+callerKey)
 		resp, err := client.Do(req)
 		if err != nil {
 			res.ErrorClass = "client_transport"
@@ -160,7 +167,11 @@ func main() {
 					}
 					var frame struct {
 						Usage struct {
-							Prompt int `json:"prompt_tokens"`
+							Prompt  int      `json:"prompt_tokens"`
+							Credit  *float64 `json:"credit"`
+							Details struct {
+								Cached *int `json:"cached_tokens"`
+							} `json:"prompt_tokens_details"`
 						} `json:"usage"`
 						Choices []struct {
 							Delta struct {
@@ -177,6 +188,12 @@ func main() {
 					if json.Unmarshal([]byte(payload), &frame) == nil {
 						if frame.Usage.Prompt > 0 {
 							res.InputTokens = frame.Usage.Prompt
+						}
+						if frame.Usage.Details.Cached != nil {
+							res.CachedTokens = frame.Usage.Details.Cached
+						}
+						if frame.Usage.Credit != nil {
+							res.Credit = frame.Usage.Credit
 						}
 						if frame.Error.Code != "" || frame.Error.Message != "" {
 							res.ErrorClass = "stream_error"

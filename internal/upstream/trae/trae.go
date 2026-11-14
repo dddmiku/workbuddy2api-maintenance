@@ -186,7 +186,7 @@ func buildHeaders(a *auth.Auth) http.Header {
 //
 // messages：OpenAI 形状直接透传（role/content/tool_calls 结构上游原样接受），
 // 只有 tools 声明需要转 Trae 原生（parameters 是 JSON 字符串而非对象）。
-// 上层 prepareBody 已做过 effort 降级与预算补齐，这里不再重复处理。
+// Trae 在通用 prepareBody 前分流，输出预算别名在本地请求边界归一。
 func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 	return BuildChatBodyWithCatalog(prepared, requestID, nil)
 }
@@ -207,15 +207,23 @@ func BuildChatBody(prepared []byte, requestID string) ([]byte, error) {
 //
 // models 为空（目录拉不到）时退回旧的写死行为：不因为缺目录把请求改道。
 func BuildChatBodyWithCatalog(prepared []byte, requestID string, models []CatalogModel) ([]byte, error) {
+	return buildChatBodyWithSession(prepared, requestID, requestID, models)
+}
+
+func buildChatBodyWithSession(prepared []byte, requestID, sessionID string, models []CatalogModel) ([]byte, error) {
+	body, _, err := buildChatBodySelected(prepared, requestID, sessionID, models)
+	return body, err
+}
+func buildChatBodySelected(prepared []byte, requestID, sessionID string, models []CatalogModel) ([]byte, outboundSelection, error) {
 	var src map[string]any
 	if err := jsonutil.Decode(prepared, &src); err != nil || src == nil {
-		return nil, fmt.Errorf("trae chat body parse: %w", err)
+		return nil, outboundSelection{}, fmt.Errorf("trae chat body parse: %w", err)
 	}
 	body := chatBody{
 		Function:  "solo_work_lite",
 		Stream:    true,
 		RequestID: requestID,
-		SessionID: requestID,
+		SessionID: sessionID,
 	}
 	// 上游按 config_name 精确匹配（大小写敏感），必须先把客户端写的宽松名
 	// （gpt-4o / claude-sonnet-4-5 之类）映射到 Trae 的真实模型名，否则会被拒。
@@ -261,10 +269,14 @@ func BuildChatBodyWithCatalog(prepared []byte, requestID string, models []Catalo
 	if body.Messages == nil {
 		body.Messages = []map[string]any{}
 	}
-	if mt, ok := src["max_tokens"].(json.Number); ok {
-		if n, err := mt.Int64(); err == nil && n > 0 {
-			body.MaxTokens = &n
-		}
+	// Explicit non-null max_tokens takes precedence, including an invalid value;
+	// only an absent/null legacy field permits the modern alias to supply it.
+	budget := src["max_tokens"]
+	if budget == nil {
+		budget = src["max_completion_tokens"]
+	}
+	if n, ok := usageCount(budget); ok && n > 0 {
+		body.MaxTokens = &n
 	}
 	if tools, ok := src["tools"].([]any); ok && len(tools) > 0 {
 		native := nativeToolDefinitions(tools)
@@ -283,9 +295,9 @@ func BuildChatBodyWithCatalog(prepared []byte, requestID string, models []Catalo
 	}
 	out, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, outboundSelection{}, err
 	}
-	return out, nil
+	return out, selectedOutbound(body.ConfigName, body.Function, body.Model, models), nil
 }
 
 // nativeMessage 把一条 OpenAI 消息转成 Trae 原生形状。

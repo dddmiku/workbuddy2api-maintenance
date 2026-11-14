@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/jsonutil"
 )
 
 const (
@@ -315,9 +316,13 @@ func buildRemoteBody(ctx context.Context, a *auth.Auth, prepared []byte) ([]byte
 // buildRemoteBodyWithCatalog 与 buildRemoteBody 相同，但可注入目录（测试用）。
 // catalog 为 nil 时按账号拉实时目录。
 func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []byte, catalog []CatalogModel) ([]byte, string, bool, error) {
+	body, agent, max, _, err := buildRemoteBodySelected(ctx, a, prepared, catalog)
+	return body, agent, max, err
+}
+func buildRemoteBodySelected(ctx context.Context, a *auth.Auth, prepared []byte, catalog []CatalogModel) ([]byte, string, bool, outboundSelection, error) {
 	var src map[string]any
 	if err := json.Unmarshal(prepared, &src); err != nil {
-		return nil, "", false, fmt.Errorf("trae remote: 请求体解析失败：%w", err)
+		return nil, "", false, outboundSelection{}, fmt.Errorf("trae remote: 请求体解析失败：%w", err)
 	}
 	rawMessages, _ := src["messages"].([]any)
 	messages := make([]map[string]any, 0, len(rawMessages))
@@ -370,6 +375,7 @@ func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []by
 	}
 
 	maxApplied := false
+	var selection outboundSelection
 	if strategy == "manual" {
 		// 档位默认取 max（1M）。请求名里的 `-max` 后缀是**客户端意图**，上游真名是
 		// `__max`（见 CatalogModel.OutboundModelName）；但 `qwen3.8-max` 这种名字里
@@ -424,7 +430,7 @@ func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []by
 			if !agentTypeSupportsModel(models, base, agentType) {
 				candidate := remoteAgentTypeForModel(models, base, agentType)
 				if candidate == "" {
-					return nil, "", false, fmt.Errorf(
+					return nil, "", false, outboundSelection{}, fmt.Errorf(
 						"trae remote: 模型 %s 只在非 Remote 表里，改走 llm_utils_chat", base)
 				}
 				if candidate != agentType {
@@ -449,6 +455,7 @@ func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []by
 			}
 		}
 		msg.ModelName = modelName
+		selection = selectedOutbound(base, agentType, modelName, models)
 		if custom, ok := customModelFor(models, base, agentType, catalogOK); ok {
 			msg.CustomModel = custom
 			source := int64(1)
@@ -502,9 +509,9 @@ func buildRemoteBodyWithCatalog(ctx context.Context, a *auth.Auth, prepared []by
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, outboundSelection{}, err
 	}
-	return encoded, agentType, maxApplied, nil
+	return encoded, agentType, maxApplied, selection, nil
 }
 
 // remoteTrimLog 裁剪日志（单独函数便于测试覆盖）。
@@ -877,7 +884,7 @@ func translateRemoteEvents(upstream io.ReadCloser, model, sessionID string, cont
 				return nil
 			}
 			if payload == "[DONE]" {
-				_, werr := io.WriteString(pw, "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+				_, werr := io.WriteString(pw, conv.finish()+"event: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
 				return werr
 			}
 			converted, ok := conv.convert(name, payload)
@@ -1046,14 +1053,18 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 
 	case "token_usage":
 		var obj map[string]any
-		if json.Unmarshal([]byte(payload), &obj) != nil {
+		if jsonutil.Decode([]byte(payload), &obj) != nil {
 			return "", false
+		}
+		if nested, ok := obj["usage"].(map[string]any); ok {
+			obj = nested
 		}
 		// Remote 把 usage 平铺在顶层（prompt_tokens/completion_tokens/...），
 		// llm_utils_chat 的 translator 期望嵌套在 usage 字段里。
 		usage := map[string]any{}
 		for _, key := range []string{"prompt_tokens", "completion_tokens", "total_tokens",
-			"cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens"} {
+			"cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens",
+			"cached_tokens", "prompt_cache_hit_tokens", "prompt_tokens_details", "completion_tokens_details"} {
 			if v, ok := obj[key]; ok {
 				usage[key] = v
 			}
@@ -1069,7 +1080,7 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 
 	case "done":
 		// Remote 的 done 给的是 status（completed/…），不是 finish_reason。
-		return "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n", true
+		return c.finish() + "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n", true
 
 	case "error":
 		return "event: error\ndata: " + payload + "\n\n", true
@@ -1097,10 +1108,8 @@ func (c *remoteEventConverter) convert(name, payload string) (string, bool) {
 	return "", false
 }
 
-// finish 流结束时补一帧 finish summary（若有且正文可能没用上）。
-//
-// 为什么放在收尾而不是 done 时：done 事件的 status 不带 summary，而 summary 在
-// 最后一个 plan_item 里；转译层无法预知后续还有没有正文，只能在 EOF 时兜底。
+// finish drains the pending summary before an explicit terminal, or at EOF.
+// It never fabricates a terminal: EOF without done remains a truncated stream.
 // 输出形态是 output 事件（translator 的累计合并会自动去重——summary 若与已交付
 // 正文相同则前缀合并后 delta 为零，不会重复下发）。
 func (c *remoteEventConverter) finish() string {
@@ -1108,6 +1117,7 @@ func (c *remoteEventConverter) finish() string {
 		return ""
 	}
 	encoded, err := json.Marshal(map[string]any{"response": c.finishSummary})
+	c.finishSummary = ""
 	if err != nil {
 		return ""
 	}

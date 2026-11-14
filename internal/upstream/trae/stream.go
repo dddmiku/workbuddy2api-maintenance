@@ -13,6 +13,8 @@
 //   - 上游自造的 finish_reason 归一（对齐网关既有的 validFinishReason 口径）。
 //
 // ═══ 更新日志 ═══
+// 2026-11-15：单轮账单 ID 与会话指纹分离；仅用严格对齐的商业账单补齐缓存计数。
+// 2026-11-14：正文前的思考增量及时交付；稳定隔离会话 ID；用量保留缺失和显式零。
 // 2026-11-14：首模型事件先检查整块读取再保留 512 字节尾部；增加请求级可选分段计时。
 // 2026-11-14：复用出站连接池；保留 300s 响应头窗口；真实 HTTP/Remote 流独立计时发心跳，关闭时取消阻塞读取。
 // 2026-11-14：legacy 的 3004 回落闸门透传完整注释心跳，角色帧仍扣住，心跳不取消回落资格。
@@ -31,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -106,10 +109,11 @@ var chunkSeq uint64
 // 所以带图请求**必须**走 legacy——那里 messages 是原生块数组，图片原样透传上游。
 // 判据用「请求体里有没有图片块」，不是模型名：客户端可能给文本模型发图，让上游
 // 按自己的口径拒绝比网关猜一个替代模型更诚实。
-func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
+func ChatStream(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string, identities ...SessionIdentity) (io.ReadCloser, int, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = withSessionIdentity(ctx, identities)
 	// ═══ 已移除「带图 + 非多模态模型 → 出站前拦下」（2026-10-16 二次修正）═══
 	//
 	// v3.8.4 加过一段拦截：读目录的 multimodal 标记，为 false 且本轮带图就在出站前
@@ -396,7 +400,8 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 			prepared = withModel(prepared, resolved)
 		}
 	}
-	body, err := BuildChatBodyWithCatalog(prepared, requestID, catalog)
+	billingID := billingSessionID(ctx, a, requestID)
+	body, selection, err := buildChatBodySelected(prepared, requestID, billingID, catalog)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -426,7 +431,7 @@ func chatStreamLegacy(ctx context.Context, a *auth.Auth, prepared []byte, client
 		return nil, resp.StatusCode, raw, nil
 	}
 	stream := translateStreamWithCredit(resp.Body, modelFromPrepared(prepared),
-		preparedTools(prepared), creditForStream(a, requestID), ctx)
+		preparedTools(prepared), creditForStream(a, billingID, selection), ctx)
 	// 工具轮次超限（3004）时透明回落到 Remote 会话端点。回落发生在**客户端收到
 	// 任何内容之前**才安全——已交付内容再换端点会让用户看到重复/断裂的输出。
 	// 触发条件与代价见 remote.go 文件头。
@@ -664,7 +669,8 @@ func (r *remoteFallbackReader) resend(prepared []byte) (io.ReadCloser, error) {
 			prepared = withModel(prepared, resolved)
 		}
 	}
-	body, err := BuildChatBodyWithCatalog(prepared, requestID, catalog)
+	billingID := billingSessionID(r.ctx, r.auth, requestID)
+	body, selection, err := buildChatBodySelected(prepared, requestID, billingID, catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -691,7 +697,7 @@ func (r *remoteFallbackReader) resend(prepared []byte) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 300))
 	}
 	return translateStreamWithCredit(resp.Body, modelFromPrepared(prepared),
-		preparedTools(prepared), creditForStream(r.auth, requestID)), nil
+		preparedTools(prepared), creditForStream(r.auth, billingID, selection)), nil
 }
 
 func (r *remoteFallbackReader) Close() error {
@@ -786,7 +792,7 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 	}
 	ctx = withTimingRoute(ctx, "remote")
 	prepareStart := time.Now()
-	body, _, _, err := buildRemoteBody(ctx, a, prepared)
+	body, _, _, selection, err := buildRemoteBodySelected(ctx, a, prepared, nil)
 	observeSpan(ctx, "prepare", prepareStart)
 	if err != nil {
 		return nil, err
@@ -815,7 +821,7 @@ func ChatStreamRemote(ctx context.Context, a *auth.Auth, prepared []byte, client
 				modelFromPrepared(prepared), session.id, ctx),
 			modelFromPrepared(prepared),
 			preparedTools(prepared),
-			remoteCreditSpec(a, session.messageID), ctx),
+			remoteCreditSpec(a, session.messageID, selection), ctx),
 		auth:    a,
 		session: session,
 	}, nil
@@ -1003,24 +1009,27 @@ func translateStreamWithCredit(upstream io.ReadCloser, model string, tools []any
 	}
 	if credit != nil {
 		tr.withCredit(credit.scope, credit.turnID, credit.fetcher)
+		tr.billingIdentity = credit.selection
 	}
 	return newTranslateReader(upstream, tr)
 }
 
 // creditSpec 一次查账所需的全部信息。
 type creditSpec struct {
-	scope   string
-	turnID  string
-	fetcher creditFetcher
+	scope     string
+	turnID    string
+	fetcher   creditFetcher
+	selection outboundSelection
 }
 
-// creditForStream 组装 legacy 路径的查账规格（turn id = 我们发的 request_id）。
-func creditForStream(a *auth.Auth, requestID string) *creditSpec {
-	fetcher := creditFor(a, requestID)
+// creditForStream uses the exact per-call session_id sent in the legacy body.
+// A stable conversation ID would aggregate bills across multiple calls.
+func creditForStream(a *auth.Auth, billingID string, selection outboundSelection) *creditSpec {
+	fetcher := creditFor(a, billingID)
 	if fetcher == nil {
 		return nil
 	}
-	return &creditSpec{scope: "llm_utils_chat", turnID: requestID, fetcher: fetcher}
+	return &creditSpec{scope: "llm_utils_chat", turnID: billingID, fetcher: fetcher, selection: selection}
 }
 
 // declaredToolNames 收集声明过的工具名（小写，供白名单比对）。
@@ -1394,18 +1403,21 @@ func (t *toolAccumulator) absorbTextCalls(calls []textToolCall) []map[string]any
 // ── 转译器 ────────────────────────────────────────────────────────────────
 
 type translator struct {
-	timingCtx context.Context
-	model     string
-	id        string
-	text      *textAccumulator
-	reasoning *textAccumulator
-	tools     *toolAccumulator
+	billingIdentity outboundSelection
+	timingCtx       context.Context
+	model           string
+	id              string
+	text            *textAccumulator
+	reasoning       *textAccumulator
+	tools           *toolAccumulator
 
-	usage        map[string]any
-	finishReason string
-	sawTerminal  bool
-	started      bool
-	contentCount int
+	usage              map[string]any
+	usageCounts        map[string]int64
+	usageCountsChanged bool
+	finishReason       string
+	sawTerminal        bool
+	started            bool
+	contentCount       int
 
 	// ── 思考的下发时机（2026-10-16 修「思考被切成很多段」）──────────────────
 	//
@@ -1415,9 +1427,9 @@ type translator struct {
 	// thinking→text→thinking 都要新开一个 content block，Claude Code 便把它
 	// 渲染成十几个「Thought for 1s」碎片，中间夹着几个字的正文。
 	//
-	// 现在改成：正文首次出现之前到达的思考先累积，等正文要发时**一次性**发出
-	// （一个 thinking block）；正文开始后到达的思考进 lateReasoning，收尾时
-	// 合并成第二个 block 发出（不丢内容，但不再与正文交替）。
+	// 正文前的思考逐增量交付，相邻 reasoning 帧仍落在同一个 thinking block，
+	// 无需等正文才让客户端看到思考。正文开始后到达的思考进 lateReasoning，
+	// 收尾时合并成第二个 block，继续避免 R,C,R,C 交替。
 	reasoningFlushed bool
 	// reasoningDelivered 记录「是否已向客户端交付过任何思考内容」。
 	//
@@ -1458,7 +1470,7 @@ type translator struct {
 	credit creditFetcher
 	// creditScope 只用于日志前缀（"llm_utils_chat" / "Remote"）。
 	creditScope string
-	// creditTurnID 查账用的 turn id（legacy = 我们发的 request_id，Remote = message_id）。
+	// creditTurnID is the per-call legacy session_id or Remote user message_id.
 	creditTurnID string
 }
 
@@ -1497,13 +1509,14 @@ func (t *translator) applyCredit() {
 		t.usage = map[string]any{}
 	}
 	t.usage["credit"] = observed.Credits
+	t.reconcileBilledCache(observed)
 	creditLog(t.creditScope, t.creditTurnID, observed)
 }
 
 // absorbReasoning 吸收一段思考（累积快照或增量，由累加器合并）。
 //
 // 增量由累加器的 add 返回（它同时推进去重状态），这里累积到待发缓冲里，
-// 等 flush 时一次性交付——不能等到 flush 再调 finalize，那时 add 已经消费过
+// 等 emitPendingReasoning 时交付——不能等到 flush 再调 finalize，那时 add 已经消费过
 // 增量、finalize 只会返回空串（2026-10-16 实测踩到）。
 func (t *translator) absorbReasoning(chunk string) {
 	if chunk == "" {
@@ -1517,7 +1530,17 @@ func (t *translator) absorbReasoning(chunk string) {
 	t.reasoningPending.WriteString(t.reasoning.add(chunk))
 }
 
-// flushReasoning 把正文之前累积的思考一次性发出（只发一次）。
+func (t *translator) emitPendingReasoning(out *bytes.Buffer) {
+	if text := t.reasoningPending.String(); text != "" {
+		t.start(out)
+		t.reasoningDelivered = true
+		t.emit(out, map[string]any{"reasoning_content": text}, nil)
+		t.reasoningPending.Reset()
+	}
+}
+
+// flushReasoning seals the pre-content reasoning stream once, then transfers
+// deduplication state to the late channel. Earlier increments are already sent.
 func (t *translator) flushReasoning(out *bytes.Buffer) {
 	if t.reasoningFlushed {
 		return
@@ -1525,11 +1548,7 @@ func (t *translator) flushReasoning(out *bytes.Buffer) {
 	t.reasoningFlushed = true
 	// finalize 放行尾部被压住的不完整标记（如恰好停在 "<tool_c" 上）。
 	t.reasoningPending.WriteString(t.reasoning.finalize())
-	if text := t.reasoningPending.String(); text != "" {
-		t.start(out)
-		t.reasoningDelivered = true
-		t.emit(out, map[string]any{"reasoning_content": text}, nil)
-	}
+	t.emitPendingReasoning(out)
 	// 尾部通道**继承**正文前的去重状态。
 	//
 	// 上游发的是**累计快照**：正文之后到达的 thought 通常是「正文前那段 + 新增」
@@ -1686,11 +1705,7 @@ func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (b
 		out.WriteString(": relay-keepalive\n\n")
 		return false, nil
 	case evTokenUsage:
-		if usage, ok := obj["usage"].(map[string]any); ok {
-			t.usage = mapUsage(usage)
-		} else {
-			t.usage = mapUsage(obj)
-		}
+		t.recordEventUsage(data, true)
 		return false, nil
 	case evDone:
 		t.sawTerminal = true
@@ -1705,12 +1720,16 @@ func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (b
 	rawResponse, _ := obj["response"].(string)
 	embeddedReasoning, visibleResponse := splitEmbeddedReasoning(rawResponse)
 
-	// 思考先累积（不与正文交替——见 translator.reasoningFlushed 注释）。
+	// Stream adjacent reasoning increments before content; late reasoning keeps
+	// its separate tail channel so it cannot fragment the content stream.
 	for _, chunk := range []string{reasoning, embeddedReasoning} {
 		t.absorbReasoning(chunk)
 	}
+	if t.contentCount == 0 {
+		t.emitPendingReasoning(out)
+	}
 	if addition := t.text.add(visibleResponse); addition != "" {
-		// 正文要发了：先把之前累积的思考一次性放出去，再开正文块。
+		// Seal any remaining pre-content reasoning before opening the text block.
 		//
 		// 但**纯空白**的正文增量不算「正文开始」：实测上游每个 plan_item 的
 		// content 字段常常只有一个换行，于是思考分片之间夹着 C("\n")，Anthropic
@@ -1736,8 +1755,8 @@ func (t *translator) handleEvent(name string, data []byte, out *bytes.Buffer) (b
 			t.emit(out, map[string]any{"tool_calls": []any{delta}}, nil)
 		}
 	}
-	if usage, ok := obj["usage"].(map[string]any); ok {
-		t.usage = mapUsage(usage)
+	if _, ok := obj["usage"].(map[string]any); ok {
+		t.recordEventUsage(data, false)
 	}
 	if reason := payloadFinishReason(obj); reason != "" {
 		// 中间快照也会带 finish_reason，那只是元数据；只有 done 才是终态。
@@ -1906,17 +1925,30 @@ func mapUsage(usage map[string]any) map[string]any {
 	}
 	if total, ok := number("total_tokens", "totalTokenCount"); ok {
 		out["total_tokens"] = total
-	} else {
-		in, _ := out["prompt_tokens"].(int64)
-		oo, _ := out["completion_tokens"].(int64)
-		out["total_tokens"] = in + oo
+	} else if in, inOK := out["prompt_tokens"].(int64); inOK {
+		if output, outOK := out["completion_tokens"].(int64); outOK && in <= math.MaxInt64-output {
+			out["total_tokens"] = in + output
+		}
 	}
-	if cached, ok := number("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"); ok {
+	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		if cached, present := usageCount(details["cached_tokens"]); present {
+			out["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
+		}
+	}
+	if cached, ok := number("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"); ok && out["prompt_tokens_details"] == nil {
 		out["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
+	}
+	if created, ok := number("cache_creation_input_tokens"); ok {
+		out["cache_creation_input_tokens"] = created
 	}
 	// reasoning_tokens 下游按 completion_tokens_details.reasoning_tokens 读取
 	// （见 server/responses.go 的 usageObject），归一过去思考量才不会丢。
-	if reasoning, ok := number("reasoning_tokens", "completion_thinking_tokens"); ok {
+	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+		if reasoning, present := usageCount(details["reasoning_tokens"]); present {
+			out["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoning}
+		}
+	}
+	if reasoning, ok := number("reasoning_tokens", "completion_thinking_tokens"); ok && out["completion_tokens_details"] == nil {
 		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoning}
 	}
 	if len(out) == 0 {
@@ -1928,17 +1960,15 @@ func mapUsage(usage map[string]any) map[string]any {
 func usageCount(value any) (int64, bool) {
 	switch v := value.(type) {
 	case float64:
-		return int64(v), true
-	case json.Number:
-		n, err := v.Int64()
-		if err != nil {
-			return 0, false
+		if v >= 0 && v < 1<<63 && math.Trunc(v) == v {
+			return int64(v), true
 		}
-		return n, true
+	case json.Number:
+		return exactUsageInteger(v)
 	case int64:
-		return v, true
+		return v, v >= 0
 	case int:
-		return int64(v), true
+		return int64(v), v >= 0
 	}
 	return 0, false
 }

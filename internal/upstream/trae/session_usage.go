@@ -1,5 +1,8 @@
 // session_usage.go — 从商业用量接口取「本轮真实扣费」。
 //
+// ═══ 更新日志 ═══
+// 2026-11-15：排除空/错轮次账单；保留商业缓存计数和有效性，并校验分组归因。
+//
 // ═══ 为什么需要这一步（2026-10-18 实测）═══
 //
 // Trae 的 `llm_utils_chat` 事件流里，`token_usage` 事件**只有 token 数，没有
@@ -54,29 +57,53 @@ const SessionUsagePath = "/api/v1/commercial/get_session_usage"
 // 实测同一主机一次往返 <200ms，取 5s 留足余量又不至于让坏网络拖住整轮。
 const sessionCreditTimeout = 5 * time.Second
 
+const maxSessionExactTokens int64 = 1<<53 - 1
+
+// SessionCacheCount 是商业账单自己的整数观测。
+// Present 区分字段缺失；Valid=false 时 Value 不代表实际零值。
+type SessionCacheCount struct {
+	Value   int64
+	Present bool
+	Valid   bool
+}
+
 // SessionCredit 是本轮的真实扣费观测。
 type SessionCredit struct {
+	// SessionMatched 只在账单回显的 session_id 与请求轮次精确一致时为真。
+	// 不保存原始标识；字段缺失时仍可读扣费，但不能据此把账单缓存关联到 SSE。
+	SessionMatched bool
+	// CacheAttributionSafe 表示关联和账单分组未见矛盾；仍须校验总计并对齐 SSE。
+	CacheAttributionSafe bool
 	// Credits 实际扣费（credits_float；缺失时退回 amount_float）。
 	Credits float64
-	// Amount 金额形态（cost_money_float）。
+	// Amount 账单金额形态（amount_float）。
 	Amount float64
-	// InputTokens / OutputTokens 上游记账用的 token 数（与事件流可能略有出入：
-	// 这里含缓存写入等内部项）。
-	InputTokens  int64
-	OutputTokens int64
+	// InputTokens / OutputTokens 是账单口径，可能汇总同一轮的多次调用。
+	// 严格对齐时必须检查 Present/Valid，不能把缺失或非法值的默认零当作真实零。
+	InputTokens         int64
+	OutputTokens        int64
+	InputTokensPresent  bool
+	InputTokensValid    bool
+	OutputTokensPresent bool
+	OutputTokensValid   bool
+	// 账单可能汇总多次调用；不能未经轮次关联和口径对齐就覆盖单条 SSE。
+	CacheReadTokens  SessionCacheCount
+	CacheWriteTokens SessionCacheCount
 	// ModelName 上游记账的模型显示名（如 "GLM-5.3"）。
 	ModelName string
-	// UseMaxMode 上游是否按 1M 档计费——「默认走 max」是否真的生效，看这个字段。
+	// UseMaxMode is the billing service's reported flag. It is not sufficient
+	// to infer the requested tier: observed __max responses can still bill false.
 	UseMaxMode bool
 }
 
 // FetchSessionCredit 用 turn id 查本轮扣费。
 //
-// turnID：legacy 路径传我们自己生成的 request_id（上游 metadata 原样回显）；
-// Remote 路径传建会话拿到的 message_id。
+// turnID：legacy 路径传本次请求 body.session_id（每次独立，禁止会话复用）；
+// Remote 路径传建会话拿到的用户 message_id。
 //
-// 返回 ok=false 的三种情形（都**不**是错误，只是没观测到）：
-//   - 上游还没出账单（user_usage_group_by_session 缺失或为空）；
+// 返回 ok=false 的以下情形（都**不**是错误，只是没观测到）：
+//   - 上游还没出账单（分组缺失、空对象，或无身份/实际用量的默认零值结构）；
+//   - 账单回显了其它轮次的标识，或标识类型错误；
 //   - 字段形态变化（credits_float 非数值）；
 //   - 网络/HTTP 失败（记一条 WARN 后返回）。
 //
@@ -123,12 +150,25 @@ func FetchSessionCredit(ctx context.Context, a *auth.Auth, turnID string) (Sessi
 	var payload struct {
 		Group map[string]any `json:"user_usage_group_by_session"`
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	// 缓存计数不能先转 float64，否则安全整数边界附近的小数会被舍入成整数。
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		log.Printf("WARN: [trae] 查扣费响应解析失败（turn=%s）：%v", turnID, err)
+		return out, false
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
 		return out, false
 	}
 	if payload.Group == nil {
 		return out, false
+	}
+	if value, present := payload.Group["session_id"]; present && value != nil {
+		id, ok := value.(string)
+		if !ok || id != "" && id != turnID {
+			return out, false
+		}
+		out.SessionMatched = id == turnID
 	}
 	credit, ok := usageFloat(payload.Group["credits_float"])
 	if !ok {
@@ -142,21 +182,102 @@ func FetchSessionCredit(ctx context.Context, a *auth.Auth, turnID string) (Sessi
 		out.Amount = amount
 	}
 	if extra, ok := payload.Group["extra_info"].(map[string]any); ok {
-		if v, ok := usageFloat(extra["input_token"]); ok {
-			out.InputTokens = int64(v)
-		}
-		if v, ok := usageFloat(extra["output_token"]); ok {
-			out.OutputTokens = int64(v)
-		}
+		input := sessionBillCount(extra, "input_token")
+		output := sessionBillCount(extra, "output_token")
+		out.InputTokens, out.InputTokensPresent, out.InputTokensValid = input.Value, input.Present, input.Valid
+		out.OutputTokens, out.OutputTokensPresent, out.OutputTokensValid = output.Value, output.Present, output.Valid
+		out.CacheReadTokens = sessionBillCount(extra, "cache_read_token")
+		out.CacheWriteTokens = sessionBillCount(extra, "cache_write_token")
 	}
 	out.ModelName, _ = payload.Group["model_name"].(string)
 	if flag, ok := payload.Group["use_max_mode"].(bool); ok {
 		out.UseMaxMode = flag
 	}
+	if credit == 0 && !hasSessionBillEvidence(payload.Group) {
+		return SessionCredit{}, false
+	}
+	out.CacheAttributionSafe = sessionCacheAttributionSafe(payload.Group, out.SessionMatched)
 	return out, true
 }
 
-// usageFloat 把 JSON 数值转 float64（兼容 float64 / json.Number / 字符串数字）。
+// 分组校验不负责判断账单与某条 SSE 是否同口径；调用方仍须严格匹配输入输出。
+func sessionCacheAttributionSafe(group map[string]any, sessionMatched bool) bool {
+	if !sessionMatched {
+		return false
+	}
+	value, present := group["usage_group_details"]
+	if !present {
+		return true
+	}
+	details, ok := value.([]any)
+	if !ok || len(details) != 1 {
+		return false
+	}
+	detail, ok := details[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	if value, present := detail["model_display_name"]; present {
+		name, valid := value.(string)
+		expected, rootValid := group["model_name"].(string)
+		if !valid || !rootValid || name != expected {
+			return false
+		}
+	}
+	if value, present := detail["extra_info"]; present {
+		extra, valid := value.(map[string]any)
+		if !valid {
+			return false
+		}
+		rootExtra, _ := group["extra_info"].(map[string]any)
+		for _, key := range []string{"input_token", "output_token", "cache_read_token", "cache_write_token"} {
+			if _, provided := extra[key]; !provided {
+				continue
+			}
+			count := sessionBillCount(extra, key)
+			total := sessionBillCount(rootExtra, key)
+			if !count.Present || !count.Valid || !total.Present || !total.Valid || count.Value != total.Value {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sessionBillCount(extra map[string]any, key string) SessionCacheCount {
+	value, present := extra[key]
+	out := SessionCacheCount{Present: present}
+	if count, ok := usageCount(value); present && ok && count <= maxSessionExactTokens {
+		out.Value, out.Valid = count, true
+	}
+	return out
+}
+
+// 默认空账单与免费账单都可能返回 credits=0；身份或实际用量才能区分二者。
+func hasSessionBillEvidence(group map[string]any) bool {
+	for _, key := range []string{"session_id", "model_name", "model_display_name"} {
+		if value, ok := group[key].(string); ok && trimSpaceASCII(value) != "" {
+			return true
+		}
+	}
+	if extra, ok := group["extra_info"].(map[string]any); ok {
+		for _, key := range []string{"input_token", "output_token", "cache_read_token", "cache_write_token"} {
+			if count := sessionBillCount(extra, key); count.Valid && count.Value > 0 {
+				return true
+			}
+		}
+	}
+	if details, ok := group["usage_group_details"].([]any); ok {
+		for _, value := range details {
+			if detail, ok := value.(map[string]any); ok && hasSessionBillEvidence(detail) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// usageFloat 把 JSON 数值转 float64（兼容 float64 / json.Number / 原生整数）。
 func usageFloat(value any) (float64, bool) {
 	switch v := value.(type) {
 	case float64:
@@ -218,10 +339,10 @@ func creditLog(scope, turnID string, credit SessionCredit) {
 // 为什么用 message_id 而不是 chat_session_id：商业接口按**单轮消息**记账，
 // chat_session_id 是一整个会话（多轮累加）。参考实现同样传 message_id
 // （main.py 的 _bind_usage_turn(message_id)）。
-func remoteCreditSpec(a *auth.Auth, messageID string) *creditSpec {
+func remoteCreditSpec(a *auth.Auth, messageID string, selection outboundSelection) *creditSpec {
 	fetcher := creditFor(a, messageID)
 	if fetcher == nil {
 		return nil
 	}
-	return &creditSpec{scope: "Remote", turnID: messageID, fetcher: fetcher}
+	return &creditSpec{scope: "Remote", turnID: messageID, fetcher: fetcher, selection: selection}
 }

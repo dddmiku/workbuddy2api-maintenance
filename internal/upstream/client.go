@@ -1420,7 +1420,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// **所有 trae 请求的用量（token 与积分）都不落账**——面板「积分」列恒为「—」
 		// 的直接原因之一（2026-10-18 实测：请求记录里 upstream_started=false）。
 		observeChatAttempt(ctx, "start", 0)
-		rc, status, respBody, err := trae.ChatStream(ctx, a, body, clientIP)
+		rc, status, respBody, err := trae.ChatStream(ctx, a, body, clientIP, trae.SessionIdentity{
+			CallerID: meta.CallerID, ConversationID: meta.ConversationID,
+		})
 		if err == nil {
 			observeChatAttempt(ctx, "headers", status)
 		}
