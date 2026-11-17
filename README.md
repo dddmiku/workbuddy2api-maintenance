@@ -1,3 +1,5 @@
+> **维护状态（2026-11-17）**：本项目已由 **LoomGate v1.0.0** 接替，新仓库为 https://github.com/dddmiku/LoomGate 。本仓库保留历史代码与既有 Release，用作回滚来源，不再新增功能发布。迁移前请阅读新仓库的 docs/migration-to-loomgate-1.0.md，并先完成离线预检、副本验收与回滚演练；不要直接覆盖旧生产数据。
+
 # workbuddy2api
 
 把已授权的 WorkBuddy / CodeBuddy 账号接入常用 AI 工具的自托管中转。网关与管理台合在一个容器里：同一端口同时提供 `/v1/`、`/v1beta/` 接口和 `/admin/` 页面。
