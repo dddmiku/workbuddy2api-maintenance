@@ -1,4 +1,4 @@
-> **维护状态（2026-11-17）**：本项目已由 **LoomGate v1.0.0** 接替，新仓库为 https://github.com/dddmiku/LoomGate 。本仓库保留历史代码与既有 Release，用作回滚来源，不再新增功能发布。迁移前请阅读新仓库的 docs/migration-to-loomgate-1.0.md，并先完成离线预检、副本验收与回滚演练；不要直接覆盖旧生产数据。
+> **维护状态（2026-11-18 修订）**：此前的 **LoomGate v1.0.0 发布已撤回**——该项目仍在开发测试阶段，为避免用户误更新，Release 与 tag 均已删除。新仓库 https://github.com/dddmiku/LoomGate 仍在内部开发中，**当前没有任何可下载的正式版本，请勿用于生产**。本仓库保留历史代码与既有 Release（最高 v3.16.1），用作回滚来源，不再新增功能发布。
 
 # workbuddy2api
 
